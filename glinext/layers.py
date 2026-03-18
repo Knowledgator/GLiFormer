@@ -203,6 +203,78 @@ class PromptRelationExtractor(nn.Module):
         return scores
 
 
+class AnchoredSpanScorer(nn.Module):
+    """Scores text positions for span extraction conditioned on anchor representations.
+
+    Unified mechanism for anchor-based tasks:
+    - NER: anchor=parent (broadcast), child=entity_type -> spans
+    - Relations (anchor mode): anchor=entity span, child=relation_type -> target spans
+    - Structuring: anchor=instance rep (from groups layer), child=field_type -> value spans
+
+    For each (anchor, child) pair, produces start/inside/end scores per text position.
+    """
+
+    def __init__(self, hidden_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+
+        self.anchor_proj = nn.Linear(hidden_size, hidden_size)
+        self.gate_proj = nn.Linear(hidden_size * 2, hidden_size)
+
+        # 3-channel projections for start/end/inside scoring
+        self.word_channel_proj = nn.Linear(hidden_size, hidden_size * 3)
+        self.child_channel_proj = nn.Linear(hidden_size, hidden_size * 3)
+
+    def forward(
+        self,
+        anchor_rep: torch.Tensor,
+        child_rep: torch.Tensor,
+        word_embs: torch.Tensor,
+        child_mask: Optional[torch.Tensor] = None,
+        word_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            anchor_rep: (B, A, D) anchor representations (instances/entities/parents)
+            child_rep: (B, C, D) child/field representations
+            word_embs: (B, L, D) text token embeddings
+            child_mask: (B, C) optional mask for valid children
+            word_mask: (B, L) optional mask for valid text positions
+
+        Returns:
+            scores: (B, A, L, C, 3) span scores — start/end/inside per anchor per child
+        """
+        B, A, D = anchor_rep.shape
+        C = child_rep.shape[1]
+        L = word_embs.shape[1]
+
+        # Condition word embeddings on each anchor via gating
+        anchor_proj = self.anchor_proj(anchor_rep)  # (B, A, D)
+        word_exp = word_embs.unsqueeze(1).expand(B, A, L, D)
+        anchor_exp = anchor_proj.unsqueeze(2).expand(B, A, L, D)
+
+        gate = torch.sigmoid(self.gate_proj(
+            torch.cat([word_exp, anchor_exp], dim=-1)
+        ))  # (B, A, L, D)
+        conditioned = word_exp + gate * anchor_exp  # (B, A, L, D)
+
+        # Project to 3 channels: (B, A, L, 3, D)
+        word_3ch = self.word_channel_proj(conditioned).view(B, A, L, 3, D)
+
+        # Project children to 3 channels: (B, C, 3, D)
+        child_3ch = self.child_channel_proj(child_rep).view(B, C, 3, D)
+
+        # Score: (B, A, L, C, 3)
+        scores = torch.einsum("baltd,bctd->balct", word_3ch, child_3ch)
+
+        if word_mask is not None:
+            scores = scores * word_mask[:, None, :, None, None].float()
+        if child_mask is not None:
+            scores = scores * child_mask[:, None, None, :, None].float()
+
+        return scores
+
+
 class SelfAttentionBlock(nn.Module):
     def __init__(self, d_model, num_heads, dropout=0.1):
         super().__init__()

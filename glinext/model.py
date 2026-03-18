@@ -1,4 +1,4 @@
-"""GLiNExT: unified multi-task model for NER, classification, relations, groups, counting, and decoding."""
+"""GLiNExT: unified multi-task model for NER, classification, relations, structuring, counting, and decoding."""
 
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -28,6 +28,7 @@ from gliner.modeling.utils import (
 
 from .config import GLiNextConfig
 from .layers import (
+    AnchoredSpanScorer,
     FeaturesProjector,
     PairRepLayer,
     PromptRelationExtractor,
@@ -53,9 +54,12 @@ class GLiNExTOutput(ModelOutput):
     rel_mask: Optional[torch.Tensor] = None
     # Count
     count_logits: Optional[torch.FloatTensor] = None
-    # Groups
+    # Groups / Structuring
     groups_output: Optional[torch.FloatTensor] = None
     groups_mask: Optional[torch.Tensor] = None
+    # Structuring (anchor-based span extraction)
+    structuring_logits: Optional[torch.FloatTensor] = None
+    structuring_anchor_mask: Optional[torch.Tensor] = None
     # Embedding similarity
     embedding_logits: Optional[torch.FloatTensor] = None
     # Embeddings (for downstream use)
@@ -262,6 +266,11 @@ class GLiNExTModel(BaseModel):
                 )
             else:
                 raise ValueError(f"Unknown groups_layer: {config.groups_layer}")
+
+            # Anchored span scorer for structuring (anchor + child → spans)
+            self.anchored_scorer = AnchoredSpanScorer(
+                config.hidden_size, dropout=config.dropout,
+            )
 
     def get_representations(
         self,
@@ -737,6 +746,126 @@ class GLiNExTModel(BaseModel):
                 threshold=threshold,
             )
 
+    def _forward_structuring(
+        self,
+        token_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        words_embedding: torch.Tensor,
+        mask: torch.Tensor,
+        prompts_embedding: torch.Tensor,
+        prompts_embedding_mask: torch.Tensor,
+        gold_count_val: Optional[torch.Tensor] = None,
+        structuring_labels: Optional[torch.Tensor] = None,
+        structuring_count: Optional[torch.Tensor] = None,
+        threshold: float = 0.5,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Structuring via anchor-based span extraction.
+
+        Unified anchor paradigm:
+          1. Groups layer generates instance anchors from parent embeddings
+          2. [CHILD] embeddings provide field type representations
+          3. AnchoredSpanScorer: (anchor, field) → scores text positions → spans
+
+        Args:
+            token_embeds: (B_enc, S, D) raw encoder output (for extracting [CHILD] tokens).
+            input_ids: (B_enc, S) for token index extraction.
+            attention_mask: (B_enc, S).
+            words_embedding: (B, W, D) text token embeddings.
+            mask: (B, W) valid text token mask.
+            prompts_embedding: (B, C_ent, D) parent/entity prompt embeddings.
+            prompts_embedding_mask: (B, C_ent).
+            gold_count_val: (B,) ground-truth instance counts (training).
+            structuring_labels: (B, X, L, C_field, 3) target span labels.
+            structuring_count: (B,) number of instances per schema.
+            threshold: Score threshold for inference.
+
+        Returns:
+            (loss, structuring_logits, groups_output, anchor_mask)
+        """
+        if not hasattr(self, "groups_layer") or not hasattr(self, "anchored_scorer"):
+            return None, None, None, None
+
+        batch_size, _, embed_dim = token_embeds.shape
+
+        # Extract [CHILD] token embeddings for field types
+        child_embedding, child_embedding_mask = extract_prompt_features(
+            self.config.child_token_index, token_embeds, input_ids, attention_mask,
+            batch_size, embed_dim, self.config.embed_child_token,
+        )
+
+        if child_embedding.shape[1] == 0:
+            return None, None, None, None
+
+        # Step 1: Generate instance anchors via groups layer
+        count_for_groups = structuring_count if structuring_count is not None else gold_count_val
+        groups_output, groups_mask_out = self._forward_groups(
+            prompts_embedding, words_embedding, count_for_groups, threshold,
+        )
+
+        if groups_output is None:
+            return None, None, None, None
+
+        # Normalize groups_output to (B, X, D) anchor representations
+        if isinstance(groups_output, list):
+            # RotaryGroupLSTM: list of (count, M, D) per batch item
+            max_instances = max(o.shape[0] for o in groups_output)
+            D = groups_output[0].shape[-1]
+            anchors = torch.zeros(len(groups_output), max_instances, D,
+                                  device=words_embedding.device)
+            anchor_mask = torch.zeros(len(groups_output), max_instances,
+                                      dtype=torch.bool, device=words_embedding.device)
+            for b, out in enumerate(groups_output):
+                n = out.shape[0]
+                anchors[b, :n] = out.mean(dim=1)  # mean over M fields → (count, D)
+                anchor_mask[b, :n] = True
+        else:
+            anchors = groups_output  # (B, k, D)
+            anchor_mask = groups_mask_out if groups_mask_out is not None else torch.ones(
+                anchors.shape[:2], dtype=torch.bool, device=anchors.device
+            )
+
+        # Step 2: Anchored span scoring
+        # anchors: (B, X, D), child_embedding: (B, C, D), words_embedding: (B, L, D)
+        structuring_logits = self.anchored_scorer(
+            anchors, child_embedding, words_embedding,
+            child_mask=child_embedding_mask, word_mask=mask,
+        )  # (B, X, L, C, 3)
+
+        # Step 3: Loss computation
+        loss = None
+        if structuring_labels is not None:
+            X_pred = structuring_logits.shape[1]
+            X_label = structuring_labels.shape[1]
+            L_pred = structuring_logits.shape[2]
+            L_label = structuring_labels.shape[2]
+            C_pred = structuring_logits.shape[3]
+            C_label = structuring_labels.shape[3]
+
+            min_X = min(X_pred, X_label)
+            min_L = min(L_pred, L_label)
+            min_C = min(C_pred, C_label)
+
+            pred = structuring_logits[:, :min_X, :min_L, :min_C, :]
+            labels = structuring_labels[:, :min_X, :min_L, :min_C, :]
+
+            all_losses = self._loss(pred, labels)
+
+            # Mask: valid instances × valid positions × valid fields
+            inst_mask = anchor_mask[:, :min_X].float()
+            word_mask_f = mask[:, :min_L].float()
+            child_mask_f = child_embedding_mask[:, :min_C].float()
+
+            full_mask = (
+                inst_mask[:, :, None, None, None]
+                * word_mask_f[:, None, :, None, None]
+                * child_mask_f[:, None, None, :, None]
+            )
+
+            loss = (all_losses * full_mask).sum()
+
+        return loss, structuring_logits, groups_output, anchor_mask
+
     def _forward_embedding(
         self,
         words_embedding: torch.Tensor,
@@ -850,8 +979,10 @@ class GLiNExTModel(BaseModel):
         decoder_labels: Optional[torch.Tensor] = None,
         # Count
         count_targets: Optional[torch.Tensor] = None,
-        # Groups
+        # Groups / Structuring
         gold_count_val: Optional[torch.Tensor] = None,
+        structuring_labels: Optional[torch.Tensor] = None,
+        structuring_count: Optional[torch.Tensor] = None,
         # Embedding similarity
         embedding_labels: Optional[torch.Tensor] = None,
         embedding_pair_idx: Optional[torch.Tensor] = None,
@@ -931,10 +1062,21 @@ class GLiNExTModel(BaseModel):
         if decoder_loss is not None:
             total_loss = total_loss + self.config.decoder_loss_coef * decoder_loss
 
-        # ── 7. Groups ────────────────────────────────────────────────────
-        groups_output, groups_mask = self._forward_groups(
-            prompts_embedding, words_embedding, gold_count_val, threshold,
+        # ── 7. Structuring (anchor-based span extraction via groups) ────
+        structuring_loss, structuring_logits, groups_output, structuring_anchor_mask = (
+            self._forward_structuring(
+                token_embeds, input_ids, attention_mask,
+                words_embedding, mask,
+                prompts_embedding, prompts_embedding_mask,
+                gold_count_val=gold_count_val,
+                structuring_labels=structuring_labels,
+                structuring_count=structuring_count,
+                threshold=threshold,
+            )
         )
+        groups_mask = structuring_anchor_mask
+        if structuring_loss is not None:
+            total_loss = total_loss + self.config.structuring_loss_coef * structuring_loss
 
         # ── 8. Embedding similarity ─────────────────────────────────────
         embedding_loss, embedding_logits = self._forward_embedding(
@@ -944,7 +1086,7 @@ class GLiNExTModel(BaseModel):
             total_loss = total_loss + self.config.embedding_loss_coef * embedding_loss
 
         # ── Collect losses ───────────────────────────────────────────────
-        has_any_loss = any(l is not None for l in [ner_loss, cat_loss, rel_loss, decoder_loss, count_loss, embedding_loss])
+        has_any_loss = any(l is not None for l in [ner_loss, cat_loss, rel_loss, decoder_loss, count_loss, embedding_loss, structuring_loss])
         final_loss = total_loss if has_any_loss else None
 
         return GLiNExTOutput(
@@ -960,6 +1102,8 @@ class GLiNExTModel(BaseModel):
             count_logits=count_logits,
             groups_output=groups_output,
             groups_mask=groups_mask,
+            structuring_logits=structuring_logits,
+            structuring_anchor_mask=structuring_anchor_mask,
             embedding_logits=embedding_logits,
             words_embedding=words_embedding,
             mask=mask,

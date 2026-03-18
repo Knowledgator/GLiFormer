@@ -43,6 +43,14 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Groups layer config
         groups_num_heads: int = 4,
         groups_num_layers: int = 2,
+        # Span representation
+        represent_spans: bool = False,
+        neg_spans_ratio: float = 1.0,
+        span_loss_coef: float = 1.0,
+        # Structuring config
+        structuring_loss_coef: float = 1.0,
+        child_token_index: int = -1,
+        embed_child_token: bool = True,
         # Classifier config
         cat_token_index: int = -1,
         embed_cat_token: bool = True,
@@ -86,6 +94,14 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.groups_layer = groups_layer
         self.groups_num_heads = groups_num_heads
         self.groups_num_layers = groups_num_layers
+
+        self.represent_spans = represent_spans
+        self.neg_spans_ratio = neg_spans_ratio
+        self.span_loss_coef = span_loss_coef
+
+        self.structuring_loss_coef = structuring_loss_coef
+        self.child_token_index = child_token_index
+        self.embed_child_token = embed_child_token
 
         self.count_layer = count_layer
         self.count_mode = count_mode

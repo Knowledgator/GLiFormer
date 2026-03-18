@@ -36,9 +36,24 @@ class ExtractionClassMapping:
 
 
 @dataclass
+class StructuringItemMapping:
+    """Mapping for a single structuring schema (e.g. 'person' with fields 'name', 'age')."""
+    field_class_to_id: BaseClassMapping  # field names → ids
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+@dataclass
+class StructuringClassMapping:
+    """Per-example structuring mappings: list of schemas each with field mappings."""
+    items: List[StructuringItemMapping] = field(default_factory=list)
+
+
+@dataclass
 class BatchClassesMapping:
     cat_mapping: List[CatClassMapping]
     extraction_mapping: List[ExtractionClassMapping]
+    structuring_mapping: List[StructuringClassMapping] = field(default_factory=list)
 
     def get_item_mapping(self, index: int) -> Tuple[CatClassMapping, ExtractionClassMapping]:
         return self.cat_mapping[index], self.extraction_mapping[index]
@@ -50,6 +65,10 @@ class BatchClassesMapping:
     def total_extraction_groups(self) -> int:
         """Total number of extraction groups across the batch."""
         return sum(len(em.items) for em in self.extraction_mapping)
+
+    def total_structuring_groups(self) -> int:
+        """Total number of structuring groups (schemas) across the batch."""
+        return sum(len(sm.items) for sm in self.structuring_mapping)
 
     def flat_cat_iter(self):
         """Iterate (flat_idx, batch_idx, group_idx, mapping) over all cat groups."""
@@ -64,6 +83,14 @@ class BatchClassesMapping:
         flat_idx = 0
         for batch_idx, em in enumerate(self.extraction_mapping):
             for group_idx, item_mapping in enumerate(em.items):
+                yield flat_idx, batch_idx, group_idx, item_mapping
+                flat_idx += 1
+
+    def flat_structuring_iter(self):
+        """Iterate (flat_idx, batch_idx, group_idx, item_mapping) over all structuring groups."""
+        flat_idx = 0
+        for batch_idx, sm in enumerate(self.structuring_mapping):
+            for group_idx, item_mapping in enumerate(sm.items):
                 yield flat_idx, batch_idx, group_idx, item_mapping
                 flat_idx += 1
 
@@ -84,6 +111,27 @@ class GLiNextProcessor(BaseProcessor):
         self.parent_token = config.parent_token
         self.child_token = config.child_token
 
+    @staticmethod
+    def _build_class_to_id(labels: List[str],
+                           negatives: Optional[List[str]],
+                           sample_neg: int,
+                           shuffle_labels: bool) -> dict:
+        if negatives is not None:
+            label_set = set(labels)
+            labels.extend(
+                label for label in negatives[:sample_neg + len(labels)]
+                if label not in label_set
+            )
+            # trim to exact count of negatives requested
+            # (the slice above over-fetches to account for overlap)
+            if len(labels) > len(label_set) + sample_neg:
+                labels = labels[:len(label_set) + sample_neg]
+
+        if shuffle_labels:
+            random.shuffle(labels)
+
+        return {label: idx for idx, label in enumerate(labels)}
+
     def get_cat_classes_mapping(self, batch_list: List[Dict],
                                 cat_negatives: Optional[List[str]] = None,
                                 sample_neg=100,
@@ -95,25 +143,13 @@ class GLiNextProcessor(BaseProcessor):
 
             class_mapping = []
             for example in cat_examples:
-                class_to_id = {}
                 all_labels = list(example['all_labels'])
-
-                if cat_negatives is not None:
-                    negative_labels = [label for label in cat_negatives if label not in all_labels]
-                    sampled_negatives = negative_labels[:sample_neg]
-                    all_labels.extend(sampled_negatives)
-
-                if shuffle_labels:
-                    random.shuffle(all_labels)
-
-                for label in all_labels:
-                    class_to_id[label] = len(class_to_id)
-
-                name = example.get('name', None)
-                description = example.get('description', None)
+                class_to_id = self._build_class_to_id(all_labels, cat_negatives, sample_neg, shuffle_labels)
 
                 class_mapping.append(BaseClassMapping(
-                    class_to_id=class_to_id, name=name, description=description
+                    class_to_id=class_to_id,
+                    name=example.get('name', None),
+                    description=example.get('description', None),
                 ))
 
             cat_mapping.append(CatClassMapping(cat_class_to_id=class_mapping))
@@ -133,19 +169,8 @@ class GLiNextProcessor(BaseProcessor):
             item_mappings = []
             for example in extraction_examples:
                 # NER classes
-                ner_class_to_id = {}
                 ner_labels = list({ent[-1] for ent in example.get('ner', [])})
-
-                if ner_negatives is not None:
-                    negative_labels = [label for label in ner_negatives if label not in ner_labels]
-                    sampled_negatives = negative_labels[:sample_neg]
-                    ner_labels.extend(sampled_negatives)
-
-                if shuffle_labels:
-                    random.shuffle(ner_labels)
-
-                for label in ner_labels:
-                    ner_class_to_id[label] = len(ner_class_to_id)
+                ner_class_to_id = self._build_class_to_id(ner_labels, ner_negatives, sample_neg, shuffle_labels)
 
                 name = example.get('name', None)
                 description = example.get('description', None)
@@ -158,19 +183,8 @@ class GLiNextProcessor(BaseProcessor):
                 rel_mapping = None
                 relations = example.get('relations', [])
                 if relations:
-                    rel_class_to_id = {}
                     rel_labels = list({rel[-1] for rel in relations})
-
-                    if rel_negatives is not None:
-                        negative_labels = [label for label in rel_negatives if label not in rel_labels]
-                        sampled_negatives = negative_labels[:sample_neg]
-                        rel_labels.extend(sampled_negatives)
-
-                    if shuffle_labels:
-                        random.shuffle(rel_labels)
-
-                    for label in rel_labels:
-                        rel_class_to_id[label] = len(rel_class_to_id)
+                    rel_class_to_id = self._build_class_to_id(rel_labels, rel_negatives, sample_neg, shuffle_labels)
 
                     rel_mapping = BaseClassMapping(
                         class_to_id=rel_class_to_id, name=name, description=description
@@ -185,6 +199,57 @@ class GLiNextProcessor(BaseProcessor):
 
         return extraction_mapping
 
+    def get_structuring_classes_mapping(self, batch_list: List[Dict],
+                                        shuffle_labels=False) -> List[StructuringClassMapping]:
+        """Build structuring class mappings from structuring data.
+
+        Structuring data format::
+
+            "structuring": {
+                "person": [
+                    {"name": "John Smith", "age": "25"},
+                    {"name": "Jane Doe", "age": "30"}
+                ]
+            }
+
+        Each key in the dict is a schema name, each list element is an instance,
+        and the dict keys within each instance are field names.
+
+        Returns:
+            Per-example StructuringClassMapping with field name → id mappings.
+        """
+        structuring_mapping = []
+        for item in batch_list:
+            structuring_data = item.get('structuring', {})
+
+            item_mappings = []
+            for schema_name, instances in structuring_data.items():
+                # Collect all field names across instances
+                field_names = []
+                seen = set()
+                for instance in instances:
+                    for field_name in instance:
+                        if field_name not in seen:
+                            field_names.append(field_name)
+                            seen.add(field_name)
+
+                if shuffle_labels:
+                    random.shuffle(field_names)
+
+                field_class_to_id = {name: idx for idx, name in enumerate(field_names)}
+
+                item_mappings.append(StructuringItemMapping(
+                    field_class_to_id=BaseClassMapping(
+                        class_to_id=field_class_to_id,
+                        name=schema_name,
+                    ),
+                    name=schema_name,
+                ))
+
+            structuring_mapping.append(StructuringClassMapping(items=item_mappings))
+
+        return structuring_mapping
+
     def batch_generate_class_mappings(self, batch_list: List[Dict],
                                       cat_negatives: Optional[List[str]] = None,
                                       rel_negatives: Optional[List[str]] = None,
@@ -196,10 +261,12 @@ class GLiNextProcessor(BaseProcessor):
         extraction_mapping = self.get_extraction_classes_mapping(
             batch_list, ner_negatives, rel_negatives, sample_neg, shuffle_labels
         )
+        structuring_mapping = self.get_structuring_classes_mapping(batch_list, shuffle_labels)
 
         return BatchClassesMapping(
             cat_mapping=cat_mapping,
-            extraction_mapping=extraction_mapping
+            extraction_mapping=extraction_mapping,
+            structuring_mapping=structuring_mapping,
         )
 
     def resolve_entity_spans(self, text: str, tokens_with_spans: List[Tuple],
@@ -268,6 +335,91 @@ class GLiNextProcessor(BaseProcessor):
                 )
 
         self.sort_extraction_data(item)
+        return item
+
+    def resolve_structuring_spans(self, item: Dict) -> Dict:
+        """Resolve structuring field values to token-level spans.
+
+        For each schema instance, resolves field value text to (start, end) token
+        indices using the same logic as NER entity resolution.
+
+        Modifies the item in-place: each field value becomes a dict with
+        'text', 'start', 'end' keys (token-level indices).
+
+        Args:
+            item: Dict with 'text', 'tokenized_text', and 'structuring' data.
+
+        Returns:
+            The item with resolved structuring spans.
+        """
+        text = item.get('text', '')
+        structuring = item.get('structuring', {})
+        if not structuring or not text:
+            return item
+
+        tokens_with_spans = list(self.words_splitter(text))
+        if 'tokenized_text' not in item:
+            item['tokenized_text'] = [tok for tok, _, _ in tokens_with_spans]
+
+        for schema_name, instances in structuring.items():
+            for instance in instances:
+                for field_name, value in list(instance.items()):
+                    if isinstance(value, dict) and 'text' in value:
+                        # Has text + optional char offsets; resolve if no token spans yet
+                        if 'start' not in value or not isinstance(value['start'], int):
+                            text_val = str(value['text'])
+                            ner_like = [[text_val, field_name]]
+                            resolved = self.resolve_entity_spans(
+                                text, tokens_with_spans, ner_like
+                            )
+                            if resolved:
+                                value['start'] = resolved[0][0]
+                                value['end'] = resolved[0][1]
+                            else:
+                                value['start'] = -1
+                                value['end'] = -1
+                    elif isinstance(value, list):
+                        # List of values — resolve each as a separate span
+                        resolved_list = []
+                        for v in value:
+                            v_str = str(v)
+                            ner_like = [[v_str, field_name]]
+                            resolved = self.resolve_entity_spans(
+                                text, tokens_with_spans, ner_like
+                            )
+                            if resolved:
+                                resolved_list.append({
+                                    'text': v_str,
+                                    'start': resolved[0][0],
+                                    'end': resolved[0][1],
+                                })
+                            else:
+                                resolved_list.append({
+                                    'text': v_str,
+                                    'start': -1,
+                                    'end': -1,
+                                })
+                        instance[field_name] = resolved_list
+                    else:
+                        # Scalar value (str, int, float, bool) — convert to str and resolve
+                        text_val = str(value)
+                        ner_like = [[text_val, field_name]]
+                        resolved = self.resolve_entity_spans(
+                            text, tokens_with_spans, ner_like
+                        )
+                        if resolved:
+                            instance[field_name] = {
+                                'text': text_val,
+                                'start': resolved[0][0],
+                                'end': resolved[0][1],
+                            }
+                        else:
+                            instance[field_name] = {
+                                'text': text_val,
+                                'start': -1,
+                                'end': -1,
+                            }
+
         return item
 
     def sort_extraction_data(self, item: Dict) -> None:
@@ -355,11 +507,23 @@ class GLiNextProcessor(BaseProcessor):
                         prompt.append(f"{self.rel_token} {rel}")
                 prompt.append(self.sep_token)
 
+            # Structuring parent groups (schema name + field names as [CHILD] tokens)
+            if hasattr(classes_mapping, 'structuring_mapping') and i < len(classes_mapping.structuring_mapping):
+                for struct_item in classes_mapping.structuring_mapping[i].items:
+                    prompt.append(self.parent_token)
+                    field_map = struct_item.field_class_to_id
+                    if field_map.name:
+                        prompt.append(field_map.name)
+                    if field_map.description:
+                        prompt.append(field_map.description)
+                    for field_name in field_map.class_to_id:
+                        prompt.append(f"{self.child_token} {field_name}")
+                    prompt.append(self.sep_token)
+
             prompt.append(self.sep_token)
             prompt_lengths.append(len(prompt))
             input_texts.append(prompt + list(text))
-        
-        #TODO: add group items 
+
         return input_texts, prompt_lengths
 
     def _prepare_label_encoder_inputs(
@@ -752,52 +916,56 @@ class GLiNextProcessor(BaseProcessor):
 
     def create_count_labels(self, batch_list: List[Dict],
                             classes_mapping: BatchClassesMapping) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Create count labels for the CountHead.
+        """Create count labels for the CountHead — one per parent group.
 
-        For each batch item, computes the ground-truth entity group count.
-        If an extraction item has a ``groups`` field (list of entity-index lists),
-        the count is ``len(groups)``.  Otherwise it falls back to the number of
-        NER entities in the first extraction item.
+        Each parent group gets a count target:
+          - Classification groups: always 1
+          - Extraction groups: always 1
+          - Structuring groups: number of instances in the schema
 
         Args:
-            batch_list: Raw batch items with 'extraction' data.
+            batch_list: Raw batch items with task data.
             classes_mapping: Multi-task class mappings.
 
         Returns:
             Tuple of:
-                - count_targets: FloatTensor (batch_size,) with per-item counts.
-                - count_batch_idx: LongTensor (batch_size,) identity mapping.
-            Returns None if no extraction data exists.
+                - count_targets: FloatTensor (total_parents,) with per-group counts.
+                - count_batch_idx: LongTensor (total_parents,) mapping group → batch item.
+            Returns None if no groups exist.
         """
-        batch_size = len(batch_list)
-        if batch_size == 0:
+        total_cat = classes_mapping.total_cat_groups()
+        total_ext = classes_mapping.total_extraction_groups()
+        total_struct = classes_mapping.total_structuring_groups()
+        total_parents = total_cat + total_ext + total_struct
+
+        if total_parents == 0:
             return None
 
-        has_any = False
-        count_targets = torch.zeros(batch_size, dtype=torch.float)
+        count_targets = torch.zeros(total_parents, dtype=torch.float)
+        count_batch_idx = torch.zeros(total_parents, dtype=torch.long)
+        offset = 0
 
-        #TODO: add proper handling of groups labels
+        # Classification: count is always 1
+        for flat_idx, batch_idx, group_idx, _ in classes_mapping.flat_cat_iter():
+            count_targets[offset] = 1.0
+            count_batch_idx[offset] = batch_idx
+            offset += 1
 
-        for i, item in enumerate(batch_list):
-            extraction = item.get('extraction', [])
-            if not extraction:
-                continue
-            # Use the first extraction group for count
-            first_ext = extraction[0]
-            groups = first_ext.get('groups')
-            if groups is not None:
-                count_targets[i] = len(groups)
-                has_any = True
-            else:
-                ner = first_ext.get('ner', [])
-                if ner:
-                    count_targets[i] = len(ner)
-                    has_any = True
+        # Extraction: count is always 1
+        for flat_idx, batch_idx, group_idx, _ in classes_mapping.flat_extraction_iter():
+            count_targets[offset] = 1.0
+            count_batch_idx[offset] = batch_idx
+            offset += 1
 
-        if not has_any:
-            return None
+        # Structuring: count is number of instances in the schema
+        for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
+            structuring_data = batch_list[batch_idx].get('structuring', {})
+            schema_name = struct_item.name
+            instances = structuring_data.get(schema_name, [])
+            count_targets[offset] = float(len(instances))
+            count_batch_idx[offset] = batch_idx
+            offset += 1
 
-        count_batch_idx = torch.arange(batch_size, dtype=torch.long)
         return count_targets, count_batch_idx
 
     def create_embedding_labels(self, batch_list: List[Dict]) -> Optional[Dict[str, torch.Tensor]]:
@@ -843,83 +1011,200 @@ class GLiNextProcessor(BaseProcessor):
             'embedding_labels': torch.tensor(scores, dtype=torch.float),
         }
 
-    def create_groups_labels(self, batch_list: List[Dict],
-                             classes_mapping: BatchClassesMapping) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Create group-assignment labels for the grouping task.
+    def create_structuring_labels(self, batch_list: List[Dict],
+                                   classes_mapping: BatchClassesMapping,
+                                   max_seq_len: int) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Create structuring labels for anchor-based span extraction.
 
-        For each extraction group that has a ``groups`` field, produces a
-        binary assignment matrix mapping entities to groups.
+        For each structuring schema, for each instance, for each field, marks
+        start/inside/end positions in text for the field's value span.
 
         Data format::
 
-            "extraction": [{
-                "name": "schema",
-                "ner": [[start, end, label], ...],
-                "groups": [[0, 1, 2], [3, 4]]   # entity indices per group
-            }]
-
-        Args:
-            batch_list: Raw batch items with 'extraction' data.
-            classes_mapping: Multi-task class mappings.
+            "structuring": {
+                "person": [
+                    {"name": {"text": "John", "start": 0, "end": 0},
+                     "age": {"text": "25", "start": 3, "end": 3}},
+                ]
+            }
 
         Returns:
             Tuple of:
-                - groups_labels: FloatTensor (total_extraction_groups, G, E)
-                  binary assignment where entry [g, e]=1 means entity e belongs
-                  to group g.
-                - groups_mask: BoolTensor (total_extraction_groups,) indicating
-                  which groups have grouping data.
-                - groups_batch_idx: LongTensor (total_extraction_groups,) mapping
-                  each group to its batch item index.
-            Returns None if no grouping data exists.
+                - structuring_labels: FloatTensor (total_groups, X, L, C, 3)
+                  where X=max instances, L=max_seq_len, C=max fields, 3=start/end/inside
+                - structuring_mask: BoolTensor (total_groups,) indicating which
+                  groups have structuring data.
+                - structuring_batch_idx: LongTensor (total_groups,) mapping each
+                  group to its batch item index.
+                - structuring_count: LongTensor (total_groups,) number of instances
+                  per schema.
+            Returns None if no structuring data exists.
         """
-        total_groups = classes_mapping.total_extraction_groups()
+        total_groups = classes_mapping.total_structuring_groups()
         if total_groups == 0:
             return None
 
-        max_num_groups = 0
-        max_entities = 0
+        max_instances = 0
+        max_fields = 0
         has_any = False
 
-        for flat_idx, batch_idx, group_idx, ext_mapping in classes_mapping.flat_extraction_iter():
-            extraction_examples = batch_list[batch_idx].get('extraction', [])
-            if group_idx >= len(extraction_examples):
+        for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
+            structuring_data = batch_list[batch_idx].get('structuring', {})
+            schema_name = struct_item.name
+            if schema_name not in structuring_data:
                 continue
-            example = extraction_examples[group_idx]
-            groups = example.get('groups')
-            if groups is not None:
+            instances = structuring_data[schema_name]
+            if instances:
                 has_any = True
-                max_num_groups = max(max_num_groups, len(groups))
-                max_ent = max((max(g) + 1 for g in groups if g), default=0)
-                max_entities = max(max_entities, max_ent, len(example.get('ner', [])))
+                max_instances = max(max_instances, len(instances))
+                max_fields = max(max_fields, len(struct_item.field_class_to_id.class_to_id))
 
-        if not has_any or max_num_groups == 0 or max_entities == 0:
+        if not has_any or max_instances == 0 or max_fields == 0:
             return None
 
-        groups_labels = torch.zeros(
-            total_groups, max_num_groups, max_entities, dtype=torch.float,
+        structuring_labels = torch.zeros(
+            total_groups, max_instances, max_seq_len, max_fields, 3,
+            dtype=torch.float,
         )
-        groups_mask = torch.zeros(total_groups, dtype=torch.bool)
-        groups_batch_idx = torch.zeros(total_groups, dtype=torch.long)
+        structuring_mask = torch.zeros(total_groups, dtype=torch.bool)
+        structuring_batch_idx = torch.zeros(total_groups, dtype=torch.long)
+        structuring_count = torch.zeros(total_groups, dtype=torch.long)
 
-        for flat_idx, batch_idx, group_idx, ext_mapping in classes_mapping.flat_extraction_iter():
-            groups_batch_idx[flat_idx] = batch_idx
-            extraction_examples = batch_list[batch_idx].get('extraction', [])
-            if group_idx >= len(extraction_examples):
+        for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
+            structuring_batch_idx[flat_idx] = batch_idx
+            structuring_data = batch_list[batch_idx].get('structuring', {})
+            schema_name = struct_item.name
+            if schema_name not in structuring_data:
                 continue
 
-            example = extraction_examples[group_idx]
-            groups = example.get('groups')
-            if groups is None:
-                continue
+            instances = structuring_data[schema_name]
+            field_to_id = struct_item.field_class_to_id.class_to_id
+            structuring_mask[flat_idx] = True
+            structuring_count[flat_idx] = len(instances)
 
-            groups_mask[flat_idx] = True
-            for g_idx, entity_indices in enumerate(groups):
-                for e_idx in entity_indices:
-                    if e_idx < max_entities:
-                        groups_labels[flat_idx, g_idx, e_idx] = 1.0
+            for inst_idx, instance in enumerate(instances):
+                if inst_idx >= max_instances:
+                    break
+                for field_name, value in instance.items():
+                    if field_name not in field_to_id:
+                        continue
+                    field_id = field_to_id[field_name]
+                    if field_id >= max_fields:
+                        continue
 
-        return groups_labels, groups_mask, groups_batch_idx
+                    # Get token span
+                    if isinstance(value, dict):
+                        st = value.get('start', -1)
+                        ed = value.get('end', -1)
+                    else:
+                        continue
+
+                    if st < 0 or ed < 0 or st >= max_seq_len or ed >= max_seq_len:
+                        continue
+
+                    # Mark start/end/inside (same as NER)
+                    structuring_labels[flat_idx, inst_idx, st, field_id, 0] = 1.0  # start
+                    structuring_labels[flat_idx, inst_idx, ed, field_id, 1] = 1.0  # end
+                    structuring_labels[flat_idx, inst_idx, st:ed + 1, field_id, 2] = 1.0  # inside
+
+        return structuring_labels, structuring_mask, structuring_batch_idx, structuring_count
+
+    def create_structuring_span_labels(self, batch_list: List[Dict],
+                                        classes_mapping: BatchClassesMapping,
+                                        max_seq_len: int) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Create span-level structuring labels with shape (gB, S, X, C).
+
+        For each structuring group, collects all field value spans across all
+        instances, then builds a label tensor where each span is assigned to
+        its (instance, field) slot.
+
+        Args:
+            batch_list: List of per-example dicts with 'structuring' data.
+            classes_mapping: BatchClassesMapping for the batch.
+            max_seq_len: Maximum sequence length (for negative span generation).
+
+        Returns:
+            Tuple of:
+                - structuring_span_idx: LongTensor (gB, S, 2) span start/end pairs
+                - structuring_span_labels: FloatTensor (gB, S, X, C) one-hot labels
+                - structuring_span_mask: BoolTensor (gB, S) valid span mask
+                - structuring_span_batch_idx: LongTensor (gB,) batch index per group
+            Returns None if no structuring data exists.
+        """
+        total_groups = classes_mapping.total_structuring_groups()
+        if total_groups == 0:
+            return None
+
+        max_instances = 0
+        max_fields = 0
+        has_any = False
+
+        # First pass: collect spans per group, find dimensions
+        all_group_spans = []  # list of list of (start, end, instance_idx, field_id)
+        batch_indices = []
+
+        for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
+            structuring_data = batch_list[batch_idx].get('structuring', {})
+            schema_name = struct_item.name
+            field_to_id = struct_item.field_class_to_id.class_to_id
+            max_fields = max(max_fields, len(field_to_id))
+            batch_indices.append(batch_idx)
+
+            group_spans = []
+            positive_spans = set()
+
+            if schema_name in structuring_data:
+                instances = structuring_data[schema_name]
+                max_instances = max(max_instances, len(instances))
+
+                for inst_idx, instance in enumerate(instances):
+                    for field_name, value in instance.items():
+                        if field_name not in field_to_id:
+                            continue
+                        field_id = field_to_id[field_name]
+                        if not isinstance(value, dict):
+                            continue
+                        st = value.get('start', -1)
+                        ed = value.get('end', -1)
+                        if 0 <= st < max_seq_len and 0 <= ed < max_seq_len:
+                            group_spans.append((st, ed, inst_idx, field_id))
+                            positive_spans.add((st, ed))
+                            has_any = True
+
+            # Add negative spans
+            neg_ratio = getattr(self.config, 'neg_spans_ratio', 0)
+            neg_count = int(len(group_spans) * neg_ratio)
+            if neg_count > 0 and max_seq_len > 0:
+                max_width = getattr(self.config, "max_width", 10)
+                negatives = self._generate_negative_spans(
+                    positive_spans, max_seq_len, neg_count, max_width
+                )
+                for st, ed in negatives:
+                    group_spans.append((st, ed, -1, -1))  # sentinel for negative
+
+            all_group_spans.append(group_spans)
+
+        if not has_any or max_instances == 0 or max_fields == 0:
+            return None
+
+        max_spans = max((len(s) for s in all_group_spans), default=0)
+        if max_spans == 0:
+            return None
+
+        span_idx = torch.zeros(total_groups, max_spans, 2, dtype=torch.long)
+        span_labels = torch.zeros(total_groups, max_spans, max_instances, max_fields, dtype=torch.float)
+        span_mask = torch.zeros(total_groups, max_spans, dtype=torch.bool)
+        span_batch_idx = torch.tensor(batch_indices, dtype=torch.long)
+
+        for g, group_spans in enumerate(all_group_spans):
+            for s, (st, ed, inst_idx, field_id) in enumerate(group_spans):
+                span_idx[g, s, 0] = st
+                span_idx[g, s, 1] = ed
+                span_mask[g, s] = True
+                if inst_idx >= 0 and field_id >= 0:
+                    span_labels[g, s, inst_idx, field_id] = 1.0
+
+        return span_idx, span_labels, span_mask, span_batch_idx
 
     def prepare_decoder_labels(self, decoder_label_strings):
         """Tokenize decoder label strings using the decoder tokenizer.
@@ -1148,6 +1433,7 @@ class GLiNextProcessor(BaseProcessor):
             "classification": batch.get("classification", [[] for _ in range(batch_size)]),
             "extraction": batch.get("extraction", [[] for _ in range(batch_size)]),
             "embedding": batch.get("embedding", [[] for _ in range(batch_size)]),
+            "structuring": batch.get("structuring", [{} for _ in range(batch_size)]),
         }
 
         if total_groups == 0:
@@ -1244,6 +1530,9 @@ class GLiNextProcessor(BaseProcessor):
                 self.resolve_extraction_spans(item)
             elif item.get('extraction'):
                 self.sort_extraction_data(item)
+            # Resolve structuring field values to token spans
+            if item.get('structuring') and item.get('text'):
+                self.resolve_structuring_spans(item)
 
         classes_mapping = self.batch_generate_class_mappings(
             batch_list,
@@ -1277,6 +1566,7 @@ class GLiNextProcessor(BaseProcessor):
             'classification': [item.get('classification', []) for item in batch_list],
             'extraction': [item.get('extraction', []) for item in batch_list],
             'embedding': [item.get('embedding', []) for item in batch_list],
+            'structuring': [item.get('structuring', {}) for item in batch_list],
         }
 
         return self.create_batch_dict(batch_dict, classes_mapping)
@@ -1296,7 +1586,7 @@ class GLiNextProcessor(BaseProcessor):
                 - ner_labels, ner_batch_idx: NER labels (if applicable)
                 - rel_labels, rel_mask, rel_batch_idx: Relation labels (if applicable)
                 - count_targets, gold_count_val: Count labels (if applicable)
-                - groups_labels, groups_mask, groups_batch_idx: Group assignment labels (if applicable)
+
         """
         classes_mapping = batch['classes_mapping']
 
@@ -1309,11 +1599,14 @@ class GLiNextProcessor(BaseProcessor):
             # Reconstruct batch_list-like structure for label creation
             batch_list = []
             for i in range(len(batch['tokens'])):
-                batch_list.append({
+                item = {
                     'classification': batch['classification'][i],
                     'extraction': batch['extraction'][i],
                     'embedding': batch['embedding'][i],
-                })
+                }
+                if 'structuring' in batch and i < len(batch['structuring']):
+                    item['structuring'] = batch['structuring'][i]
+                batch_list.append(item)
 
             # Classification labels: (total_cat_groups, C)
             cat_result = self.create_cat_labels(batch_list, classes_mapping)
@@ -1360,12 +1653,32 @@ class GLiNextProcessor(BaseProcessor):
                 tokenized_input['embedding_labels'] = embedding_result['embedding_labels']
                 tokenized_input['embedding_pair_idx'] = embedding_result['embedding_pair_idx']
 
-            # Groups labels: (total_extraction_groups, G, E) — entity-to-group assignment
-            groups_result = self.create_groups_labels(batch_list, classes_mapping)
-            if groups_result is not None:
-                tokenized_input['groups_labels'] = groups_result[0]
-                tokenized_input['groups_mask'] = groups_result[1]
-                tokenized_input['groups_batch_idx'] = groups_result[2]
+            # Span labels — only when represent_spans is enabled
+            if getattr(self.config, 'represent_spans', False):
+                # NER spans: (gB_ext, S, C) — per extraction group
+                ner_span_result = self.create_span_labels(batch)
+                if ner_span_result is not None:
+                    tokenized_input['ner_span_labels'] = ner_span_result[0]
+                    tokenized_input['ner_span_mask'] = ner_span_result[1]
+                    tokenized_input['ner_span_idx'] = batch['span_idx']
+
+                # Structuring spans: (gB_struct, S, X, C) — per structuring group
+                struct_span_result = self.create_structuring_span_labels(
+                    batch_list, classes_mapping, max_seq_len
+                )
+                if struct_span_result is not None:
+                    tokenized_input['structuring_span_idx'] = struct_span_result[0]
+                    tokenized_input['structuring_span_labels'] = struct_span_result[1]
+                    tokenized_input['structuring_span_mask'] = struct_span_result[2]
+                    tokenized_input['structuring_span_batch_idx'] = struct_span_result[3]
+
+            # Structuring labels: (total_structuring_groups, X, L, C, 3) — anchor-based span extraction
+            structuring_result = self.create_structuring_labels(batch_list, classes_mapping, max_seq_len)
+            if structuring_result is not None:
+                tokenized_input['structuring_labels'] = structuring_result[0]
+                tokenized_input['structuring_mask'] = structuring_result[1]
+                tokenized_input['structuring_batch_idx'] = structuring_result[2]
+                tokenized_input['structuring_count'] = structuring_result[3]
 
         return tokenized_input
 
