@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 from transformers.models.auto import CONFIG_MAPPING
@@ -5,30 +6,137 @@ from transformers.models.auto import CONFIG_MAPPING
 from gliner.config import BaseGLiNERConfig
 
 
+@dataclass
+class NERHeadConfig:
+    loss_coef: float = 1.0
+    represent_spans: bool = False
+    neg_spans_ratio: float = 1.0
+    span_loss_coef: float = 1.0
+    scorer_type: str = "gliner"  # "gliner" (GLiNER Scorer), "anchored" (AnchoredSpanScorer)
+    anchor_mode: str = "parent"  # "parent", "fixed"
+    anchor_modeling: str = "linear"  # "linear", "lstm", "mlp"
+
+
+@dataclass
+class ClassificationHeadConfig:
+    layer_type: str = "dot"  # "dot", "weighted-dot", "mlp"
+    cat_token_index: int = -1
+    embed_cat_token: bool = True
+    loss_coef: float = 1.0
+    pooling_type: str = "mean"  # "mean", "cls", "max"
+
+
+@dataclass
+class JointRelexHeadConfig:
+    """Config for joint NER + relation extraction (GLiNER-relex style).
+
+    Inherits NER scoring from NERHead and adds adjacency-based
+    entity pair scoring against [REL] type embeddings.
+    """
+    layer_type: str = "dot"                # "dot", "weighted-dot", "mlp"
+    pair_rep_type: str = "concat_proj"     # pair representation type
+    triples_layer: Optional[str] = None    # optional triples scoring layer
+    embed_rel_token: bool = True
+    rel_token_index: int = -1
+    loss_coef: float = 1.0
+    adjacency_loss_coef: float = 1.0
+
+
+@dataclass
+class OpenRelexHeadConfig:
+    """Config for anchor-based relation extraction (GLiNER2 style).
+
+    Standalone head — no NER dependency. Uses configurable anchor layers
+    to extract head/tail spans directly per (anchor, rel_type) pair.
+    """
+    anchor_mode: str = "fixed"          # "fixed", "rotary", "query_lstm", "query_transformer"
+    anchor_modeling: str = "linear"     # "linear", "lstm", "mlp"
+    num_fixed_slots: int = 10
+    max_count: int = 20
+    groups_num_heads: int = 4
+    groups_num_layers: int = 2
+    rel_token_index: int = -1
+    embed_rel_token: bool = True
+    loss_coef: float = 1.0
+
+
+@dataclass
+class StructuringHeadConfig:
+    groups_layer: str = "lstm"  # "lstm", "query_lstm", "query_transformer", "fixed"
+    groups_num_heads: int = 4
+    groups_num_layers: int = 2
+    max_count: int = 20
+    num_fixed_slots: int = 10  # number of learnable anchor slots (for groups_layer="fixed")
+    child_token_index: int = -1
+    embed_child_token: bool = True
+    loss_coef: float = 1.0
+    anchor_modeling: str = "linear"  # "linear", "lstm", "mlp"
+
+
+@dataclass
+class CountHeadConfig:
+    mode: str = "regression"
+    max_count: int = 20
+    loss_coef: float = 1.0
+
+
+@dataclass
+class DecoderHeadConfig:
+    model_name: Optional[str] = "gpt2"
+    decoder_config: Optional[dict] = None
+    full_decoder_context: bool = True
+    loss_coef: float = 0.5
+
+
+@dataclass
+class EmbeddingHeadConfig:
+    loss_coef: float = 1.0
+    pooling_type: str = "mean"  # "mean", "cls", "max", "weighted"
+    similarity_fn: str = "cosine"  # "cosine", "dot", "l2"
+    loss_fn: str = "mse"  # "mse", "contrastive", "triplet"
+
+
 class GLiNextConfig(BaseGLiNERConfig):
     model_type = "glinext"
 
     def __init__(
         self,
-        # Layer selection (None = disabled)
-        relations_layer: Optional[str] = None,
-        classifier_layer: Optional[str] = "dot",
-        groups_layer: Optional[str] = None,
-        count_layer: Optional[str] = None,
-        # Relations config
-        rel_mode: str = "adjacency",  # "adjacency" (pair-based) or "prompt" (prompt-guided source/target)
-        pair_rep_type: str = "concat_proj",  # for adjacency mode: "concat_proj", "bilinear", "additive", "mlp"
-        triples_layer: Optional[str] = None,
-        embed_rel_token: bool = True,
-        rel_token_index: int = -1,
+        # Per-task sub-configs (None = disabled, dict or dataclass = enabled)
+        ner_config: Optional[dict] = None,
+        classification_config: Optional[dict] = None,
+        relations_config: Optional[dict] = None,  # backward compat alias for joint_relex_config
+        joint_relex_config: Optional[dict] = None,
+        open_relex_config: Optional[dict] = None,
+        structuring_config: Optional[dict] = None,
+        count_config: Optional[dict] = None,
+        decoder_config: Optional[dict] = None,
+        embedding_config: Optional[dict] = None,
         # Labels encoder (bi-encoder style)
         labels_encoder: Optional[str] = None,
         labels_encoder_config: Optional[dict] = None,
-        # Decoder model
+        # Special tokens
+        seq_token: str = "[SEQ]",
+        cat_token: str = "[CAT]",
+        rel_token: str = "[REL]",
+        parent_token: str = "[PARENT]",
+        child_token: str = "[CHILD]",
+        # ── Backward compat: flat params auto-migrated to sub-configs ──
+        # Layer selection
+        relations_layer: Optional[str] = None,
+        classifier_layer: Optional[str] = None,
+        groups_layer: Optional[str] = None,
+        count_layer: Optional[str] = None,
         decoder_model: Optional[str] = None,
-        decoder_config: Optional[dict] = None,
-        full_decoder_context: bool = True,
-        # Loss coefficients
+        # Relations flat params
+        rel_mode: str = "adjacency",
+        pair_rep_type: str = "concat_proj",
+        triples_layer: Optional[str] = None,
+        embed_rel_token: bool = True,
+        rel_token_index: int = -1,
+        # Classification flat params
+        cat_token_index: int = -1,
+        embed_cat_token: bool = True,
+        # Loss coefficients (flat)
         ner_loss_coef: float = 1.0,
         cat_loss_coef: float = 1.0,
         rel_loss_coef: float = 1.0,
@@ -37,40 +145,131 @@ class GLiNextConfig(BaseGLiNERConfig):
         count_loss_coef: float = 1.0,
         groups_loss_coef: float = 1.0,
         embedding_loss_coef: float = 1.0,
-        # Count layer config
-        count_mode: str = "regression",
-        max_count: int = 20,
-        # Groups layer config
-        groups_num_heads: int = 4,
-        groups_num_layers: int = 2,
-        # Span representation
+        structuring_loss_coef: float = 1.0,
+        # Span representation (flat)
         represent_spans: bool = False,
         neg_spans_ratio: float = 1.0,
         span_loss_coef: float = 1.0,
-        # Structuring config
-        structuring_loss_coef: float = 1.0,
+        # Count (flat)
+        count_mode: str = "regression",
+        max_count: int = 20,
+        # Groups (flat)
+        groups_num_heads: int = 4,
+        groups_num_layers: int = 2,
+        # Structuring (flat)
         child_token_index: int = -1,
         embed_child_token: bool = True,
-        # Classifier config
-        cat_token_index: int = -1,
-        embed_cat_token: bool = True,
-        # Special tokens
-        seq_token: str = "[SEQ]",
-        cat_token: str = "[CAT]",
-        rel_token: str = "[REL]",
-        parent_token: str = "[PARENT]",
-        child_token: str = "[CHILD]",
+        # Decoder (flat)
+        full_decoder_context: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        # Decoder config
+        # ── Migrate flat params to sub-configs if sub-configs not provided ──
+
+        # NER: always on by default (use flat params if no sub-config)
+        if ner_config is None:
+            ner_config = {}
+        if isinstance(ner_config, dict):
+            ner_config.setdefault("loss_coef", ner_loss_coef)
+            ner_config.setdefault("represent_spans", represent_spans)
+            ner_config.setdefault("neg_spans_ratio", neg_spans_ratio)
+            ner_config.setdefault("span_loss_coef", span_loss_coef)
+            self.ner_config = NERHeadConfig(**ner_config)
+        else:
+            self.ner_config = ner_config
+
+        # Classification
+        if classification_config is None and classifier_layer is not None:
+            classification_config = {
+                "layer_type": classifier_layer,
+                "cat_token_index": cat_token_index,
+                "embed_cat_token": embed_cat_token,
+                "loss_coef": cat_loss_coef,
+            }
+        if isinstance(classification_config, dict):
+            self.classification_config = ClassificationHeadConfig(**classification_config)
+        else:
+            self.classification_config = classification_config
+
+        # Joint Relex (backward compat: relations_config → joint_relex_config)
+        if joint_relex_config is None and relations_config is not None:
+            joint_relex_config = relations_config
+        if joint_relex_config is None and relations_layer is not None:
+            joint_relex_config = {
+                "layer_type": relations_layer,
+                "pair_rep_type": pair_rep_type,
+                "triples_layer": triples_layer,
+                "embed_rel_token": embed_rel_token,
+                "rel_token_index": rel_token_index,
+                "loss_coef": rel_loss_coef,
+                "adjacency_loss_coef": adjacency_loss_coef,
+            }
+        if isinstance(joint_relex_config, dict):
+            self.joint_relex_config = JointRelexHeadConfig(**joint_relex_config)
+        else:
+            self.joint_relex_config = joint_relex_config
+        # Backward compat alias
+        self.relations_config = self.joint_relex_config
+
+        # Open Relex
+        if isinstance(open_relex_config, dict):
+            self.open_relex_config = OpenRelexHeadConfig(**open_relex_config)
+        else:
+            self.open_relex_config = open_relex_config
+
+        # Structuring
+        if structuring_config is None and groups_layer is not None:
+            structuring_config = {
+                "groups_layer": groups_layer,
+                "groups_num_heads": groups_num_heads,
+                "groups_num_layers": groups_num_layers,
+                "max_count": max_count,
+                "child_token_index": child_token_index,
+                "embed_child_token": embed_child_token,
+                "loss_coef": structuring_loss_coef,
+            }
+        if isinstance(structuring_config, dict):
+            self.structuring_config = StructuringHeadConfig(**structuring_config)
+        else:
+            self.structuring_config = structuring_config
+
+        # Count
+        if count_config is None and count_layer is not None:
+            count_config = {
+                "mode": count_mode,
+                "max_count": max_count,
+                "loss_coef": count_loss_coef,
+            }
+        if isinstance(count_config, dict):
+            self.count_config = CountHeadConfig(**count_config)
+        else:
+            self.count_config = count_config
+
+        # Decoder
+        if decoder_config is None and decoder_model is not None:
+            decoder_config = {
+                "model_name": decoder_model,
+                "full_decoder_context": full_decoder_context,
+                "loss_coef": decoder_loss_coef,
+            }
         if isinstance(decoder_config, dict):
-            decoder_config["model_type"] = decoder_config.get("model_type", "gpt2")
-            decoder_config = CONFIG_MAPPING[decoder_config["model_type"]](**decoder_config)
-        self.decoder_model = decoder_model
-        self.decoder_config = decoder_config
-        self.full_decoder_context = full_decoder_context
+            # Handle nested transformer decoder_config
+            nested_dec_config = decoder_config.pop("decoder_config", None)
+            if isinstance(nested_dec_config, dict):
+                nested_dec_config["model_type"] = nested_dec_config.get("model_type", "gpt2")
+                nested_dec_config = CONFIG_MAPPING[nested_dec_config["model_type"]](**nested_dec_config)
+            self.decoder_head_config = DecoderHeadConfig(**decoder_config)
+            self.decoder_head_config.decoder_config = nested_dec_config
+        else:
+            self.decoder_head_config = decoder_config
+
+        # Embedding
+        if isinstance(embedding_config, dict):
+            embedding_config.setdefault("loss_coef", embedding_loss_coef)
+            self.embedding_config = EmbeddingHeadConfig(**embedding_config)
+        else:
+            self.embedding_config = embedding_config
 
         # Labels encoder config
         if isinstance(labels_encoder_config, dict):
@@ -79,47 +278,50 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.labels_encoder = labels_encoder
         self.labels_encoder_config = labels_encoder_config
 
-        # Layer configs
-        self.relations_layer = relations_layer
-        self.rel_mode = rel_mode
-        self.pair_rep_type = pair_rep_type
-        self.triples_layer = triples_layer
-        self.embed_rel_token = embed_rel_token
-        self.rel_token_index = rel_token_index
-
-        self.classifier_layer = classifier_layer
-        self.cat_token_index = cat_token_index
-        self.embed_cat_token = embed_cat_token
-
-        self.groups_layer = groups_layer
-        self.groups_num_heads = groups_num_heads
-        self.groups_num_layers = groups_num_layers
-
-        self.represent_spans = represent_spans
-        self.neg_spans_ratio = neg_spans_ratio
-        self.span_loss_coef = span_loss_coef
-
-        self.structuring_loss_coef = structuring_loss_coef
-        self.child_token_index = child_token_index
-        self.embed_child_token = embed_child_token
-
-        self.count_layer = count_layer
-        self.count_mode = count_mode
-        self.max_count = max_count
-
-        # Loss coefficients
-        self.ner_loss_coef = ner_loss_coef
-        self.cat_loss_coef = cat_loss_coef
-        self.rel_loss_coef = rel_loss_coef
-        self.adjacency_loss_coef = adjacency_loss_coef
-        self.decoder_loss_coef = decoder_loss_coef
-        self.count_loss_coef = count_loss_coef
-        self.groups_loss_coef = groups_loss_coef
-        self.embedding_loss_coef = embedding_loss_coef
-
         # Special tokens
         self.seq_token = seq_token
         self.cat_token = cat_token
         self.rel_token = rel_token
         self.parent_token = parent_token
         self.child_token = child_token
+
+        # ── Backward compat: keep flat attributes for code that reads them ──
+        self.relations_layer = relations_layer or (self.joint_relex_config.layer_type if self.joint_relex_config else None)
+        self.classifier_layer = classifier_layer or (self.classification_config.layer_type if self.classification_config else None)
+        self.groups_layer = groups_layer or (self.structuring_config.groups_layer if self.structuring_config else None)
+        self.count_layer = count_layer or ("regression" if self.count_config else None)
+        self.decoder_model = decoder_model or (self.decoder_head_config.model_name if self.decoder_head_config else None)
+
+        self.rel_mode = rel_mode
+        self.pair_rep_type = self.joint_relex_config.pair_rep_type if self.joint_relex_config else pair_rep_type
+        self.triples_layer = self.joint_relex_config.triples_layer if self.joint_relex_config else triples_layer
+        self.embed_rel_token = self.joint_relex_config.embed_rel_token if self.joint_relex_config else embed_rel_token
+        self.rel_token_index = self.joint_relex_config.rel_token_index if self.joint_relex_config else rel_token_index
+
+        self.cat_token_index = self.classification_config.cat_token_index if self.classification_config else cat_token_index
+        self.embed_cat_token = self.classification_config.embed_cat_token if self.classification_config else embed_cat_token
+
+        self.represent_spans = self.ner_config.represent_spans if self.ner_config else represent_spans
+        self.neg_spans_ratio = self.ner_config.neg_spans_ratio if self.ner_config else neg_spans_ratio
+        self.span_loss_coef = self.ner_config.span_loss_coef if self.ner_config else span_loss_coef
+
+        self.groups_num_heads = self.structuring_config.groups_num_heads if self.structuring_config else groups_num_heads
+        self.groups_num_layers = self.structuring_config.groups_num_layers if self.structuring_config else groups_num_layers
+        self.child_token_index = self.structuring_config.child_token_index if self.structuring_config else child_token_index
+        self.embed_child_token = self.structuring_config.embed_child_token if self.structuring_config else embed_child_token
+
+        self.count_mode = self.count_config.mode if self.count_config else count_mode
+        self.max_count = max_count
+
+        self.full_decoder_context = self.decoder_head_config.full_decoder_context if self.decoder_head_config else full_decoder_context
+        self.decoder_config = self.decoder_head_config.decoder_config if self.decoder_head_config else None
+
+        self.ner_loss_coef = self.ner_config.loss_coef if self.ner_config else ner_loss_coef
+        self.cat_loss_coef = self.classification_config.loss_coef if self.classification_config else cat_loss_coef
+        self.rel_loss_coef = self.joint_relex_config.loss_coef if self.joint_relex_config else rel_loss_coef
+        self.adjacency_loss_coef = self.joint_relex_config.adjacency_loss_coef if self.joint_relex_config else adjacency_loss_coef
+        self.decoder_loss_coef = self.decoder_head_config.loss_coef if self.decoder_head_config else decoder_loss_coef
+        self.count_loss_coef = self.count_config.loss_coef if self.count_config else count_loss_coef
+        self.groups_loss_coef = groups_loss_coef
+        self.embedding_loss_coef = self.embedding_config.loss_coef if self.embedding_config else embedding_loss_coef
+        self.structuring_loss_coef = self.structuring_config.loss_coef if self.structuring_config else structuring_loss_coef
