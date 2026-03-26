@@ -4,21 +4,20 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .. import TaskProcessor
-from ...mappings import BatchClassesMapping
+from ..ner.processor import NERProcessor
 
 
-class JointRelexProcessor(TaskProcessor):
+class JointRelexProcessor(NERProcessor):
     """Processor for joint NER + relation extraction task.
 
+    Inherits NERProcessor for shared span resolution and extraction mapping utilities.
     Relation classes are derived from extraction data by NERProcessor.
     REL tokens are already included by NERProcessor within extraction groups.
     """
 
-    def __init__(self, config, **kwargs):
-        super().__init__(config)
+    def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
+        super().__init__(config, tokenizer, words_splitter, **kwargs)
         self.rel_token = config.rel_token
-        self.sep_token = config.sep_token
 
     def get_classes_mapping(self, batch_list, **kwargs):
         # Relation mappings are derived from extraction data by NERProcessor

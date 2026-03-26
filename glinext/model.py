@@ -45,6 +45,9 @@ class GLiNExTOutput(ModelOutput):
     # Open Relex (anchor-based relation extraction)
     open_rel_logits: Optional[torch.FloatTensor] = None
     open_rel_anchor_mask: Optional[torch.Tensor] = None
+    open_rel_span_logits: Optional[torch.FloatTensor] = None
+    open_rel_span_idx: Optional[torch.LongTensor] = None
+    open_rel_span_mask: Optional[torch.Tensor] = None
     # Count
     count_logits: Optional[torch.FloatTensor] = None
     # Groups / Structuring
@@ -53,6 +56,9 @@ class GLiNExTOutput(ModelOutput):
     # Structuring (anchor-based span extraction)
     structuring_logits: Optional[torch.FloatTensor] = None
     structuring_anchor_mask: Optional[torch.Tensor] = None
+    structuring_span_logits: Optional[torch.FloatTensor] = None
+    structuring_span_idx: Optional[torch.LongTensor] = None
+    structuring_span_mask: Optional[torch.Tensor] = None
     # Embedding similarity
     embedding_logits: Optional[torch.FloatTensor] = None
     # Embeddings (for downstream use)
@@ -405,11 +411,17 @@ class GLiNExTModel(BaseModel):
             joint_rel_mask=joint_rel_out.extra.get("rel_mask"),
             open_rel_logits=open_rel_out.logits,
             open_rel_anchor_mask=open_rel_out.extra.get("anchor_mask"),
+            open_rel_span_logits=open_rel_out.extra.get("span_logits"),
+            open_rel_span_idx=open_rel_out.extra.get("span_idx"),
+            open_rel_span_mask=open_rel_out.extra.get("span_mask"),
             count_logits=count_out.logits,
             groups_output=struct_out.extra.get("groups_output"),
             groups_mask=struct_out.extra.get("anchor_mask"),
             structuring_logits=struct_out.logits,
             structuring_anchor_mask=struct_out.extra.get("anchor_mask"),
+            structuring_span_logits=struct_out.extra.get("span_logits"),
+            structuring_span_idx=struct_out.extra.get("span_idx"),
+            structuring_span_mask=struct_out.extra.get("span_mask"),
             embedding_logits=emb_out.logits,
             words_embedding=words_embedding,
             mask=mask,

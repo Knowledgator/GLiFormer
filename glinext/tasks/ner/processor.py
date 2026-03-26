@@ -1,26 +1,22 @@
 """NER task processor."""
 
-import re
 import random
 from typing import Dict, List, Optional
 
 import torch
 
-from .. import TaskProcessor
+from ..span_processor import SpanProcessor
 from ...mappings import (
     BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping, BatchClassesMapping,
 )
 
 
-class NERProcessor(TaskProcessor):
+class NERProcessor(SpanProcessor):
     """Processor for NER task: class mappings, prompts, labels, span resolution."""
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
-        super().__init__(config, tokenizer, words_splitter)
-        self.words_splitter = words_splitter
+        super().__init__(config, tokenizer, words_splitter, **kwargs)
         self.ent_token = config.ent_token
-        self.parent_token = config.parent_token
-        self.sep_token = config.sep_token
 
     @staticmethod
     def _build_class_to_id(labels, negatives, sample_neg, shuffle_labels):
@@ -90,10 +86,9 @@ class NERProcessor(TaskProcessor):
         if not item.get('extraction') or not item.get('text'):
             return
         text = item.get('text', '')
-        tokens_with_spans = list(self.words_splitter(text))
-        tokens = [tok for tok, _, _ in tokens_with_spans]
-        if 'tokenized_text' not in item:
-            item['tokenized_text'] = tokens
+        tokens_with_spans, tokens = self._tokenize_text(item)
+        if tokens_with_spans is None:
+            return
 
         for ext_example in item.get('extraction', []):
             ner = ext_example.get('ner', [])
@@ -103,27 +98,6 @@ class NERProcessor(TaskProcessor):
                 )
 
         self._sort_extraction_data(item)
-
-    @staticmethod
-    def _resolve_entity_spans(text, tokens_with_spans, ner):
-        if not ner:
-            return []
-        s2t = {s: idx for idx, (_, s, _) in enumerate(tokens_with_spans)}
-        e2t = {e: idx for idx, (_, _, e) in enumerate(tokens_with_spans)}
-        resolved = []
-        for ent in ner:
-            if len(ent) == 3 and isinstance(ent[0], int):
-                resolved.append(list(ent))
-            else:
-                ent_text, label = ent[0], ent[-1]
-                try:
-                    for match in re.finditer(re.escape(ent_text), text, re.IGNORECASE):
-                        s, e = match.start(), match.end()
-                        if s in s2t and e in e2t:
-                            resolved.append([s2t[s], e2t[e], label])
-                except (ValueError, re.error):
-                    continue
-        return resolved
 
     @staticmethod
     def _sort_extraction_data(item):
@@ -180,29 +154,6 @@ class NERProcessor(TaskProcessor):
                     ner_labels[flat_idx, start:end + 1, class_idx, 2] = 1
 
         return {"ner_labels": ner_labels, "ner_batch_idx": ner_batch_idx}
-
-    def _generate_negative_spans(self, positive_spans, num_tokens, num_negatives, max_width=None):
-        if max_width is None:
-            max_width = getattr(self.config, "max_width", 10)
-        negative_spans = []
-        attempts = 0
-        max_attempts = num_negatives * 20
-        while len(negative_spans) < num_negatives and attempts < max_attempts:
-            attempts += 1
-            start = random.randint(0, num_tokens - 1)
-            width = random.randint(1, min(max_width, num_tokens - start))
-            end = start + width - 1
-            span = (start, end)
-            if span in positive_spans:
-                continue
-            overlaps = False
-            for pos_start, pos_end in positive_spans:
-                if not (end < pos_start or start > pos_end):
-                    overlaps = True
-                    break
-            if not overlaps and span not in negative_spans:
-                negative_spans.append(span)
-        return negative_spans
 
     def prepare_span_idx(self, ner, classes_to_id, num_tokens):
         if ner is not None and getattr(self.config, 'represent_spans', False):

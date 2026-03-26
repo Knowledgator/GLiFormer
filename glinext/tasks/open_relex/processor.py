@@ -1,17 +1,16 @@
 """Open relex task processor."""
 
-import re
 from typing import Dict, List, Optional
 
 import torch
 
-from .. import TaskProcessor
+from ..span_processor import SpanProcessor
 from ...mappings import (
     BaseClassMapping, OpenRelexItemMapping, OpenRelexClassMapping, BatchClassesMapping,
 )
 
 
-class OpenRelexProcessor(TaskProcessor):
+class OpenRelexProcessor(SpanProcessor):
     """Processor for anchor-based open relation extraction.
 
     Builds its own extraction groups with [P] and [REL] tokens.
@@ -19,11 +18,8 @@ class OpenRelexProcessor(TaskProcessor):
     """
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
-        super().__init__(config, tokenizer, words_splitter)
-        self.words_splitter = words_splitter
+        super().__init__(config, tokenizer, words_splitter, **kwargs)
         self.rel_token = config.rel_token
-        self.parent_token = config.parent_token
-        self.sep_token = config.sep_token
 
     def get_classes_mapping(self, batch_list, shuffle_labels=False, **kwargs):
         open_relex_mapping = []
@@ -72,14 +68,14 @@ class OpenRelexProcessor(TaskProcessor):
 
     def resolve_spans(self, item):
         """Resolve head/tail text mentions to token indices."""
-        text = item.get('text', '')
         open_relex_data = item.get('open_relex', [])
-        if not open_relex_data or not text:
+        if not open_relex_data:
             return
 
-        tokens_with_spans = list(self.words_splitter(text))
-        if 'tokenized_text' not in item:
-            item['tokenized_text'] = [tok for tok, _, _ in tokens_with_spans]
+        text = item.get('text', '')
+        tokens_with_spans, _ = self._tokenize_text(item)
+        if tokens_with_spans is None:
+            return
 
         for group in open_relex_data:
             for rel in group.get('relations', []):
@@ -88,29 +84,15 @@ class OpenRelexProcessor(TaskProcessor):
                     if value is None:
                         continue
                     if isinstance(value, str):
-                        # Resolve text → {text, start, end}
-                        resolved = self._resolve_text_span(text, tokens_with_spans, value)
-                        rel[role] = resolved
+                        start, end = self._resolve_text_span(text, tokens_with_spans, value)
+                        rel[role] = {'text': value, 'start': start, 'end': end}
                     elif isinstance(value, dict) and 'text' in value:
                         if 'start' not in value or not isinstance(value['start'], int):
-                            resolved = self._resolve_text_span(
+                            start, end = self._resolve_text_span(
                                 text, tokens_with_spans, str(value['text']),
                             )
-                            value.update(resolved)
-
-    @staticmethod
-    def _resolve_text_span(text, tokens_with_spans, mention_text):
-        """Resolve a text mention to token start/end indices."""
-        s2t = {s: idx for idx, (_, s, _) in enumerate(tokens_with_spans)}
-        e2t = {e: idx for idx, (_, _, e) in enumerate(tokens_with_spans)}
-        try:
-            for match in re.finditer(re.escape(mention_text), text, re.IGNORECASE):
-                s, e = match.start(), match.end()
-                if s in s2t and e in e2t:
-                    return {'text': mention_text, 'start': s2t[s], 'end': e2t[e]}
-        except (ValueError, re.error):
-            pass
-        return {'text': mention_text, 'start': -1, 'end': -1}
+                            value['start'] = start
+                            value['end'] = end
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
         """Create label tensors for open relex.
@@ -224,6 +206,134 @@ class OpenRelexProcessor(TaskProcessor):
             "open_rel_mask": open_rel_mask,
             "open_rel_batch_idx": open_rel_batch_idx,
             "open_rel_count": open_rel_count,
+        }
+
+    def create_span_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
+        """Create span-level labels for open relex when represent_spans is enabled.
+
+        Returns dict with:
+            open_rel_span_idx: (total_groups, max_spans, 2)
+            open_rel_span_labels: (total_groups, max_spans, max_anchors, max_rel_classes, 2)
+                2 = [head_match, tail_match] per span per (anchor, rel_class) pair
+            open_rel_span_mask: (total_groups, max_spans)
+            open_rel_span_batch_idx: (total_groups,)
+        """
+        cfg = getattr(self.config, 'open_relex_config', None)
+        if cfg is None or not getattr(cfg, 'represent_spans', False):
+            return None
+
+        total_groups = classes_mapping.total_open_relex_groups()
+        if total_groups == 0:
+            return None
+
+        neg_ratio = getattr(cfg, 'neg_spans_ratio', 1.0)
+        max_anchors = 0
+        max_rel_classes = 0
+        has_any = False
+
+        # Collect per-group: anchor assignments and all unique spans
+        all_group_data = []  # list of (anchor_rels_dict, all_spans, positive_spans_set)
+        batch_indices = []
+
+        for flat_idx, batch_idx, group_idx, relex_item in classes_mapping.flat_open_relex_iter():
+            batch_indices.append(batch_idx)
+            open_relex_data = batch_list[batch_idx].get('open_relex', [])
+            if group_idx >= len(open_relex_data):
+                all_group_data.append(({}, [], set()))
+                continue
+
+            group = open_relex_data[group_idx]
+            relations = group.get('relations', [])
+            rel_to_id = relex_item.rel_class_to_id.class_to_id
+            max_rel_classes = max(max_rel_classes, len(rel_to_id))
+
+            # Collect all head/tail spans and group by anchor
+            anchor_rels = {}  # anchor_idx → list of (rel_class_id, h_start, h_end, t_start, t_end)
+            positive_spans = set()
+            anchor_idx = 0
+            seen_anchors = {}
+
+            for rel in relations:
+                head = rel.get('head', {})
+                tail = rel.get('tail', {})
+                if not isinstance(head, dict) or not isinstance(tail, dict):
+                    continue
+                h_start, h_end = head.get('start', -1), head.get('end', -1)
+                t_start, t_end = tail.get('start', -1), tail.get('end', -1)
+                rel_type = rel.get('relation', '')
+                if rel_type not in rel_to_id or h_start < 0 or t_start < 0:
+                    continue
+                if h_start >= max_seq_len or h_end >= max_seq_len:
+                    continue
+                if t_start >= max_seq_len or t_end >= max_seq_len:
+                    continue
+
+                anchor_key = (h_start, h_end, t_start, t_end)
+                if anchor_key not in seen_anchors:
+                    seen_anchors[anchor_key] = anchor_idx
+                    anchor_rels[anchor_idx] = []
+                    anchor_idx += 1
+                a_idx = seen_anchors[anchor_key]
+                anchor_rels[a_idx].append((rel_to_id[rel_type], h_start, h_end, t_start, t_end))
+                positive_spans.add((h_start, h_end))
+                positive_spans.add((t_start, t_end))
+                has_any = True
+
+            max_anchors = max(max_anchors, len(anchor_rels))
+
+            # Generate negative spans
+            all_spans = list(positive_spans)
+            neg_count = int(len(all_spans) * neg_ratio)
+            if neg_count > 0 and max_seq_len > 0:
+                negatives = self._generate_negative_spans(positive_spans, max_seq_len, neg_count)
+                all_spans.extend(negatives)
+
+            all_group_data.append((anchor_rels, all_spans, positive_spans))
+
+        if not has_any or max_anchors == 0 or max_rel_classes == 0:
+            return None
+
+        max_spans = max((len(d[1]) for d in all_group_data), default=0)
+        if max_spans == 0:
+            return None
+
+        span_idx = torch.zeros(total_groups, max_spans, 2, dtype=torch.long)
+        # Labels: for each span, for each (anchor, rel_class): does span match as head (0) or tail (1)?
+        span_labels = torch.zeros(
+            total_groups, max_spans, max_anchors, max_rel_classes, 2,
+            dtype=torch.float,
+        )
+        span_mask = torch.zeros(total_groups, max_spans, dtype=torch.bool)
+        span_batch_idx = torch.tensor(batch_indices, dtype=torch.long)
+
+        for g, (anchor_rels, all_spans, _) in enumerate(all_group_data):
+            # Build span→index mapping
+            span_to_idx = {}
+            for s, (st, ed) in enumerate(all_spans):
+                span_idx[g, s, 0] = st
+                span_idx[g, s, 1] = ed
+                span_mask[g, s] = True
+                span_to_idx[(st, ed)] = s
+
+            # Fill labels
+            for a_idx, rels in anchor_rels.items():
+                if a_idx >= max_anchors:
+                    break
+                for rel_class_id, h_start, h_end, t_start, t_end in rels:
+                    if rel_class_id >= max_rel_classes:
+                        continue
+                    h_span_idx = span_to_idx.get((h_start, h_end))
+                    t_span_idx = span_to_idx.get((t_start, t_end))
+                    if h_span_idx is not None:
+                        span_labels[g, h_span_idx, a_idx, rel_class_id, 0] = 1.0
+                    if t_span_idx is not None:
+                        span_labels[g, t_span_idx, a_idx, rel_class_id, 1] = 1.0
+
+        return {
+            "open_rel_span_idx": span_idx,
+            "open_rel_span_labels": span_labels,
+            "open_rel_span_mask": span_mask,
+            "open_rel_span_batch_idx": span_batch_idx,
         }
 
     def prepare_label_encoder_inputs(self, classes_mapping, labels_tokenizer):

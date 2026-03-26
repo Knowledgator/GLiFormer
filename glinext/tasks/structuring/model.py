@@ -1,15 +1,21 @@
 """Structuring task head."""
 
 import torch
+from torch import nn
 
 from gliner.modeling.utils import extract_prompt_features
+from gliner.modeling.span_rep import SpanRepLayer
 
 from .. import TaskHead, TaskHeadOutput, SharedRepresentations
 from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling
 
 
 class StructuringHead(TaskHead):
-    """Structuring via anchor-based span extraction using configurable anchor layer."""
+    """Structuring via anchor-based span extraction using configurable anchor layer.
+
+    Supports optional span representation (represent_spans) for direct span-level
+    scoring alongside token-level BIO scoring.
+    """
 
     name = "structuring"
     dependencies = []
@@ -20,6 +26,8 @@ class StructuringHead(TaskHead):
         self.loss_coef = struct_cfg.loss_coef
         self.child_token_index = struct_cfg.child_token_index
         self.embed_child_token = struct_cfg.embed_child_token
+        self.represent_spans = getattr(struct_cfg, 'represent_spans', False)
+        self.span_loss_coef = getattr(struct_cfg, 'span_loss_coef', 1.0)
 
         # Map groups_layer config to anchor_mode for AnchorLayer factory
         anchor_mode = struct_cfg.groups_layer
@@ -42,6 +50,14 @@ class StructuringHead(TaskHead):
 
         self.anchored_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
 
+        if self.represent_spans:
+            self.span_rep_layer = SpanRepLayer(
+                span_mode="token_level",
+                hidden_size=hidden_size,
+                max_width=getattr(config, "max_width", 12),
+                dropout=dropout,
+            )
+
     @classmethod
     def from_config(cls, config, **kwargs):
         if config.structuring_config is None:
@@ -62,6 +78,11 @@ class StructuringHead(TaskHead):
         structuring_labels = batch.get("structuring_labels")
         structuring_count = batch.get("structuring_count")
         threshold = batch.get("threshold", 0.5)
+
+        # Span representation inputs
+        span_idx = batch.get("structuring_span_idx")
+        span_mask = batch.get("structuring_span_mask")
+        span_labels = batch.get("structuring_span_labels")
 
         batch_size, _, embed_dim = token_embeds.shape
 
@@ -96,18 +117,22 @@ class StructuringHead(TaskHead):
         )
         structuring_logits = structuring_logits_flat.view(B, X, C, -1, 3)
 
+        # Optional span representation
+        span_logits_out = None
+        if self.represent_spans and hasattr(self, "span_rep_layer"):
+            if span_idx is not None:
+                span_rep = self.span_rep_layer(words_embedding, span_idx)  # (B, S, D)
+                # Score spans against fused (anchor+child) reps: (B, S, X*C)
+                span_logits_flat = torch.einsum("BSD,BND->BSN", span_rep, fused_flat)
+                # Reshape to (B, X, S, C) for per-anchor, per-field span scores
+                S = span_rep.shape[1]
+                span_logits_out = span_logits_flat.view(B, S, X, C).permute(0, 2, 1, 3)
+
         loss = None
         if structuring_labels is not None and base_loss_fn is not None:
-            X_pred = structuring_logits.shape[1]
-            X_label = structuring_labels.shape[1]
-            L_pred = structuring_logits.shape[2]
-            L_label = structuring_labels.shape[2]
-            C_pred = structuring_logits.shape[3]
-            C_label = structuring_labels.shape[3]
-
-            min_X = min(X_pred, X_label)
-            min_L = min(L_pred, L_label)
-            min_C = min(C_pred, C_label)
+            min_X = min(structuring_logits.shape[1], structuring_labels.shape[1])
+            min_L = min(structuring_logits.shape[2], structuring_labels.shape[2])
+            min_C = min(structuring_logits.shape[3], structuring_labels.shape[3])
 
             pred = structuring_logits[:, :min_X, :min_L, :min_C, :]
             labels = structuring_labels[:, :min_X, :min_L, :min_C, :]
@@ -126,11 +151,37 @@ class StructuringHead(TaskHead):
 
             loss = (all_losses * full_mask).sum()
 
+            # Span-level loss
+            if span_labels is not None and span_logits_out is not None:
+                min_X_s = min(span_logits_out.shape[1], span_labels.shape[2])
+                min_S = min(span_logits_out.shape[2], span_labels.shape[1])
+                min_C_s = min(span_logits_out.shape[3], span_labels.shape[3])
+
+                # span_logits_out: (B, X, S, C), span_labels: (B, S, X, C)
+                span_pred = span_logits_out[:, :min_X_s, :min_S, :min_C_s]
+                s_labels = span_labels[:, :min_S, :min_X_s, :min_C_s].permute(0, 2, 1, 3)
+
+                span_losses = base_loss_fn(span_pred, s_labels)
+                s_inst_mask = anchor_mask[:, :min_X_s].float()
+                s_span_mask = span_mask[:, :min_S].float()
+                s_child_mask = child_embedding_mask[:, :min_C_s].float()
+
+                s_full_mask = (
+                    s_inst_mask[:, :, None, None]
+                    * s_span_mask[:, None, :, None]
+                    * s_child_mask[:, None, None, :]
+                )
+                span_loss = (span_losses * s_full_mask).sum()
+                loss = loss + self.span_loss_coef * span_loss
+
         return TaskHeadOutput(
             loss=loss,
             logits=structuring_logits,
             extra={
                 "groups_output": anchors,
                 "anchor_mask": anchor_mask,
+                "span_logits": span_logits_out,
+                "span_idx": span_idx,
+                "span_mask": span_mask,
             },
         )

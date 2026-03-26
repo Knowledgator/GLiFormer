@@ -50,6 +50,23 @@ class TaskHead(ABC, nn.Module):
         ...
 
 
+class TaskDecoder(ABC):
+    """Abstract base class for task-specific decoders."""
+
+    def __init__(self, config):
+        self.config = config
+
+    @classmethod
+    def from_config(cls, config, **kwargs) -> "TaskDecoder":
+        """Construct decoder from config."""
+        return cls(config, **kwargs)
+
+    @abstractmethod
+    def decode(self, model_output, classes_mapping=None, **kwargs):
+        """Decode model output into structured predictions."""
+        ...
+
+
 class TaskProcessor(ABC):
     """Abstract base class for task-specific data processors."""
 

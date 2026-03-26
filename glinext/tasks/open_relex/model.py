@@ -3,11 +3,16 @@
 Standalone anchor-based head — no NER dependency. Uses configurable anchor
 layers to generate relation instance slots, fuses with [REL] type embeddings,
 and extracts head/tail spans via dual AnchoredSpanScorers.
+
+Supports optional span representation (represent_spans) for direct span-level
+scoring alongside token-level BIO scoring.
 """
 
 import torch
+from torch import nn
 
 from gliner.modeling.utils import extract_prompt_features
+from gliner.modeling.span_rep import SpanRepLayer
 
 from .. import TaskHead, TaskHeadOutput, SharedRepresentations
 from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling
@@ -32,6 +37,8 @@ class OpenRelexHead(TaskHead):
         self.loss_coef = cfg.loss_coef
         self.rel_token_index = cfg.rel_token_index
         self.embed_rel_token = cfg.embed_rel_token
+        self.represent_spans = getattr(cfg, 'represent_spans', False)
+        self.span_loss_coef = getattr(cfg, 'span_loss_coef', 1.0)
 
         # Anchor layer (configurable strategy)
         anchor_mode = cfg.anchor_mode
@@ -56,6 +63,17 @@ class OpenRelexHead(TaskHead):
         self.head_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
         self.tail_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
 
+        if self.represent_spans:
+            self.span_rep_layer = SpanRepLayer(
+                span_mode="token_level",
+                hidden_size=hidden_size,
+                max_width=getattr(config, "max_width", 12),
+                dropout=dropout,
+            )
+            # Separate projections for head/tail span scoring
+            self.head_span_proj = nn.Linear(hidden_size, hidden_size)
+            self.tail_span_proj = nn.Linear(hidden_size, hidden_size)
+
     @classmethod
     def from_config(cls, config, **kwargs):
         if config.open_relex_config is None:
@@ -74,6 +92,11 @@ class OpenRelexHead(TaskHead):
         open_rel_labels = batch.get("open_rel_labels")
         open_rel_count = batch.get("open_rel_count")
         threshold = batch.get("threshold", 0.5)
+
+        # Span representation inputs
+        span_idx = batch.get("open_rel_span_idx")
+        span_mask = batch.get("open_rel_span_mask")
+        span_labels = batch.get("open_rel_span_labels")
 
         batch_size, _, embed_dim = token_embeds.shape
 
@@ -114,7 +137,24 @@ class OpenRelexHead(TaskHead):
         tail_logits = tail_logits_flat.view(B, X, C, L, 3)
         logits = torch.stack([head_logits, tail_logits], dim=-2)  # (B, X, C, L, 2, 3)
 
-        # 6. Loss computation
+        # 6. Optional span representation
+        span_logits_out = None
+        if self.represent_spans and hasattr(self, "span_rep_layer"):
+            if span_idx is not None:
+                span_rep = self.span_rep_layer(words_embedding, span_idx)  # (B, S, D)
+                S = span_rep.shape[1]
+                # Separate projections for head/tail roles
+                head_span_rep = self.head_span_proj(span_rep)  # (B, S, D)
+                tail_span_rep = self.tail_span_proj(span_rep)  # (B, S, D)
+                # Score: (B, S, X*C) each
+                head_span_scores = torch.einsum("BSD,BND->BSN", head_span_rep, fused_flat)
+                tail_span_scores = torch.einsum("BSD,BND->BSN", tail_span_rep, fused_flat)
+                # Reshape to (B, X, C, S) and stack head/tail: (B, S, X, C, 2)
+                head_span = head_span_scores.view(B, S, X, C)
+                tail_span = tail_span_scores.view(B, S, X, C)
+                span_logits_out = torch.stack([head_span, tail_span], dim=-1)  # (B, S, X, C, 2)
+
+        # 7. Loss computation
         loss = None
         if open_rel_labels is not None and base_loss_fn is not None:
             X_pred, X_label = logits.shape[1], open_rel_labels.shape[1]
@@ -143,11 +183,38 @@ class OpenRelexHead(TaskHead):
 
             loss = (all_losses * full_mask).sum()
 
+            # Span-level loss
+            if span_labels is not None and span_logits_out is not None:
+                # span_logits_out: (B, S, X, C, 2)
+                # span_labels:     (B, S, X, C, 2)
+                min_S = min(span_logits_out.shape[1], span_labels.shape[1])
+                min_X_s = min(span_logits_out.shape[2], span_labels.shape[2])
+                min_C_s = min(span_logits_out.shape[3], span_labels.shape[3])
+
+                span_pred = span_logits_out[:, :min_S, :min_X_s, :min_C_s, :]
+                s_labels = span_labels[:, :min_S, :min_X_s, :min_C_s, :]
+
+                span_losses = base_loss_fn(span_pred, s_labels)
+                s_span_mask = span_mask[:, :min_S].float()
+                s_inst_mask = anchor_mask[:, :min_X_s].float()
+                s_rel_mask = rel_embedding_mask[:, :min_C_s].float()
+
+                s_full_mask = (
+                    s_span_mask[:, :, None, None, None]
+                    * s_inst_mask[:, None, :, None, None]
+                    * s_rel_mask[:, None, None, :, None]
+                )
+                span_loss = (span_losses * s_full_mask).sum()
+                loss = loss + self.span_loss_coef * span_loss
+
         return TaskHeadOutput(
             loss=loss,
             logits=logits,
             extra={
                 "anchors": anchors,
                 "anchor_mask": anchor_mask,
+                "span_logits": span_logits_out,
+                "span_idx": span_idx,
+                "span_mask": span_mask,
             },
         )

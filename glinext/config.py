@@ -58,6 +58,9 @@ class OpenRelexHeadConfig:
     rel_token_index: int = -1
     embed_rel_token: bool = True
     loss_coef: float = 1.0
+    represent_spans: bool = False
+    neg_spans_ratio: float = 1.0
+    span_loss_coef: float = 1.0
 
 
 @dataclass
@@ -71,6 +74,9 @@ class StructuringHeadConfig:
     embed_child_token: bool = True
     loss_coef: float = 1.0
     anchor_modeling: str = "linear"  # "linear", "lstm", "mlp"
+    represent_spans: bool = False
+    neg_spans_ratio: float = 1.0
+    span_loss_coef: float = 1.0
 
 
 @dataclass

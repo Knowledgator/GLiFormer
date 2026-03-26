@@ -1,19 +1,12 @@
 """Count task decoder — converts count logits to integer predictions."""
 
-from typing import Dict, List, Optional
+from typing import List
 
-import torch
+from .. import TaskDecoder
 
 
-class CountDecoder:
+class CountDecoder(TaskDecoder):
     """Decodes count logits into integer predictions."""
-
-    def __init__(self, config):
-        self.config = config
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(config)
 
     def decode(self, model_output, classes_mapping=None, **kwargs) -> List[int]:
         """Decode count logits into integer counts.

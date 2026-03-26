@@ -47,7 +47,7 @@ class GLiNextProcessor(BaseProcessor):
         if config.classification_config is not None:
             self.task_processors["classification"] = ClassificationProcessor(config)
         if config.joint_relex_config is not None:
-            self.task_processors["joint_relex"] = JointRelexProcessor(config)
+            self.task_processors["joint_relex"] = JointRelexProcessor(config, tokenizer, words_splitter)
         if config.open_relex_config is not None:
             self.task_processors["open_relex"] = OpenRelexProcessor(config, tokenizer, words_splitter)
         if config.count_config is not None:
@@ -659,14 +659,19 @@ class GLiNextProcessor(BaseProcessor):
                     tokenized_input['ner_span_mask'] = ner_span_result[1]
                     tokenized_input['ner_span_idx'] = batch['span_idx']
 
-                struct_span_result = self.create_structuring_span_labels(
-                    batch_list, classes_mapping, max_seq_len
+            if "structuring" in self.task_processors:
+                struct_span_result = self.task_processors["structuring"].create_span_labels(
+                    batch_list, classes_mapping, max_seq_len=max_seq_len,
                 )
                 if struct_span_result is not None:
-                    tokenized_input['structuring_span_idx'] = struct_span_result[0]
-                    tokenized_input['structuring_span_labels'] = struct_span_result[1]
-                    tokenized_input['structuring_span_mask'] = struct_span_result[2]
-                    tokenized_input['structuring_span_batch_idx'] = struct_span_result[3]
+                    tokenized_input.update(struct_span_result)
+
+            if "open_relex" in self.task_processors:
+                open_rel_span_result = self.task_processors["open_relex"].create_span_labels(
+                    batch_list, classes_mapping, max_seq_len=max_seq_len,
+                )
+                if open_rel_span_result is not None:
+                    tokenized_input.update(open_rel_span_result)
 
             structuring_result = self.create_structuring_labels(batch_list, classes_mapping, max_seq_len)
             if structuring_result is not None:

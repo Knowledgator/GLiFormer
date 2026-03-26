@@ -1,26 +1,22 @@
 """Structuring task processor."""
 
-import re
 import random
 from typing import Dict, List, Optional
 
 import torch
 
-from .. import TaskProcessor
+from ..span_processor import SpanProcessor
 from ...mappings import (
     BaseClassMapping, StructuringItemMapping, StructuringClassMapping, BatchClassesMapping,
 )
 
 
-class StructuringProcessor(TaskProcessor):
+class StructuringProcessor(SpanProcessor):
     """Processor for structuring task."""
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
-        super().__init__(config, tokenizer, words_splitter)
-        self.words_splitter = words_splitter
+        super().__init__(config, tokenizer, words_splitter, **kwargs)
         self.child_token = config.child_token
-        self.parent_token = config.parent_token
-        self.sep_token = config.sep_token
 
     def get_classes_mapping(self, batch_list, shuffle_labels=False, **kwargs):
         structuring_mapping = []
@@ -67,14 +63,14 @@ class StructuringProcessor(TaskProcessor):
         return prompt
 
     def resolve_spans(self, item):
-        text = item.get('text', '')
         structuring = item.get('structuring', {})
-        if not structuring or not text:
+        if not structuring:
             return
 
-        tokens_with_spans = list(self.words_splitter(text))
-        if 'tokenized_text' not in item:
-            item['tokenized_text'] = [tok for tok, _, _ in tokens_with_spans]
+        text = item.get('text', '')
+        tokens_with_spans, _ = self._tokenize_text(item)
+        if tokens_with_spans is None:
+            return
 
         for schema_name, instances in structuring.items():
             for instance in instances:
@@ -124,24 +120,6 @@ class StructuringProcessor(TaskProcessor):
                             instance[field_name] = {
                                 'text': text_val, 'start': -1, 'end': -1,
                             }
-
-    @staticmethod
-    def _resolve_entity_spans(text, tokens_with_spans, ner):
-        if not ner:
-            return []
-        s2t = {s: idx for idx, (_, s, _) in enumerate(tokens_with_spans)}
-        e2t = {e: idx for idx, (_, _, e) in enumerate(tokens_with_spans)}
-        resolved = []
-        for ent in ner:
-            ent_text, label = ent[0], ent[-1]
-            try:
-                for match in re.finditer(re.escape(ent_text), text, re.IGNORECASE):
-                    s, e = match.start(), match.end()
-                    if s in s2t and e in e2t:
-                        resolved.append([s2t[s], e2t[e], label])
-            except (ValueError, re.error):
-                continue
-        return resolved
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
         total_groups = classes_mapping.total_structuring_groups()
@@ -211,6 +189,94 @@ class StructuringProcessor(TaskProcessor):
             "structuring_mask": structuring_mask,
             "structuring_batch_idx": structuring_batch_idx,
             "structuring_count": structuring_count,
+        }
+
+    def create_span_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
+        """Create span-level labels for structuring when represent_spans is enabled.
+
+        Returns dict with:
+            structuring_span_idx: (total_groups, max_spans, 2)
+            structuring_span_labels: (total_groups, max_spans, max_instances, max_fields)
+            structuring_span_mask: (total_groups, max_spans)
+            structuring_span_batch_idx: (total_groups,)
+        """
+        struct_cfg = getattr(self.config, 'structuring_config', None)
+        if struct_cfg is None or not getattr(struct_cfg, 'represent_spans', False):
+            return None
+
+        total_groups = classes_mapping.total_structuring_groups()
+        if total_groups == 0:
+            return None
+
+        neg_ratio = getattr(struct_cfg, 'neg_spans_ratio', 1.0)
+        max_instances = 0
+        max_fields = 0
+        has_any = False
+
+        all_group_spans = []
+        batch_indices = []
+
+        for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
+            structuring_data = batch_list[batch_idx].get('structuring', {})
+            schema_name = struct_item.name
+            field_to_id = struct_item.field_class_to_id.class_to_id
+            max_fields = max(max_fields, len(field_to_id))
+            batch_indices.append(batch_idx)
+
+            group_spans = []  # (start, end, inst_idx, field_id)
+            positive_spans = set()
+
+            if schema_name in structuring_data:
+                instances = structuring_data[schema_name]
+                max_instances = max(max_instances, len(instances))
+
+                for inst_idx, instance in enumerate(instances):
+                    for field_name, value in instance.items():
+                        if field_name not in field_to_id:
+                            continue
+                        field_id = field_to_id[field_name]
+                        if not isinstance(value, dict):
+                            continue
+                        st = value.get('start', -1)
+                        ed = value.get('end', -1)
+                        if 0 <= st < max_seq_len and 0 <= ed < max_seq_len:
+                            group_spans.append((st, ed, inst_idx, field_id))
+                            positive_spans.add((st, ed))
+                            has_any = True
+
+            neg_count = int(len(group_spans) * neg_ratio)
+            if neg_count > 0 and max_seq_len > 0:
+                negatives = self._generate_negative_spans(positive_spans, max_seq_len, neg_count)
+                for st, ed in negatives:
+                    group_spans.append((st, ed, -1, -1))
+
+            all_group_spans.append(group_spans)
+
+        if not has_any or max_instances == 0 or max_fields == 0:
+            return None
+
+        max_spans = max((len(s) for s in all_group_spans), default=0)
+        if max_spans == 0:
+            return None
+
+        span_idx = torch.zeros(total_groups, max_spans, 2, dtype=torch.long)
+        span_labels = torch.zeros(total_groups, max_spans, max_instances, max_fields, dtype=torch.float)
+        span_mask = torch.zeros(total_groups, max_spans, dtype=torch.bool)
+        span_batch_idx = torch.tensor(batch_indices, dtype=torch.long)
+
+        for g, group_spans in enumerate(all_group_spans):
+            for s, (st, ed, inst_idx, field_id) in enumerate(group_spans):
+                span_idx[g, s, 0] = st
+                span_idx[g, s, 1] = ed
+                span_mask[g, s] = True
+                if inst_idx >= 0 and field_id >= 0:
+                    span_labels[g, s, inst_idx, field_id] = 1.0
+
+        return {
+            "structuring_span_idx": span_idx,
+            "structuring_span_labels": span_labels,
+            "structuring_span_mask": span_mask,
+            "structuring_span_batch_idx": span_batch_idx,
         }
 
     def prepare_label_encoder_inputs(self, classes_mapping, labels_tokenizer):

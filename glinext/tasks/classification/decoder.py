@@ -1,20 +1,18 @@
 """Classification task decoder — post-processing logits into label predictions."""
 
-from typing import Dict, List, Optional
+from typing import List
 
 import torch
 
+from .. import TaskDecoder
 
-class ClassificationDecoder:
+
+class ClassificationDecoder(TaskDecoder):
     """Decodes classification logits into predicted labels."""
 
     def __init__(self, config):
-        self.config = config
+        super().__init__(config)
         self.threshold = 0.5
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(config)
 
     def decode(self, model_output, classes_mapping=None, threshold=None, **kwargs) -> List[List[dict]]:
         """Decode classification logits into predicted labels.

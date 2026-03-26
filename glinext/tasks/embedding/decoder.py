@@ -1,19 +1,12 @@
 """Embedding task decoder — returns similarity scores."""
 
-from typing import Dict, List, Optional
+from typing import List
 
-import torch
+from .. import TaskDecoder
 
 
-class EmbeddingDecoder:
+class EmbeddingDecoder(TaskDecoder):
     """Returns similarity scores from embedding logits."""
-
-    def __init__(self, config):
-        self.config = config
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(config)
 
     def decode(self, model_output, classes_mapping=None, **kwargs) -> List[float]:
         """Decode embedding logits into similarity scores.
