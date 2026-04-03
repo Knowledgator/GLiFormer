@@ -19,16 +19,13 @@ from .tasks.joint_relex.processor import JointRelexProcessor
 from .tasks.open_relex.processor import OpenRelexProcessor
 from .tasks.count.processor import CountProcessor
 from .tasks.structuring.processor import StructuringProcessor
-from .tasks.decoder.processor import DecoderProcessor
 from .tasks.embedding.processor import EmbeddingProcessor
 
 
 class GLiNextProcessor(BaseProcessor):
     def __init__(self, config, tokenizer, words_splitter,
-                 decoder_tokenizer: Optional[object] = None,
                  labels_tokenizer: Optional[object] = None):
         super().__init__(config, tokenizer, words_splitter)
-        self.decoder_tokenizer = decoder_tokenizer
         self.labels_tokenizer = labels_tokenizer
 
         self.seq_token = config.seq_token
@@ -54,8 +51,6 @@ class GLiNextProcessor(BaseProcessor):
             self.task_processors["count"] = CountProcessor(config)
         if config.structuring_config is not None:
             self.task_processors["structuring"] = StructuringProcessor(config, tokenizer, words_splitter)
-        if config.decoder_head_config is not None:
-            self.task_processors["decoder"] = DecoderProcessor(config, decoder_tokenizer)
         if config.embedding_config is not None:
             self.task_processors["embedding"] = EmbeddingProcessor(config)
 
@@ -285,25 +280,6 @@ class GLiNextProcessor(BaseProcessor):
             if result is not None:
                 return (result["structuring_labels"], result["structuring_mask"],
                         result["structuring_batch_idx"], result["structuring_count"])
-        return None
-
-    def create_decoder_labels(self, batch_list, classes_mapping, max_seq_len):
-        if "decoder" in self.task_processors:
-            return self.task_processors["decoder"].create_labels(
-                batch_list, classes_mapping, max_seq_len=max_seq_len
-            )
-        return None
-
-    def create_rel_decoder_labels(self, batch_list, classes_mapping):
-        if "decoder" in self.task_processors:
-            return self.task_processors["decoder"].create_rel_decoder_labels(
-                batch_list, classes_mapping
-            )
-        return None
-
-    def prepare_decoder_labels(self, decoder_label_strings):
-        if "decoder" in self.task_processors:
-            return self.task_processors["decoder"]._prepare_decoder_labels(decoder_label_strings)
         return None
 
     # ── Span labels (NER + structuring) ─────────────────────────────────
@@ -626,21 +602,6 @@ class GLiNextProcessor(BaseProcessor):
                 tokenized_input['open_rel_mask'] = open_rel_result['open_rel_mask']
                 tokenized_input['open_rel_batch_idx'] = open_rel_result['open_rel_batch_idx']
                 tokenized_input['open_rel_count'] = open_rel_result['open_rel_count']
-
-            decoder_result = self.create_decoder_labels(batch_list, classes_mapping, max_seq_len)
-            if decoder_result is not None:
-                tokenized_input['decoder_labels_ids'] = decoder_result['decoder_labels_ids']
-                tokenized_input['decoder_labels_mask'] = decoder_result['decoder_labels_mask']
-                tokenized_input['decoder_labels'] = decoder_result['decoder_labels']
-                tokenized_input['decoder_group_idx'] = decoder_result['decoder_group_idx']
-
-            rel_decoder_result = self.create_rel_decoder_labels(batch_list, classes_mapping)
-            if rel_decoder_result is not None:
-                tokenized_input['rel_decoder_labels_ids'] = rel_decoder_result['decoder_labels_ids']
-                tokenized_input['rel_decoder_labels_mask'] = rel_decoder_result['decoder_labels_mask']
-                tokenized_input['rel_decoder_labels'] = rel_decoder_result['decoder_labels']
-                tokenized_input['rel_decoder_group_idx'] = rel_decoder_result['rel_decoder_group_idx']
-                tokenized_input['rel_decoder_pair_idx'] = rel_decoder_result['rel_decoder_pair_idx']
 
             count_result = self.create_count_labels(batch_list, classes_mapping)
             if count_result is not None:

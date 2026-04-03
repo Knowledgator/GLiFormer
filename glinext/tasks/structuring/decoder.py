@@ -48,6 +48,9 @@ class StructuringDecoder(SpanDecoder):
 
         id_to_fields = self._build_field_class_maps(classes_mapping, B)
 
+        batch_origin = getattr(model_output, 'structuring_batch_origin', None)
+        batch_size = getattr(model_output, 'batch_size', None)
+
         # Prefer span-level decoding when available
         if (model_output.structuring_span_logits is not None
                 and model_output.structuring_span_idx is not None
@@ -62,6 +65,8 @@ class StructuringDecoder(SpanDecoder):
                 flat_ner,
                 multi_label,
                 texts,
+                batch_origin=batch_origin,
+                batch_size=batch_size,
             )
 
         # Fall back to token-level BIO decoding
@@ -73,22 +78,26 @@ class StructuringDecoder(SpanDecoder):
             flat_ner,
             multi_label,
             texts,
+            batch_origin=batch_origin,
+            batch_size=batch_size,
         )
 
     def _decode_token_level(self, logits, anchor_mask, id_to_fields, threshold,
-                            flat_ner, multi_label, texts):
-        """Decode from token-level BIO logits (B, X, L, C, 3)."""
-        B, X, L, C, _ = logits.shape
-        all_instances = []
+                            flat_ner, multi_label, texts, batch_origin=None, batch_size=None):
+        """Decode from token-level BIO logits (BN, X, L, C, 3)."""
+        BN, X, L, C, _ = logits.shape
+        flat_results = []
 
-        for b in range(B):
+        for b in range(BN):
+            # Resolve batch idx for text lookup
+            text_bi = batch_origin[b].item() if batch_origin is not None else b
             instances = []
             for x in range(X):
                 if anchor_mask is not None and not anchor_mask[b, x]:
                     continue
 
                 instance_logits = logits[b, x]  # (L, C, 3)
-                field_id_to_class = id_to_fields[b] if id_to_fields[b] else {
+                field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
                     i + 1: str(i) for i in range(C)
                 }
                 spans = self.decode_bio_spans(
@@ -96,26 +105,32 @@ class StructuringDecoder(SpanDecoder):
                 )
 
                 if spans:
-                    fields = self._spans_to_fields(spans, texts, b)
+                    fields = self._spans_to_fields(spans, texts, text_bi)
                     instances.append(fields)
-            all_instances.append(instances)
+            flat_results.append(instances)
 
-        return all_instances
+        if batch_origin is not None and batch_size is not None:
+            from ...decoder import unflatten_by_batch_origin
+            return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
+
+        return flat_results
 
     def _decode_from_spans(self, span_logits, span_idx, span_mask, anchor_mask,
-                           id_to_fields, threshold, flat_ner, multi_label, texts):
-        """Decode from span-level predictions (B, X, S, C)."""
-        B, X, S, C = span_logits.shape
+                           id_to_fields, threshold, flat_ner, multi_label, texts,
+                           batch_origin=None, batch_size=None):
+        """Decode from span-level predictions (BN, X, S, C)."""
+        BN, X, S, C = span_logits.shape
         span_probs = torch.sigmoid(span_logits)
-        all_instances = []
+        flat_results = []
 
-        for b in range(B):
+        for b in range(BN):
+            text_bi = batch_origin[b].item() if batch_origin is not None else b
             instances = []
             for x in range(X):
                 if anchor_mask is not None and not anchor_mask[b, x]:
                     continue
 
-                field_id_to_class = id_to_fields[b] if id_to_fields[b] else {
+                field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
                     i + 1: str(i) for i in range(C)
                 }
                 spans = []
@@ -139,11 +154,15 @@ class StructuringDecoder(SpanDecoder):
 
                 spans = self.greedy_search(spans, flat_ner, multi_label)
                 if spans:
-                    fields = self._spans_to_fields(spans, texts, b)
+                    fields = self._spans_to_fields(spans, texts, text_bi)
                     instances.append(fields)
-            all_instances.append(instances)
+            flat_results.append(instances)
 
-        return all_instances
+        if batch_origin is not None and batch_size is not None:
+            from ...decoder import unflatten_by_batch_origin
+            return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
+
+        return flat_results
 
     def _spans_to_fields(self, spans, texts, batch_idx):
         """Convert Span objects to field dicts with text."""

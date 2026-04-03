@@ -71,29 +71,29 @@ class JointRelexDecoder(NERDecoder):
         probs = torch.sigmoid(model_output.joint_rel_logits)
         pair_idx = model_output.joint_rel_idx
         pair_mask = model_output.joint_rel_mask
-        B = probs.shape[0]
+        BN = probs.shape[0]
 
-        all_triples = []
-        for b in range(B):
+        flat_triples = []
+        for bn in range(BN):
             triples = []
-            batch_entities = entities[b] if b < len(entities) else []
+            batch_entities = entities[bn] if bn < len(entities) else []
 
             for p in range(probs.shape[1]):
-                if pair_mask is not None and not pair_mask[b, p]:
+                if pair_mask is not None and not pair_mask[bn, p]:
                     continue
                 for c in range(probs.shape[2]):
-                    score = probs[b, p, c].item()
+                    score = probs[bn, p, c].item()
                     if score <= threshold:
                         continue
 
-                    head_id = pair_idx[b, p, 0].item()
-                    tail_id = pair_idx[b, p, 1].item()
+                    head_id = pair_idx[bn, p, 0].item()
+                    tail_id = pair_idx[bn, p, 1].item()
 
                     head_span = self._resolve_entity(
-                        batch_entities, head_id, texts, b,
+                        batch_entities, head_id, texts, bn,
                     )
                     tail_span = self._resolve_entity(
-                        batch_entities, tail_id, texts, b,
+                        batch_entities, tail_id, texts, bn,
                     )
 
                     rel_name = rel_id_to_classes.get(c, str(c))
@@ -104,9 +104,16 @@ class JointRelexDecoder(NERDecoder):
                         "relation": rel_name,
                         "score": score,
                     })
-            all_triples.append(triples)
+            flat_triples.append(triples)
 
-        return all_triples
+        # Unflatten BN → B if batch_origin is available
+        if model_output.joint_rel_batch_origin is not None and model_output.batch_size is not None:
+            from ...decoder import unflatten_by_batch_origin
+            return unflatten_by_batch_origin(
+                flat_triples, model_output.joint_rel_batch_origin, model_output.batch_size,
+            )
+
+        return flat_triples
 
     def _resolve_entity(
         self,

@@ -6,7 +6,7 @@ from torch import nn
 from gliner.modeling.loss_functions import focal_loss_with_logits
 from gliner.modeling.utils import extract_prompt_features
 
-from .. import TaskHead, TaskHeadOutput, SharedRepresentations
+from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
 from ...layers import FeaturesProjector, Pooling
 
 
@@ -78,28 +78,34 @@ class ClassificationHead(TaskHead):
             return None
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout)
 
-    def forward(self, shared, dependency_outputs, cat_label_embeds=None, **batch):
-        token_embeds = shared.token_embeds
-        input_ids = shared.input_ids
-        attention_mask = shared.attention_mask
+    def forward(self, shared, dependency_outputs, flat_inputs=None, cat_label_embeds=None, **batch):
         cat_labels = batch.get("cat_labels")
 
-        batch_size, _, embed_dim = token_embeds.shape
-
-        if cat_label_embeds is not None:
-            cat_embedding = self.cat_projector(cat_label_embeds)
-            cat_embedding_mask = torch.ones(
-                cat_embedding.shape[:-1], dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
+        # Use flat_inputs (BN-indexed) when available
+        if flat_inputs is not None:
+            cat_embedding = self.cat_projector(flat_inputs.child_embedding)
+            cat_embedding_mask = flat_inputs.child_mask
+            text_rep = self.pooling(flat_inputs.words_embedding, flat_inputs.mask)
         else:
-            cat_embedding, cat_embedding_mask = extract_prompt_features(
-                self.cat_token_index, token_embeds, input_ids, attention_mask,
-                batch_size, embed_dim, self.embed_cat_token,
-            )
-            cat_embedding = self.cat_projector(cat_embedding)
+            token_embeds = shared.token_embeds
+            input_ids = shared.input_ids
+            attention_mask = shared.attention_mask
+            batch_size, _, embed_dim = token_embeds.shape
 
-        text_rep = self.pooling(token_embeds, attention_mask)
+            if cat_label_embeds is not None:
+                cat_embedding = self.cat_projector(cat_label_embeds)
+                cat_embedding_mask = torch.ones(
+                    cat_embedding.shape[:-1], dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+            else:
+                cat_embedding, cat_embedding_mask = extract_prompt_features(
+                    self.cat_token_index, token_embeds, input_ids, attention_mask,
+                    batch_size, embed_dim, self.embed_cat_token,
+                )
+                cat_embedding = self.cat_projector(cat_embedding)
+
+            text_rep = self.pooling(token_embeds, attention_mask)
 
         scores = self.cat_scorer(text_rep, cat_embedding)
 

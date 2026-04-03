@@ -14,8 +14,8 @@ from torch import nn
 from gliner.modeling.utils import extract_prompt_features
 from gliner.modeling.span_rep import SpanRepLayer
 
-from .. import TaskHead, TaskHeadOutput, SharedRepresentations
-from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling
+from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
+from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling, AnchorCrossAttentionLayer
 
 
 class OpenRelexHead(TaskHead):
@@ -59,6 +59,13 @@ class OpenRelexHead(TaskHead):
             cfg.anchor_modeling, hidden_size, dropout=dropout,
         )
 
+        refine_layers = getattr(cfg, "anchor_refine_layers", 0)
+        if refine_layers > 0:
+            refine_heads = getattr(cfg, "anchor_refine_heads", 8)
+            self.anchor_refine = AnchorCrossAttentionLayer(
+                hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+            )
+
         # Dual scorers: one for head spans, one for tail spans
         self.head_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
         self.tail_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
@@ -80,15 +87,8 @@ class OpenRelexHead(TaskHead):
             return None
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout)
 
-    def forward(self, shared, dependency_outputs,
+    def forward(self, shared, dependency_outputs, flat_inputs=None,
                 open_rel_label_embeds=None, base_loss_fn=None, **batch):
-        token_embeds = shared.token_embeds
-        input_ids = shared.input_ids
-        attention_mask = shared.attention_mask
-        words_embedding = shared.words_embedding
-        mask = shared.mask
-        prompts_embedding = shared.prompts_embedding
-
         open_rel_labels = batch.get("open_rel_labels")
         open_rel_count = batch.get("open_rel_count")
         threshold = batch.get("threshold", 0.5)
@@ -98,29 +98,47 @@ class OpenRelexHead(TaskHead):
         span_mask = batch.get("open_rel_span_mask")
         span_labels = batch.get("open_rel_span_labels")
 
-        batch_size, _, embed_dim = token_embeds.shape
-
-        # 1. Get [REL] type embeddings
-        if open_rel_label_embeds is not None:
-            rel_embedding = open_rel_label_embeds
-            rel_embedding_mask = torch.ones(
-                rel_embedding.shape[:-1], dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
+        # Use flat_inputs (BN-indexed) when available
+        if flat_inputs is not None:
+            words_embedding = flat_inputs.words_embedding
+            mask = flat_inputs.mask
+            rel_embedding = flat_inputs.child_embedding
+            rel_embedding_mask = flat_inputs.child_mask
+            parent_embedding = flat_inputs.parent_embedding.unsqueeze(1)  # (BN, 1, D)
         else:
-            rel_embedding, rel_embedding_mask = extract_prompt_features(
-                self.rel_token_index, token_embeds, input_ids, attention_mask,
-                batch_size, embed_dim, self.embed_rel_token,
-            )
+            token_embeds = shared.token_embeds
+            input_ids = shared.input_ids
+            attention_mask = shared.attention_mask
+            words_embedding = shared.words_embedding
+            mask = shared.mask
+            parent_embedding = shared.prompts_embedding
+
+            batch_size, _, embed_dim = token_embeds.shape
+
+            # 1. Get [REL] type embeddings
+            if open_rel_label_embeds is not None:
+                rel_embedding = open_rel_label_embeds
+                rel_embedding_mask = torch.ones(
+                    rel_embedding.shape[:-1], dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+            else:
+                rel_embedding, rel_embedding_mask = extract_prompt_features(
+                    self.rel_token_index, token_embeds, input_ids, attention_mask,
+                    batch_size, embed_dim, self.embed_rel_token,
+                )
 
         if rel_embedding.shape[1] == 0:
             return TaskHeadOutput()
 
         # 2. Generate anchors
         anchors, anchor_mask = self.anchor_layer(
-            prompts_embedding, words_embedding,
+            parent_embedding, words_embedding,
             count=open_rel_count, threshold=threshold,
         )
+
+        if hasattr(self, "anchor_refine"):
+            anchors = self.anchor_refine(anchors, words_embedding, token_mask=mask)
 
         # 3. Fuse anchors + rel types: (B, X, C, D)
         fused = self.anchor_modeling(anchors, rel_embedding)

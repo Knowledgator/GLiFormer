@@ -18,12 +18,13 @@ class ClassificationDecoder(TaskDecoder):
         """Decode classification logits into predicted labels.
 
         Args:
-            model_output: GLiNExTOutput with cat_logits (B*N, C).
+            model_output: GLiNExTOutput with cat_logits (BN, C).
             classes_mapping: BatchClassesMapping for label resolution.
             threshold: Override detection threshold.
 
         Returns:
-            List of lists of label dicts: [{class_id, score}, ...] per group.
+            If batch_origin available: List[List[List[dict]]] — per batch item, per group.
+            Otherwise: List[List[dict]] — per group (flat BN).
         """
         if model_output.cat_logits is None:
             return []
@@ -31,7 +32,7 @@ class ClassificationDecoder(TaskDecoder):
         threshold = threshold or self.threshold
         probs = torch.sigmoid(model_output.cat_logits)
 
-        all_predictions = []
+        flat_results = []
         for b in range(probs.shape[0]):
             predictions = []
             for c in range(probs.shape[1]):
@@ -41,6 +42,13 @@ class ClassificationDecoder(TaskDecoder):
                         "class_id": c,
                         "score": score,
                     })
-            all_predictions.append(predictions)
+            flat_results.append(predictions)
 
-        return all_predictions
+        # Unflatten BN → B if batch_origin is available
+        if model_output.cat_batch_origin is not None and model_output.batch_size is not None:
+            from ...decoder import unflatten_by_batch_origin
+            return unflatten_by_batch_origin(
+                flat_results, model_output.cat_batch_origin, model_output.batch_size,
+            )
+
+        return flat_results

@@ -22,6 +22,21 @@ class SharedRepresentations:
 
 
 @dataclass
+class TaskFlatInputs:
+    """Per-task flattened representations with BN indexing.
+
+    BN = total number of subtask groups across the batch for a specific task.
+    E.g., if batch item 0 has 3 NER schemas and item 1 has 1, BN=4 for NER.
+    """
+    words_embedding: torch.Tensor     # (BN, W, D) word embeddings repeated per group
+    mask: torch.Tensor                # (BN, W) word mask repeated per group
+    parent_embedding: torch.Tensor    # (BN, D) parent embedding per group
+    child_embedding: torch.Tensor     # (BN, max_C, D) child embeddings per group
+    child_mask: torch.Tensor          # (BN, max_C) child mask per group
+    batch_origin: torch.Tensor        # (BN,) maps flat idx to original batch idx
+
+
+@dataclass
 class TaskHeadOutput(ModelOutput):
     """Output from a single task head."""
     loss: Optional[torch.FloatTensor] = None

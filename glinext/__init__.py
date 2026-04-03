@@ -6,7 +6,6 @@ from .config import (
     OpenRelexHeadConfig,
     StructuringHeadConfig,
     CountHeadConfig,
-    DecoderHeadConfig,
     EmbeddingHeadConfig,
 )
 from .model import GLiNExTModel, GLiNExTOutput

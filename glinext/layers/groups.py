@@ -2,9 +2,69 @@
 
 import torch
 from torch import nn
-
 from .mlp import create_mlp
 from .rotary import RotaryEmbedding, apply_rotary_pos_emb
+
+
+class AnchorCrossAttentionLayer(nn.Module):
+    """Pre-processing layer that refines anchor embeddings via cross-attention with token embeddings.
+
+    Sits between anchor acquisition (AnchorLayer) and anchor modeling (AnchorModeling).
+    Each layer applies: anchor attends to tokens → residual + norm → FFN → residual + norm.
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int = 8, num_layers: int = 1, dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            _AnchorCrossAttentionBlock(hidden_size, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+
+    def forward(
+        self,
+        anchor_rep: torch.Tensor,
+        token_emb: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            anchor_rep: (B, A, D) anchor embeddings to refine
+            token_emb: (B, L, D) token embeddings from encoder
+            token_mask: (B, L) optional mask for valid token positions
+
+        Returns:
+            refined: (B, A, D) refined anchor embeddings
+        """
+        for layer in self.layers:
+            anchor_rep = layer(anchor_rep, token_emb, token_mask)
+        return anchor_rep
+
+
+class _AnchorCrossAttentionBlock(nn.Module):
+
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(hidden_size)
+
+    def forward(self, anchor_rep, token_emb, token_mask=None):
+        key_padding_mask = ~token_mask if token_mask is not None else None
+        attn_out, _ = self.cross_attn(
+            anchor_rep, token_emb, token_emb, key_padding_mask=key_padding_mask,
+        )
+        x = self.norm1(anchor_rep + attn_out)
+        x = self.norm2(x + self.ffn(x))
+        return x
 
 
 class RotaryGroupLSTM(nn.Module):

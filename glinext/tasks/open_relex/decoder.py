@@ -39,6 +39,8 @@ class OpenRelexDecoder(SpanDecoder):
 
         threshold = threshold or self.threshold
         anchor_mask = model_output.open_rel_anchor_mask
+        batch_origin = getattr(model_output, 'open_rel_batch_origin', None)
+        batch_size = getattr(model_output, 'batch_size', None)
 
         # Prefer span-level decoding when available
         if (model_output.open_rel_span_logits is not None
@@ -54,6 +56,8 @@ class OpenRelexDecoder(SpanDecoder):
                 flat_ner,
                 multi_label,
                 texts,
+                batch_origin=batch_origin,
+                batch_size=batch_size,
             )
 
         # Fall back to token-level BIO decoding
@@ -65,18 +69,22 @@ class OpenRelexDecoder(SpanDecoder):
             flat_ner,
             multi_label,
             texts,
+            batch_origin=batch_origin,
+            batch_size=batch_size,
         )
 
     def _decode_token_level(self, logits, anchor_mask, classes_mapping,
-                            threshold, flat_ner, multi_label, texts):
-        """Decode from token-level BIO logits (B, X, C, L, 2, 3)."""
+                            threshold, flat_ner, multi_label, texts,
+                            batch_origin=None, batch_size=None):
+        """Decode from token-level BIO logits (BN, X, C, L, 2, 3)."""
         probs = torch.sigmoid(logits)
-        B, X, C, _, _, _ = probs.shape
-        id_to_rel_classes = self._build_rel_class_maps(classes_mapping, B)
+        BN, X, C, _, _, _ = probs.shape
+        id_to_rel_classes = self._build_rel_class_maps(classes_mapping, BN)
 
         all_results = []
 
-        for b in range(B):
+        for b in range(BN):
+            text_bi = batch_origin[b].item() if batch_origin is not None else b
             triples = []
 
             for x in range(X):
@@ -97,25 +105,31 @@ class OpenRelexDecoder(SpanDecoder):
                         continue
 
                     rel_name = id_to_rel_classes[b].get(c, str(c))
-                    self._add_triples(triples, head_spans, tail_spans, rel_name, texts, b)
+                    self._add_triples(triples, head_spans, tail_spans, rel_name, texts, text_bi)
 
             all_results.append(triples)
+
+        if batch_origin is not None and batch_size is not None:
+            from ...decoder import unflatten_by_batch_origin
+            return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
 
         return all_results
 
     def _decode_from_spans(self, span_logits, span_idx, span_mask, anchor_mask,
-                           classes_mapping, threshold, flat_ner, multi_label, texts):
+                           classes_mapping, threshold, flat_ner, multi_label, texts,
+                           batch_origin=None, batch_size=None):
         """Decode from span-level predictions.
 
-        span_logits: (B, S, X, C, 2) — per span, per anchor, per rel class, head/tail score
+        span_logits: (BN, S, X, C, 2) — per span, per anchor, per rel class, head/tail score
         """
-        B, S, X, C, _ = span_logits.shape
+        BN, S, X, C, _ = span_logits.shape
         span_probs = torch.sigmoid(span_logits)
-        id_to_rel_classes = self._build_rel_class_maps(classes_mapping, B)
+        id_to_rel_classes = self._build_rel_class_maps(classes_mapping, BN)
 
         all_results = []
 
-        for b in range(B):
+        for b in range(BN):
+            text_bi = batch_origin[b].item() if batch_origin is not None else b
             triples = []
             valid_indices = torch.where(span_mask[b])[0]
 
@@ -149,9 +163,13 @@ class OpenRelexDecoder(SpanDecoder):
                     if not head_spans or not tail_spans:
                         continue
 
-                    self._add_triples(triples, head_spans, tail_spans, rel_name, texts, b)
+                    self._add_triples(triples, head_spans, tail_spans, rel_name, texts, text_bi)
 
             all_results.append(triples)
+
+        if batch_origin is not None and batch_size is not None:
+            from ...decoder import unflatten_by_batch_origin
+            return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
 
         return all_results
 

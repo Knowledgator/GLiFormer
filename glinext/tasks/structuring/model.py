@@ -6,8 +6,8 @@ from torch import nn
 from gliner.modeling.utils import extract_prompt_features
 from gliner.modeling.span_rep import SpanRepLayer
 
-from .. import TaskHead, TaskHeadOutput, SharedRepresentations
-from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling
+from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
+from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling, AnchorCrossAttentionLayer
 
 
 class StructuringHead(TaskHead):
@@ -48,6 +48,13 @@ class StructuringHead(TaskHead):
             anchor_modeling_type, hidden_size, dropout=dropout,
         )
 
+        refine_layers = getattr(struct_cfg, "anchor_refine_layers", 0)
+        if refine_layers > 0:
+            refine_heads = getattr(struct_cfg, "anchor_refine_heads", 8)
+            self.anchor_refine = AnchorCrossAttentionLayer(
+                hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+            )
+
         self.anchored_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
 
         if self.represent_spans:
@@ -64,16 +71,8 @@ class StructuringHead(TaskHead):
             return None
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout)
 
-    def forward(self, shared, dependency_outputs, child_label_embeds=None,
-                base_loss_fn=None, **batch):
-        token_embeds = shared.token_embeds
-        input_ids = shared.input_ids
-        attention_mask = shared.attention_mask
-        words_embedding = shared.words_embedding
-        mask = shared.mask
-        prompts_embedding = shared.prompts_embedding
-        prompts_embedding_mask = shared.prompts_embedding_mask
-
+    def forward(self, shared, dependency_outputs, flat_inputs=None,
+                child_label_embeds=None, base_loss_fn=None, **batch):
         gold_count_val = batch.get("gold_count_val")
         structuring_labels = batch.get("structuring_labels")
         structuring_count = batch.get("structuring_count")
@@ -84,28 +83,47 @@ class StructuringHead(TaskHead):
         span_mask = batch.get("structuring_span_mask")
         span_labels = batch.get("structuring_span_labels")
 
-        batch_size, _, embed_dim = token_embeds.shape
-
-        if child_label_embeds is not None:
-            child_embedding = child_label_embeds
-            child_embedding_mask = torch.ones(
-                child_label_embeds.shape[:-1], dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
+        # Use flat_inputs (BN-indexed) when available
+        if flat_inputs is not None:
+            words_embedding = flat_inputs.words_embedding
+            mask = flat_inputs.mask
+            child_embedding = flat_inputs.child_embedding
+            child_embedding_mask = flat_inputs.child_mask
+            # Parent embedding used for anchor generation
+            parent_embedding = flat_inputs.parent_embedding.unsqueeze(1)  # (BN, 1, D)
         else:
-            child_embedding, child_embedding_mask = extract_prompt_features(
-                self.child_token_index, token_embeds, input_ids, attention_mask,
-                batch_size, embed_dim, self.embed_child_token,
-            )
+            token_embeds = shared.token_embeds
+            input_ids = shared.input_ids
+            attention_mask = shared.attention_mask
+            words_embedding = shared.words_embedding
+            mask = shared.mask
+            parent_embedding = shared.prompts_embedding
+
+            batch_size, _, embed_dim = token_embeds.shape
+
+            if child_label_embeds is not None:
+                child_embedding = child_label_embeds
+                child_embedding_mask = torch.ones(
+                    child_label_embeds.shape[:-1], dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+            else:
+                child_embedding, child_embedding_mask = extract_prompt_features(
+                    self.child_token_index, token_embeds, input_ids, attention_mask,
+                    batch_size, embed_dim, self.embed_child_token,
+                )
 
         if child_embedding.shape[1] == 0:
             return TaskHeadOutput()
 
         count_for_groups = structuring_count if structuring_count is not None else gold_count_val
         anchors, anchor_mask = self.anchor_layer(
-            prompts_embedding, words_embedding,
+            parent_embedding, words_embedding,
             count=count_for_groups, threshold=threshold,
         )
+
+        if hasattr(self, "anchor_refine"):
+            anchors = self.anchor_refine(anchors, words_embedding, token_mask=mask)
 
         # Fuse anchors + children: (B, X, C, D) then score against words
         fused = self.anchor_modeling(anchors, child_embedding)

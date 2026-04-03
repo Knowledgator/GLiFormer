@@ -1,8 +1,29 @@
 """GLiNExT decoder — factory that assembles per-task decoders based on config."""
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+import torch
 
 from .config import GLiNextConfig
+
+
+def unflatten_by_batch_origin(results: list, batch_origin: torch.Tensor, batch_size: int) -> List[list]:
+    """Group BN-indexed results back to B-indexed list of lists.
+
+    Args:
+        results: List of length BN with per-group results.
+        batch_origin: (BN,) tensor mapping flat idx → batch idx.
+        batch_size: Original batch size B.
+
+    Returns:
+        List of length B, where each element collects results from its groups.
+    """
+    output = [[] for _ in range(batch_size)]
+    for flat_idx, group_result in enumerate(results):
+        bi = batch_origin[flat_idx].item()
+        if bi < batch_size:
+            output[bi].append(group_result)
+    return output
 
 
 class GLiNExTDecoder:

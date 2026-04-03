@@ -7,8 +7,8 @@ from gliner.modeling.scorers import Scorer
 from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import extract_spans_from_tokens
 
-from .. import TaskHead, TaskHeadOutput, SharedRepresentations
-from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling
+from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
+from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling, AnchorCrossAttentionLayer
 
 
 class NERHead(TaskHead):
@@ -39,6 +39,12 @@ class NERHead(TaskHead):
             self.anchor_modeling = AnchorModeling.from_config(
                 anchor_modeling_type, hidden_size, dropout=dropout,
             )
+            refine_layers = getattr(ner_cfg, "anchor_refine_layers", 0)
+            if refine_layers > 0:
+                refine_heads = getattr(ner_cfg, "anchor_refine_heads", 8)
+                self.anchor_refine = AnchorCrossAttentionLayer(
+                    hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+                )
             self.scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
         else:
             self.scorer = Scorer(hidden_size, dropout)
@@ -83,11 +89,19 @@ class NERHead(TaskHead):
             mask = mask[:, :target_length]
         return tensor, mask
 
-    def forward(self, shared, dependency_outputs, base_loss_fn=None, **batch):
-        words_embedding = shared.words_embedding
-        mask = shared.mask
-        prompts_embedding = shared.prompts_embedding
-        prompts_embedding_mask = shared.prompts_embedding_mask
+    def forward(self, shared, dependency_outputs, flat_inputs=None, base_loss_fn=None, **batch):
+        # Use flat_inputs (BN-indexed) when available, else fall back to shared (B-indexed)
+        if flat_inputs is not None:
+            words_embedding = flat_inputs.words_embedding
+            mask = flat_inputs.mask
+            prompts_embedding = flat_inputs.child_embedding
+            prompts_embedding_mask = flat_inputs.child_mask
+        else:
+            words_embedding = shared.words_embedding
+            mask = shared.mask
+            prompts_embedding = shared.prompts_embedding
+            prompts_embedding_mask = shared.prompts_embedding_mask
+
         ner_labels = batch.get("ner_labels")
         span_idx = batch.get("span_idx")
         span_mask = batch.get("span_mask")
@@ -107,6 +121,8 @@ class NERHead(TaskHead):
             anchor_rep, anchor_mask = self.anchor_layer(
                 prompts_embedding, words_embedding,
             )
+            if hasattr(self, "anchor_refine"):
+                anchor_rep = self.anchor_refine(anchor_rep, words_embedding, token_mask=mask)
             fused = self.anchor_modeling(anchor_rep, prompts_embedding)
             B_a, A, C, D = fused.shape
             L = words_embedding.shape[1]

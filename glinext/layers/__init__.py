@@ -6,7 +6,7 @@ from .pair_rep import PairRepLayer, PromptRelationExtractor
 from .anchored_scorer import AnchoredSpanScorer
 from .attention import SelfAttentionBlock, CrossAttentionBlock, Fuser, LayerwiseAttention
 from .rotary import RotaryEmbedding, rotate_half, apply_rotary_pos_emb
-from .groups import RotaryGroupLSTM, QueryGroupLSTM, QueryGroupTransformer
+from .groups import RotaryGroupLSTM, QueryGroupLSTM, QueryGroupTransformer, AnchorCrossAttentionLayer
 from .anchor_layer import (
     AnchorLayer, ParentAnchorLayer, FixedAnchorLayer,
     RotaryAnchorLayer, QueryLSTMAnchorLayer, QueryTransformerAnchorLayer,
@@ -23,7 +23,7 @@ __all__ = [
     "AnchoredSpanScorer",
     "SelfAttentionBlock", "CrossAttentionBlock", "Fuser", "LayerwiseAttention",
     "RotaryEmbedding", "rotate_half", "apply_rotary_pos_emb",
-    "RotaryGroupLSTM", "QueryGroupLSTM", "QueryGroupTransformer",
+    "RotaryGroupLSTM", "QueryGroupLSTM", "QueryGroupTransformer", "AnchorCrossAttentionLayer",
     "AnchorLayer", "ParentAnchorLayer", "FixedAnchorLayer",
     "RotaryAnchorLayer", "QueryLSTMAnchorLayer", "QueryTransformerAnchorLayer",
     "AnchorModeling", "LinearAnchorModeling", "LSTMAnchorModeling", "MLPAnchorModeling",

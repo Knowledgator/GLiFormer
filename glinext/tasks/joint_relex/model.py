@@ -172,11 +172,11 @@ class JointRelexHead(NERHead):
             extra={"rel_idx": pair_idx, "rel_mask": pair_mask},
         )
 
-    def forward(self, shared, dependency_outputs, base_loss_fn=None,
+    def forward(self, shared, dependency_outputs, flat_inputs=None, base_loss_fn=None,
                 rel_label_embeds=None, **batch):
-        # 1. Run NER forward (inherited)
+        # 1. Run NER forward (inherited) — passes flat_inputs through
         ner_output = super().forward(
-            shared, dependency_outputs, base_loss_fn=base_loss_fn, **batch,
+            shared, dependency_outputs, flat_inputs=flat_inputs, base_loss_fn=base_loss_fn, **batch,
         )
 
         # 2. Select entity spans from NER scores
