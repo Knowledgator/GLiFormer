@@ -82,6 +82,8 @@ class JointRelexDecoder(NERDecoder):
                 if pair_mask is not None and not pair_mask[bn, p]:
                     continue
                 for c in range(probs.shape[2]):
+                    if rel_id_to_classes and c not in rel_id_to_classes:
+                        continue
                     score = probs[bn, p, c].item()
                     if score <= threshold:
                         continue
@@ -145,8 +147,7 @@ class JointRelexDecoder(NERDecoder):
     def _get_ner_id_to_classes(self, classes_mapping) -> Union[Dict[int, str], List[Dict[int, str]]]:
         """Extract NER id→class mappings from BatchClassesMapping.
 
-        Returns BN-level list of 1-indexed dicts (matching the label layout
-        where index 0 is parent, entity types start at 1).
+        Returns BN-level list of 0-indexed dicts (entity types at index 0+).
         """
         if classes_mapping is None:
             return {}
@@ -156,8 +157,7 @@ class JointRelexDecoder(NERDecoder):
         maps = []
         for em in classes_mapping.extraction_mapping:
             for item in em.items:
-                reverse = item.ner_class_to_id.get_reverse_mapping()
-                maps.append({k + 1: v for k, v in reverse.items()})
+                maps.append(item.ner_class_to_id.get_reverse_mapping())
         return maps
 
     def _get_rel_id_to_classes(self, classes_mapping) -> Dict[int, str]:

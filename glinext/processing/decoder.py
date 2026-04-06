@@ -84,5 +84,7 @@ class GLiNExTDecoder:
         """
         results = {}
         for name, decoder in self.task_decoders.items():
-            results[name] = decoder.decode(model_output, classes_mapping=classes_mapping, **kwargs)
+            decoded = decoder.decode(model_output, classes_mapping=classes_mapping, **kwargs)
+            if decoded is not None and decoded != []:
+                results[name] = decoded
         return results

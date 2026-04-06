@@ -667,11 +667,35 @@ class GLiNExTModel(BaseModel):
             threshold=threshold, adjacency_threshold=adjacency_threshold,
         )
 
+        # Map head names to their label keys — used to detect whether a head
+        # has any work to do (flat_inputs OR labels present).
+        _HEAD_LABEL_KEYS = {
+            "ner": "ner_labels",
+            "joint_relex": "rel_labels",
+            "classification": "cat_labels",
+            "open_relex": "open_rel_labels",
+            "structuring": "structuring_labels",
+            "count": "count_targets",
+            # embedding uses shared reps directly — always runs when head exists
+        }
+
         # ── 2. Execute heads in order ───────────────────────────────────
         head_outputs = {}
         for name in _EXECUTION_ORDER:
             if name not in self.heads:
                 continue
+
+            # Skip heads that have no groups and no labels (e.g. NER head
+            # during classification-only inference).  When classes_mapping is
+            # present we are in the flat_inputs path: a head without
+            # flat_inputs AND without its label tensor has nothing to do.
+            label_key = _HEAD_LABEL_KEYS.get(name)
+            if (classes_mapping is not None
+                    and name not in flat_inputs_map
+                    and label_key is not None
+                    and batch_kwargs.get(label_key) is None):
+                continue
+
             head = self.heads[name]
 
             dep_outputs = {d: head_outputs[d] for d in head.dependencies if d in head_outputs}

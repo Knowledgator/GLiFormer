@@ -32,14 +32,24 @@ class ClassificationDecoder(TaskDecoder):
         threshold = threshold or self.threshold
         probs = torch.sigmoid(model_output.cat_logits)
 
+        # Build per-flat-group id→name mappings from classes_mapping
+        id_to_class_maps = []
+        if classes_mapping is not None and hasattr(classes_mapping, 'cat_mapping'):
+            for cm in classes_mapping.cat_mapping:
+                for base_map in cm.cat_class_to_id:
+                    id_to_class_maps.append(base_map.get_reverse_mapping())
+
         flat_results = []
         for b in range(probs.shape[0]):
+            id_to_class = id_to_class_maps[b] if b < len(id_to_class_maps) else {}
+            # Only iterate over valid classes (skip padding positions)
+            num_classes = len(id_to_class) if id_to_class else probs.shape[1]
             predictions = []
-            for c in range(probs.shape[1]):
+            for c in range(num_classes):
                 score = probs[b, c].item()
                 if score > threshold:
                     predictions.append({
-                        "class_id": c,
+                        "class_name": id_to_class.get(c, str(c)),
                         "score": score,
                     })
             flat_results.append(predictions)

@@ -98,7 +98,7 @@ class StructuringDecoder(SpanDecoder):
 
                 instance_logits = logits[b, x]  # (L, C, 3)
                 field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
-                    i + 1: str(i) for i in range(C)
+                    i: str(i) for i in range(C)
                 }
                 spans = self.decode_bio_spans(
                     instance_logits, field_id_to_class, threshold, flat_ner, multi_label,
@@ -131,7 +131,7 @@ class StructuringDecoder(SpanDecoder):
                     continue
 
                 field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
-                    i + 1: str(i) for i in range(C)
+                    i: str(i) for i in range(C)
                 }
                 spans = []
                 valid_indices = torch.where(span_mask[b])[0]
@@ -143,7 +143,7 @@ class StructuringDecoder(SpanDecoder):
                     class_indices = torch.where(probs > threshold)[0]
 
                     for class_idx in class_indices:
-                        class_id = class_idx.item() + 1  # 1-indexed
+                        class_id = class_idx.item()
                         if class_id in field_id_to_class:
                             spans.append(Span(
                                 start=span_start,

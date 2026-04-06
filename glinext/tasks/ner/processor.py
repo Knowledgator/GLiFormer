@@ -129,7 +129,7 @@ class NERProcessor(SpanProcessor):
             return None
 
         ner_labels = torch.zeros(
-            total_groups, max_seq_len, max_num_classes + 1, 3,
+            total_groups, max_seq_len, max_num_classes, 3,
             dtype=torch.float
         )
         ner_batch_idx = torch.zeros(total_groups, dtype=torch.long)
@@ -147,13 +147,8 @@ class NERProcessor(SpanProcessor):
                 start, end, label = ent[0], ent[1], ent[-1]
                 if start >= max_seq_len or end >= max_seq_len:
                     continue
-                # Parent class (index 0)
-                ner_labels[flat_idx, start, 0, 0] = 1
-                ner_labels[flat_idx, end, 0, 1] = 1
-                ner_labels[flat_idx, start:end + 1, 0, 2] = 1
-                # Child class labels (1-indexed)
                 if label in mapping.class_to_id:
-                    class_idx = mapping.class_to_id[label] + 1
+                    class_idx = mapping.class_to_id[label]
                     ner_labels[flat_idx, start, class_idx, 0] = 1
                     ner_labels[flat_idx, end, class_idx, 1] = 1
                     ner_labels[flat_idx, start:end + 1, class_idx, 2] = 1

@@ -25,8 +25,8 @@ class NERDecoder(SpanDecoder):
     ) -> Union[Dict[int, str], List[Dict[int, str]]]:
         """Extract NER id->class mappings from BatchClassesMapping.
 
-        Returns a BN-level list of 1-indexed dicts (matching the label layout
-        where index 0 is the parent class and entity types start at 1).
+        Returns a BN-level list of 0-indexed dicts matching the label layout
+        (entity types at index 0+, no parent class).
         """
         if classes_mapping is None:
             return {}
@@ -36,11 +36,7 @@ class NERDecoder(SpanDecoder):
         maps = []
         for em in classes_mapping.extraction_mapping:
             for item in em.items:
-                # get_reverse_mapping() returns 0-indexed {0: "person", 1: "org"}.
-                # _calculate_span_score does id_to_classes.get(cls_st + 1), so
-                # keys must be 1-indexed: {1: "person", 2: "org"}.
-                reverse = item.ner_class_to_id.get_reverse_mapping()
-                maps.append({k + 1: v for k, v in reverse.items()})
+                maps.append(item.ner_class_to_id.get_reverse_mapping())
         return maps
 
     def decode(

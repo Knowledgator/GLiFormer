@@ -91,6 +91,8 @@ class OpenRelexDecoder(SpanDecoder):
                 if anchor_mask is not None and not anchor_mask[b, x]:
                     continue
                 for c in range(C):
+                    if id_to_rel_classes[b] and c not in id_to_rel_classes[b]:
+                        continue
                     head_probs = probs[b, x, c, :, 0, :]  # (L, 3)
                     tail_probs = probs[b, x, c, :, 1, :]  # (L, 3)
 
@@ -137,6 +139,8 @@ class OpenRelexDecoder(SpanDecoder):
                 if anchor_mask is not None and not anchor_mask[b, x]:
                     continue
                 for c in range(C):
+                    if id_to_rel_classes[b] and c not in id_to_rel_classes[b]:
+                        continue
                     rel_name = id_to_rel_classes[b].get(c, str(c))
 
                     # Collect head and tail spans above threshold

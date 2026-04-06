@@ -87,8 +87,9 @@ class SpanDecoder(TaskDecoder):
                     end_score = scores_end[ed, cls_ed]
                     combined = torch.cat([ins, start_score.unsqueeze(0), end_score.unsqueeze(0)])
                     score = combined.min().item()
-                    # id_to_classes uses 1-indexed keys (0 is parent)
-                    entity_type = id_to_classes.get(cls_st + 1, str(cls_st))
+                    if id_to_classes and cls_st not in id_to_classes:
+                        continue
+                    entity_type = id_to_classes.get(cls_st, str(cls_st))
                     spans.append(Span(
                         start=st,
                         end=ed,
@@ -162,13 +163,13 @@ class SpanDecoder(TaskDecoder):
             scores_end.unsqueeze(-1).logit(), threshold,
         )
 
-        # Single class: id_to_classes maps 1→""
+        # Single class: id_to_classes maps 0→""
         spans = self._calculate_span_score(
             start_idx, end_idx,
             scores_inside.unsqueeze(-1),
             scores_start.unsqueeze(-1),
             scores_end.unsqueeze(-1),
-            {1: ""},
+            {0: ""},
             threshold,
         )
         if not spans:
@@ -246,7 +247,7 @@ class SpanDecoder(TaskDecoder):
                 class_indices = torch.where(probs > threshold)[0]
 
                 for class_idx in class_indices:
-                    class_id = class_idx.item() + 1  # 1-indexed (0 is parent)
+                    class_id = class_idx.item()
                     if class_id in id_to_class_i:
                         spans.append(Span(
                             start=span_start,
