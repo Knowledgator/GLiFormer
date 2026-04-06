@@ -243,10 +243,13 @@ class GLiNExT(BaseEncoderGLiNER):
 
             # Structuring
             if structures:
-                item["structuring"] = {
-                    schema_name: []
-                    for schema_name in structures
-                }
+                structuring = {}
+                for schema_name, fields in structures.items():
+                    field_list = fields if isinstance(fields, list) else fields.get("fields", [])
+                    # Dummy instance with all field names so the processor
+                    # can build the class mapping during inference
+                    structuring[schema_name] = [dict.fromkeys(field_list, "")] if field_list else []
+                item["structuring"] = structuring
                 item["structuring_schema"] = {
                     schema_name: fields if isinstance(fields, list) else fields.get("fields", [])
                     for schema_name, fields in structures.items()

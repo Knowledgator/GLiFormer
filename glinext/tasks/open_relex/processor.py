@@ -27,14 +27,17 @@ class OpenRelexProcessor(SpanProcessor):
             open_relex_data = item.get('open_relex', [])
             item_mappings = []
             for group in open_relex_data:
-                # Collect unique relation types
-                rel_types = []
-                seen = set()
-                for rel in group.get('relations', []):
-                    rel_type = rel.get('relation', '')
-                    if rel_type and rel_type not in seen:
-                        rel_types.append(rel_type)
-                        seen.add(rel_type)
+                # Use all_labels when available (inference), else extract from annotations
+                if 'all_labels' in group:
+                    rel_types = list(group['all_labels'])
+                else:
+                    rel_types = []
+                    seen = set()
+                    for rel in group.get('relations', []):
+                        rel_type = rel.get('relation', '')
+                        if rel_type and rel_type not in seen:
+                            rel_types.append(rel_type)
+                            seen.add(rel_type)
                 if shuffle_labels:
                     import random
                     random.shuffle(rel_types)

@@ -39,7 +39,10 @@ class NERProcessor(SpanProcessor):
             extraction_examples = item.get('extraction', [])
             item_mappings = []
             for example in extraction_examples:
-                ner_labels = list({ent[-1] for ent in example.get('ner', [])})
+                if 'all_labels' in example:
+                    ner_labels = list(example['all_labels'])
+                else:
+                    ner_labels = list({ent[-1] for ent in example.get('ner', [])})
                 ner_class_to_id = self._build_class_to_id(ner_labels, ner_negatives, sample_neg, shuffle_labels)
                 name = example.get('name', None)
                 description = example.get('description', None)
@@ -48,9 +51,11 @@ class NERProcessor(SpanProcessor):
                 )
 
                 rel_mapping = None
-                relations = example.get('relations', [])
-                if relations:
-                    rel_labels = list({rel[-1] for rel in relations})
+                if 'all_rel_labels' in example:
+                    rel_labels = list(example['all_rel_labels'])
+                else:
+                    rel_labels = list({rel[-1] for rel in example.get('relations', [])})
+                if rel_labels:
                     rel_class_to_id = self._build_class_to_id(rel_labels, rel_negatives, sample_neg, shuffle_labels)
                     rel_mapping = BaseClassMapping(
                         class_to_id=rel_class_to_id, name=name, description=description

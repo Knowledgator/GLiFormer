@@ -7,7 +7,7 @@ from gliner.modeling.scorers import Scorer
 from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import extract_spans_from_tokens
 
-from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
+from .. import TaskHead, TaskHeadOutput
 from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling, AnchorCrossAttentionLayer
 
 

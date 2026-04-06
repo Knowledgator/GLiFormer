@@ -143,7 +143,11 @@ class JointRelexDecoder(NERDecoder):
         }
 
     def _get_ner_id_to_classes(self, classes_mapping) -> Union[Dict[int, str], List[Dict[int, str]]]:
-        """Extract NER id→class mappings from BatchClassesMapping."""
+        """Extract NER id→class mappings from BatchClassesMapping.
+
+        Returns BN-level list of 1-indexed dicts (matching the label layout
+        where index 0 is parent, entity types start at 1).
+        """
         if classes_mapping is None:
             return {}
         if not hasattr(classes_mapping, 'extraction_mapping'):
@@ -151,10 +155,9 @@ class JointRelexDecoder(NERDecoder):
 
         maps = []
         for em in classes_mapping.extraction_mapping:
-            merged = {}
             for item in em.items:
-                merged.update(item.ner_class_to_id.get_reverse_mapping())
-            maps.append(merged)
+                reverse = item.ner_class_to_id.get_reverse_mapping()
+                maps.append({k + 1: v for k, v in reverse.items()})
         return maps
 
     def _get_rel_id_to_classes(self, classes_mapping) -> Dict[int, str]:

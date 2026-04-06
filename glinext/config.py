@@ -1,5 +1,6 @@
+import dataclasses
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from transformers.models.auto import CONFIG_MAPPING
 
@@ -315,3 +316,10 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.shared_anchor_modeling = shared_anchor_modeling
         self.shared_anchor_refine_layers = shared_anchor_refine_layers
         self.shared_anchor_refine_heads = shared_anchor_refine_heads
+
+    def to_dict(self) -> dict[str, Any]:
+        output = super().to_dict()
+        for key, value in output.items():
+            if dataclasses.is_dataclass(value) and not isinstance(value, type):
+                output[key] = dataclasses.asdict(value)
+        return output
