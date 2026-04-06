@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 import torch
 
 from ..span_processor import SpanProcessor
-from ...mappings import (
+from ...processing.mappings import (
     BaseClassMapping, OpenRelexItemMapping, OpenRelexClassMapping, BatchClassesMapping,
 )
 
@@ -180,7 +180,7 @@ class OpenRelexProcessor(SpanProcessor):
             open_rel_mask[flat_idx] = True
             open_rel_count[flat_idx] = len(anchor_rels)
 
-            for anchor_idx, (anchor_key, rel_class_ids) in enumerate(anchor_rels.items()):
+            for anchor_idx, (anchor_key, rel_class_ids) in enumerate(sorted(anchor_rels.items())):
                 if anchor_idx >= max_anchors:
                     break
                 h_start, h_end, t_start, t_end = anchor_key
@@ -248,10 +248,8 @@ class OpenRelexProcessor(SpanProcessor):
             max_rel_classes = max(max_rel_classes, len(rel_to_id))
 
             # Collect all head/tail spans and group by anchor
-            anchor_rels = {}  # anchor_idx → list of (rel_class_id, h_start, h_end, t_start, t_end)
+            keyed_anchor_rels = {}  # anchor_key → list of (rel_class_id, h_start, h_end, t_start, t_end)
             positive_spans = set()
-            anchor_idx = 0
-            seen_anchors = {}
 
             for rel in relations:
                 head = rel.get('head', {})
@@ -269,15 +267,17 @@ class OpenRelexProcessor(SpanProcessor):
                     continue
 
                 anchor_key = (h_start, h_end, t_start, t_end)
-                if anchor_key not in seen_anchors:
-                    seen_anchors[anchor_key] = anchor_idx
-                    anchor_rels[anchor_idx] = []
-                    anchor_idx += 1
-                a_idx = seen_anchors[anchor_key]
-                anchor_rels[a_idx].append((rel_to_id[rel_type], h_start, h_end, t_start, t_end))
+                if anchor_key not in keyed_anchor_rels:
+                    keyed_anchor_rels[anchor_key] = []
+                keyed_anchor_rels[anchor_key].append((rel_to_id[rel_type], h_start, h_end, t_start, t_end))
                 positive_spans.add((h_start, h_end))
                 positive_spans.add((t_start, t_end))
                 has_any = True
+
+            # Sort anchors by position (head start, head end, tail start, tail end)
+            anchor_rels = {}
+            for anchor_idx, (_, rels) in enumerate(sorted(keyed_anchor_rels.items())):
+                anchor_rels[anchor_idx] = rels
 
             max_anchors = max(max_anchors, len(anchor_rels))
 

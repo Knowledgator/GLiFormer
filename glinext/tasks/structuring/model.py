@@ -20,7 +20,7 @@ class StructuringHead(TaskHead):
     name = "structuring"
     dependencies = []
 
-    def __init__(self, config, hidden_size, dropout):
+    def __init__(self, config, hidden_size, dropout, shared_layers=None):
         super().__init__()
         struct_cfg = config.structuring_config
         self.loss_coef = struct_cfg.loss_coef
@@ -28,6 +28,8 @@ class StructuringHead(TaskHead):
         self.embed_child_token = struct_cfg.embed_child_token
         self.represent_spans = getattr(struct_cfg, 'represent_spans', False)
         self.span_loss_coef = getattr(struct_cfg, 'span_loss_coef', 1.0)
+        if shared_layers is None:
+            shared_layers = {}
 
         # Map groups_layer config to anchor_mode for AnchorLayer factory
         anchor_mode = struct_cfg.groups_layer
@@ -43,17 +45,23 @@ class StructuringHead(TaskHead):
             dropout=dropout,
         )
 
-        anchor_modeling_type = getattr(struct_cfg, "anchor_modeling", "linear")
-        self.anchor_modeling = AnchorModeling.from_config(
-            anchor_modeling_type, hidden_size, dropout=dropout,
-        )
-
-        refine_layers = getattr(struct_cfg, "anchor_refine_layers", 0)
-        if refine_layers > 0:
-            refine_heads = getattr(struct_cfg, "anchor_refine_heads", 8)
-            self.anchor_refine = AnchorCrossAttentionLayer(
-                hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+        if "anchor_modeling" in shared_layers:
+            self.anchor_modeling = shared_layers["anchor_modeling"]
+        else:
+            anchor_modeling_type = getattr(struct_cfg, "anchor_modeling", "linear")
+            self.anchor_modeling = AnchorModeling.from_config(
+                anchor_modeling_type, hidden_size, dropout=dropout,
             )
+
+        if "anchor_refine" in shared_layers:
+            self.anchor_refine = shared_layers["anchor_refine"]
+        else:
+            refine_layers = getattr(struct_cfg, "anchor_refine_layers", 0)
+            if refine_layers > 0:
+                refine_heads = getattr(struct_cfg, "anchor_refine_heads", 8)
+                self.anchor_refine = AnchorCrossAttentionLayer(
+                    hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+                )
 
         self.anchored_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
 
@@ -66,10 +74,11 @@ class StructuringHead(TaskHead):
             )
 
     @classmethod
-    def from_config(cls, config, **kwargs):
+    def from_config(cls, config, shared_layers=None, **kwargs):
         if config.structuring_config is None:
             return None
-        return cls(config, hidden_size=config.hidden_size, dropout=config.dropout)
+        return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
+                   shared_layers=shared_layers)
 
     def forward(self, shared, dependency_outputs, flat_inputs=None,
                 child_label_embeds=None, base_loss_fn=None, **batch):

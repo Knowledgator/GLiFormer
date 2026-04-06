@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from glinext.tasks.count.processor import CountProcessor
-from glinext.mappings import (
+from glinext.processing.mappings import (
     BaseClassMapping, CatClassMapping, ExtractionItemMapping, ExtractionClassMapping,
     StructuringItemMapping, StructuringClassMapping,
 )

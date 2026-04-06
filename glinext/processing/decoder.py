@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .config import GLiNextConfig
+from ..config import GLiNextConfig
 
 
 def unflatten_by_batch_origin(results: list, batch_origin: torch.Tensor, batch_size: int) -> List[list]:
@@ -38,37 +38,37 @@ class GLiNExTDecoder:
         self.task_decoders: Dict[str, object] = {}
 
         if config.ner_config is not None:
-            from .tasks.ner.decoder import NERDecoder
+            from ..tasks.ner.decoder import NERDecoder
             if hasattr(NERDecoder, 'from_config'):
                 self.task_decoders["ner"] = NERDecoder.from_config(config)
 
         if config.classification_config is not None:
-            from .tasks.classification.decoder import ClassificationDecoder
+            from ..tasks.classification.decoder import ClassificationDecoder
             if hasattr(ClassificationDecoder, 'from_config'):
                 self.task_decoders["classification"] = ClassificationDecoder.from_config(config)
 
         if config.joint_relex_config is not None:
-            from .tasks.joint_relex.decoder import JointRelexDecoder
+            from ..tasks.joint_relex.decoder import JointRelexDecoder
             if hasattr(JointRelexDecoder, 'from_config'):
                 self.task_decoders["joint_relex"] = JointRelexDecoder.from_config(config)
 
         if config.open_relex_config is not None:
-            from .tasks.open_relex.decoder import OpenRelexDecoder
+            from ..tasks.open_relex.decoder import OpenRelexDecoder
             if hasattr(OpenRelexDecoder, 'from_config'):
                 self.task_decoders["open_relex"] = OpenRelexDecoder.from_config(config)
 
         if config.structuring_config is not None:
-            from .tasks.structuring.decoder import StructuringDecoder
+            from ..tasks.structuring.decoder import StructuringDecoder
             if hasattr(StructuringDecoder, 'from_config'):
                 self.task_decoders["structuring"] = StructuringDecoder.from_config(config)
 
         if config.embedding_config is not None:
-            from .tasks.embedding.decoder import EmbeddingDecoder
+            from ..tasks.embedding.decoder import EmbeddingDecoder
             if hasattr(EmbeddingDecoder, 'from_config'):
                 self.task_decoders["embedding"] = EmbeddingDecoder.from_config(config)
 
         if config.count_config is not None:
-            from .tasks.count.decoder import CountDecoder
+            from ..tasks.count.decoder import CountDecoder
             if hasattr(CountDecoder, 'from_config'):
                 self.task_decoders["count"] = CountDecoder.from_config(config)
 

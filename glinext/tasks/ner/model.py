@@ -22,7 +22,7 @@ class NERHead(TaskHead):
     name = "ner"
     dependencies = []
 
-    def __init__(self, config, hidden_size, dropout):
+    def __init__(self, config, hidden_size, dropout, shared_layers=None):
         super().__init__()
         self.config = config
         ner_cfg = config.ner_config
@@ -30,21 +30,29 @@ class NERHead(TaskHead):
         self.represent_spans = ner_cfg.represent_spans
         self.span_loss_coef = ner_cfg.span_loss_coef
         self.scorer_type = getattr(ner_cfg, "scorer_type", "gliner")
+        if shared_layers is None:
+            shared_layers = {}
 
         if self.scorer_type == "anchored":
             self.anchor_layer = AnchorLayer.from_config(
                 getattr(ner_cfg, "anchor_mode", "parent"), hidden_size,
             )
-            anchor_modeling_type = getattr(ner_cfg, "anchor_modeling", "linear")
-            self.anchor_modeling = AnchorModeling.from_config(
-                anchor_modeling_type, hidden_size, dropout=dropout,
-            )
-            refine_layers = getattr(ner_cfg, "anchor_refine_layers", 0)
-            if refine_layers > 0:
-                refine_heads = getattr(ner_cfg, "anchor_refine_heads", 8)
-                self.anchor_refine = AnchorCrossAttentionLayer(
-                    hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+            if "anchor_modeling" in shared_layers:
+                self.anchor_modeling = shared_layers["anchor_modeling"]
+            else:
+                anchor_modeling_type = getattr(ner_cfg, "anchor_modeling", "linear")
+                self.anchor_modeling = AnchorModeling.from_config(
+                    anchor_modeling_type, hidden_size, dropout=dropout,
                 )
+            if "anchor_refine" in shared_layers:
+                self.anchor_refine = shared_layers["anchor_refine"]
+            else:
+                refine_layers = getattr(ner_cfg, "anchor_refine_layers", 0)
+                if refine_layers > 0:
+                    refine_heads = getattr(ner_cfg, "anchor_refine_heads", 8)
+                    self.anchor_refine = AnchorCrossAttentionLayer(
+                        hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+                    )
             self.scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
         else:
             self.scorer = Scorer(hidden_size, dropout)
@@ -58,13 +66,14 @@ class NERHead(TaskHead):
             )
 
     @classmethod
-    def from_config(cls, config, **kwargs):
+    def from_config(cls, config, shared_layers=None, **kwargs):
         if config.ner_config is None:
             return None
         return cls(
             config,
             hidden_size=config.hidden_size,
             dropout=config.dropout,
+            shared_layers=shared_layers,
         )
 
     def _ner_loss(self, scores, labels, prompts_embedding_mask, word_mask, base_loss_fn):

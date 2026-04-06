@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 import torch
 
 from ..span_processor import SpanProcessor
-from ...mappings import (
+from ...processing.mappings import (
     BaseClassMapping, StructuringItemMapping, StructuringClassMapping, BatchClassesMapping,
 )
 
@@ -17,6 +17,23 @@ class StructuringProcessor(SpanProcessor):
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
         super().__init__(config, tokenizer, words_splitter, **kwargs)
         self.child_token = config.child_token
+
+    @staticmethod
+    def _instance_sort_key(instance):
+        """Return the earliest span start position across all fields in an instance."""
+        min_start = float('inf')
+        for value in instance.values():
+            if isinstance(value, dict):
+                st = value.get('start', -1)
+                if st >= 0:
+                    min_start = min(min_start, st)
+            elif isinstance(value, list):
+                for v in value:
+                    if isinstance(v, dict):
+                        st = v.get('start', -1)
+                        if st >= 0:
+                            min_start = min(min_start, st)
+        return min_start
 
     def get_classes_mapping(self, batch_list, shuffle_labels=False, **kwargs):
         structuring_mapping = []
@@ -159,7 +176,7 @@ class StructuringProcessor(SpanProcessor):
             if schema_name not in structuring_data:
                 continue
 
-            instances = structuring_data[schema_name]
+            instances = sorted(structuring_data[schema_name], key=self._instance_sort_key)
             field_to_id = struct_item.field_class_to_id.class_to_id
             structuring_mask[flat_idx] = True
             structuring_count[flat_idx] = len(instances)
@@ -227,7 +244,7 @@ class StructuringProcessor(SpanProcessor):
             positive_spans = set()
 
             if schema_name in structuring_data:
-                instances = structuring_data[schema_name]
+                instances = sorted(structuring_data[schema_name], key=self._instance_sort_key)
                 max_instances = max(max_instances, len(instances))
 
                 for inst_idx, instance in enumerate(instances):

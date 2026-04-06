@@ -33,8 +33,8 @@ class JointRelexHead(NERHead):
     name = "joint_relex"
     dependencies = []  # NER is built-in, not an external dependency
 
-    def __init__(self, config, hidden_size, dropout):
-        super().__init__(config, hidden_size, dropout)
+    def __init__(self, config, hidden_size, dropout, shared_layers=None):
+        super().__init__(config, hidden_size, dropout, shared_layers=shared_layers)
         rel_cfg = config.joint_relex_config
         self.rel_loss_coef = rel_cfg.loss_coef
         self.adjacency_loss_coef = rel_cfg.adjacency_loss_coef
@@ -53,10 +53,11 @@ class JointRelexHead(NERHead):
             )
 
     @classmethod
-    def from_config(cls, config, **kwargs):
+    def from_config(cls, config, shared_layers=None, **kwargs):
         if config.joint_relex_config is None:
             return None
-        return cls(config, hidden_size=config.hidden_size, dropout=config.dropout)
+        return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
+                   shared_layers=shared_layers)
 
     def _select_entity_spans(self, scores, words_embedding, ner_labels=None,
                               threshold=0.5, top_k=None):

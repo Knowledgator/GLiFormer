@@ -5,7 +5,7 @@ import torch
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
-from glinext.decoder import GLiNExTDecoder, unflatten_by_batch_origin
+from glinext.processing.decoder import GLiNExTDecoder, unflatten_by_batch_origin
 from glinext.config import (
     NERHeadConfig,
     ClassificationHeadConfig,

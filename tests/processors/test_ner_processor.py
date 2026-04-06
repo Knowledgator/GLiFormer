@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from glinext.tasks.ner.processor import NERProcessor
-from glinext.mappings import (
+from glinext.processing.mappings import (
     BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping, BatchClassesMapping,
     CatClassMapping, StructuringClassMapping, OpenRelexClassMapping,
 )

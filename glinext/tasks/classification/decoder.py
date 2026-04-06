@@ -46,7 +46,7 @@ class ClassificationDecoder(TaskDecoder):
 
         # Unflatten BN → B if batch_origin is available
         if model_output.cat_batch_origin is not None and model_output.batch_size is not None:
-            from ...decoder import unflatten_by_batch_origin
+            from ...processing.decoder import unflatten_by_batch_origin
             return unflatten_by_batch_origin(
                 flat_results, model_output.cat_batch_origin, model_output.batch_size,
             )

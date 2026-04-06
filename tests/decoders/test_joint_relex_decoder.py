@@ -7,7 +7,7 @@ from typing import Optional
 
 from glinext.tasks.joint_relex.decoder import JointRelexDecoder
 from glinext.tasks.span_decoder import Span
-from glinext.mappings import (
+from glinext.processing.mappings import (
     BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping,
     BatchClassesMapping, CatClassMapping, StructuringClassMapping, OpenRelexClassMapping,
 )

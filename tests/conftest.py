@@ -14,7 +14,7 @@ from glinext.config import (
     CountHeadConfig,
     EmbeddingHeadConfig,
 )
-from glinext.mappings import (
+from glinext.processing.mappings import (
     BaseClassMapping,
     CatClassMapping,
     ExtractionItemMapping,

@@ -13,13 +13,13 @@ from .mappings import (
     OpenRelexClassMapping,
     BatchClassesMapping,
 )
-from .tasks.ner.processor import NERProcessor
-from .tasks.classification.processor import ClassificationProcessor
-from .tasks.joint_relex.processor import JointRelexProcessor
-from .tasks.open_relex.processor import OpenRelexProcessor
-from .tasks.count.processor import CountProcessor
-from .tasks.structuring.processor import StructuringProcessor
-from .tasks.embedding.processor import EmbeddingProcessor
+from ..tasks.ner.processor import NERProcessor
+from ..tasks.classification.processor import ClassificationProcessor
+from ..tasks.joint_relex.processor import JointRelexProcessor
+from ..tasks.open_relex.processor import OpenRelexProcessor
+from ..tasks.count.processor import CountProcessor
+from ..tasks.structuring.processor import StructuringProcessor
+from ..tasks.embedding.processor import EmbeddingProcessor
 
 
 class GLiNextProcessor(BaseProcessor):

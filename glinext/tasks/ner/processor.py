@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 import torch
 
 from ..span_processor import SpanProcessor
-from ...mappings import (
+from ...processing.mappings import (
     BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping, BatchClassesMapping,
 )
 

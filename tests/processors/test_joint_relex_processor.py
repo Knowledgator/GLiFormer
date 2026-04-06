@@ -52,7 +52,7 @@ class TestCreateLabels:
             ],
         }
         # Build extraction mapping manually with correct rel_class_to_id
-        from glinext.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
         ext_mapping = [ExtractionClassMapping(items=[
             ExtractionItemMapping(
                 ner_class_to_id=BaseClassMapping(class_to_id={"person": 0, "location": 1}, name="entities"),
@@ -89,7 +89,7 @@ class TestCreateLabels:
         assert result is None
 
     def test_batch_idx(self, relex_proc):
-        from glinext.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
         item = {
             "text": "A B",
             "extraction": [{"ner": [[0, 0, "X"]], "relations": [[0, "r", 0]]}],

@@ -31,7 +31,7 @@ class OpenRelexHead(TaskHead):
     name = "open_relex"
     dependencies = []
 
-    def __init__(self, config, hidden_size, dropout):
+    def __init__(self, config, hidden_size, dropout, shared_layers=None):
         super().__init__()
         cfg = config.open_relex_config
         self.loss_coef = cfg.loss_coef
@@ -39,6 +39,8 @@ class OpenRelexHead(TaskHead):
         self.embed_rel_token = cfg.embed_rel_token
         self.represent_spans = getattr(cfg, 'represent_spans', False)
         self.span_loss_coef = getattr(cfg, 'span_loss_coef', 1.0)
+        if shared_layers is None:
+            shared_layers = {}
 
         # Anchor layer (configurable strategy)
         anchor_mode = cfg.anchor_mode
@@ -55,16 +57,22 @@ class OpenRelexHead(TaskHead):
         )
 
         # Anchor-child fusion
-        self.anchor_modeling = AnchorModeling.from_config(
-            cfg.anchor_modeling, hidden_size, dropout=dropout,
-        )
-
-        refine_layers = getattr(cfg, "anchor_refine_layers", 0)
-        if refine_layers > 0:
-            refine_heads = getattr(cfg, "anchor_refine_heads", 8)
-            self.anchor_refine = AnchorCrossAttentionLayer(
-                hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+        if "anchor_modeling" in shared_layers:
+            self.anchor_modeling = shared_layers["anchor_modeling"]
+        else:
+            self.anchor_modeling = AnchorModeling.from_config(
+                cfg.anchor_modeling, hidden_size, dropout=dropout,
             )
+
+        if "anchor_refine" in shared_layers:
+            self.anchor_refine = shared_layers["anchor_refine"]
+        else:
+            refine_layers = getattr(cfg, "anchor_refine_layers", 0)
+            if refine_layers > 0:
+                refine_heads = getattr(cfg, "anchor_refine_heads", 8)
+                self.anchor_refine = AnchorCrossAttentionLayer(
+                    hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
+                )
 
         # Dual scorers: one for head spans, one for tail spans
         self.head_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
@@ -82,10 +90,11 @@ class OpenRelexHead(TaskHead):
             self.tail_span_proj = nn.Linear(hidden_size, hidden_size)
 
     @classmethod
-    def from_config(cls, config, **kwargs):
+    def from_config(cls, config, shared_layers=None, **kwargs):
         if config.open_relex_config is None:
             return None
-        return cls(config, hidden_size=config.hidden_size, dropout=config.dropout)
+        return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
+                   shared_layers=shared_layers)
 
     def forward(self, shared, dependency_outputs, flat_inputs=None,
                 open_rel_label_embeds=None, base_loss_fn=None, **batch):

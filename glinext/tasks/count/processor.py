@@ -3,7 +3,7 @@
 import torch
 
 from .. import TaskProcessor
-from ...mappings import BatchClassesMapping
+from ...processing.mappings import BatchClassesMapping
 
 
 class CountProcessor(TaskProcessor):

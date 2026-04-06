@@ -19,6 +19,7 @@ from gliner.modeling.utils import (
 
 from .config import GLiNextConfig
 from .tasks import SharedRepresentations, TaskFlatInputs, TaskHeadOutput
+from .layers import AnchorModeling, AnchorCrossAttentionLayer
 from .tasks.ner.model import NERHead
 from .tasks.classification.model import ClassificationHead
 from .tasks.joint_relex.model import JointRelexHead
@@ -119,6 +120,23 @@ class GLiNExTModel(BaseModel):
                 schema=config.post_fusion_schema,
             )
 
+        # ── Shared layers (optional) ───────────────────────────────────
+        shared_layers = {}
+        if config.shared_anchor_modeling is not None:
+            self.shared_anchor_modeling = AnchorModeling.from_config(
+                config.shared_anchor_modeling, config.hidden_size, dropout=config.dropout,
+            )
+            shared_layers["anchor_modeling"] = self.shared_anchor_modeling
+
+        if config.shared_anchor_refine_layers > 0:
+            self.shared_anchor_refine = AnchorCrossAttentionLayer(
+                config.hidden_size,
+                num_heads=config.shared_anchor_refine_heads,
+                num_layers=config.shared_anchor_refine_layers,
+                dropout=config.dropout,
+            )
+            shared_layers["anchor_refine"] = self.shared_anchor_refine
+
         # ── Register task heads ─────────────────────────────────────────
         self.heads = nn.ModuleDict()
         for HeadClass in _HEAD_CLASSES:
@@ -126,6 +144,7 @@ class GLiNExTModel(BaseModel):
                 config,
                 from_pretrained=from_pretrained,
                 cache_dir=cache_dir,
+                shared_layers=shared_layers,
             )
             if head is not None:
                 self.heads[head.name] = head

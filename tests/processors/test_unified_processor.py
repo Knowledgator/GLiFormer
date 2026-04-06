@@ -5,13 +5,13 @@ import torch
 from unittest.mock import MagicMock
 from dataclasses import asdict
 
-from glinext.processor import GLiNextProcessor
+from glinext.processing.processor import GLiNextProcessor
 from glinext.config import (
     GLiNextConfig, NERHeadConfig, ClassificationHeadConfig,
     JointRelexHeadConfig, OpenRelexHeadConfig, StructuringHeadConfig,
     CountHeadConfig, EmbeddingHeadConfig,
 )
-from glinext.mappings import BatchClassesMapping
+from glinext.processing.mappings import BatchClassesMapping
 from tests.conftest import make_config, FakeWordsSplitter
 
 

@@ -110,7 +110,7 @@ class OpenRelexDecoder(SpanDecoder):
             all_results.append(triples)
 
         if batch_origin is not None and batch_size is not None:
-            from ...decoder import unflatten_by_batch_origin
+            from ...processing.decoder import unflatten_by_batch_origin
             return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
 
         return all_results
@@ -168,7 +168,7 @@ class OpenRelexDecoder(SpanDecoder):
             all_results.append(triples)
 
         if batch_origin is not None and batch_size is not None:
-            from ...decoder import unflatten_by_batch_origin
+            from ...processing.decoder import unflatten_by_batch_origin
             return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
 
         return all_results

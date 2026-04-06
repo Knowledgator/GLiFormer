@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 import torch
 
 from .. import TaskProcessor
-from ...mappings import BaseClassMapping, CatClassMapping, BatchClassesMapping
+from ...processing.mappings import BaseClassMapping, CatClassMapping, BatchClassesMapping
 
 
 class ClassificationProcessor(TaskProcessor):

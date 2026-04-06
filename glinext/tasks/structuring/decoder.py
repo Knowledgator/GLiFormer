@@ -110,7 +110,7 @@ class StructuringDecoder(SpanDecoder):
             flat_results.append(instances)
 
         if batch_origin is not None and batch_size is not None:
-            from ...decoder import unflatten_by_batch_origin
+            from ...processing.decoder import unflatten_by_batch_origin
             return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
 
         return flat_results
@@ -159,7 +159,7 @@ class StructuringDecoder(SpanDecoder):
             flat_results.append(instances)
 
         if batch_origin is not None and batch_size is not None:
-            from ...decoder import unflatten_by_batch_origin
+            from ...processing.decoder import unflatten_by_batch_origin
             return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
 
         return flat_results

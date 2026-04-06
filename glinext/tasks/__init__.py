@@ -41,7 +41,12 @@ class TaskHeadOutput(ModelOutput):
     """Output from a single task head."""
     loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.extra is None:
+            self.extra = {}
 
 
 class TaskHead(ABC, nn.Module):

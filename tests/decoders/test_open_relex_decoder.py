@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from glinext.tasks.open_relex.decoder import OpenRelexDecoder
-from glinext.mappings import (
+from glinext.processing.mappings import (
     BaseClassMapping, OpenRelexItemMapping, OpenRelexClassMapping,
     BatchClassesMapping, CatClassMapping, ExtractionClassMapping, StructuringClassMapping,
 )

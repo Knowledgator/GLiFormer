@@ -9,9 +9,12 @@ from .config import (
     EmbeddingHeadConfig,
 )
 from .model import GLiNExTModel, GLiNExTOutput
-from .processor import GLiNextProcessor
-from .decoder import GLiNExTDecoder
-from .mappings import (
+from .processing.processor import GLiNextProcessor
+from .processing.decoder import GLiNExTDecoder
+from .processing.collator import GLiNExTDataCollator
+from .processing.schema import GLiNExTSchema
+from .processing.formatting import StructuringOutputFormatter, FieldType
+from .processing.mappings import (
     BaseClassMapping,
     CatClassMapping,
     ExtractionItemMapping,
@@ -22,6 +25,8 @@ from .mappings import (
     OpenRelexClassMapping,
     BatchClassesMapping,
 )
+from .glinext import GLiNExT
+from .training import GLiNExTTrainer
 
 # Backward compat alias
 RelationsHeadConfig = JointRelexHeadConfig

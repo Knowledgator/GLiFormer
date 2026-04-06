@@ -114,6 +114,10 @@ class GLiNextConfig(BaseGLiNERConfig):
         structuring_config: Optional[dict] = None,
         count_config: Optional[dict] = None,
         embedding_config: Optional[dict] = None,
+        # Shared layers across tasks (None = each task creates its own)
+        shared_anchor_modeling: Optional[str] = None,  # "linear", "lstm", "mlp" — shared AnchorModeling layer
+        shared_anchor_refine_layers: int = 0,  # shared AnchorCrossAttentionLayer (0 = disabled)
+        shared_anchor_refine_heads: int = 8,
         # Labels encoder (bi-encoder style)
         labels_encoder: Optional[str] = None,
         labels_encoder_config: Optional[dict] = None,
@@ -306,3 +310,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.groups_loss_coef = groups_loss_coef
         self.embedding_loss_coef = self.embedding_config.loss_coef if self.embedding_config else embedding_loss_coef
         self.structuring_loss_coef = self.structuring_config.loss_coef if self.structuring_config else structuring_loss_coef
+
+        # Shared layers config
+        self.shared_anchor_modeling = shared_anchor_modeling
+        self.shared_anchor_refine_layers = shared_anchor_refine_layers
+        self.shared_anchor_refine_heads = shared_anchor_refine_heads

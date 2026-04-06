@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from glinext.tasks.structuring.decoder import StructuringDecoder
-from glinext.mappings import (
+from glinext.processing.mappings import (
     BaseClassMapping, StructuringItemMapping, StructuringClassMapping,
     BatchClassesMapping, CatClassMapping, ExtractionClassMapping, OpenRelexClassMapping,
 )
