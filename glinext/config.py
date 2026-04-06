@@ -267,6 +267,9 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.labels_encoder = labels_encoder
         self.labels_encoder_config = labels_encoder_config
 
+        # Projector
+        self.projector_hidden_act = kwargs.pop("projector_hidden_act", "gelu")
+
         # Special tokens
         self.seq_token = seq_token
         self.cat_token = cat_token

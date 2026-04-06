@@ -323,7 +323,6 @@ class GLiNextProcessor(BaseProcessor):
         if total_groups == 0:
             return None
 
-        import random
         max_instances = 0
         max_fields = 0
         has_any = False
