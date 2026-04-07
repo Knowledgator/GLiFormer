@@ -466,6 +466,8 @@ class GLiNExTModel(BaseModel):
         # Embedding similarity
         embedding_labels: Optional[torch.Tensor] = None,
         embedding_pair_idx: Optional[torch.Tensor] = None,
+        embedding_input_ids: Optional[torch.Tensor] = None,
+        embedding_attention_mask: Optional[torch.Tensor] = None,
         # Labels encoder (bi-encoder) — NER labels
         labels_input_ids: Optional[torch.Tensor] = None,
         labels_attention_mask: Optional[torch.Tensor] = None,
@@ -655,6 +657,14 @@ class GLiNExTModel(BaseModel):
                         batch_origin=bo,
                     )
 
+        # ── 1e. Encode embedding pair texts (separate batch) ───────────
+        embedding_encodings = None
+        embedding_encoding_mask = None
+        if embedding_input_ids is not None and embedding_pair_idx is not None:
+            emb_token_embeds = self.token_rep_layer(embedding_input_ids, embedding_attention_mask)
+            embedding_encodings = emb_token_embeds
+            embedding_encoding_mask = embedding_attention_mask
+
         # Collect all batch kwargs for heads
         batch_kwargs = dict(
             ner_labels=ner_labels, span_idx=span_idx, span_mask=span_mask,
@@ -664,6 +674,8 @@ class GLiNExTModel(BaseModel):
             gold_count_val=gold_count_val, structuring_labels=structuring_labels,
             structuring_count=structuring_count, embedding_labels=embedding_labels,
             embedding_pair_idx=embedding_pair_idx,
+            embedding_encodings=embedding_encodings,
+            embedding_encoding_mask=embedding_encoding_mask,
             threshold=threshold, adjacency_threshold=adjacency_threshold,
         )
 

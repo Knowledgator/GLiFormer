@@ -62,7 +62,16 @@ class TripletLoss(EmbeddingLoss, loss_fn="triplet"):
 
 
 class EmbeddingHead(TaskHead):
-    """Semantic similarity via configurable pooling, similarity, and loss functions."""
+    """Semantic similarity via configurable pooling, similarity, and loss functions.
+
+    During training, pair texts are encoded as a separate batch through the
+    shared encoder.  The head receives pre-encoded token embeddings
+    (``embedding_encodings``) and corresponding attention mask, pools them,
+    and computes pairwise similarity + loss.
+
+    During inference, the head uses the shared encoder output
+    (``shared.words_embedding``) to produce pooled text embeddings.
+    """
 
     name = "embedding"
     dependencies = []
@@ -100,26 +109,50 @@ class EmbeddingHead(TaskHead):
     def forward(self, shared, dependency_outputs, **batch):
         embedding_labels = batch.get("embedding_labels")
         embedding_pair_idx = batch.get("embedding_pair_idx")
+        embedding_encodings = batch.get("embedding_encodings")
+        embedding_encoding_mask = batch.get("embedding_encoding_mask")
 
-        if embedding_pair_idx is None:
-            return TaskHeadOutput()
+        # Training path: pair texts encoded as a separate batch
+        if embedding_encodings is not None and embedding_pair_idx is not None:
+            mask = embedding_encoding_mask.bool() if embedding_encoding_mask is not None else None
+            pooled = self.pooling(embedding_encodings, mask)
+            if self.similarity_fn == "cosine":
+                pooled = F.normalize(pooled, p=2, dim=-1)
 
-        words_embedding = shared.words_embedding
-        mask = shared.mask
+            idx_a = embedding_pair_idx[:, 0]
+            idx_b = embedding_pair_idx[:, 1]
+            emb_a = pooled[idx_a]
+            emb_b = pooled[idx_b]
 
-        pooled = self.pooling(words_embedding, mask)
-        if self.similarity_fn == "cosine":
-            pooled = F.normalize(pooled, p=2, dim=-1)
+            similarities = self._similarity(emb_a, emb_b)
 
-        idx_a = embedding_pair_idx[:, 0]
-        idx_b = embedding_pair_idx[:, 1]
-        emb_a = pooled[idx_a]
-        emb_b = pooled[idx_b]
+            loss = None
+            if embedding_labels is not None:
+                loss = self.loss(similarities, embedding_labels)
 
-        similarities = self._similarity(emb_a, emb_b)
+            return TaskHeadOutput(loss=loss, logits=similarities)
 
-        loss = None
-        if embedding_labels is not None:
-            loss = self.loss(similarities, embedding_labels)
+        # Inference / fallback path: use shared encoder output
+        if embedding_pair_idx is not None:
+            words_embedding = shared.words_embedding
+            mask = shared.mask
 
-        return TaskHeadOutput(loss=loss, logits=similarities)
+            pooled = self.pooling(words_embedding, mask)
+            if self.similarity_fn == "cosine":
+                pooled = F.normalize(pooled, p=2, dim=-1)
+
+            idx_a = embedding_pair_idx[:, 0]
+            idx_b = embedding_pair_idx[:, 1]
+            emb_a = pooled[idx_a]
+            emb_b = pooled[idx_b]
+
+            similarities = self._similarity(emb_a, emb_b)
+
+            loss = None
+            if embedding_labels is not None:
+                loss = self.loss(similarities, embedding_labels)
+
+            return TaskHeadOutput(loss=loss, logits=similarities)
+
+        # No embedding data — return pooled embeddings for downstream use
+        return TaskHeadOutput()

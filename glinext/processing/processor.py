@@ -609,6 +609,16 @@ class GLiNextProcessor(BaseProcessor):
 
             embedding_result = self.create_embedding_labels(batch_list)
             if embedding_result is not None:
+                emb_texts = embedding_result.pop('embedding_texts')
+                emb_tokenized = self.transformer_tokenizer(
+                    emb_texts,
+                    is_split_into_words=True,
+                    return_tensors="pt",
+                    truncation=True,
+                    padding="longest",
+                )
+                tokenized_input['embedding_input_ids'] = emb_tokenized['input_ids']
+                tokenized_input['embedding_attention_mask'] = emb_tokenized['attention_mask']
                 tokenized_input['embedding_labels'] = embedding_result['embedding_labels']
                 tokenized_input['embedding_pair_idx'] = embedding_result['embedding_pair_idx']
 

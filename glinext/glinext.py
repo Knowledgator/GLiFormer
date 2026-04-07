@@ -803,6 +803,11 @@ class GLiNExT(BaseEncoderGLiNER):
     ) -> torch.Tensor:
         """Compute text embeddings via the shared encoder.
 
+        Uses the same encoding path as training: texts are tokenized directly
+        (without task prompts) and encoded through the shared encoder, then
+        pooled using the EmbeddingHead's pooling layer (if available) or
+        mean pooling as fallback.
+
         Args:
             texts: Input text(s).
             batch_size: Batch size for processing.
@@ -818,33 +823,42 @@ class GLiNExT(BaseEncoderGLiNER):
         if not valid_texts:
             return torch.zeros(len(texts), self.config.hidden_size)
 
+        # Tokenize texts directly (no prompts) — matching the training path
+        # where embedding pair texts are tokenized via transformer_tokenizer
         all_tokens, _, _ = self.prepare_inputs(valid_texts)
 
-        # Minimal input — no task labels, just encode text
-        input_x = [{"tokenized_text": tk} for tk in all_tokens]
-
-        collator = GLiNExTDataCollator(
-            self.config,
-            data_processor=self.data_processor,
-            prepare_labels=False,
-        )
-
         data_loader = DataLoader(
-            input_x, batch_size=batch_size, shuffle=False, collate_fn=collator,
+            all_tokens, batch_size=batch_size, shuffle=False,
+            collate_fn=lambda batch: self.data_processor.transformer_tokenizer(
+                batch,
+                is_split_into_words=True,
+                return_tensors="pt",
+                truncation=True,
+                padding="longest",
+            ),
         )
 
         device = self.device
         all_embeddings = []
 
+        # Get EmbeddingHead's pooling if available
+        embedding_head = self.model.heads["embedding"] if (hasattr(self.model, "heads") and "embedding" in self.model.heads) else None
+
         for batch in data_loader:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
-            output = self.model(**batch)
-            # Mean pooling over valid word positions
-            words_emb = output.words_embedding  # (B, W, D)
-            mask = output.mask  # (B, W)
-            mask_expanded = mask.unsqueeze(-1).float()
-            pooled = (words_emb * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            # Encode through shared encoder — same as training
+            token_embeds = self.model.token_rep_layer(input_ids, attention_mask)
+
+            # Pool using EmbeddingHead's pooling layer — same as training
+            if embedding_head is not None:
+                pooled = embedding_head.pooling(token_embeds, attention_mask)
+            else:
+                # Fallback: mean pooling
+                mask_f = attention_mask.unsqueeze(-1).float()
+                pooled = (token_embeds * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1e-9)
+
             all_embeddings.append(pooled.cpu())
 
         valid_embeddings = torch.cat(all_embeddings, dim=0)

@@ -6,7 +6,16 @@ from .. import TaskProcessor
 
 
 class EmbeddingProcessor(TaskProcessor):
-    """Processor for embedding similarity task."""
+    """Processor for embedding similarity task.
+
+    Each training item may carry embedding pairs in its ``embedding`` field.
+    Each pair is ``[tokenized_text_a, tokenized_text_b, score]`` where
+    the texts are lists of word tokens and score is the similarity target.
+
+    The processor collects all pairs from the batch, and the collator
+    tokenizes them as a separate batch that the model encodes independently
+    through the shared encoder.
+    """
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
@@ -15,23 +24,27 @@ class EmbeddingProcessor(TaskProcessor):
         return None
 
     def create_labels(self, batch_list, classes_mapping, **kwargs):
-        pair_indices = []
+        texts_a = []
+        texts_b = []
         scores = []
-        offset = 0
 
         for item in batch_list:
-            embedding_pairs = item.get('embedding', [])
-            for pair in embedding_pairs:
-                pair_indices.append([offset, offset + 1])
+            for pair in item.get('embedding', []):
+                texts_a.append(pair[0])
+                texts_b.append(pair[1])
                 scores.append(float(pair[2]))
-                offset += 2
-            if not embedding_pairs:
-                offset += 1
 
-        if not pair_indices:
+        if not scores:
             return None
 
+        n = len(scores)
+        pair_idx = torch.stack([
+            torch.arange(n),
+            torch.arange(n, 2 * n),
+        ], dim=1)
+
         return {
-            'embedding_pair_idx': torch.tensor(pair_indices, dtype=torch.long),
+            'embedding_texts': texts_a + texts_b,
+            'embedding_pair_idx': pair_idx,
             'embedding_labels': torch.tensor(scores, dtype=torch.float),
         }
