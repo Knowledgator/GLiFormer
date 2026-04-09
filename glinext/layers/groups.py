@@ -6,6 +6,32 @@ from .mlp import create_mlp
 from .rotary import RotaryEmbedding, apply_rotary_pos_emb
 
 
+class _AnchorCrossAttentionBlock(nn.Module):
+
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(hidden_size)
+
+    def forward(self, anchor_rep, token_emb, token_mask=None):
+        key_padding_mask = ~token_mask if token_mask is not None else None
+        attn_out, _ = self.cross_attn(
+            anchor_rep, token_emb, token_emb, key_padding_mask=key_padding_mask,
+        )
+        x = self.norm1(anchor_rep + attn_out)
+        x = self.norm2(x + self.ffn(x))
+        return x
+
 class AnchorCrossAttentionLayer(nn.Module):
     """Pre-processing layer that refines anchor embeddings via cross-attention with token embeddings.
 
@@ -39,34 +65,6 @@ class AnchorCrossAttentionLayer(nn.Module):
             anchor_rep = layer(anchor_rep, token_emb, token_mask)
         return anchor_rep
 
-
-class _AnchorCrossAttentionBlock(nn.Module):
-
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(
-            hidden_size, num_heads, dropout=dropout, batch_first=True,
-        )
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 4, hidden_size),
-            nn.Dropout(dropout),
-        )
-        self.norm2 = nn.LayerNorm(hidden_size)
-
-    def forward(self, anchor_rep, token_emb, token_mask=None):
-        key_padding_mask = ~token_mask if token_mask is not None else None
-        attn_out, _ = self.cross_attn(
-            anchor_rep, token_emb, token_emb, key_padding_mask=key_padding_mask,
-        )
-        x = self.norm1(anchor_rep + attn_out)
-        x = self.norm2(x + self.ffn(x))
-        return x
-
-
 class RotaryGroupLSTM(nn.Module):
     def __init__(self, hidden_size, max_count=20, rope_base=10_000.0):
         """
@@ -91,49 +89,49 @@ class RotaryGroupLSTM(nn.Module):
             add_layer_norm=False
         )
 
-    def forward(self, pc_emb: torch.Tensor, gold_count_val: torch.Tensor) -> torch.Tensor:
+    def forward(self, field_emb: torch.Tensor, count_val: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pc_emb (Tensor): Field embeddings of shape (M, hidden_size).
-            gold_count_val (int): Predicted count value (number of steps).
+            field_emb (Tensor): Field embeddings of shape (M, hidden_size).
+            count_val (int): Predicted count value (number of steps).
         Returns:
-            Tensor: Count-aware structure embeddings of shape (gold_count_val, M, hidden_size).
+            Tensor: Count-aware structure embeddings of shape (count_val, M, hidden_size).
         """
-        M, D = pc_emb.shape
-        device = pc_emb.device
+        M, D = field_emb.shape
+        device = field_emb.device
 
-        min_count = min(gold_count_val, self.max_count)
+        min_count = min(count_val, self.max_count)
         base_indices = torch.arange(min_count, device=device)
         base_pos = self.pos_embedding(base_indices)
 
-        if gold_count_val > self.max_count:
-            num_repeats = (gold_count_val + self.max_count - 1) // self.max_count
-            pos_seq = base_pos.repeat(num_repeats, 1)[:gold_count_val, :]
+        if count_val > self.max_count:
+            num_repeats = (count_val + self.max_count - 1) // self.max_count
+            pos_seq = base_pos.repeat(num_repeats, 1)[:count_val, :]
         else:
             pos_seq = base_pos
 
         pos_seq = pos_seq.unsqueeze(0)
 
-        position_ids = torch.arange(gold_count_val, device=device).unsqueeze(0)
+        position_ids = torch.arange(count_val, device=device).unsqueeze(0)
 
         cos, sin = self.rotary_embeddings(pos_seq, position_ids)
         pos_seq = apply_rotary_pos_emb(pos_seq, cos, sin)
 
         pos_seq = pos_seq.squeeze(0).unsqueeze(1).expand(-1, M, -1)
 
-        h0 = pc_emb.unsqueeze(0)
+        h0 = field_emb.unsqueeze(0)
 
         output, _ = self.gru(pos_seq, h0)
 
-        pc_broadcast = pc_emb.unsqueeze(0).expand_as(output)
-        return self.projector(torch.cat([output, pc_broadcast], dim=-1))
+        field_broadcast = field_emb.unsqueeze(0).expand_as(output)
+        return self.projector(torch.cat([output, field_broadcast], dim=-1))
 
 
 class QueryGroupLSTM(nn.Module):
     def __init__(self, hidden_size, max_count=20, rope_base=10_000.0):
         """
         Like RotaryGroupLSTM but selects tokens from token_emb (B, L, D) based on
-        similarity with pc_emb (M, D) instead of using learned positional embeddings.
+        similarity with field_emb (M, D) instead of using learned positional embeddings.
         """
         super().__init__()
         self.hidden_size = hidden_size
@@ -152,33 +150,33 @@ class QueryGroupLSTM(nn.Module):
             add_layer_norm=False
         )
 
-    def forward(self, pc_emb: torch.Tensor, token_emb: torch.Tensor, gold_count_val: torch.Tensor = None, threshold: float = 0.5) -> torch.Tensor:
+    def forward(self, field_emb: torch.Tensor, token_emb: torch.Tensor, count_val: torch.Tensor = None, threshold: float = 0.5) -> torch.Tensor:
         """
         Args:
-            pc_emb (Tensor): Field embeddings of shape (M, D).
+            field_emb (Tensor): Field embeddings of shape (M, D).
             token_emb (Tensor): Token embeddings of shape (B, L, D).
-            gold_count_val (Tensor): Per-sample counts of shape (B,), or None.
-            threshold (float): Similarity threshold when gold_count_val is None.
+            count_val (Tensor): Per-sample counts of shape (B,), or None.
+            threshold (float): Similarity threshold when count_val is None.
         Returns:
             Tuple[Tensor, Tensor]: (output of shape (B, k, D), mask of shape (B, k))
         """
         B, L, _ = token_emb.shape
-        device = pc_emb.device
+        device = field_emb.device
 
         # Similarity between each token and each field: (B, L, M)
-        pc_token = torch.einsum("bld,md->blm", token_emb, pc_emb)
+        field_token_sim = torch.einsum("bld,md->blm", token_emb, field_emb)
 
         # Max similarity across fields for each token: (B, L)
-        max_sim = pc_token.max(dim=2).values
+        max_sim = field_token_sim.max(dim=2).values
 
-        if gold_count_val is not None:
-            max_k = min(int(gold_count_val.max().item()), L)
+        if count_val is not None:
+            max_k = min(int(count_val.max().item()), L)
             _, topk_indices = torch.topk(max_sim, k=max_k, dim=1)  # (B, max_k)
 
             batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(topk_indices)
             selected_token_emb = token_emb[batch_idx, topk_indices]  # (B, max_k, D)
 
-            mask = torch.arange(max_k, device=device).unsqueeze(0) < gold_count_val.unsqueeze(1)  # (B, max_k)
+            mask = torch.arange(max_k, device=device).unsqueeze(0) < count_val.unsqueeze(1)  # (B, max_k)
         else:
             mask = max_sim > threshold  # (B, L)
             selected_token_emb = token_emb  # (B, L, D)
@@ -189,17 +187,17 @@ class QueryGroupLSTM(nn.Module):
         cos, sin = self.rotary_embeddings(selected_token_emb, position_ids)
         selected_token_emb = apply_rotary_pos_emb(selected_token_emb, cos, sin)
 
-        # GRU: use mean-pooled pc_emb as initial hidden state
+        # GRU: use mean-pooled field_emb as initial hidden state
         # GRU expects input (seq, batch, D) and h0 (1, batch, D)
-        h0 = pc_emb.mean(dim=0, keepdim=True).unsqueeze(0).expand(1, B, -1).contiguous()  # (1, B, D)
+        h0 = field_emb.mean(dim=0, keepdim=True).unsqueeze(0).expand(1, B, -1).contiguous()  # (1, B, D)
         gru_input = selected_token_emb.transpose(0, 1)  # (seq_len, B, D)
 
         output, _ = self.gru(gru_input, h0)  # (seq_len, B, D)
         output = output.transpose(0, 1)  # (B, seq_len, D)
 
-        # Concat with mean-pooled pc_emb and project
-        pc_broadcast = pc_emb.mean(dim=0, keepdim=True).unsqueeze(0).expand(B, seq_len, -1)  # (B, seq_len, D)
-        output = self.projector(torch.cat([output, pc_broadcast], dim=-1))  # (B, seq_len, D)
+        # Concat with mean-pooled field_emb and project
+        field_broadcast = field_emb.mean(dim=0, keepdim=True).unsqueeze(0).expand(B, seq_len, -1)  # (B, seq_len, D)
+        output = self.projector(torch.cat([output, field_broadcast], dim=-1))  # (B, seq_len, D)
 
         return output, mask
 
@@ -224,29 +222,29 @@ class QueryGroupTransformer(nn.Module):
             add_layer_norm=False
         )
 
-    def forward(self, pc_emb: torch.Tensor, token_emb: torch.Tensor, gold_count_val: torch.Tensor = None, threshold: float = 0.5) -> torch.Tensor:
+    def forward(self, field_emb: torch.Tensor, token_emb: torch.Tensor, count_val: torch.Tensor = None, threshold: float = 0.5) -> torch.Tensor:
         """
         Args:
-            pc_emb (Tensor): Field embeddings of shape (M, D).
+            field_emb (Tensor): Field embeddings of shape (M, D).
             token_emb (Tensor): Token embeddings of shape (B, L, D).
-            gold_count_val (Tensor): Per-sample counts of shape (B,), or None.
-            threshold (float): Similarity threshold when gold_count_val is None.
+            count_val (Tensor): Per-sample counts of shape (B,), or None.
+            threshold (float): Similarity threshold when count_val is None.
         Returns:
             Tuple[Tensor, Tensor]: (output of shape (B, k, D), mask of shape (B, k))
         """
-        M = pc_emb.shape[0]
+        M = field_emb.shape[0]
         B, L, _ = token_emb.shape
-        device = pc_emb.device
+        device = field_emb.device
 
         # Similarity between each token and each field: (B, L, M)
-        pc_token = torch.einsum("bld,md->blm", token_emb, pc_emb)
+        field_token_sim = torch.einsum("bld,md->blm", token_emb, field_emb)
 
         # Max similarity across fields for each token: (B, L)
-        max_sim = pc_token.max(dim=2).values
+        max_sim = field_token_sim.max(dim=2).values
 
-        if gold_count_val is not None:
+        if count_val is not None:
             # Select top-k tokens based on max similarity with fields
-            max_k = min(int(gold_count_val.max().item()), L)
+            max_k = min(int(count_val.max().item()), L)
             _, topk_indices = torch.topk(max_sim, k=max_k, dim=1)  # (B, max_k)
 
             # Gather selected tokens per batch
@@ -254,7 +252,7 @@ class QueryGroupTransformer(nn.Module):
             selected_token_emb = token_emb[batch_idx, topk_indices]  # (B, max_k, D)
 
             # Mask for variable counts per sample
-            mask = torch.arange(max_k, device=device).unsqueeze(0) < gold_count_val.unsqueeze(1)  # (B, max_k)
+            mask = torch.arange(max_k, device=device).unsqueeze(0) < count_val.unsqueeze(1)  # (B, max_k)
         else:
             # Select tokens based on threshold — keep all tokens but mask below threshold
             mask = max_sim > threshold  # (B, L)
@@ -266,13 +264,13 @@ class QueryGroupTransformer(nn.Module):
         cos, sin = self.rotary_embeddings(selected_token_emb, position_ids)
         selected_token_emb = apply_rotary_pos_emb(selected_token_emb, cos, sin)
 
-        # Prepend pc_emb as context tokens: (B, M + seq_len, D)
-        pc_expanded = pc_emb.unsqueeze(0).expand(B, -1, -1)  # (B, M, D)
-        combined = torch.cat([pc_expanded, selected_token_emb], dim=1)  # (B, M + seq_len, D)
+        # Prepend field_emb as context tokens: (B, M + seq_len, D)
+        field_expanded = field_emb.unsqueeze(0).expand(B, -1, -1)  # (B, M, D)
+        combined = torch.cat([field_expanded, selected_token_emb], dim=1)  # (B, M + seq_len, D)
 
-        # Extend mask to cover the prepended pc_emb tokens (always valid)
-        pc_mask = torch.ones(B, M, dtype=torch.bool, device=device)
-        full_mask = torch.cat([pc_mask, mask], dim=1)  # (B, M + seq_len)
+        # Extend mask to cover the prepended field_emb tokens (always valid)
+        field_mask = torch.ones(B, M, dtype=torch.bool, device=device)
+        full_mask = torch.cat([field_mask, mask], dim=1)  # (B, M + seq_len)
 
         # Transformer encoder (expects seq-first format)
         transformer_output = self.transformer_encoder(
@@ -282,8 +280,8 @@ class QueryGroupTransformer(nn.Module):
         # Strip the M prefix tokens, keep only selected token outputs
         transformer_output = transformer_output[:, M:, :]  # (B, seq_len, D)
 
-        # Concat with mean-pooled pc_emb and project
-        pc_broadcast = pc_emb.mean(dim=0, keepdim=True).unsqueeze(0).expand(B, seq_len, -1)  # (B, seq_len, D)
-        output = self.projector(torch.cat([transformer_output, pc_broadcast], dim=-1))  # (B, seq_len, D)
+        # Concat with mean-pooled field_emb and project
+        field_broadcast = field_emb.mean(dim=0, keepdim=True).unsqueeze(0).expand(B, seq_len, -1)  # (B, seq_len, D)
+        output = self.projector(torch.cat([transformer_output, field_broadcast], dim=-1))  # (B, seq_len, D)
 
         return output, mask

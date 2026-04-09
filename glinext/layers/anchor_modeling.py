@@ -67,7 +67,25 @@ class LinearAnchorModeling(AnchorModeling):
         combined = torch.cat([anchor_exp, child_exp], dim=-1)
         return self.proj(combined)
 
+class MLPAnchorModeling(AnchorModeling):
+    """MLP fusion of anchor + child representations."""
 
+    def __init__(self, hidden_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.mlp = create_mlp(
+            hidden_size * 2, [hidden_size * 2], hidden_size,
+            dropout=dropout, activation="gelu",
+        )
+
+    def forward(self, anchor_rep, child_rep):
+        B, A, D = anchor_rep.shape
+        C = child_rep.shape[1]
+
+        anchor_exp = anchor_rep.unsqueeze(2).expand(B, A, C, D)
+        child_exp = child_rep.unsqueeze(1).expand(B, A, C, D)
+        combined = torch.cat([anchor_exp, child_exp], dim=-1)
+        return self.mlp(combined)
+    
 class LSTMAnchorModeling(AnchorModeling):
     """Recurrent processing of anchor-child pairs (GLiNER2-style).
 
@@ -105,22 +123,3 @@ class LSTMAnchorModeling(AnchorModeling):
         # Reshape back to (B, A, C, D)
         return fused.reshape(A, B, C, D).permute(1, 0, 2, 3)
 
-
-class MLPAnchorModeling(AnchorModeling):
-    """MLP fusion of anchor + child representations."""
-
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
-        super().__init__()
-        self.mlp = create_mlp(
-            hidden_size * 2, [hidden_size * 2], hidden_size,
-            dropout=dropout, activation="gelu",
-        )
-
-    def forward(self, anchor_rep, child_rep):
-        B, A, D = anchor_rep.shape
-        C = child_rep.shape[1]
-
-        anchor_exp = anchor_rep.unsqueeze(2).expand(B, A, C, D)
-        child_exp = child_rep.unsqueeze(1).expand(B, A, C, D)
-        combined = torch.cat([anchor_exp, child_exp], dim=-1)
-        return self.mlp(combined)

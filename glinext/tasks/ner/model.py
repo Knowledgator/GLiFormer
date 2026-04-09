@@ -4,11 +4,10 @@ import torch
 from torch import nn
 
 from gliner.modeling.scorers import Scorer
-from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import extract_spans_from_tokens
 
 from .. import TaskHead, TaskHeadOutput
-from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling, AnchorCrossAttentionLayer
+from ...layers import AnchoredSpanScorer
 
 
 class NERHead(TaskHead):
@@ -27,43 +26,25 @@ class NERHead(TaskHead):
         self.config = config
         ner_cfg = config.ner_config
         self.loss_coef = ner_cfg.loss_coef
-        self.represent_spans = ner_cfg.represent_spans
-        self.span_loss_coef = ner_cfg.span_loss_coef
         self.scorer_type = getattr(ner_cfg, "scorer_type", "gliner")
         if shared_layers is None:
             shared_layers = {}
 
         if self.scorer_type == "anchored":
-            self.anchor_layer = AnchorLayer.from_config(
-                getattr(ner_cfg, "anchor_mode", "parent"), hidden_size,
-            )
-            if "anchor_modeling" in shared_layers:
-                self.anchor_modeling = shared_layers["anchor_modeling"]
-            else:
-                anchor_modeling_type = getattr(ner_cfg, "anchor_modeling", "linear")
-                self.anchor_modeling = AnchorModeling.from_config(
-                    anchor_modeling_type, hidden_size, dropout=dropout,
-                )
-            if "anchor_refine" in shared_layers:
-                self.anchor_refine = shared_layers["anchor_refine"]
-            else:
-                refine_layers = getattr(ner_cfg, "anchor_refine_layers", 0)
-                if refine_layers > 0:
-                    refine_heads = getattr(ner_cfg, "anchor_refine_heads", 8)
-                    self.anchor_refine = AnchorCrossAttentionLayer(
-                        hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
-                    )
+            self._init_anchor_pipeline(ner_cfg, config, hidden_size, dropout, shared_layers)
             self.scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
         else:
+            self.represent_spans = ner_cfg.represent_spans
+            self.span_loss_coef = ner_cfg.span_loss_coef
             self.scorer = Scorer(hidden_size, dropout)
-
-        if ner_cfg.represent_spans:
-            self.span_rep_layer = SpanRepLayer(
-                span_mode="token_level",
-                hidden_size=hidden_size,
-                max_width=getattr(config, "max_width", 12),
-                dropout=dropout,
-            )
+            if ner_cfg.represent_spans:
+                from gliner.modeling.span_rep import SpanRepLayer
+                self.span_rep_layer = SpanRepLayer(
+                    span_mode="token_level",
+                    hidden_size=hidden_size,
+                    max_width=getattr(config, "max_width", 12),
+                    dropout=dropout,
+                )
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):

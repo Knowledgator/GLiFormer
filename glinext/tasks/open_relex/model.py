@@ -12,10 +12,9 @@ import torch
 from torch import nn
 
 from gliner.modeling.utils import extract_prompt_features
-from gliner.modeling.span_rep import SpanRepLayer
 
 from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
-from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling, AnchorCrossAttentionLayer
+from ...layers import AnchoredSpanScorer
 
 
 class OpenRelexHead(TaskHead):
@@ -37,55 +36,16 @@ class OpenRelexHead(TaskHead):
         self.loss_coef = cfg.loss_coef
         self.rel_token_index = cfg.rel_token_index
         self.embed_rel_token = cfg.embed_rel_token
-        self.represent_spans = getattr(cfg, 'represent_spans', False)
-        self.span_loss_coef = getattr(cfg, 'span_loss_coef', 1.0)
         if shared_layers is None:
             shared_layers = {}
 
-        # Anchor layer (configurable strategy)
-        anchor_mode = cfg.anchor_mode
-        if anchor_mode == "lstm":
-            anchor_mode = "rotary"
-
-        self.anchor_layer = AnchorLayer.from_config(
-            anchor_mode, hidden_size,
-            max_count=cfg.max_count,
-            num_slots=cfg.num_fixed_slots,
-            num_heads=cfg.groups_num_heads,
-            num_layers=cfg.groups_num_layers,
-            dropout=dropout,
-        )
-
-        # Anchor-child fusion
-        if "anchor_modeling" in shared_layers:
-            self.anchor_modeling = shared_layers["anchor_modeling"]
-        else:
-            self.anchor_modeling = AnchorModeling.from_config(
-                cfg.anchor_modeling, hidden_size, dropout=dropout,
-            )
-
-        if "anchor_refine" in shared_layers:
-            self.anchor_refine = shared_layers["anchor_refine"]
-        else:
-            refine_layers = getattr(cfg, "anchor_refine_layers", 0)
-            if refine_layers > 0:
-                refine_heads = getattr(cfg, "anchor_refine_heads", 8)
-                self.anchor_refine = AnchorCrossAttentionLayer(
-                    hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
-                )
+        self._init_anchor_pipeline(cfg, config, hidden_size, dropout, shared_layers)
 
         # Dual scorers: one for head spans, one for tail spans
         self.head_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
         self.tail_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
 
         if self.represent_spans:
-            self.span_rep_layer = SpanRepLayer(
-                span_mode="token_level",
-                hidden_size=hidden_size,
-                max_width=getattr(config, "max_width", 12),
-                dropout=dropout,
-            )
-            # Separate projections for head/tail span scoring
             self.head_span_proj = nn.Linear(hidden_size, hidden_size)
             self.tail_span_proj = nn.Linear(hidden_size, hidden_size)
 

@@ -4,10 +4,9 @@ import torch
 from torch import nn
 
 from gliner.modeling.utils import extract_prompt_features
-from gliner.modeling.span_rep import SpanRepLayer
 
 from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
-from ...layers import AnchoredSpanScorer, AnchorLayer, AnchorModeling, AnchorCrossAttentionLayer
+from ...layers import AnchoredSpanScorer
 
 
 class StructuringHead(TaskHead):
@@ -26,52 +25,12 @@ class StructuringHead(TaskHead):
         self.loss_coef = struct_cfg.loss_coef
         self.child_token_index = struct_cfg.child_token_index
         self.embed_child_token = struct_cfg.embed_child_token
-        self.represent_spans = getattr(struct_cfg, 'represent_spans', False)
-        self.span_loss_coef = getattr(struct_cfg, 'span_loss_coef', 1.0)
         if shared_layers is None:
             shared_layers = {}
 
-        # Map groups_layer config to anchor_mode for AnchorLayer factory
-        anchor_mode = struct_cfg.groups_layer
-        if anchor_mode == "lstm":
-            anchor_mode = "rotary"
-
-        self.anchor_layer = AnchorLayer.from_config(
-            anchor_mode, hidden_size,
-            max_count=struct_cfg.max_count,
-            num_slots=getattr(struct_cfg, "num_fixed_slots", 10),
-            num_heads=struct_cfg.groups_num_heads,
-            num_layers=struct_cfg.groups_num_layers,
-            dropout=dropout,
-        )
-
-        if "anchor_modeling" in shared_layers:
-            self.anchor_modeling = shared_layers["anchor_modeling"]
-        else:
-            anchor_modeling_type = getattr(struct_cfg, "anchor_modeling", "linear")
-            self.anchor_modeling = AnchorModeling.from_config(
-                anchor_modeling_type, hidden_size, dropout=dropout,
-            )
-
-        if "anchor_refine" in shared_layers:
-            self.anchor_refine = shared_layers["anchor_refine"]
-        else:
-            refine_layers = getattr(struct_cfg, "anchor_refine_layers", 0)
-            if refine_layers > 0:
-                refine_heads = getattr(struct_cfg, "anchor_refine_heads", 8)
-                self.anchor_refine = AnchorCrossAttentionLayer(
-                    hidden_size, num_heads=refine_heads, num_layers=refine_layers, dropout=dropout,
-                )
+        self._init_anchor_pipeline(struct_cfg, config, hidden_size, dropout, shared_layers)
 
         self.anchored_scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
-
-        if self.represent_spans:
-            self.span_rep_layer = SpanRepLayer(
-                span_mode="token_level",
-                hidden_size=hidden_size,
-                max_width=getattr(config, "max_width", 12),
-                dropout=dropout,
-            )
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
@@ -82,7 +41,7 @@ class StructuringHead(TaskHead):
 
     def forward(self, shared, dependency_outputs, flat_inputs=None,
                 child_label_embeds=None, base_loss_fn=None, **batch):
-        gold_count_val = batch.get("gold_count_val")
+        count_val = batch.get("count_val")
         structuring_labels = batch.get("structuring_labels")
         structuring_count = batch.get("structuring_count")
         threshold = batch.get("threshold", 0.5)
@@ -125,7 +84,7 @@ class StructuringHead(TaskHead):
         if child_embedding.shape[1] == 0:
             return TaskHeadOutput()
 
-        count_for_groups = structuring_count if structuring_count is not None else gold_count_val
+        count_for_groups = structuring_count if structuring_count is not None else count_val
         anchors, anchor_mask = self.anchor_layer(
             parent_embedding, words_embedding,
             count=count_for_groups, threshold=threshold,
@@ -142,7 +101,8 @@ class StructuringHead(TaskHead):
         structuring_logits_flat = self.anchored_scorer(
             fused_flat, words_embedding, word_mask=mask,
         )
-        structuring_logits = structuring_logits_flat.view(B, X, C, -1, 3)
+        # Reshape and permute to (B, X, L, C, 3) to match labels and decoder
+        structuring_logits = structuring_logits_flat.view(B, X, C, -1, 3).permute(0, 1, 3, 2, 4)
 
         # Optional span representation
         span_logits_out = None

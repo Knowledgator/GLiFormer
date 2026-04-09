@@ -46,4 +46,4 @@ class CountProcessor(TaskProcessor):
             count_batch_idx[offset] = batch_idx
             offset += 1
 
-        return {"count_targets": count_targets, "gold_count_val": count_targets.clone()}
+        return {"count_targets": count_targets, "count_val": count_targets.clone()}

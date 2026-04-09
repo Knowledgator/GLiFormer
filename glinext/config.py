@@ -56,8 +56,8 @@ class OpenRelexHeadConfig:
     anchor_modeling: str = "linear"     # "linear", "lstm", "mlp"
     num_fixed_slots: int = 10
     max_count: int = 20
-    groups_num_heads: int = 4
-    groups_num_layers: int = 2
+    anchor_num_heads: int = 4
+    anchor_num_layers: int = 2
     rel_token_index: int = -1
     embed_rel_token: bool = True
     loss_coef: float = 1.0
@@ -70,11 +70,11 @@ class OpenRelexHeadConfig:
 
 @dataclass
 class StructuringHeadConfig:
-    groups_layer: str = "lstm"  # "lstm", "query_lstm", "query_transformer", "fixed"
-    groups_num_heads: int = 4
-    groups_num_layers: int = 2
+    anchor_mode: str = "lstm"  # "lstm", "query_lstm", "query_transformer", "fixed"
+    anchor_num_heads: int = 4
+    anchor_num_layers: int = 2
     max_count: int = 20
-    num_fixed_slots: int = 10  # number of learnable anchor slots (for groups_layer="fixed")
+    num_fixed_slots: int = 10  # number of learnable anchor slots (for anchor_mode="fixed")
     child_token_index: int = -1
     embed_child_token: bool = True
     loss_coef: float = 1.0
@@ -135,7 +135,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Layer selection
         relations_layer: Optional[str] = None,
         classifier_layer: Optional[str] = None,
-        groups_layer: Optional[str] = None,
+        groups_layer: Optional[str] = None,  # backward compat alias for anchor_mode
         count_layer: Optional[str] = None,
         # Relations flat params
         rel_mode: str = "adjacency",
@@ -163,8 +163,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         count_mode: str = "regression",
         max_count: int = 20,
         # Groups (flat)
-        groups_num_heads: int = 4,
-        groups_num_layers: int = 2,
+        anchor_num_heads: int = 4,
+        anchor_num_layers: int = 2,
         # Structuring (flat)
         child_token_index: int = -1,
         embed_child_token: bool = True,
@@ -228,9 +228,9 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Structuring
         if structuring_config is None and groups_layer is not None:
             structuring_config = {
-                "groups_layer": groups_layer,
-                "groups_num_heads": groups_num_heads,
-                "groups_num_layers": groups_num_layers,
+                "anchor_mode": groups_layer,
+                "anchor_num_heads": anchor_num_heads,
+                "anchor_num_layers": anchor_num_layers,
                 "max_count": max_count,
                 "child_token_index": child_token_index,
                 "embed_child_token": embed_child_token,
@@ -282,7 +282,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         # ── Backward compat: keep flat attributes for code that reads them ──
         self.relations_layer = relations_layer or (self.joint_relex_config.layer_type if self.joint_relex_config else None)
         self.classifier_layer = classifier_layer or (self.classification_config.layer_type if self.classification_config else None)
-        self.groups_layer = groups_layer or (self.structuring_config.groups_layer if self.structuring_config else None)
+        self.groups_layer = groups_layer or (self.structuring_config.anchor_mode if self.structuring_config else None)
         self.count_layer = count_layer or ("regression" if self.count_config else None)
 
         self.rel_mode = rel_mode
@@ -298,8 +298,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.neg_spans_ratio = self.ner_config.neg_spans_ratio if self.ner_config else neg_spans_ratio
         self.span_loss_coef = self.ner_config.span_loss_coef if self.ner_config else span_loss_coef
 
-        self.groups_num_heads = self.structuring_config.groups_num_heads if self.structuring_config else groups_num_heads
-        self.groups_num_layers = self.structuring_config.groups_num_layers if self.structuring_config else groups_num_layers
+        self.anchor_num_heads = self.structuring_config.anchor_num_heads if self.structuring_config else anchor_num_heads
+        self.anchor_num_layers = self.structuring_config.anchor_num_layers if self.structuring_config else anchor_num_layers
         self.child_token_index = self.structuring_config.child_token_index if self.structuring_config else child_token_index
         self.embed_child_token = self.structuring_config.embed_child_token if self.structuring_config else embed_child_token
 

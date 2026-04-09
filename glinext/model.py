@@ -460,7 +460,7 @@ class GLiNExTModel(BaseModel):
         # Count
         count_targets: Optional[torch.Tensor] = None,
         # Groups / Structuring
-        gold_count_val: Optional[torch.Tensor] = None,
+        count_val: Optional[torch.Tensor] = None,
         structuring_labels: Optional[torch.Tensor] = None,
         structuring_count: Optional[torch.Tensor] = None,
         # Embedding similarity
@@ -671,7 +671,7 @@ class GLiNExTModel(BaseModel):
             span_labels=span_labels, cat_labels=cat_labels, rel_labels=rel_labels,
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
             count_targets=count_targets,
-            gold_count_val=gold_count_val, structuring_labels=structuring_labels,
+            count_val=count_val, structuring_labels=structuring_labels,
             structuring_count=structuring_count, embedding_labels=embedding_labels,
             embedding_pair_idx=embedding_pair_idx,
             embedding_encodings=embedding_encodings,

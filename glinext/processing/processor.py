@@ -462,6 +462,7 @@ class GLiNextProcessor(BaseProcessor):
             "extraction": batch.get("extraction", [[] for _ in range(batch_size)]),
             "embedding": batch.get("embedding", [[] for _ in range(batch_size)]),
             "structuring": batch.get("structuring", [{} for _ in range(batch_size)]),
+            "open_relex": batch.get("open_relex", [[] for _ in range(batch_size)]),
         }
 
         if total_groups == 0:
@@ -605,7 +606,7 @@ class GLiNextProcessor(BaseProcessor):
             count_result = self.create_count_labels(batch_list, classes_mapping)
             if count_result is not None:
                 tokenized_input['count_targets'] = count_result[0]
-                tokenized_input['gold_count_val'] = count_result[1]
+                tokenized_input['count_val'] = count_result[1]
 
             embedding_result = self.create_embedding_labels(batch_list)
             if embedding_result is not None:

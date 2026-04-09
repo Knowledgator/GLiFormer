@@ -176,8 +176,8 @@ class QueryLSTMAnchorLayer(AnchorLayer):
                 torch.zeros(B, 0, context_embedding.shape[-1], device=device),
                 torch.zeros(B, 0, dtype=torch.bool, device=device),
             )
-        pc_emb = context_embedding.mean(dim=0) if context_embedding.dim() == 3 else context_embedding
-        return self.groups_layer(pc_emb, word_embeddings, gold_count_val=count, threshold=threshold)
+        field_emb = context_embedding.mean(dim=0) if context_embedding.dim() == 3 else context_embedding
+        return self.groups_layer(field_emb, word_embeddings, count_val=count, threshold=threshold)
 
 
 class QueryTransformerAnchorLayer(AnchorLayer):
@@ -199,5 +199,5 @@ class QueryTransformerAnchorLayer(AnchorLayer):
                 torch.zeros(B, 0, context_embedding.shape[-1], device=device),
                 torch.zeros(B, 0, dtype=torch.bool, device=device),
             )
-        pc_emb = context_embedding.mean(dim=0) if context_embedding.dim() == 3 else context_embedding
-        return self.groups_layer(pc_emb, word_embeddings, gold_count_val=count, threshold=threshold)
+        field_emb = context_embedding.mean(dim=0) if context_embedding.dim() == 3 else context_embedding
+        return self.groups_layer(field_emb, word_embeddings, count_val=count, threshold=threshold)
