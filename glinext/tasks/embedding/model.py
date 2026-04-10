@@ -6,6 +6,7 @@ from torch.nn import functional as F
 
 from .. import TaskHead, TaskHeadOutput
 from ...layers import Pooling
+from ...layers.mlp import create_mlp
 
 
 class EmbeddingLoss(nn.Module):
@@ -82,9 +83,16 @@ class EmbeddingHead(TaskHead):
         self.loss_coef = emb_cfg.loss_coef
         self.similarity_fn = getattr(emb_cfg, "similarity_fn", "cosine")
 
+        projection_dim = getattr(emb_cfg, "projection_dim", None)
+        if projection_dim is not None:
+            self.projection = create_mlp(config.hidden_size, [config.hidden_size], projection_dim)
+        else:
+            self.projection = None
+
+        pooling_hidden_size = projection_dim if projection_dim is not None else config.hidden_size
         self.pooling = Pooling.from_config(
             pooling_type=getattr(emb_cfg, "pooling_type", "mean"),
-            hidden_size=config.hidden_size,
+            hidden_size=pooling_hidden_size,
         )
         self.loss = EmbeddingLoss.from_config(
             loss_fn=getattr(emb_cfg, "loss_fn", "mse"),
@@ -95,6 +103,11 @@ class EmbeddingHead(TaskHead):
         if config.embedding_config is None:
             return None
         return cls(config)
+
+    def _project(self, embeddings):
+        if self.projection is not None:
+            return self.projection(embeddings)
+        return embeddings
 
     def _similarity(self, emb_a, emb_b):
         if self.similarity_fn == "dot":
@@ -115,7 +128,7 @@ class EmbeddingHead(TaskHead):
         # Training path: pair texts encoded as a separate batch
         if embedding_encodings is not None and embedding_pair_idx is not None:
             mask = embedding_encoding_mask.bool() if embedding_encoding_mask is not None else None
-            pooled = self.pooling(embedding_encodings, mask)
+            pooled = self.pooling(self._project(embedding_encodings), mask)
             if self.similarity_fn == "cosine":
                 pooled = F.normalize(pooled, p=2, dim=-1)
 
@@ -137,7 +150,7 @@ class EmbeddingHead(TaskHead):
             words_embedding = shared.words_embedding
             mask = shared.mask
 
-            pooled = self.pooling(words_embedding, mask)
+            pooled = self.pooling(self._project(words_embedding), mask)
             if self.similarity_fn == "cosine":
                 pooled = F.normalize(pooled, p=2, dim=-1)
 
