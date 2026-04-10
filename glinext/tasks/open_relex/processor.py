@@ -18,7 +18,8 @@ class OpenRelexProcessor(SpanProcessor):
     """
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
-        super().__init__(config, tokenizer, words_splitter, **kwargs)
+        super().__init__(config, tokenizer, words_splitter,
+                         parent_token=getattr(config, 'open_rel_parent_token', None), **kwargs)
         self.rel_token = config.rel_token
 
     def get_classes_mapping(self, batch_list, shuffle_labels=False, **kwargs):

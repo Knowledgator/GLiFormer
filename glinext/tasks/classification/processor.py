@@ -15,7 +15,7 @@ class ClassificationProcessor(TaskProcessor):
     def __init__(self, config, **kwargs):
         super().__init__(config)
         self.cat_token = config.cat_token
-        self.parent_token = config.parent_token
+        self.parent_token = getattr(config, 'cat_parent_token', None) or config.parent_token
         self.sep_token = config.sep_token
 
     @staticmethod

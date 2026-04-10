@@ -15,7 +15,8 @@ class NERProcessor(SpanProcessor):
     """Processor for NER task: class mappings, prompts, labels, span resolution."""
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
-        super().__init__(config, tokenizer, words_splitter, **kwargs)
+        super().__init__(config, tokenizer, words_splitter,
+                         parent_token=getattr(config, 'ner_parent_token', None), **kwargs)
         self.ent_token = config.ent_token
 
     @staticmethod

@@ -18,6 +18,8 @@ class NERHeadConfig:
     anchor_modeling: str = "linear"  # "linear", "lstm", "mlp"
     anchor_refine_layers: int = 0  # number of cross-attention layers for anchor refinement (0 = disabled)
     anchor_refine_heads: int = 8
+    parent_token_index: int = -1
+    embed_parent_token: bool = True
 
 
 @dataclass
@@ -27,6 +29,8 @@ class ClassificationHeadConfig:
     embed_cat_token: bool = True
     loss_coef: float = 1.0
     pooling_type: str = "mean"  # "mean", "cls", "max"
+    parent_token_index: int = -1
+    embed_parent_token: bool = True
 
 
 @dataclass
@@ -66,6 +70,8 @@ class OpenRelexHeadConfig:
     span_loss_coef: float = 1.0
     anchor_refine_layers: int = 0
     anchor_refine_heads: int = 8
+    parent_token_index: int = -1
+    embed_parent_token: bool = True
 
 
 @dataclass
@@ -84,6 +90,8 @@ class StructuringHeadConfig:
     span_loss_coef: float = 1.0
     anchor_refine_layers: int = 0
     anchor_refine_heads: int = 8
+    parent_token_index: int = -1
+    embed_parent_token: bool = True
 
 
 @dataclass
@@ -128,6 +136,11 @@ class GLiNextConfig(BaseGLiNERConfig):
         rel_token: str = "[REL]",
         parent_token: str = "[PARENT]",
         child_token: str = "[CHILD]",
+        # Per-task parent tokens (None = fall back to shared parent_token)
+        ner_parent_token: Optional[str] = None,
+        cat_parent_token: Optional[str] = None,
+        open_rel_parent_token: Optional[str] = None,
+        struct_parent_token: Optional[str] = None,
         # Parent token index (resolved during model init, like class_token_index)
         parent_token_index: int = -1,
         embed_parent_token: bool = True,
@@ -278,6 +291,11 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.parent_token_index = parent_token_index
         self.embed_parent_token = embed_parent_token
         self.child_token = child_token
+        # Per-task parent tokens (fall back to shared parent_token)
+        self.ner_parent_token = ner_parent_token or parent_token
+        self.cat_parent_token = cat_parent_token or parent_token
+        self.open_rel_parent_token = open_rel_parent_token or parent_token
+        self.struct_parent_token = struct_parent_token or parent_token
 
         # ── Backward compat: keep flat attributes for code that reads them ──
         self.relations_layer = relations_layer or (self.joint_relex_config.layer_type if self.joint_relex_config else None)
@@ -319,6 +337,13 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.shared_anchor_modeling = shared_anchor_modeling
         self.shared_anchor_refine_layers = shared_anchor_refine_layers
         self.shared_anchor_refine_heads = shared_anchor_refine_heads
+
+    @property
+    def uses_per_task_parents(self) -> bool:
+        """True when per-task parent tokens are distinct from each other."""
+        tokens = {self.ner_parent_token, self.cat_parent_token,
+                  self.open_rel_parent_token, self.struct_parent_token}
+        return len(tokens) > 1
 
     def to_dict(self) -> dict[str, Any]:
         output = super().to_dict()

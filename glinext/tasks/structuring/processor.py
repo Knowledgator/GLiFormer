@@ -15,7 +15,8 @@ class StructuringProcessor(SpanProcessor):
     """Processor for structuring task."""
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
-        super().__init__(config, tokenizer, words_splitter, **kwargs)
+        super().__init__(config, tokenizer, words_splitter,
+                         parent_token=getattr(config, 'struct_parent_token', None), **kwargs)
         self.child_token = config.child_token
 
     @staticmethod

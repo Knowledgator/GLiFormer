@@ -1,7 +1,7 @@
 """GLiNExT: unified multi-task model — thin orchestrator over modular task heads."""
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
 import torch
@@ -301,6 +301,7 @@ class GLiNExTModel(BaseModel):
         classes_mapping,
         task_name: str,
         label_group_sizes: Optional[torch.Tensor] = None,
+        per_task_parents: bool = False,
     ) -> Optional[TaskFlatInputs]:
         """Build TaskFlatInputs for a specific task by flattening B-indexed tensors to BN.
 
@@ -314,6 +315,8 @@ class GLiNExTModel(BaseModel):
             classes_mapping: BatchClassesMapping
             task_name: "ner", "classification", "structuring", "open_relex", "joint_relex"
             label_group_sizes: (BN,) for labels encoder path — number of children per flat group
+            per_task_parents: when True, parent_embeds contains only this task's parents
+                (no offset needed); when False, uses shared parent tensor with offset computation
         """
         device = words_embedding.device
         D = words_embedding.shape[-1]
@@ -331,9 +334,14 @@ class GLiNExTModel(BaseModel):
         for flat_idx, batch_idx, group_idx, _ in flat_iter():
             batch_origins.append(batch_idx)
 
-            # Parent position within the item's parent list
-            p_offset = self._parent_offset_for_item(classes_mapping, task_name, batch_idx)
-            parent_positions.append((batch_idx, p_offset + group_idx))
+            # Parent position within the parent tensor
+            if per_task_parents:
+                # Per-task parents: positions are task-local (no offset)
+                parent_positions.append((batch_idx, group_idx))
+            else:
+                # Shared parents: offset by preceding tasks in prompt order
+                p_offset = self._parent_offset_for_item(classes_mapping, task_name, batch_idx)
+                parent_positions.append((batch_idx, p_offset + group_idx))
 
             if label_group_sizes is None:
                 # Prompt path: children within batch item, accumulated by group
@@ -529,11 +537,33 @@ class GLiNExTModel(BaseModel):
         # ── 1c. Extract parent embeddings ───────────────────────────────
         parent_embeds = None
         parent_mask_t = None
-        if classes_mapping is not None and self.config.parent_token_index > 0:
-            parent_embeds, parent_mask_t = extract_prompt_features(
-                self.config.parent_token_index, token_embeds, input_ids, attention_mask,
-                batch_size, embed_dim, self.config.embed_parent_token,
-            )
+        per_task_parent_embeds: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+        if classes_mapping is not None:
+            if self.config.uses_per_task_parents:
+                # Per-task parent tokens: extract each task's parents independently
+                _task_parent_cfgs = {
+                    "ner": self.config.ner_config,
+                    "classification": self.config.classification_config,
+                    "open_relex": self.config.open_relex_config,
+                    "structuring": self.config.structuring_config,
+                }
+                for t_name, t_cfg in _task_parent_cfgs.items():
+                    if t_cfg is not None and getattr(t_cfg, 'parent_token_index', -1) > 0:
+                        p_e, p_m = extract_prompt_features(
+                            t_cfg.parent_token_index, token_embeds, input_ids, attention_mask,
+                            batch_size, embed_dim, getattr(t_cfg, 'embed_parent_token', True),
+                        )
+                        per_task_parent_embeds[t_name] = (p_e, p_m)
+                # Joint relex shares NER's parent token
+                if "ner" in per_task_parent_embeds:
+                    per_task_parent_embeds["joint_relex"] = per_task_parent_embeds["ner"]
+            elif self.config.parent_token_index > 0:
+                # Legacy: single shared parent token for all tasks
+                parent_embeds, parent_mask_t = extract_prompt_features(
+                    self.config.parent_token_index, token_embeds, input_ids, attention_mask,
+                    batch_size, embed_dim, self.config.embed_parent_token,
+                )
 
         # ── 1d. Extract task-specific child embeddings (prompt path) ────
         # NER children = prompts_embedding (already extracted via class_token_index)
@@ -584,7 +614,10 @@ class GLiNExTModel(BaseModel):
 
         # ── 1e. Build TaskFlatInputs per task ───────────────────────────
         flat_inputs_map = {}
-        if classes_mapping is not None and parent_embeds is not None:
+        _use_per_task = bool(per_task_parent_embeds)
+        _has_parents = parent_embeds is not None or _use_per_task
+
+        if classes_mapping is not None and _has_parents:
             label_group_sizes_map = {
                 "ner": kwargs.get("ner_labels_group_size"),
                 "classification": kwargs.get("cat_labels_group_size"),
@@ -606,48 +639,70 @@ class GLiNExTModel(BaseModel):
                 child_e, child_m = task_child_map.get(task_name, (None, None))
                 if child_e is None:
                     continue
+
+                # Select parent embeddings: per-task or shared
+                if _use_per_task:
+                    if task_name not in per_task_parent_embeds:
+                        continue
+                    t_parent_e, t_parent_m = per_task_parent_embeds[task_name]
+                else:
+                    t_parent_e, t_parent_m = parent_embeds, parent_mask_t
+
                 lgs = label_group_sizes_map.get(
                     "ner" if task_name == "joint_relex" else task_name
                 )
                 fi = self._build_flat_inputs(
-                    parent_embeds, parent_mask_t,
+                    t_parent_e, t_parent_m,
                     child_e, child_m,
                     words_embedding, mask,
                     classes_mapping, task_name,
                     label_group_sizes=lgs,
+                    per_task_parents=_use_per_task,
                 )
                 if fi is not None:
                     flat_inputs_map[task_name] = fi
 
             # Count uses ALL parents (cat + ner + struct), so build a combined flat input
             if "count" in self.heads:
-                # Count iterates over cat + extraction + structuring groups in order
-                # We build a special flat_inputs where children are empty but parent is set
                 count_batch_origins = []
-                count_parent_positions = []
+                count_parent_embeds_list = []
 
-                for _, bi, gi, _ in classes_mapping.flat_cat_iter():
-                    count_batch_origins.append(bi)
-                    p_off = self._parent_offset_for_item(classes_mapping, "classification", bi)
-                    count_parent_positions.append((bi, p_off + gi))
+                _count_tasks = [
+                    ("classification", classes_mapping.flat_cat_iter),
+                    ("ner", classes_mapping.flat_extraction_iter),
+                    ("structuring", classes_mapping.flat_structuring_iter),
+                ]
 
-                for _, bi, gi, _ in classes_mapping.flat_extraction_iter():
-                    count_batch_origins.append(bi)
-                    p_off = self._parent_offset_for_item(classes_mapping, "ner", bi)
-                    count_parent_positions.append((bi, p_off + gi))
-
-                for _, bi, gi, _ in classes_mapping.flat_structuring_iter():
-                    count_batch_origins.append(bi)
-                    p_off = self._parent_offset_for_item(classes_mapping, "structuring", bi)
-                    count_parent_positions.append((bi, p_off + gi))
+                for c_task, c_iter in _count_tasks:
+                    if _use_per_task:
+                        t_pe = per_task_parent_embeds.get(c_task)
+                        if t_pe is None:
+                            continue
+                        t_parent_e, _ = t_pe
+                        for _, bi, gi, _ in c_iter():
+                            count_batch_origins.append(bi)
+                            if gi < t_parent_e.shape[1]:
+                                count_parent_embeds_list.append(t_parent_e[bi, gi])
+                            else:
+                                count_parent_embeds_list.append(
+                                    torch.zeros(embed_dim, device=words_embedding.device, dtype=t_parent_e.dtype)
+                                )
+                    else:
+                        for _, bi, gi, _ in c_iter():
+                            count_batch_origins.append(bi)
+                            p_off = self._parent_offset_for_item(classes_mapping, c_task, bi)
+                            pp = p_off + gi
+                            if pp < parent_embeds.shape[1]:
+                                count_parent_embeds_list.append(parent_embeds[bi, pp])
+                            else:
+                                count_parent_embeds_list.append(
+                                    torch.zeros(embed_dim, device=words_embedding.device, dtype=parent_embeds.dtype)
+                                )
 
                 BN_count = len(count_batch_origins)
                 if BN_count > 0:
                     bo = torch.tensor(count_batch_origins, dtype=torch.long, device=words_embedding.device)
-                    flat_parent = torch.zeros(BN_count, embed_dim, device=words_embedding.device, dtype=parent_embeds.dtype)
-                    for idx, (bi, pp) in enumerate(count_parent_positions):
-                        if pp < parent_embeds.shape[1]:
-                            flat_parent[idx] = parent_embeds[bi, pp]
+                    flat_parent = torch.stack(count_parent_embeds_list)
                     flat_inputs_map["count"] = TaskFlatInputs(
                         words_embedding=words_embedding[bo],
                         mask=mask[bo],

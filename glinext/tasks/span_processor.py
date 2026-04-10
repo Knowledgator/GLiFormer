@@ -22,10 +22,10 @@ class SpanProcessor(TaskProcessor):
     Used by NER, open relex, and structuring processors.
     """
 
-    def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
+    def __init__(self, config, tokenizer=None, words_splitter=None, parent_token=None, **kwargs):
         super().__init__(config, tokenizer, words_splitter, **kwargs)
         self.words_splitter = words_splitter
-        self.parent_token = config.parent_token
+        self.parent_token = parent_token or config.parent_token
         self.sep_token = config.sep_token
 
     @staticmethod

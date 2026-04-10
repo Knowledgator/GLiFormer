@@ -90,8 +90,15 @@ class GLiNExT(BaseEncoderGLiNER):
 
         Order matters — ``set_class_indices`` looks them up by string after addition.
         """
-        tokens = [self.config.ent_token, self.config.sep_token,
-                  self.config.parent_token]
+        # Collect unique parent tokens (per-task may differ from shared)
+        parent_tokens = sorted({
+            self.config.ner_parent_token,
+            self.config.cat_parent_token,
+            self.config.open_rel_parent_token,
+            self.config.struct_parent_token,
+        })
+
+        tokens = [self.config.ent_token, self.config.sep_token] + parent_tokens
 
         if self.config.classification_config is not None:
             tokens.append(self.config.cat_token)
@@ -119,7 +126,17 @@ class GLiNExT(BaseEncoderGLiNER):
         self.config.class_token_index = _idx(self.config.ent_token)
         self.config.parent_token_index = _idx(self.config.parent_token)
 
-        # Per-task token indices
+        # Per-task parent token indices
+        if self.config.ner_config is not None:
+            self.config.ner_config.parent_token_index = _idx(self.config.ner_parent_token)
+        if self.config.classification_config is not None:
+            self.config.classification_config.parent_token_index = _idx(self.config.cat_parent_token)
+        if self.config.open_relex_config is not None:
+            self.config.open_relex_config.parent_token_index = _idx(self.config.open_rel_parent_token)
+        if self.config.structuring_config is not None:
+            self.config.structuring_config.parent_token_index = _idx(self.config.struct_parent_token)
+
+        # Per-task child token indices
         if self.config.classification_config is not None:
             cat_idx = _idx(self.config.cat_token)
             self.config.classification_config.cat_token_index = cat_idx
