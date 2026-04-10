@@ -3,9 +3,7 @@
 import torch
 from torch import nn
 
-from gliner.modeling.utils import extract_prompt_features
-
-from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
+from .. import TaskHead, TaskHeadOutput
 from ...layers import AnchoredSpanScorer
 
 
@@ -40,7 +38,7 @@ class StructuringHead(TaskHead):
                    shared_layers=shared_layers)
 
     def forward(self, shared, dependency_outputs, flat_inputs=None,
-                child_label_embeds=None, base_loss_fn=None, **batch):
+                base_loss_fn=None, **batch):
         count_val = batch.get("count_val")
         structuring_labels = batch.get("structuring_labels")
         structuring_count = batch.get("structuring_count")
@@ -51,35 +49,11 @@ class StructuringHead(TaskHead):
         span_mask = batch.get("structuring_span_mask")
         span_labels = batch.get("structuring_span_labels")
 
-        # Use flat_inputs (BN-indexed) when available
-        if flat_inputs is not None:
-            words_embedding = flat_inputs.words_embedding
-            mask = flat_inputs.mask
-            child_embedding = flat_inputs.child_embedding
-            child_embedding_mask = flat_inputs.child_mask
-            # Parent embedding used for anchor generation
-            parent_embedding = flat_inputs.parent_embedding  # (BN, D)
-        else:
-            token_embeds = shared.token_embeds
-            input_ids = shared.input_ids
-            attention_mask = shared.attention_mask
-            words_embedding = shared.words_embedding
-            mask = shared.mask
-            parent_embedding = shared.prompts_embedding.mean(dim=1)  # (B, D)
-
-            batch_size, _, embed_dim = token_embeds.shape
-
-            if child_label_embeds is not None:
-                child_embedding = child_label_embeds
-                child_embedding_mask = torch.ones(
-                    child_label_embeds.shape[:-1], dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
-            else:
-                child_embedding, child_embedding_mask = extract_prompt_features(
-                    self.child_token_index, token_embeds, input_ids, attention_mask,
-                    batch_size, embed_dim, self.embed_child_token,
-                )
+        words_embedding = flat_inputs.words_embedding       # (BN, W, D)
+        mask = flat_inputs.mask                              # (BN, W)
+        child_embedding = flat_inputs.child_embedding        # (BN, max_C, D)
+        child_embedding_mask = flat_inputs.child_mask        # (BN, max_C)
+        parent_embedding = flat_inputs.parent_embedding      # (BN, D)
 
         if child_embedding.shape[1] == 0:
             return TaskHeadOutput()

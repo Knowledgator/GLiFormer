@@ -10,6 +10,7 @@ import torch
 
 from ..span_decoder import Span  # noqa: F401 — re-exported
 from ..ner.decoder import NERDecoder
+from ...processing.decoder import unflatten_by_batch_origin
 
 
 class JointRelexDecoder(NERDecoder):
@@ -53,7 +54,7 @@ class JointRelexDecoder(NERDecoder):
 
         threshold = threshold or self.threshold
 
-        # 1. Decode NER entities first
+        # 1. Decode NER entities first (returns B × groups × spans)
         ner_id_to_classes = self._get_ner_id_to_classes(classes_mapping)
         entities = super().decode(
             model_output,
@@ -63,6 +64,9 @@ class JointRelexDecoder(NERDecoder):
             multi_label=multi_label,
             **kwargs,
         )
+
+        # Flatten back to BN-indexed list of span lists for per-group entity lookup
+        flat_entities = [spans for batch_groups in entities for spans in batch_groups]
 
         # 2. Build relation class mappings
         rel_id_to_classes = self._get_rel_id_to_classes(classes_mapping)
@@ -76,7 +80,7 @@ class JointRelexDecoder(NERDecoder):
         flat_triples = []
         for bn in range(BN):
             triples = []
-            batch_entities = entities[bn] if bn < len(entities) else []
+            batch_entities = flat_entities[bn] if bn < len(flat_entities) else []
 
             for p in range(probs.shape[1]):
                 if pair_mask is not None and not pair_mask[bn, p]:
@@ -108,14 +112,10 @@ class JointRelexDecoder(NERDecoder):
                     })
             flat_triples.append(triples)
 
-        # Unflatten BN → B if batch_origin is available
-        if model_output.joint_rel_batch_origin is not None and model_output.batch_size is not None:
-            from ...processing.decoder import unflatten_by_batch_origin
-            return unflatten_by_batch_origin(
-                flat_triples, model_output.joint_rel_batch_origin, model_output.batch_size,
-            )
-
-        return flat_triples
+        # Unflatten BN → B
+        return unflatten_by_batch_origin(
+            flat_triples, model_output.joint_rel_batch_origin, model_output.batch_size,
+        )
 
     def _resolve_entity(
         self,

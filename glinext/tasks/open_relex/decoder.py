@@ -9,6 +9,7 @@ from typing import Dict, List
 import torch
 
 from ..span_decoder import Span, SpanDecoder
+from ...processing.decoder import unflatten_by_batch_origin
 
 
 class OpenRelexDecoder(SpanDecoder):
@@ -39,8 +40,8 @@ class OpenRelexDecoder(SpanDecoder):
 
         threshold = threshold or self.threshold
         anchor_mask = model_output.open_rel_anchor_mask
-        batch_origin = getattr(model_output, 'open_rel_batch_origin', None)
-        batch_size = getattr(model_output, 'batch_size', None)
+        batch_origin = model_output.open_rel_batch_origin
+        batch_size = model_output.batch_size
 
         # Prefer span-level decoding when available
         if (model_output.open_rel_span_logits is not None
@@ -84,7 +85,7 @@ class OpenRelexDecoder(SpanDecoder):
         all_results = []
 
         for b in range(BN):
-            text_bi = batch_origin[b].item() if batch_origin is not None else b
+            text_bi = batch_origin[b].item()
             triples = []
 
             for x in range(X):
@@ -111,11 +112,7 @@ class OpenRelexDecoder(SpanDecoder):
 
             all_results.append(triples)
 
-        if batch_origin is not None and batch_size is not None:
-            from ...processing.decoder import unflatten_by_batch_origin
-            return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
-
-        return all_results
+        return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
 
     def _decode_from_spans(self, span_logits, span_idx, span_mask, anchor_mask,
                            classes_mapping, threshold, flat_ner, multi_label, texts,
@@ -131,7 +128,7 @@ class OpenRelexDecoder(SpanDecoder):
         all_results = []
 
         for b in range(BN):
-            text_bi = batch_origin[b].item() if batch_origin is not None else b
+            text_bi = batch_origin[b].item()
             triples = []
             valid_indices = torch.where(span_mask[b])[0]
 
@@ -171,11 +168,7 @@ class OpenRelexDecoder(SpanDecoder):
 
             all_results.append(triples)
 
-        if batch_origin is not None and batch_size is not None:
-            from ...processing.decoder import unflatten_by_batch_origin
-            return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
-
-        return all_results
+        return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
 
     def _add_triples(self, triples, head_spans, tail_spans, rel_name, texts, batch_idx):
         """Build relation triple dicts from head/tail span lists."""

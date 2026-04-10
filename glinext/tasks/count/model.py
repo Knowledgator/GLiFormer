@@ -58,14 +58,7 @@ class CountHead(TaskHead):
     def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
         count_targets = batch.get("count_targets")
 
-        # Use parent_embedding from flat_inputs (BN-indexed) when available
-        if flat_inputs is not None:
-            pooled = flat_inputs.parent_embedding  # (BN, D)
-        else:
-            prompts_embedding = shared.prompts_embedding
-            prompts_embedding_mask = shared.prompts_embedding_mask
-            mask_f = prompts_embedding_mask.float().unsqueeze(-1)
-            pooled = (prompts_embedding * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+        pooled = flat_inputs.parent_embedding  # (BN, D)
 
         logits = self.count_head(pooled)
 

@@ -3,6 +3,7 @@
 from typing import List
 
 from .. import TaskDecoder
+from ...processing.decoder import unflatten_by_batch_origin
 
 
 class CountDecoder(TaskDecoder):
@@ -15,7 +16,7 @@ class CountDecoder(TaskDecoder):
             model_output: GLiNExTOutput with count_logits.
 
         Returns:
-            List of integer count predictions, or List[List[int]] when batch_origin available.
+            List[List[int]] — per batch item, per group count predictions.
         """
         if model_output.count_logits is None:
             return []
@@ -26,10 +27,7 @@ class CountDecoder(TaskDecoder):
         else:
             flat_results = model_output.count_logits.squeeze(-1).round().clamp(min=0).long().tolist()
 
-        batch_origin = getattr(model_output, 'count_batch_origin', None)
-        batch_size = getattr(model_output, 'batch_size', None)
-        if batch_origin is not None and batch_size is not None:
-            from ...processing.decoder import unflatten_by_batch_origin
-            return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
-
-        return flat_results
+        # Unflatten BN → B
+        return unflatten_by_batch_origin(
+            flat_results, model_output.count_batch_origin, model_output.batch_size,
+        )

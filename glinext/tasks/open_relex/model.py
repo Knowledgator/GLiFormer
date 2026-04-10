@@ -11,9 +11,7 @@ scoring alongside token-level BIO scoring.
 import torch
 from torch import nn
 
-from gliner.modeling.utils import extract_prompt_features
-
-from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
+from .. import TaskHead, TaskHeadOutput
 from ...layers import AnchoredSpanScorer
 
 
@@ -57,7 +55,7 @@ class OpenRelexHead(TaskHead):
                    shared_layers=shared_layers)
 
     def forward(self, shared, dependency_outputs, flat_inputs=None,
-                open_rel_label_embeds=None, base_loss_fn=None, **batch):
+                base_loss_fn=None, **batch):
         open_rel_labels = batch.get("open_rel_labels")
         open_rel_count = batch.get("open_rel_count")
         threshold = batch.get("threshold", 0.5)
@@ -67,35 +65,11 @@ class OpenRelexHead(TaskHead):
         span_mask = batch.get("open_rel_span_mask")
         span_labels = batch.get("open_rel_span_labels")
 
-        # Use flat_inputs (BN-indexed) when available
-        if flat_inputs is not None:
-            words_embedding = flat_inputs.words_embedding
-            mask = flat_inputs.mask
-            rel_embedding = flat_inputs.child_embedding
-            rel_embedding_mask = flat_inputs.child_mask
-            parent_embedding = flat_inputs.parent_embedding  # (BN, D)
-        else:
-            token_embeds = shared.token_embeds
-            input_ids = shared.input_ids
-            attention_mask = shared.attention_mask
-            words_embedding = shared.words_embedding
-            mask = shared.mask
-            parent_embedding = shared.prompts_embedding.mean(dim=1)  # (B, D)
-
-            batch_size, _, embed_dim = token_embeds.shape
-
-            # 1. Get [REL] type embeddings
-            if open_rel_label_embeds is not None:
-                rel_embedding = open_rel_label_embeds
-                rel_embedding_mask = torch.ones(
-                    rel_embedding.shape[:-1], dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
-            else:
-                rel_embedding, rel_embedding_mask = extract_prompt_features(
-                    self.rel_token_index, token_embeds, input_ids, attention_mask,
-                    batch_size, embed_dim, self.embed_rel_token,
-                )
+        words_embedding = flat_inputs.words_embedding       # (BN, W, D)
+        mask = flat_inputs.mask                              # (BN, W)
+        rel_embedding = flat_inputs.child_embedding          # (BN, max_C, D)
+        rel_embedding_mask = flat_inputs.child_mask          # (BN, max_C)
+        parent_embedding = flat_inputs.parent_embedding      # (BN, D)
 
         if rel_embedding.shape[1] == 0:
             return TaskHeadOutput()

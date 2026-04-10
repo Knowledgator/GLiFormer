@@ -4,9 +4,8 @@ import torch
 from torch import nn
 
 from gliner.modeling.loss_functions import focal_loss_with_logits
-from gliner.modeling.utils import extract_prompt_features
 
-from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
+from .. import TaskHead, TaskHeadOutput
 from ...layers import Pooling
 from .scorer import ClassificationScorer
 
@@ -49,35 +48,13 @@ class ClassificationHead(TaskHead):
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
                    shared_layers=shared_layers)
 
-    def forward(self, shared, dependency_outputs, flat_inputs=None, cat_label_embeds=None, **batch):
+    def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
         cat_labels = batch.get("cat_labels")
 
-        # Use flat_inputs (BN-indexed) when available
-        if flat_inputs is not None:
-            cat_embedding = flat_inputs.child_embedding
-            cat_embedding_mask = flat_inputs.child_mask
-            text_rep = self.pooling(flat_inputs.words_embedding, flat_inputs.mask)
-            context = flat_inputs.parent_embedding  # (BN, D)
-        else:
-            token_embeds = shared.token_embeds
-            input_ids = shared.input_ids
-            attention_mask = shared.attention_mask
-            batch_size, _, embed_dim = token_embeds.shape
-
-            if cat_label_embeds is not None:
-                cat_embedding = cat_label_embeds
-                cat_embedding_mask = torch.ones(
-                    cat_embedding.shape[:-1], dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
-            else:
-                cat_embedding, cat_embedding_mask = extract_prompt_features(
-                    self.cat_token_index, token_embeds, input_ids, attention_mask,
-                    batch_size, embed_dim, self.embed_cat_token,
-                )
-
-            text_rep = self.pooling(token_embeds, attention_mask)
-            context = cat_embedding.mean(dim=1)  # (B, D)
+        cat_embedding = flat_inputs.child_embedding      # (BN, max_C, D)
+        cat_embedding_mask = flat_inputs.child_mask       # (BN, max_C)
+        text_rep = self.pooling(flat_inputs.words_embedding, flat_inputs.mask)
+        context = flat_inputs.parent_embedding            # (BN, D)
 
         # Anchor paradigm: anchor_layer → anchor_modeling → dot product
         anchor_rep, anchor_mask = self.anchor_layer(context)

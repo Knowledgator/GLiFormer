@@ -64,17 +64,10 @@ class NERHead(TaskHead):
         return tensor, mask
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, base_loss_fn=None, **batch):
-        # Use flat_inputs (BN-indexed) when available, else fall back to shared (B-indexed)
-        if flat_inputs is not None:
-            words_embedding = flat_inputs.words_embedding
-            mask = flat_inputs.mask
-            prompts_embedding = flat_inputs.child_embedding
-            prompts_embedding_mask = flat_inputs.child_mask
-        else:
-            words_embedding = shared.words_embedding
-            mask = shared.mask
-            prompts_embedding = shared.prompts_embedding
-            prompts_embedding_mask = shared.prompts_embedding_mask
+        words_embedding = flat_inputs.words_embedding       # (BN, W, D)
+        mask = flat_inputs.mask                              # (BN, W)
+        prompts_embedding = flat_inputs.child_embedding      # (BN, max_C, D)
+        prompts_embedding_mask = flat_inputs.child_mask      # (BN, max_C)
 
         ner_labels = batch.get("ner_labels")
         span_idx = batch.get("span_idx")
@@ -91,10 +84,7 @@ class NERHead(TaskHead):
             )
 
         # Anchor paradigm: anchor_layer → anchor_refine → anchor_modeling → scorer
-        if flat_inputs is not None:
-            context = flat_inputs.parent_embedding  # (BN, D)
-        else:
-            context = prompts_embedding.mean(dim=1)  # (B, D)
+        context = flat_inputs.parent_embedding  # (BN, D)
         anchor_rep, anchor_mask = self.anchor_layer(
             context, words_embedding,
         )

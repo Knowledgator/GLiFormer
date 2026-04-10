@@ -9,6 +9,7 @@ from typing import Dict, List
 import torch
 
 from ..span_decoder import Span, SpanDecoder
+from ...processing.decoder import unflatten_by_batch_origin
 
 
 class StructuringDecoder(SpanDecoder):
@@ -48,8 +49,8 @@ class StructuringDecoder(SpanDecoder):
 
         id_to_fields = self._build_field_class_maps(classes_mapping, B)
 
-        batch_origin = getattr(model_output, 'structuring_batch_origin', None)
-        batch_size = getattr(model_output, 'batch_size', None)
+        batch_origin = model_output.structuring_batch_origin
+        batch_size = model_output.batch_size
 
         # Prefer span-level decoding when available
         if (model_output.structuring_span_logits is not None
@@ -89,8 +90,7 @@ class StructuringDecoder(SpanDecoder):
         flat_results = []
 
         for b in range(BN):
-            # Resolve batch idx for text lookup
-            text_bi = batch_origin[b].item() if batch_origin is not None else b
+            text_bi = batch_origin[b].item()
             instances = []
             for x in range(X):
                 if anchor_mask is not None and not anchor_mask[b, x]:
@@ -109,11 +109,7 @@ class StructuringDecoder(SpanDecoder):
                     instances.append(fields)
             flat_results.append(instances)
 
-        if batch_origin is not None and batch_size is not None:
-            from ...processing.decoder import unflatten_by_batch_origin
-            return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
-
-        return flat_results
+        return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
 
     def _decode_from_spans(self, span_logits, span_idx, span_mask, anchor_mask,
                            id_to_fields, threshold, flat_ner, multi_label, texts,
@@ -124,7 +120,7 @@ class StructuringDecoder(SpanDecoder):
         flat_results = []
 
         for b in range(BN):
-            text_bi = batch_origin[b].item() if batch_origin is not None else b
+            text_bi = batch_origin[b].item()
             instances = []
             for x in range(X):
                 if anchor_mask is not None and not anchor_mask[b, x]:
@@ -158,11 +154,7 @@ class StructuringDecoder(SpanDecoder):
                     instances.append(fields)
             flat_results.append(instances)
 
-        if batch_origin is not None and batch_size is not None:
-            from ...processing.decoder import unflatten_by_batch_origin
-            return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
-
-        return flat_results
+        return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
 
     def _spans_to_fields(self, spans, texts, batch_idx):
         """Convert Span objects to field dicts with text."""

@@ -7,6 +7,7 @@ and span-level decoding (when represent_spans is enabled in NERHead).
 from typing import Dict, List, Union
 
 from ..span_decoder import Span, SpanDecoder
+from ...processing.decoder import unflatten_by_batch_origin
 
 
 class NERDecoder(SpanDecoder):
@@ -16,8 +17,8 @@ class NERDecoder(SpanDecoder):
     1. Token-level BIO: uses ner_logits (BN, L, C+1, 3) with start/end/inside
     2. Span-level: uses span_logits (BN, S, C) + span_idx (BN, S, 2) + span_mask (BN, S)
 
-    When batch_origin is available in model_output, results are grouped back
-    to per-batch-item lists of lists. Otherwise returns flat per-group lists.
+    Model outputs are always BN-indexed; results are unflattened back to
+    per-batch-item lists via batch_origin.
     """
 
     def _get_ner_id_to_classes(
@@ -51,8 +52,7 @@ class NERDecoder(SpanDecoder):
         """Decode NER predictions.
 
         Returns:
-            If batch_origin available: List[List[List[Span]]] — per batch item, per group.
-            Otherwise: List[List[Span]] — per group (flat BN).
+            List[List[List[Span]]] — per batch item, per group, list of spans.
         """
         if model_output.ner_logits is None and model_output.span_logits is None:
             return []
@@ -86,11 +86,7 @@ class NERDecoder(SpanDecoder):
                 multi_label=multi_label,
             )
 
-        # Unflatten BN → B if batch_origin is available
-        if model_output.ner_batch_origin is not None and model_output.batch_size is not None:
-            from ...processing.decoder import unflatten_by_batch_origin
-            return unflatten_by_batch_origin(
-                flat_results, model_output.ner_batch_origin, model_output.batch_size,
-            )
-
-        return flat_results
+        # Unflatten BN → B
+        return unflatten_by_batch_origin(
+            flat_results, model_output.ner_batch_origin, model_output.batch_size,
+        )
