@@ -8,6 +8,7 @@ Strategies:
 - LinearAnchorModeling: linear projection of concatenated anchor + child
 - LSTMAnchorModeling: recurrent processing (GLiNER2-style)
 - MLPAnchorModeling: multi-layer perceptron fusion
+- TransformerAnchorModeling: self-attention over anchor sequence conditioned on child reps
 """
 
 import torch
@@ -127,4 +128,55 @@ class LSTMAnchorModeling(AnchorModeling, modeling_type="lstm"):
 
         # Reshape back to (B, A, C, D)
         return fused.reshape(A, B, C, D).permute(1, 0, 2, 3)
+
+
+class TransformerAnchorModeling(AnchorModeling, modeling_type="transformer"):
+    """Transformer-based processing of anchor-child pairs.
+
+    Uses child representations as conditioning: concatenates child embedding
+    to each anchor position, applies self-attention over the anchor sequence,
+    then projects back. Analogous to LSTMAnchorModeling but replaces the GRU
+    with a transformer encoder for parallel, attention-based fusion.
+    """
+
+    def __init__(self, hidden_size: int, num_layers: int = 2, num_heads: int = 8, dropout: float = 0.1, **kwargs):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.proj_in = nn.Linear(hidden_size * 2, hidden_size)
+        self.proj_out = create_mlp(
+            hidden_size * 2, [hidden_size * 2], hidden_size,
+            dropout=0., activation="gelu",
+        )
+
+    def forward(self, anchor_rep, child_rep):
+        B, A, D = anchor_rep.shape
+        C = child_rep.shape[1]
+
+        # Expand anchor and child: (B, A, C, D)
+        anchor_exp = anchor_rep.unsqueeze(2).expand(B, A, C, D)
+        child_exp = child_rep.unsqueeze(1).expand(B, A, C, D)
+
+        # Concatenate and project to D: (B, A, C, 2D) -> (B, A, C, D)
+        combined = self.proj_in(torch.cat([anchor_exp, child_exp], dim=-1))
+
+        # Reshape to run transformer over anchor dim per child: (B*C, A, D)
+        combined = combined.permute(0, 2, 1, 3).reshape(B * C, A, D)
+
+        # Self-attention over anchor sequence
+        trans_out = self.transformer(combined)  # (B*C, A, D)
+
+        # Concatenate with original child embeddings and project
+        child_broadcast = child_rep.unsqueeze(2).expand(B, C, A, D).reshape(B * C, A, D)
+        fused = self.proj_out(torch.cat([trans_out, child_broadcast], dim=-1))  # (B*C, A, D)
+
+        # Reshape back to (B, A, C, D)
+        return fused.reshape(B, C, A, D).permute(0, 2, 1, 3)
 

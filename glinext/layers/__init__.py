@@ -14,6 +14,7 @@ from .anchor_layer import (
 )
 from .anchor_modeling import (
     AnchorModeling, LinearAnchorModeling, LSTMAnchorModeling, MLPAnchorModeling,
+    TransformerAnchorModeling,
 )
 from .pooling import Pooling, MeanPooling, CLSPooling, MaxPooling, WeightedPooling
 
@@ -28,6 +29,6 @@ __all__ = [
     "AnchorLayer", "ParentAnchorLayer", "FixedAnchorLayer",
     "FixedLSTMAnchorLayer", "FixedTransformerAnchorLayer",
     "RotaryAnchorLayer", "QueryLSTMAnchorLayer", "QueryTransformerAnchorLayer",
-    "AnchorModeling", "LinearAnchorModeling", "LSTMAnchorModeling", "MLPAnchorModeling",
+    "AnchorModeling", "LinearAnchorModeling", "LSTMAnchorModeling", "MLPAnchorModeling", "TransformerAnchorModeling",
     "Pooling", "MeanPooling", "CLSPooling", "MaxPooling", "WeightedPooling",
 ]
