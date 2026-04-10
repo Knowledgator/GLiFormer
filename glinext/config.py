@@ -32,6 +32,7 @@ class ClassificationHeadConfig(BaseHeadConfig):
     cat_token_index: int = -1
     embed_cat_token: bool = True
     pooling_type: str = "mean"  # "mean", "cls", "max"
+    scorer_type: str = "dot"  # "dot", "weighted-dot", "mlp", "hopfield"
 
 
 @dataclass

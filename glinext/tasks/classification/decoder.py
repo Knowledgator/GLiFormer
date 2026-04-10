@@ -14,13 +14,16 @@ class ClassificationDecoder(TaskDecoder):
         super().__init__(config)
         self.threshold = 0.5
 
-    def decode(self, model_output, classes_mapping=None, threshold=None, **kwargs) -> List[List[dict]]:
+    def decode(self, model_output, classes_mapping=None, threshold=None,
+               multi_label=True, **kwargs) -> List[List[dict]]:
         """Decode classification logits into predicted labels.
 
         Args:
             model_output: GLiNExTOutput with cat_logits (BN, C).
             classes_mapping: BatchClassesMapping for label resolution.
             threshold: Override detection threshold.
+            multi_label: If True, return all classes above threshold.
+                If False, return only the top-scoring class (if above threshold).
 
         Returns:
             If batch_origin available: List[List[List[dict]]] — per batch item, per group.
@@ -42,16 +45,30 @@ class ClassificationDecoder(TaskDecoder):
         flat_results = []
         for b in range(probs.shape[0]):
             id_to_class = id_to_class_maps[b] if b < len(id_to_class_maps) else {}
-            # Only iterate over valid classes (skip padding positions)
             num_classes = len(id_to_class) if id_to_class else probs.shape[1]
-            predictions = []
-            for c in range(num_classes):
-                score = probs[b, c].item()
-                if score > threshold:
-                    predictions.append({
-                        "class_name": id_to_class.get(c, str(c)),
-                        "score": score,
-                    })
+
+            if multi_label:
+                predictions = []
+                for c in range(num_classes):
+                    score = probs[b, c].item()
+                    if score > threshold:
+                        predictions.append({
+                            "class_name": id_to_class.get(c, str(c)),
+                            "score": score,
+                        })
+            else:
+                # Single-label: pick the highest-scoring class
+                valid_probs = probs[b, :num_classes]
+                best_idx = valid_probs.argmax().item()
+                best_score = valid_probs[best_idx].item()
+                if best_score > threshold:
+                    predictions = [{
+                        "class_name": id_to_class.get(best_idx, str(best_idx)),
+                        "score": best_score,
+                    }]
+                else:
+                    predictions = []
+
             flat_results.append(predictions)
 
         # Unflatten BN → B if batch_origin is available

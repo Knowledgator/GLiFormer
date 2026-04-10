@@ -8,6 +8,7 @@ from gliner.modeling.utils import extract_prompt_features
 
 from .. import TaskHead, TaskHeadOutput, TaskFlatInputs, SharedRepresentations
 from ...layers import Pooling
+from .scorer import ClassificationScorer
 
 
 class ClassificationHead(TaskHead):
@@ -33,6 +34,11 @@ class ClassificationHead(TaskHead):
 
         self.pooling = Pooling.from_config(
             pooling_type=getattr(cat_cfg, "pooling_type", "mean"),
+            hidden_size=hidden_size,
+        )
+
+        self.scorer = ClassificationScorer.from_config(
+            scorer_type=getattr(cat_cfg, "scorer_type", "dot"),
             hidden_size=hidden_size,
         )
 
@@ -79,7 +85,7 @@ class ClassificationHead(TaskHead):
             anchor_rep = self.anchor_refine(anchor_rep, cat_embedding)
         fused = self.anchor_modeling(anchor_rep, cat_embedding)  # (B, 1, C, D)
         fused = fused.squeeze(1)  # (B, C, D) — parent mode always A=1
-        scores = torch.einsum("bd,bcd->bc", text_rep, fused)
+        scores = self.scorer(text_rep, fused)
 
         loss = None
         if cat_labels is not None:
