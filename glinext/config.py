@@ -8,33 +8,34 @@ from gliner.config import BaseGLiNERConfig
 
 
 @dataclass
-class NERHeadConfig:
+class BaseHeadConfig:
+    """Base config for all task heads that use the anchor paradigm."""
     loss_coef: float = 1.0
+    anchor_mode: str = "parent"
+    anchor_modeling: str = "linear"
+    anchor_refine_layers: int = 0
+    anchor_refine_heads: int = 8
     represent_spans: bool = False
     neg_spans_ratio: float = 1.0
     span_loss_coef: float = 1.0
-    scorer_type: str = "gliner"  # "gliner" (GLiNER Scorer), "anchored" (AnchoredSpanScorer)
-    anchor_mode: str = "parent"  # "parent", "fixed"
-    anchor_modeling: str = "linear"  # "linear", "lstm", "mlp"
-    anchor_refine_layers: int = 0  # number of cross-attention layers for anchor refinement (0 = disabled)
-    anchor_refine_heads: int = 8
     parent_token_index: int = -1
     embed_parent_token: bool = True
 
 
 @dataclass
-class ClassificationHeadConfig:
-    layer_type: str = "dot"  # "dot", "weighted-dot", "mlp"
+class NERHeadConfig(BaseHeadConfig):
+    pass
+
+
+@dataclass
+class ClassificationHeadConfig(BaseHeadConfig):
     cat_token_index: int = -1
     embed_cat_token: bool = True
-    loss_coef: float = 1.0
     pooling_type: str = "mean"  # "mean", "cls", "max"
-    parent_token_index: int = -1
-    embed_parent_token: bool = True
 
 
 @dataclass
-class JointRelexHeadConfig:
+class JointRelexHeadConfig(BaseHeadConfig):
     """Config for joint NER + relation extraction (GLiNER-relex style).
 
     Inherits NER scoring from NERHead and adds adjacency-based
@@ -45,37 +46,27 @@ class JointRelexHeadConfig:
     triples_layer: Optional[str] = None    # optional triples scoring layer
     embed_rel_token: bool = True
     rel_token_index: int = -1
-    loss_coef: float = 1.0
     adjacency_loss_coef: float = 1.0
 
 
 @dataclass
-class OpenRelexHeadConfig:
+class OpenRelexHeadConfig(BaseHeadConfig):
     """Config for anchor-based relation extraction (GLiNER2 style).
 
     Standalone head — no NER dependency. Uses configurable anchor layers
     to extract head/tail spans directly per (anchor, rel_type) pair.
     """
     anchor_mode: str = "fixed"          # "fixed", "rotary", "query_lstm", "query_transformer"
-    anchor_modeling: str = "linear"     # "linear", "lstm", "mlp"
     num_fixed_slots: int = 10
     max_count: int = 20
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
     rel_token_index: int = -1
     embed_rel_token: bool = True
-    loss_coef: float = 1.0
-    represent_spans: bool = False
-    neg_spans_ratio: float = 1.0
-    span_loss_coef: float = 1.0
-    anchor_refine_layers: int = 0
-    anchor_refine_heads: int = 8
-    parent_token_index: int = -1
-    embed_parent_token: bool = True
 
 
 @dataclass
-class StructuringHeadConfig:
+class StructuringHeadConfig(BaseHeadConfig):
     anchor_mode: str = "lstm"  # "lstm", "query_lstm", "query_transformer", "fixed"
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
@@ -83,15 +74,6 @@ class StructuringHeadConfig:
     num_fixed_slots: int = 10  # number of learnable anchor slots (for anchor_mode="fixed")
     child_token_index: int = -1
     embed_child_token: bool = True
-    loss_coef: float = 1.0
-    anchor_modeling: str = "linear"  # "linear", "lstm", "mlp"
-    represent_spans: bool = False
-    neg_spans_ratio: float = 1.0
-    span_loss_coef: float = 1.0
-    anchor_refine_layers: int = 0
-    anchor_refine_heads: int = 8
-    parent_token_index: int = -1
-    embed_parent_token: bool = True
 
 
 @dataclass
@@ -192,6 +174,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         if ner_config is None:
             ner_config = {}
         if isinstance(ner_config, dict):
+            ner_config.pop("scorer_type", None)  # backward compat: scorer_type removed
             ner_config.setdefault("loss_coef", ner_loss_coef)
             ner_config.setdefault("represent_spans", represent_spans)
             ner_config.setdefault("neg_spans_ratio", neg_spans_ratio)
@@ -203,12 +186,12 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Classification
         if classification_config is None and classifier_layer is not None:
             classification_config = {
-                "layer_type": classifier_layer,
                 "cat_token_index": cat_token_index,
                 "embed_cat_token": embed_cat_token,
                 "loss_coef": cat_loss_coef,
             }
         if isinstance(classification_config, dict):
+            classification_config.pop("layer_type", None)  # backward compat: layer_type removed
             self.classification_config = ClassificationHeadConfig(**classification_config)
         else:
             self.classification_config = classification_config
@@ -315,7 +298,7 @@ class GLiNextConfig(BaseGLiNERConfig):
 
         # ── Backward compat: keep flat attributes for code that reads them ──
         self.relations_layer = relations_layer or (self.joint_relex_config.layer_type if self.joint_relex_config else None)
-        self.classifier_layer = classifier_layer or (self.classification_config.layer_type if self.classification_config else None)
+        self.classifier_layer = classifier_layer
         self.groups_layer = groups_layer or (self.structuring_config.anchor_mode if self.structuring_config else None)
         self.count_layer = count_layer or ("regression" if self.count_config else None)
 

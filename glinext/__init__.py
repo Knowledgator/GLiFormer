@@ -1,5 +1,6 @@
 from .config import (
     GLiNextConfig,
+    BaseHeadConfig,
     NERHeadConfig,
     ClassificationHeadConfig,
     JointRelexHeadConfig,

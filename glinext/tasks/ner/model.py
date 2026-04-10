@@ -3,7 +3,6 @@
 import torch
 from torch import nn
 
-from gliner.modeling.scorers import Scorer
 from gliner.modeling.utils import extract_spans_from_tokens
 
 from .. import TaskHead, TaskHeadOutput
@@ -11,11 +10,10 @@ from ...layers import AnchoredSpanScorer
 
 
 class NERHead(TaskHead):
-    """Token-level NER scorer (start/end/inside) with optional span representation.
+    """Token-level NER scorer (start/end/inside) with anchor paradigm.
 
-    Supports multiple scorer types via config:
-    - "gliner": Original GLiNER Scorer (dot product, default)
-    - "anchored": AnchoredSpanScorer with configurable anchor layer
+    Always uses AnchoredSpanScorer with configurable anchor layer.
+    Default: parent anchor mode (single anchor = context embedding).
     """
 
     name = "ner"
@@ -26,25 +24,11 @@ class NERHead(TaskHead):
         self.config = config
         ner_cfg = config.ner_config
         self.loss_coef = ner_cfg.loss_coef
-        self.scorer_type = getattr(ner_cfg, "scorer_type", "gliner")
         if shared_layers is None:
             shared_layers = {}
 
-        if self.scorer_type == "anchored":
-            self._init_anchor_pipeline(ner_cfg, config, hidden_size, dropout, shared_layers)
-            self.scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
-        else:
-            self.represent_spans = ner_cfg.represent_spans
-            self.span_loss_coef = ner_cfg.span_loss_coef
-            self.scorer = Scorer(hidden_size, dropout)
-            if ner_cfg.represent_spans:
-                from gliner.modeling.span_rep import SpanRepLayer
-                self.span_rep_layer = SpanRepLayer(
-                    span_mode="token_level",
-                    hidden_size=hidden_size,
-                    max_width=getattr(config, "max_width", 12),
-                    dropout=dropout,
-                )
+        self._init_anchor_pipeline(ner_cfg, config, hidden_size, dropout, shared_layers)
+        self.scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
@@ -106,25 +90,25 @@ class NERHead(TaskHead):
                 prompts_embedding, prompts_embedding_mask, target_C,
             )
 
-        if self.scorer_type == "anchored":
-            # Use AnchoredSpanScorer: anchor=parent, child=entity types
-            if flat_inputs is not None:
-                context = flat_inputs.parent_embedding  # (BN, D)
-            else:
-                context = prompts_embedding.mean(dim=1)  # (B, D)
-            anchor_rep, anchor_mask = self.anchor_layer(
-                context, words_embedding,
-            )
-            if hasattr(self, "anchor_refine"):
-                anchor_rep = self.anchor_refine(anchor_rep, words_embedding, token_mask=mask)
-            fused = self.anchor_modeling(anchor_rep, prompts_embedding)
-            B_a, A, C, D = fused.shape
-            L = words_embedding.shape[1]
-            fused_flat = fused.view(B_a, A * C, D)
-            scores_flat = self.scorer(fused_flat, words_embedding, word_mask=mask)
-            scores = scores_flat.view(B_a, A, C, L, 3).permute(0, 1, 3, 2, 4)
+        # Anchor paradigm: anchor_layer → anchor_refine → anchor_modeling → scorer
+        if flat_inputs is not None:
+            context = flat_inputs.parent_embedding  # (BN, D)
         else:
-            scores = self.scorer(words_embedding, prompts_embedding)
+            context = prompts_embedding.mean(dim=1)  # (B, D)
+        anchor_rep, anchor_mask = self.anchor_layer(
+            context, words_embedding,
+        )
+        if hasattr(self, "anchor_refine"):
+            anchor_rep = self.anchor_refine(anchor_rep, words_embedding, token_mask=mask)
+        fused = self.anchor_modeling(anchor_rep, prompts_embedding)
+        B_a, A, C, D = fused.shape
+        L = words_embedding.shape[1]
+        fused_flat = fused.view(B_a, A * C, D)
+        scores_flat = self.scorer(fused_flat, words_embedding, word_mask=mask)
+        scores = scores_flat.view(B_a, A, C, L, 3).permute(0, 1, 3, 2, 4)
+        # Squeeze anchor dim for parent mode (A=1) to maintain (B, W, C, 3) shape
+        if A == 1:
+            scores = scores.squeeze(1)
 
         # Optional span representation
         span_logits_out = None

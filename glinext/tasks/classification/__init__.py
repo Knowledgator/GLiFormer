@@ -1,2 +1,2 @@
-from .model import ClassificationHead, ClassificationScorer
+from .model import ClassificationHead
 from .processor import ClassificationProcessor

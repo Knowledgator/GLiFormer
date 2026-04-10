@@ -31,45 +31,23 @@ class AnchorLayer(nn.Module):
     All subclasses produce:
         anchors: (B, A, D) — anchor representations
         mask: (B, A) — boolean mask for valid anchors
+
+    Uses registry-based polymorphism via __init_subclass__.
     """
+
+    _registry: dict = {}
+
+    def __init_subclass__(cls, anchor_mode: str = "", **kwargs):
+        super().__init_subclass__(**kwargs)
+        if anchor_mode:
+            cls._registry[anchor_mode] = cls
 
     @classmethod
     def from_config(cls, anchor_mode: str, hidden_size: int, **kwargs) -> "AnchorLayer":
         """Factory method to create the appropriate anchor layer."""
-        if anchor_mode == "parent":
-            return ParentAnchorLayer(hidden_size)
-        elif anchor_mode == "fixed":
-            num_slots = kwargs.get("num_slots", 10)
-            return FixedAnchorLayer(hidden_size, num_slots=num_slots)
-        elif anchor_mode == "fixed_lstm":
-            num_slots = kwargs.get("num_slots", 10)
-            return FixedLSTMAnchorLayer(hidden_size, num_slots=num_slots)
-        elif anchor_mode == "fixed_transformer":
-            num_slots = kwargs.get("num_slots", 10)
-            num_heads = kwargs.get("num_heads", 4)
-            num_layers = kwargs.get("num_layers", 2)
-            dropout = kwargs.get("dropout", 0.1)
-            return FixedTransformerAnchorLayer(
-                hidden_size, num_slots=num_slots, num_heads=num_heads,
-                num_layers=num_layers, dropout=dropout,
-            )
-        elif anchor_mode in ("lstm", "rotary"):
-            max_count = kwargs.get("max_count", 20)
-            return RotaryAnchorLayer(hidden_size, max_count=max_count)
-        elif anchor_mode == "query_lstm":
-            max_count = kwargs.get("max_count", 20)
-            return QueryLSTMAnchorLayer(hidden_size, max_count=max_count)
-        elif anchor_mode == "query_transformer":
-            max_count = kwargs.get("max_count", 20)
-            num_heads = kwargs.get("num_heads", 4)
-            num_layers = kwargs.get("num_layers", 2)
-            dropout = kwargs.get("dropout", 0.1)
-            return QueryTransformerAnchorLayer(
-                hidden_size, num_heads=num_heads, num_layers=num_layers,
-                dropout=dropout, max_count=max_count,
-            )
-        else:
-            raise ValueError(f"Unknown anchor_mode: {anchor_mode}")
+        if anchor_mode not in cls._registry:
+            raise ValueError(f"Unknown anchor_mode: {anchor_mode}. Available: {list(cls._registry.keys())}")
+        return cls._registry[anchor_mode](hidden_size, **kwargs)
 
     def forward(
         self,
@@ -101,14 +79,14 @@ def _count_mask(B: int, num_slots: int, count: Optional[torch.Tensor], device: t
     return torch.ones(B, num_slots, dtype=torch.bool, device=device)
 
 
-class ParentAnchorLayer(AnchorLayer):
+class ParentAnchorLayer(AnchorLayer, anchor_mode="parent"):
     """Context embedding as single anchor — simplest case.
 
     Used by NER and Classification where the anchor is the parent prompt embedding.
     Returns a single anchor per sample: context_embedding unsqueezed to (B, 1, D).
     """
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
 
@@ -119,13 +97,13 @@ class ParentAnchorLayer(AnchorLayer):
         return anchor, mask
 
 
-class FixedAnchorLayer(AnchorLayer):
+class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
     """Learnable fixed-size embedding table conditioned on context.
 
     Each anchor slot is a learnable embedding shifted by a projected context vector.
     """
 
-    def __init__(self, hidden_size: int, num_slots: int = 10):
+    def __init__(self, hidden_size: int, num_slots: int = 10, **kwargs):
         super().__init__()
         self.num_slots = num_slots
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
@@ -143,14 +121,14 @@ class FixedAnchorLayer(AnchorLayer):
         return anchors, mask
 
 
-class FixedLSTMAnchorLayer(AnchorLayer):
+class FixedLSTMAnchorLayer(AnchorLayer, anchor_mode="fixed_lstm"):
     """Learnable fixed slots conditioned on context via GRU.
 
     Fixed slot embeddings are fed as input sequence to a GRU whose initial hidden
     state is the context embedding. Output is concatenated with context and projected.
     """
 
-    def __init__(self, hidden_size: int, num_slots: int = 10):
+    def __init__(self, hidden_size: int, num_slots: int = 10, **kwargs):
         super().__init__()
         self.num_slots = num_slots
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
@@ -183,7 +161,7 @@ class FixedLSTMAnchorLayer(AnchorLayer):
         return anchors, mask
 
 
-class FixedTransformerAnchorLayer(AnchorLayer):
+class FixedTransformerAnchorLayer(AnchorLayer, anchor_mode="fixed_transformer"):
     """Learnable fixed slots conditioned on context via transformer cross-attention.
 
     Fixed slot embeddings serve as queries in a transformer decoder that cross-attends
@@ -191,7 +169,7 @@ class FixedTransformerAnchorLayer(AnchorLayer):
     """
 
     def __init__(self, hidden_size: int, num_slots: int = 10, num_heads: int = 4,
-                 num_layers: int = 2, dropout: float = 0.1):
+                 num_layers: int = 2, dropout: float = 0.1, **kwargs):
         super().__init__()
         self.num_slots = num_slots
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
@@ -219,10 +197,10 @@ class FixedTransformerAnchorLayer(AnchorLayer):
         return anchors, mask
 
 
-class RotaryAnchorLayer(AnchorLayer):
+class RotaryAnchorLayer(AnchorLayer, anchor_mode="rotary"):
     """Wraps RotaryGroupLSTM — rotary position-conditioned anchor generation."""
 
-    def __init__(self, hidden_size: int, max_count: int = 20):
+    def __init__(self, hidden_size: int, max_count: int = 20, **kwargs):
         super().__init__()
         self.groups_layer = RotaryGroupLSTM(hidden_size=hidden_size, max_count=max_count)
 
@@ -249,10 +227,14 @@ class RotaryAnchorLayer(AnchorLayer):
         return anchors, mask
 
 
-class QueryLSTMAnchorLayer(AnchorLayer):
+# Backward compat: "lstm" alias for "rotary"
+AnchorLayer._registry["lstm"] = RotaryAnchorLayer
+
+
+class QueryLSTMAnchorLayer(AnchorLayer, anchor_mode="query_lstm"):
     """Wraps QueryGroupLSTM — similarity-based token selection + GRU."""
 
-    def __init__(self, hidden_size: int, max_count: int = 20):
+    def __init__(self, hidden_size: int, max_count: int = 20, **kwargs):
         super().__init__()
         self.groups_layer = QueryGroupLSTM(hidden_size=hidden_size, max_count=max_count)
 
@@ -267,11 +249,11 @@ class QueryLSTMAnchorLayer(AnchorLayer):
         return self.groups_layer(context_embedding, word_embeddings, count_val=count, threshold=threshold)
 
 
-class QueryTransformerAnchorLayer(AnchorLayer):
+class QueryTransformerAnchorLayer(AnchorLayer, anchor_mode="query_transformer"):
     """Wraps QueryGroupTransformer — similarity-based selection + Transformer."""
 
     def __init__(self, hidden_size: int, num_heads: int = 4, num_layers: int = 2,
-                 dropout: float = 0.1, max_count: int = 20):
+                 dropout: float = 0.1, max_count: int = 20, **kwargs):
         super().__init__()
         self.groups_layer = QueryGroupTransformer(
             hidden_size=hidden_size, num_heads=num_heads,

@@ -21,18 +21,23 @@ class AnchorModeling(nn.Module):
 
     Takes anchor reps (B, A, D) and child reps (B, C, D) and produces
     fused representations (B, A, C, D) ready for scoring.
+
+    Uses registry-based polymorphism via __init_subclass__.
     """
+
+    _registry: dict = {}
+
+    def __init_subclass__(cls, modeling_type: str = "", **kwargs):
+        super().__init_subclass__(**kwargs)
+        if modeling_type:
+            cls._registry[modeling_type] = cls
 
     @classmethod
     def from_config(cls, modeling_type: str, hidden_size: int, **kwargs) -> "AnchorModeling":
         """Factory method to create the appropriate modeling layer."""
-        if modeling_type == "lstm":
-            return LSTMAnchorModeling(hidden_size, **kwargs)
-        elif modeling_type == "mlp":
-            dropout = kwargs.get("dropout", 0.1)
-            return MLPAnchorModeling(hidden_size, dropout=dropout)
-        else:  # "linear" (default)
-            return LinearAnchorModeling(hidden_size)
+        if modeling_type not in cls._registry:
+            raise ValueError(f"Unknown modeling_type: {modeling_type}. Available: {list(cls._registry.keys())}")
+        return cls._registry[modeling_type](hidden_size, **kwargs)
 
     def forward(
         self,
@@ -50,10 +55,10 @@ class AnchorModeling(nn.Module):
         raise NotImplementedError
 
 
-class LinearAnchorModeling(AnchorModeling):
+class LinearAnchorModeling(AnchorModeling, modeling_type="linear"):
     """Linear projection of anchor + child concatenation."""
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, **kwargs):
         super().__init__()
         self.proj = nn.Linear(hidden_size * 2, hidden_size)
 
@@ -67,10 +72,10 @@ class LinearAnchorModeling(AnchorModeling):
         combined = torch.cat([anchor_exp, child_exp], dim=-1)
         return self.proj(combined)
 
-class MLPAnchorModeling(AnchorModeling):
+class MLPAnchorModeling(AnchorModeling, modeling_type="mlp"):
     """MLP fusion of anchor + child representations."""
 
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
+    def __init__(self, hidden_size: int, dropout: float = 0.1, **kwargs):
         super().__init__()
         self.mlp = create_mlp(
             hidden_size * 2, [hidden_size * 2], hidden_size,
@@ -86,7 +91,7 @@ class MLPAnchorModeling(AnchorModeling):
         combined = torch.cat([anchor_exp, child_exp], dim=-1)
         return self.mlp(combined)
     
-class LSTMAnchorModeling(AnchorModeling):
+class LSTMAnchorModeling(AnchorModeling, modeling_type="lstm"):
     """Recurrent processing of anchor-child pairs (GLiNER2-style).
 
     Uses child representations as h0 (initial hidden state) for the GRU,
