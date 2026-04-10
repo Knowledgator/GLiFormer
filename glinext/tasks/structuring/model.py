@@ -58,14 +58,14 @@ class StructuringHead(TaskHead):
             child_embedding = flat_inputs.child_embedding
             child_embedding_mask = flat_inputs.child_mask
             # Parent embedding used for anchor generation
-            parent_embedding = flat_inputs.parent_embedding.unsqueeze(1)  # (BN, 1, D)
+            parent_embedding = flat_inputs.parent_embedding  # (BN, D)
         else:
             token_embeds = shared.token_embeds
             input_ids = shared.input_ids
             attention_mask = shared.attention_mask
             words_embedding = shared.words_embedding
             mask = shared.mask
-            parent_embedding = shared.prompts_embedding
+            parent_embedding = shared.prompts_embedding.mean(dim=1)  # (B, D)
 
             batch_size, _, embed_dim = token_embeds.shape
 

@@ -136,7 +136,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         rel_token: str = "[REL]",
         parent_token: str = "[PARENT]",
         child_token: str = "[CHILD]",
-        # Per-task parent tokens (None = fall back to shared parent_token)
+        # Per-task parent tokens
+        per_task_parents: Optional[bool] = None,  # True = distinct per-task tokens; False = shared [PARENT]; None = auto-detect
         ner_parent_token: Optional[str] = None,
         cat_parent_token: Optional[str] = None,
         open_rel_parent_token: Optional[str] = None,
@@ -291,11 +292,26 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.parent_token_index = parent_token_index
         self.embed_parent_token = embed_parent_token
         self.child_token = child_token
-        # Per-task parent tokens (fall back to shared parent_token)
-        self.ner_parent_token = ner_parent_token or parent_token
-        self.cat_parent_token = cat_parent_token or parent_token
-        self.open_rel_parent_token = open_rel_parent_token or parent_token
-        self.struct_parent_token = struct_parent_token or parent_token
+        # Per-task parent tokens
+        if per_task_parents is True:
+            # Distinct parent tokens per task (use explicit overrides or defaults)
+            self.ner_parent_token = ner_parent_token or "[ENT_P]"
+            self.cat_parent_token = cat_parent_token or "[CAT_P]"
+            self.open_rel_parent_token = open_rel_parent_token or "[REL_P]"
+            self.struct_parent_token = struct_parent_token or "[STRUCT_P]"
+        else:
+            # Shared parent token (or explicit per-task overrides for backward compat)
+            self.ner_parent_token = ner_parent_token or parent_token
+            self.cat_parent_token = cat_parent_token or parent_token
+            self.open_rel_parent_token = open_rel_parent_token or parent_token
+            self.struct_parent_token = struct_parent_token or parent_token
+        # Resolve auto-detect: if None, infer from whether tokens are actually distinct
+        if per_task_parents is None:
+            tokens = {self.ner_parent_token, self.cat_parent_token,
+                      self.open_rel_parent_token, self.struct_parent_token}
+            self.per_task_parents = len(tokens) > 1
+        else:
+            self.per_task_parents = per_task_parents
 
         # ── Backward compat: keep flat attributes for code that reads them ──
         self.relations_layer = relations_layer or (self.joint_relex_config.layer_type if self.joint_relex_config else None)
@@ -341,9 +357,7 @@ class GLiNextConfig(BaseGLiNERConfig):
     @property
     def uses_per_task_parents(self) -> bool:
         """True when per-task parent tokens are distinct from each other."""
-        tokens = {self.ner_parent_token, self.cat_parent_token,
-                  self.open_rel_parent_token, self.struct_parent_token}
-        return len(tokens) > 1
+        return self.per_task_parents
 
     def to_dict(self) -> dict[str, Any]:
         output = super().to_dict()

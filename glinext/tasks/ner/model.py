@@ -108,8 +108,12 @@ class NERHead(TaskHead):
 
         if self.scorer_type == "anchored":
             # Use AnchoredSpanScorer: anchor=parent, child=entity types
+            if flat_inputs is not None:
+                context = flat_inputs.parent_embedding  # (BN, D)
+            else:
+                context = prompts_embedding.mean(dim=1)  # (B, D)
             anchor_rep, anchor_mask = self.anchor_layer(
-                prompts_embedding, words_embedding,
+                context, words_embedding,
             )
             if hasattr(self, "anchor_refine"):
                 anchor_rep = self.anchor_refine(anchor_rep, words_embedding, token_mask=mask)

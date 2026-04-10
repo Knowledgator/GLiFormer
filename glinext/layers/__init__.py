@@ -9,6 +9,7 @@ from .rotary import RotaryEmbedding, rotate_half, apply_rotary_pos_emb
 from .groups import RotaryGroupLSTM, QueryGroupLSTM, QueryGroupTransformer, AnchorCrossAttentionLayer
 from .anchor_layer import (
     AnchorLayer, ParentAnchorLayer, FixedAnchorLayer,
+    FixedLSTMAnchorLayer, FixedTransformerAnchorLayer,
     RotaryAnchorLayer, QueryLSTMAnchorLayer, QueryTransformerAnchorLayer,
 )
 from .anchor_modeling import (
@@ -25,6 +26,7 @@ __all__ = [
     "RotaryEmbedding", "rotate_half", "apply_rotary_pos_emb",
     "RotaryGroupLSTM", "QueryGroupLSTM", "QueryGroupTransformer", "AnchorCrossAttentionLayer",
     "AnchorLayer", "ParentAnchorLayer", "FixedAnchorLayer",
+    "FixedLSTMAnchorLayer", "FixedTransformerAnchorLayer",
     "RotaryAnchorLayer", "QueryLSTMAnchorLayer", "QueryTransformerAnchorLayer",
     "AnchorModeling", "LinearAnchorModeling", "LSTMAnchorModeling", "MLPAnchorModeling",
     "Pooling", "MeanPooling", "CLSPooling", "MaxPooling", "WeightedPooling",
