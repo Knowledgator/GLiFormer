@@ -27,6 +27,17 @@ class FakeModelOutput:
     joint_rel_batch_origin: Optional[torch.Tensor] = None
     batch_size: Optional[int] = None
 
+    def __post_init__(self):
+        if self.batch_size is None:
+            logits = self.ner_logits if self.ner_logits is not None else self.span_logits
+            if logits is not None:
+                BN = logits.shape[0]
+                if self.ner_batch_origin is None:
+                    self.ner_batch_origin = torch.arange(BN)
+                if self.joint_rel_batch_origin is None and self.joint_rel_logits is not None:
+                    self.joint_rel_batch_origin = torch.arange(BN)
+                self.batch_size = BN
+
 
 def _bio_logits(BN, L, C, spans):
     logits = torch.full((BN, L, C, 3), -10.0)
@@ -78,15 +89,16 @@ class TestJointRelexDecoder:
             joint_rel_mask=rel_mask,
         )
 
-        ner_id_to_classes = {1: "person", 2: "location"}
+        ner_id_to_classes = {0: "person", 1: "location"}
         result = decoder.decode(
             out,
             classes_mapping=ner_id_to_classes,
             texts=[["John", "lives", "in", "New", "York"]],
         )
-        assert len(result) == 1
-        assert len(result[0]) == 1
-        triple = result[0][0]
+        assert len(result) == 1  # 1 batch item
+        assert len(result[0]) == 1  # 1 group
+        assert len(result[0][0]) == 1  # 1 triple
+        triple = result[0][0][0]
         assert triple["head"]["start"] == 0
         assert triple["tail"]["start"] == 3
         assert triple["score"] > 0.5
@@ -103,8 +115,8 @@ class TestJointRelexDecoder:
             joint_rel_idx=rel_idx,
             joint_rel_mask=rel_mask,
         )
-        result = decoder.decode(out, classes_mapping={1: "A"})
-        assert result[0] == []
+        result = decoder.decode(out, classes_mapping={0: "A"})
+        assert result[0][0] == []
 
     def test_masked_pairs_skipped(self, decoder):
         ner_logits = _bio_logits(1, 5, 1, [(0, 0, 0, 0), (0, 2, 2, 0)])
@@ -118,8 +130,8 @@ class TestJointRelexDecoder:
             joint_rel_idx=rel_idx,
             joint_rel_mask=rel_mask,
         )
-        result = decoder.decode(out, classes_mapping={1: "A"})
-        assert len(result[0]) == 1
+        result = decoder.decode(out, classes_mapping={0: "A"})
+        assert len(result[0][0]) == 1
 
     def test_entity_out_of_range_fallback(self, decoder):
         ner_logits = _bio_logits(1, 5, 1, [(0, 0, 0, 0)])  # only 1 entity
@@ -133,9 +145,9 @@ class TestJointRelexDecoder:
             joint_rel_idx=rel_idx,
             joint_rel_mask=rel_mask,
         )
-        result = decoder.decode(out, classes_mapping={1: "A"})
-        assert len(result[0]) == 1
-        assert result[0][0]["tail"]["start"] == -1  # fallback
+        result = decoder.decode(out, classes_mapping={0: "A"})
+        assert len(result[0][0]) == 1
+        assert result[0][0][0]["tail"]["start"] == -1  # fallback
 
     def test_with_batch_classes_mapping(self, decoder):
         ner_logits = _bio_logits(1, 5, 2, [(0, 0, 0, 0), (0, 3, 4, 1)])
@@ -151,6 +163,7 @@ class TestJointRelexDecoder:
         )
         mapping = _make_classes_mapping()
         result = decoder.decode(out, classes_mapping=mapping)
-        assert len(result) == 1
-        triple = result[0][0]
+        assert len(result) == 1  # 1 batch item
+        assert len(result[0]) == 1  # 1 group
+        triple = result[0][0][0]
         assert triple["relation"] == "lives_in"

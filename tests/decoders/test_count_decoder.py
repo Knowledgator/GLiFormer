@@ -16,6 +16,12 @@ class FakeModelOutput:
     count_batch_origin: Optional[torch.Tensor] = None
     batch_size: Optional[int] = None
 
+    def __post_init__(self):
+        if self.count_batch_origin is None and self.batch_size is None and self.count_logits is not None:
+            BN = self.count_logits.shape[0]
+            self.count_batch_origin = torch.arange(BN)
+            self.batch_size = BN
+
 
 def _make_decoder(mode="regression"):
     from dataclasses import asdict
@@ -34,14 +40,15 @@ class TestCountDecoder:
         logits = torch.tensor([[2.7], [0.3], [-0.5]])
         out = FakeModelOutput(count_logits=logits)
         result = decoder.decode(out)
-        assert result == [3, 0, 0]  # round then clamp min=0
+        # BN=B=3, each batch item has 1 group
+        assert result == [[3], [0], [0]]  # round then clamp min=0
 
     def test_classification_mode(self):
         decoder = _make_decoder("classification")
         logits = torch.tensor([[0.1, 5.0, 0.2], [3.0, 0.1, 0.1]])
         out = FakeModelOutput(count_logits=logits)
         result = decoder.decode(out)
-        assert result == [1, 0]  # argmax
+        assert result == [[1], [0]]  # argmax
 
     def test_with_batch_origin(self):
         decoder = _make_decoder("regression")
@@ -61,4 +68,4 @@ class TestCountDecoder:
         logits = torch.tensor([[-5.0]])
         out = FakeModelOutput(count_logits=logits)
         result = decoder.decode(out)
-        assert result == [0]
+        assert result == [[0]]

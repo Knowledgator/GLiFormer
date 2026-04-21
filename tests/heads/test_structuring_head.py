@@ -12,7 +12,7 @@ from glinext.config import StructuringHeadConfig
 
 def _make_head(**kwargs):
     defaults = dict(
-        groups_layer="fixed",
+        anchor_mode="fixed",
         num_fixed_slots=3,
         max_count=5,
     )
@@ -30,16 +30,16 @@ class TestStructuringHeadConstruction:
         assert StructuringHead.from_config(config) is None
 
     def test_from_config_fixed(self):
-        head = _make_head(groups_layer="fixed")
+        head = _make_head(anchor_mode="fixed")
         assert head is not None
         assert head.name == "structuring"
 
     def test_from_config_rotary(self):
-        head = _make_head(groups_layer="rotary")
+        head = _make_head(anchor_mode="rotary")
         assert head is not None
 
     def test_from_config_query_lstm(self):
-        head = _make_head(groups_layer="query_lstm")
+        head = _make_head(anchor_mode="query_lstm")
         assert head is not None
 
     def test_from_config_with_span_rep(self):

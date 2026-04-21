@@ -84,6 +84,22 @@ class FakeModelOutput:
     count_logits: Optional[torch.Tensor] = None
     count_batch_origin: Optional[torch.Tensor] = None
 
+    def __post_init__(self):
+        """Auto-fill batch_origin/batch_size for BN=B (1:1) when not provided."""
+        _task_logits = {
+            "ner": (self.ner_logits if self.ner_logits is not None else self.span_logits, "ner_batch_origin"),
+            "cat": (self.cat_logits, "cat_batch_origin"),
+            "count": (self.count_logits, "count_batch_origin"),
+            "open_rel": (self.open_rel_logits if self.open_rel_logits is not None else self.open_rel_span_logits, "open_rel_batch_origin"),
+            "structuring": (self.structuring_logits if self.structuring_logits is not None else self.structuring_span_logits, "structuring_batch_origin"),
+        }
+        for logits, origin_field in _task_logits.values():
+            if logits is not None and getattr(self, origin_field) is None:
+                BN = logits.shape[0]
+                setattr(self, origin_field, torch.arange(BN))
+                if self.batch_size is None:
+                    self.batch_size = BN
+
 
 class TestGLiNExTDecoderConstruction:
     def test_no_tasks(self):
@@ -144,10 +160,11 @@ class TestGLiNExTDecoderDecode:
         logits = torch.full((1, 5, 2, 3), -10.0)
         logits[0, 0, 0, :] = 5.0  # entity at pos 0, class 0
         out = FakeModelOutput(ner_logits=logits)
-        results = dec.decode(out, classes_mapping={1: "person", 2: "loc"})
+        results = dec.decode(out, classes_mapping={0: "person", 1: "loc"})
         assert "ner" in results
-        assert len(results["ner"]) == 1
-        assert len(results["ner"][0]) == 1
+        assert len(results["ner"]) == 1  # 1 batch item
+        assert len(results["ner"][0]) == 1  # 1 group
+        assert len(results["ner"][0][0]) == 1  # 1 span
 
     def test_classification_decode(self):
         config = make_config(classification_config=asdict(ClassificationHeadConfig()))
@@ -157,8 +174,9 @@ class TestGLiNExTDecoderDecode:
         out = FakeModelOutput(cat_logits=logits)
         results = dec.decode(out)
         assert "classification" in results
-        assert len(results["classification"]) == 1
-        assert results["classification"][0][0]["class_id"] == 0
+        assert len(results["classification"]) == 1  # 1 batch item
+        assert len(results["classification"][0]) == 1  # 1 group
+        assert results["classification"][0][0][0]["class_name"] == "0"
 
     def test_embedding_decode(self):
         config = make_config(embedding_config=asdict(EmbeddingHeadConfig()))
@@ -186,12 +204,14 @@ class TestGLiNExTDecoderDecode:
             embedding_logits=torch.tensor([0.5]),
         )
 
-        results = dec.decode(out, classes_mapping={1: "A"})
+        results = dec.decode(out, classes_mapping={0: "A"})
         assert "ner" in results
         assert "classification" in results
         assert "embedding" in results
-        assert len(results["ner"][0]) == 1
-        assert len(results["classification"][0]) == 1
+        assert len(results["ner"][0]) == 1  # 1 group for batch item 0
+        assert len(results["ner"][0][0]) == 1  # 1 span in group 0
+        assert len(results["classification"][0]) == 1  # 1 group
+        assert len(results["classification"][0][0]) == 1  # 1 prediction
         assert len(results["embedding"]) == 1
 
     def test_kwargs_forwarded(self):
@@ -202,7 +222,7 @@ class TestGLiNExTDecoderDecode:
         logits[0, 0, 0, :] = 5.0
         out = FakeModelOutput(ner_logits=logits)
         # threshold forwarded via kwargs
-        results = dec.decode(out, classes_mapping={1: "A"}, threshold=0.99)
+        results = dec.decode(out, classes_mapping={0: "A"}, threshold=0.99)
         # With high threshold, the borderline detection at sigmoid(0)≈0.5 is filtered
         # but the strong one at sigmoid(5)≈0.99 may still pass
         assert "ner" in results

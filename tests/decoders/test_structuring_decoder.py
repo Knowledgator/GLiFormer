@@ -23,6 +23,14 @@ class FakeModelOutput:
     structuring_span_mask: Optional[torch.Tensor] = None
     batch_size: Optional[int] = None
 
+    def __post_init__(self):
+        if self.structuring_batch_origin is None and self.batch_size is None:
+            logits = self.structuring_logits if self.structuring_logits is not None else self.structuring_span_logits
+            if logits is not None:
+                BN = logits.shape[0]
+                self.structuring_batch_origin = torch.arange(BN)
+                self.batch_size = BN
+
 
 @pytest.fixture
 def decoder():
@@ -32,8 +40,7 @@ def decoder():
 
 def _make_field_mapping(fields, batch_size=1):
     # class_to_id uses 0-indexed values; get_reverse_mapping produces {0: name, 1: age, ...}
-    # but the decoder uses 1-indexed class_id (class_idx + 1), so we need 1-indexed values
-    field_map = BaseClassMapping(class_to_id={f: i + 1 for i, f in enumerate(fields)})
+    field_map = BaseClassMapping(class_to_id={f: i for i, f in enumerate(fields)})
     item = StructuringItemMapping(field_class_to_id=field_map, name="schema")
     return BatchClassesMapping(
         cat_mapping=[CatClassMapping(cat_class_to_id=[]) for _ in range(batch_size)],
@@ -68,9 +75,10 @@ class TestStructuringTokenLevel:
         out = FakeModelOutput(structuring_logits=logits)
         mapping = _make_field_mapping(["name", "age"])
         result = decoder.decode(out, classes_mapping=mapping)
-        assert len(result) == 1  # 1 group
-        assert len(result[0]) == 1  # 1 instance
-        assert result[0][0][0]["field"] == "name"
+        assert len(result) == 1  # 1 batch item
+        assert len(result[0]) == 1  # 1 group
+        assert len(result[0][0]) == 1  # 1 instance
+        assert result[0][0][0][0]["field"] == "name"
 
     def test_multiple_instances(self, decoder):
         logits = _bio_structuring_logits(1, 2, 5, 1, [
@@ -81,7 +89,7 @@ class TestStructuringTokenLevel:
         out = FakeModelOutput(structuring_logits=logits, structuring_anchor_mask=anchor_mask)
         mapping = _make_field_mapping(["value"])
         result = decoder.decode(out, classes_mapping=mapping)
-        assert len(result[0]) == 2
+        assert len(result[0][0]) == 2  # 2 instances in group 0
 
     def test_anchor_mask(self, decoder):
         logits = _bio_structuring_logits(1, 2, 5, 1, [
@@ -92,7 +100,7 @@ class TestStructuringTokenLevel:
         out = FakeModelOutput(structuring_logits=logits, structuring_anchor_mask=anchor_mask)
         mapping = _make_field_mapping(["f"])
         result = decoder.decode(out, classes_mapping=mapping)
-        assert len(result[0]) == 1  # only instance 0
+        assert len(result[0][0]) == 1  # only instance 0
 
     def test_with_texts(self, decoder):
         logits = _bio_structuring_logits(1, 1, 5, 1, [(0, 0, 0, 0, 0)])
@@ -101,13 +109,13 @@ class TestStructuringTokenLevel:
         result = decoder.decode(
             out, classes_mapping=mapping, texts=[["John", "lives", "in", "New", "York"]],
         )
-        assert result[0][0][0]["text"] == "John"
+        assert result[0][0][0][0]["text"] == "John"
 
     def test_no_spans_returns_empty_instances(self, decoder):
         logits = torch.full((1, 1, 5, 2, 3), -10.0)
         out = FakeModelOutput(structuring_logits=logits)
         result = decoder.decode(out)
-        assert result[0] == []
+        assert result[0][0] == []
 
 
 class TestStructuringSpanLevel:
@@ -129,9 +137,10 @@ class TestStructuringSpanLevel:
         )
         mapping = _make_field_mapping(["name", "location"])
         result = decoder.decode(out, classes_mapping=mapping)
-        assert len(result) == 1
-        assert len(result[0]) == 1  # 1 instance
-        fields = {f["field"] for f in result[0][0]}
+        assert len(result) == 1  # 1 batch item
+        assert len(result[0]) == 1  # 1 group
+        assert len(result[0][0]) == 1  # 1 instance
+        fields = {f["field"] for f in result[0][0][0]}
         assert fields == {"name", "location"}
 
     def test_span_level_masked(self, decoder):
@@ -150,7 +159,7 @@ class TestStructuringSpanLevel:
         mapping = _make_field_mapping(["f"])
         result = decoder.decode(out, classes_mapping=mapping)
         # Only 2 valid spans (0 and 2), but greedy search may reduce overlapping
-        instance_fields = result[0][0]
+        instance_fields = result[0][0][0]
         starts = {f["start"] for f in instance_fields}
         assert 1 not in starts
 

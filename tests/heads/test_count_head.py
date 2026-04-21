@@ -76,38 +76,32 @@ class TestCountHeadForward:
         config = make_config(count_config=asdict(CountHeadConfig(mode=mode, max_count=max_count)))
         return CountHead.from_config(config)
 
-    def test_inference_with_shared(self, shared):
-        head = self._make_head()
-        out = head(shared, {})
-        assert out.loss is None
-        assert out.logits is not None
-        assert out.logits.shape == (B, 1)
-
     def test_inference_with_flat_inputs(self, flat_inputs, shared):
         head = self._make_head()
         out = head(shared, {}, flat_inputs=flat_inputs)
+        assert out.loss is None
         assert out.logits is not None
         assert out.logits.shape[0] == flat_inputs.parent_embedding.shape[0]
 
-    def test_training_regression(self, shared):
+    def test_training_regression(self, shared, flat_inputs):
         head = self._make_head(mode="regression")
         targets = torch.tensor([3.0, 5.0])
-        out = head(shared, {}, count_targets=targets)
+        out = head(shared, {}, flat_inputs=flat_inputs, count_targets=targets)
         assert out.loss is not None
         assert out.loss.item() >= 0
 
-    def test_training_classification(self, shared):
+    def test_training_classification(self, shared, flat_inputs):
         head = self._make_head(mode="classification", max_count=10)
         targets = torch.tensor([2, 5])
-        out = head(shared, {}, count_targets=targets)
+        out = head(shared, {}, flat_inputs=flat_inputs, count_targets=targets)
         assert out.loss is not None
         assert out.loss.item() >= 0
 
-    def test_gradient_flows(self, shared):
+    def test_gradient_flows(self, shared, flat_inputs):
         head = self._make_head()
-        shared.prompts_embedding.requires_grad_(True)
+        flat_inputs.parent_embedding = flat_inputs.parent_embedding.detach().requires_grad_(True)
         targets = torch.tensor([1.0, 2.0])
-        out = head(shared, {}, count_targets=targets)
+        out = head(shared, {}, flat_inputs=flat_inputs, count_targets=targets)
         out.loss.backward()
-        assert shared.prompts_embedding.grad is not None
-        shared.prompts_embedding.requires_grad_(False)
+        assert flat_inputs.parent_embedding.grad is not None
+        flat_inputs.parent_embedding.requires_grad_(False)

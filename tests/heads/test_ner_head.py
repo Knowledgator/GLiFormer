@@ -23,14 +23,10 @@ class TestNERHeadConstruction:
         config.ner_config = None
         assert NERHead.from_config(config) is None
 
-    def test_from_config_gliner_scorer(self):
-        head = _make_head(scorer_type="gliner")
+    def test_from_config_default(self):
+        head = _make_head()
         assert head is not None
-        assert head.scorer_type == "gliner"
-
-    def test_from_config_anchored_scorer(self):
-        head = _make_head(scorer_type="anchored")
-        assert head.scorer_type == "anchored"
+        assert head.name == "ner"
         assert hasattr(head, "anchor_layer")
         assert hasattr(head, "anchor_modeling")
 
@@ -39,76 +35,50 @@ class TestNERHeadConstruction:
         assert head.represent_spans is True
         assert hasattr(head, "span_rep_layer")
 
-    def test_from_config_anchored_with_refine(self):
-        head = _make_head(scorer_type="anchored", anchor_refine_layers=2)
+    def test_from_config_with_refine(self):
+        head = _make_head(anchor_refine_layers=2)
         assert hasattr(head, "anchor_refine")
 
 
-# ── Forward (gliner scorer) ─────────────────────────────────────────────
+# ── Forward ──────────────────────────────────────────────────────────────
 
-class TestNERHeadForwardGliner:
-    def test_inference_shared(self, shared):
-        head = _make_head(scorer_type="gliner")
-        out = head(shared, {})
+class TestNERHeadForward:
+    def test_inference(self, shared, flat_inputs):
+        head = _make_head()
+        out = head(shared, {}, flat_inputs=flat_inputs)
         assert out.logits is not None
-        # GLiNER scorer: (B, W, C, 3)
         assert out.logits.shape[0] == B
         assert out.logits.shape[-1] == 3  # start/end/inside
         assert out.loss is None
 
+    def test_output_shape_squeezed(self, shared, flat_inputs):
+        """Parent anchor mode (A=1) squeezes to (B, W, C, 3)."""
+        head = _make_head()
+        out = head(shared, {}, flat_inputs=flat_inputs)
+        assert out.logits.dim() == 4  # (B, W, C, 3), not (B, A, W, C, 3)
+
     def test_inference_flat_inputs(self, shared, flat_inputs):
-        head = _make_head(scorer_type="gliner")
+        head = _make_head()
         out = head(shared, {}, flat_inputs=flat_inputs)
         assert out.logits is not None
         BN = flat_inputs.words_embedding.shape[0]
         assert out.logits.shape[0] == BN
 
-    def test_training_with_labels(self, shared):
-        head = _make_head(scorer_type="gliner")
-        # Labels: (B, W, C, 3)
+    def test_training_with_labels(self, shared, flat_inputs):
+        head = _make_head()
         ner_labels = torch.zeros(B, W, C, 3)
         ner_labels[0, 0, 0, 0] = 1.0  # start signal
 
         from gliner.modeling.loss_functions import focal_loss_with_logits
-        out = head(shared, {}, ner_labels=ner_labels, base_loss_fn=focal_loss_with_logits)
+        out = head(shared, {}, flat_inputs=flat_inputs, ner_labels=ner_labels, base_loss_fn=focal_loss_with_logits)
         assert out.loss is not None
         assert out.loss.item() >= 0
 
-    def test_output_extra_contains_embeddings(self, shared):
-        head = _make_head(scorer_type="gliner")
-        out = head(shared, {})
+    def test_output_extra_contains_embeddings(self, shared, flat_inputs):
+        head = _make_head()
+        out = head(shared, {}, flat_inputs=flat_inputs)
         assert "words_embedding" in out.extra
         assert "mask" in out.extra
-
-
-# ── Forward (anchored scorer) ───────────────────────────────────────────
-
-class TestNERHeadForwardAnchored:
-    def test_inference_shared(self, shared):
-        head = _make_head(scorer_type="anchored")
-        out = head(shared, {})
-        assert out.logits is not None
-        assert out.logits.shape[0] == B
-        assert out.logits.shape[-1] == 3
-
-    def test_inference_flat_inputs(self, shared, flat_inputs):
-        head = _make_head(scorer_type="anchored")
-        out = head(shared, {}, flat_inputs=flat_inputs)
-        assert out.logits is not None
-
-    def test_training_with_labels_gliner_only(self, shared, flat_inputs):
-        """Anchored scorer training uses the same _ner_loss as gliner — tested via gliner scorer.
-
-        The anchored scorer produces (BN, A, W, C, 3) logits with an extra anchor
-        dimension that _ner_loss's mask broadcasting doesn't handle. In production,
-        the model orchestrator reshapes before calling _ner_loss. Inference is fully
-        tested above.
-        """
-        # Verify inference still works with anchored scorer
-        head = _make_head(scorer_type="anchored")
-        out = head(shared, {}, flat_inputs=flat_inputs)
-        assert out.logits is not None
-        assert out.logits.shape[-1] == 3
 
 
 # ── _fit_length ──────────────────────────────────────────────────────────
@@ -143,12 +113,12 @@ class TestFitLength:
 # ── Gradient flow ────────────────────────────────────────────────────────
 
 class TestNERGradient:
-    def test_gradient_flows_gliner(self, shared):
-        head = _make_head(scorer_type="gliner")
-        shared.words_embedding.requires_grad_(True)
+    def test_gradient_flows(self, shared, flat_inputs):
+        head = _make_head()
+        flat_inputs.words_embedding.requires_grad_(True)
         ner_labels = torch.zeros(B, W, C, 3)
         from gliner.modeling.loss_functions import focal_loss_with_logits
-        out = head(shared, {}, ner_labels=ner_labels, base_loss_fn=focal_loss_with_logits)
+        out = head(shared, {}, flat_inputs=flat_inputs, ner_labels=ner_labels, base_loss_fn=focal_loss_with_logits)
         out.loss.backward()
-        assert shared.words_embedding.grad is not None
-        shared.words_embedding.requires_grad_(False)
+        assert flat_inputs.words_embedding.grad is not None
+        flat_inputs.words_embedding.requires_grad_(False)

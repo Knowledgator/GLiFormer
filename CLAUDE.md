@@ -89,7 +89,7 @@ TaskProcessor (ABC)                    TaskDecoder (ABC)
 | **NER** | `tasks/ner/` | Named entity recognition via span scoring |
 | **Joint Relex** | `tasks/joint_relex/` | Joint NER + relation extraction; inherits NERHead, adjacency-based entity pair scoring (GLiNER-relex style) |
 | **Open Relex** | `tasks/open_relex/` | Anchor-based relation extraction; dual AnchoredSpanScorers, no NER dependency (GLiNER2-style) |
-| **Classification** | `tasks/classification/` | Text classification with configurable scorers (GLiClass-style) |
+| **Classification** | `tasks/classification/` | Text classification via anchor paradigm + pooling (GLiClass-style) |
 | **Embedding** | `tasks/embedding/` | Text pair similarity with configurable pooling and loss |
 | **Structuring** | `tasks/structuring/` | Group entities into clusters for JSON schema extraction (GLiNER2-style) |
 | **Count** | `tasks/count/` | Predict instance counts per parent group |
@@ -132,7 +132,7 @@ glinext/
     │   ├── processor.py   — NERProcessor (inherits SpanProcessor)
     │   └── decoder.py     — NERDecoder (inherits SpanDecoder)
     ├── classification/
-    │   ├── model.py       — ClassificationHead, ClassificationScorer
+    │   ├── model.py       — ClassificationHead (anchor paradigm + Pooling)
     │   ├── processor.py   — ClassificationProcessor
     │   └── decoder.py     — ClassificationDecoder
     ├── joint_relex/
@@ -202,10 +202,28 @@ Configured per-task via: `represent_spans: bool`, `neg_spans_ratio: float`, `spa
 
 ## Configuration
 
-Config dataclasses expose per-task settings:
-- `scorer_type` — e.g. NER supports `"gliner"` (default) or `"anchored"` (AnchoredSpanScorer)
-- `anchor_mode` — anchor acquisition strategy
-- `anchor_modeling` — post-anchor fusion strategy
+All anchor-based head configs inherit from `BaseHeadConfig`:
+```python
+@dataclass
+class BaseHeadConfig:
+    loss_coef: float = 1.0
+    anchor_mode: str = "parent"
+    anchor_modeling: str = "linear"
+    anchor_refine_layers: int = 0
+    anchor_refine_heads: int = 8
+    represent_spans: bool = False
+    neg_spans_ratio: float = 1.0
+    span_loss_coef: float = 1.0
+    parent_token_index: int = -1
+    embed_parent_token: bool = True
+```
+
+Inheriting configs: `NERHeadConfig`, `ClassificationHeadConfig`, `JointRelexHeadConfig`, `OpenRelexHeadConfig`, `StructuringHeadConfig`.
+Non-inheriting: `CountHeadConfig`, `EmbeddingHeadConfig` (no anchor pipeline).
+
+Key per-task settings:
+- `anchor_mode` — anchor acquisition strategy (default: "parent" for NER/Classification/JointRelex)
+- `anchor_modeling` — post-anchor fusion strategy (default: "linear")
 - `pooling_type` — text/label pooling (Classification, Embedding)
 - `similarity_fn`, `loss_fn` — Embedding task-specific
 
@@ -213,13 +231,27 @@ Set a task sub-config to `None` to disable it entirely.
 
 ### Shared layers across tasks
 
-`GLiNextConfig` supports sharing anchor modeling and cross-attention layers across all tasks that use them (NER with `scorer_type="anchored"`, Open Relex, Structuring, Joint Relex):
+`GLiNextConfig` supports sharing anchor modeling and cross-attention layers across all heads that use the anchor paradigm (NER, Classification, Open Relex, Structuring, Joint Relex):
 
 - `shared_anchor_modeling: Optional[str]` — `"linear"`, `"lstm"`, or `"mlp"`. When set, a single `AnchorModeling` instance is created in `GLiNExTModel` and shared across all applicable task heads. Per-task `anchor_modeling` settings are ignored when this is set.
 - `shared_anchor_refine_layers: int` — number of shared `AnchorCrossAttentionLayer` layers (0 = disabled). When > 0, a single cross-attention refinement layer is shared across all applicable heads. Per-task `anchor_refine_layers` settings are ignored.
 - `shared_anchor_refine_heads: int` — number of attention heads for the shared cross-attention layer (default: 8).
 
 When shared layers are not configured (`None` / `0`), each task head creates its own layers as before.
+
+### Parent embedding modes
+
+`GLiNextConfig.per_task_parents: Optional[bool]` controls how parent token embeddings are shared across tasks:
+
+| Value | Behavior |
+|-------|----------|
+| `False` | All tasks share a single `[PARENT]` token. Parent offset within the shared tensor is computed via `_parent_offset_for_item()` using `_PROMPT_TASK_ORDER`. |
+| `True` | Each task gets a distinct parent token (`[ENT_P]`, `[CAT_P]`, `[REL_P]`, `[STRUCT_P]` by default). Parent positions are task-local — no offset computation needed. |
+| `None` (default) | Auto-detect from whether the resolved per-task parent tokens are distinct. Ensures backward compatibility with saved configs that predate this parameter. |
+
+Per-task tokens can be overridden individually via `ner_parent_token`, `cat_parent_token`, `open_rel_parent_token`, `struct_parent_token`.
+
+The resolved boolean is exposed as `config.uses_per_task_parents` (read-only property).
 
 ## Data Format
 
@@ -430,7 +462,7 @@ Typed structuring fields are automatically converted via `StructuringOutputForma
 
 1. **Modular heads** — each task is independent and optional; toggle via config (set to `None` to disable)
 2. **Shared encoder** — single transformer backbone serving all tasks
-3. **Unified anchor paradigm** — anchor + child → spans across NER, relations, and structuring
+3. **Unified anchor paradigm** — anchor + child → spans across all extraction tasks (NER, Classification, relations, structuring)
 4. **Dependency ordering** — heads execute in declared order; Joint Relex has built-in NER via inheritance
 5. **Task-specific label encoding** — optional BiEncoder for label embeddings per task
 6. **Processor delegation** — main processor delegates prompt/label work to per-task processors

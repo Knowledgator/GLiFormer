@@ -86,7 +86,7 @@ class TestDecodeBioSpans:
         return logits
 
     def test_single_span(self, decoder):
-        id_to_classes = {1: "person", 2: "location"}
+        id_to_classes = {0: "person", 1: "location"}
         logits = self._make_logits(6, 2, [(0, 0, 0)])  # class 0 → id 1 → "person"
         spans = decoder.decode_bio_spans(logits, id_to_classes, threshold=0.5)
         assert len(spans) == 1
@@ -95,7 +95,7 @@ class TestDecodeBioSpans:
         assert spans[0].end == 0
 
     def test_two_spans_different_classes(self, decoder):
-        id_to_classes = {1: "person", 2: "location"}
+        id_to_classes = {0: "person", 1: "location"}
         logits = self._make_logits(6, 2, [(0, 0, 0), (3, 4, 1)])
         spans = decoder.decode_bio_spans(logits, id_to_classes, threshold=0.5)
         assert len(spans) == 2
@@ -104,11 +104,11 @@ class TestDecodeBioSpans:
 
     def test_no_spans_below_threshold(self, decoder):
         logits = torch.full((5, 2, 3), -10.0)
-        spans = decoder.decode_bio_spans(logits, {1: "A"}, threshold=0.5)
+        spans = decoder.decode_bio_spans(logits, {0: "A"}, threshold=0.5)
         assert spans == []
 
     def test_multi_token_span(self, decoder):
-        id_to_classes = {1: "location"}
+        id_to_classes = {0: "location"}
         logits = self._make_logits(6, 1, [(2, 4, 0)])
         spans = decoder.decode_bio_spans(logits, id_to_classes, threshold=0.5)
         assert len(spans) == 1
@@ -121,7 +121,7 @@ class TestDecodeBioSpans:
 class TestDecodeBioSpansBatch:
     def test_batch(self, decoder):
         L, C = 5, 2
-        id_to_classes = {1: "A", 2: "B"}
+        id_to_classes = {0: "A", 1: "B"}
         logits = torch.full((3, L, C, 3), -10.0)
         # sample 0: span at (0,0) class 0
         logits[0, 0, 0, 0] = 5.0
@@ -147,7 +147,7 @@ class TestDecodeBioSpansBatch:
         logits = torch.full((2, L, C, 3), -10.0)
         logits[0, 0, 0, :] = 5.0
         logits[1, 1, 0, :] = 5.0
-        per_sample = [{1: "X"}, {1: "Y"}]
+        per_sample = [{0: "X"}, {0: "Y"}]
         result = decoder.decode_bio_spans_batch(logits, per_sample, 2, threshold=0.5)
         assert result[0][0].entity_type == "X"
         assert result[1][0].entity_type == "Y"
@@ -164,7 +164,7 @@ class TestDecodeSpanLevel:
         span_idx = torch.tensor([[[0, 1], [2, 3], [4, 5]]])
         span_mask = torch.ones(B, S, dtype=torch.bool)
 
-        id_to_classes = {1: "person", 2: "location"}
+        id_to_classes = {0: "person", 1: "location"}
         result = decoder.decode_span_level(
             span_logits, span_idx, span_mask, id_to_classes, threshold=0.5,
         )
@@ -180,7 +180,7 @@ class TestDecodeSpanLevel:
         span_mask = torch.tensor([[True, False, True]])
 
         result = decoder.decode_span_level(
-            span_logits, span_idx, span_mask, {1: "A"}, threshold=0.5,
+            span_logits, span_idx, span_mask, {0: "A"}, threshold=0.5,
         )
         assert len(result[0]) == 2
 
@@ -191,7 +191,7 @@ class TestDecodeSpanLevel:
         span_mask = torch.ones(B, S, dtype=torch.bool)
 
         result = decoder.decode_span_level(
-            span_logits, span_idx, span_mask, {1: "A"}, threshold=0.5,
+            span_logits, span_idx, span_mask, {0: "A"}, threshold=0.5,
         )
         assert result[0] == []
 

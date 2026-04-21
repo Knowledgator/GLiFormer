@@ -43,24 +43,24 @@ class TestJointRelexHeadConstruction:
 # ── Forward ──────────────────────────────────────────────────────────────
 
 class TestJointRelexHeadForward:
-    def test_inference(self, shared):
+    def test_inference(self, shared, flat_inputs):
         head = _make_head()
-        out = head(shared, {})
+        out = head(shared, {}, flat_inputs=flat_inputs)
         assert out.logits is not None  # NER logits
         assert "rel_logits" in out.extra
         assert "rel_idx" in out.extra
         assert "rel_mask" in out.extra
 
-    def test_inference_with_rel_embeds(self, shared):
+    def test_inference_with_rel_embeds(self, shared, flat_inputs):
         head = _make_head()
         R = 2  # number of relation types
         rel_label_embeds = torch.randn(B, R, D)
-        out = head(shared, {}, rel_label_embeds=rel_label_embeds)
+        out = head(shared, {}, flat_inputs=flat_inputs, rel_label_embeds=rel_label_embeds)
         assert out.logits is not None
         if out.extra["rel_logits"] is not None:
             assert out.extra["rel_logits"].shape[-1] == R
 
-    def test_combined_loss(self, shared):
+    def test_combined_loss(self, shared, flat_inputs):
         head = _make_head()
         ner_labels = torch.zeros(B, W, C, 3)
         # Rel labels: (B, E, E, C_rel)
@@ -72,6 +72,7 @@ class TestJointRelexHeadForward:
         from gliner.modeling.loss_functions import focal_loss_with_logits
         out = head(
             shared, {},
+            flat_inputs=flat_inputs,
             ner_labels=ner_labels,
             rel_labels=rel_labels,
             rel_label_embeds=rel_label_embeds,

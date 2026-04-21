@@ -23,6 +23,14 @@ class FakeModelOutput:
     open_rel_span_mask: Optional[torch.Tensor] = None
     batch_size: Optional[int] = None
 
+    def __post_init__(self):
+        if self.open_rel_batch_origin is None and self.batch_size is None:
+            logits = self.open_rel_logits if self.open_rel_logits is not None else self.open_rel_span_logits
+            if logits is not None:
+                BN = logits.shape[0]
+                self.open_rel_batch_origin = torch.arange(BN)
+                self.batch_size = BN
+
 
 @pytest.fixture
 def decoder():
@@ -60,9 +68,10 @@ class TestOpenRelexTokenLevel:
         out = FakeModelOutput(open_rel_logits=logits)
         mapping = _make_mapping(["lives_in"])
         result = decoder.decode(out, classes_mapping=mapping, texts=[["John", "lives", "in", "New", "York"]])
-        assert len(result) == 1
-        assert len(result[0]) >= 1
-        triple = result[0][0]
+        assert len(result) == 1  # 1 batch item
+        assert len(result[0]) == 1  # 1 group
+        assert len(result[0][0]) >= 1
+        triple = result[0][0][0]
         assert triple["relation"] == "lives_in"
         assert triple["head"]["start"] == 0
         assert triple["tail"]["start"] == 3
@@ -73,18 +82,18 @@ class TestOpenRelexTokenLevel:
         out = FakeModelOutput(open_rel_logits=logits, open_rel_anchor_mask=anchor_mask)
         result = decoder.decode(out)
         # Only triples from anchor 0 should appear
-        for triple in result[0]:
+        for triple in result[0][0]:
             # All triples should come from the unmasked anchor
             pass
         # With anchor_mask[1]=False, triples from anchor 1 are excluded
         result_no_mask = decoder.decode(FakeModelOutput(open_rel_logits=logits))
-        assert len(result[0]) <= len(result_no_mask[0])
+        assert len(result[0][0]) <= len(result_no_mask[0][0])
 
     def test_no_spans_found(self, decoder):
         logits = torch.full((1, 1, 1, 5, 2, 3), -10.0)
         out = FakeModelOutput(open_rel_logits=logits)
         result = decoder.decode(out)
-        assert result[0] == []
+        assert result[0][0] == []
 
 
 class TestOpenRelexSpanLevel:
@@ -105,10 +114,11 @@ class TestOpenRelexSpanLevel:
         )
         mapping = _make_mapping(["rel_a"])
         result = decoder.decode(out, classes_mapping=mapping)
-        assert len(result) == 1
-        assert len(result[0]) == 1
-        assert result[0][0]["head"]["start"] == 0
-        assert result[0][0]["tail"]["start"] == 3
+        assert len(result) == 1  # 1 batch item
+        assert len(result[0]) == 1  # 1 group
+        assert len(result[0][0]) == 1  # 1 triple
+        assert result[0][0][0]["head"]["start"] == 0
+        assert result[0][0][0]["tail"]["start"] == 3
 
     def test_span_level_masked_spans(self, decoder):
         BN, S, X, C = 1, 3, 1, 1
@@ -123,7 +133,7 @@ class TestOpenRelexSpanLevel:
         )
         result = decoder.decode(out)
         # span 1 is masked out, so triples should only use spans 0 and 2
-        for triple in result[0]:
+        for triple in result[0][0]:
             assert triple["head"]["start"] != 1
             assert triple["tail"]["start"] != 1
 

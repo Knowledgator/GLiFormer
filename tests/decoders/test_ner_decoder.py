@@ -20,6 +20,15 @@ class FakeModelOutput:
     ner_batch_origin: Optional[torch.Tensor] = None
     batch_size: Optional[int] = None
 
+    def __post_init__(self):
+        # Auto-fill batch_origin/batch_size for BN=B (1:1) when not provided
+        if self.ner_batch_origin is None and self.batch_size is None:
+            logits = self.ner_logits if self.ner_logits is not None else self.span_logits
+            if logits is not None:
+                BN = logits.shape[0]
+                self.ner_batch_origin = torch.arange(BN)
+                self.batch_size = BN
+
 
 @pytest.fixture
 def decoder():
@@ -49,27 +58,30 @@ class TestNERDecoderTokenLevel:
     def test_single_entity(self, decoder):
         logits = _bio_logits(1, 5, 2, [(0, 0, 0, 0)])
         out = FakeModelOutput(ner_logits=logits)
-        id_to_classes = {1: "person", 2: "location"}
+        id_to_classes = {0: "person", 1: "location"}
         result = decoder.decode(out, classes_mapping=id_to_classes)
+        # result[batch_item][group][span]
         assert len(result) == 1
-        assert len(result[0]) == 1
-        assert result[0][0].entity_type == "person"
+        assert len(result[0]) == 1  # 1 group
+        assert len(result[0][0]) == 1  # 1 span in group
+        assert result[0][0][0].entity_type == "person"
 
     def test_multiple_entities(self, decoder):
         logits = _bio_logits(1, 6, 2, [(0, 0, 0, 0), (0, 3, 4, 1)])
         out = FakeModelOutput(ner_logits=logits)
-        id_to_classes = {1: "person", 2: "location"}
+        id_to_classes = {0: "person", 1: "location"}
         result = decoder.decode(out, classes_mapping=id_to_classes)
-        assert len(result[0]) == 2
+        assert len(result[0][0]) == 2  # 2 spans in group 0
 
     def test_batch_multiple_groups(self, decoder):
         logits = _bio_logits(2, 5, 1, [(0, 0, 0, 0), (1, 2, 3, 0)])
         out = FakeModelOutput(ner_logits=logits)
-        id_to_classes = {1: "entity"}
+        id_to_classes = {0: "entity"}
         result = decoder.decode(out, classes_mapping=id_to_classes)
+        # BN=B=2, 1:1 mapping: 2 batch items, 1 group each
         assert len(result) == 2
-        assert len(result[0]) == 1
-        assert len(result[1]) == 1
+        assert len(result[0]) == 1  # 1 group for batch item 0
+        assert len(result[1]) == 1  # 1 group for batch item 1
 
     def test_with_batch_origin(self, decoder):
         logits = _bio_logits(3, 5, 1, [(0, 0, 0, 0), (1, 1, 1, 0), (2, 2, 2, 0)])
@@ -79,7 +91,7 @@ class TestNERDecoderTokenLevel:
             ner_batch_origin=batch_origin,
             batch_size=2,
         )
-        result = decoder.decode(out, classes_mapping={1: "A"})
+        result = decoder.decode(out, classes_mapping={0: "A"})
         # 2 batch items: batch 0 has groups 0,1; batch 1 has group 2
         assert len(result) == 2
         assert len(result[0]) == 2  # two groups for batch item 0
@@ -90,8 +102,8 @@ class TestNERDecoderTokenLevel:
         logits[0, 0, 0, :] = 0.5  # sigmoid≈0.62
         out = FakeModelOutput(ner_logits=logits)
         # High threshold should filter
-        result = decoder.decode(out, classes_mapping={1: "A"}, threshold=0.99)
-        assert len(result[0]) == 0
+        result = decoder.decode(out, classes_mapping={0: "A"}, threshold=0.99)
+        assert len(result[0][0]) == 0
 
 
 class TestNERDecoderSpanLevel:
@@ -111,10 +123,11 @@ class TestNERDecoderSpanLevel:
             span_idx=span_idx,
             span_mask=span_mask,
         )
-        result = decoder.decode(out, classes_mapping={1: "person"})
-        assert len(result) == 1
-        assert len(result[0]) == 1
-        assert result[0][0].entity_type == "person"
+        result = decoder.decode(out, classes_mapping={0: "person"})
+        assert len(result) == 1  # 1 batch item
+        assert len(result[0]) == 1  # 1 group
+        assert len(result[0][0]) == 1  # 1 span
+        assert result[0][0][0].entity_type == "person"
 
     def test_span_level_with_batch_origin(self, decoder):
         B, S, C = 2, 2, 1
@@ -131,6 +144,6 @@ class TestNERDecoderSpanLevel:
             ner_batch_origin=torch.tensor([0, 0]),
             batch_size=1,
         )
-        result = decoder.decode(out, classes_mapping={1: "A"})
+        result = decoder.decode(out, classes_mapping={0: "A"})
         assert len(result) == 1  # 1 batch item
         assert len(result[0]) == 2  # 2 groups
