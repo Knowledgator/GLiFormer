@@ -1,0 +1,77 @@
+model:
+  model_name: microsoft/deberta-v3-small
+  name: "glinext"
+  max_width: 12
+  hidden_size: 768
+  dropout: 0.3
+  fine_tune: true
+  subtoken_pooling: first
+  span_mode: markerV0
+  max_types: 100
+  max_len: 512
+  max_neg_type_ratio: 1
+
+  ner_config: null
+  joint_relex_config: null
+  structuring_config: null
+  count_config: null
+  embedding_config: null
+
+  classification_config:
+    # Scorer type: "dot", "weighted-dot", "mlp"
+    layer_type: "dot"
+    # Text pooling strategy: "mean", "cls", "max"
+    pooling_type: "mean"
+    loss_coef: 1.0
+
+  open_relex_config:
+    # Anchor acquisition strategy:
+    #   "fixed"             — learnable embedding table with num_fixed_slots anchor slots
+    #   "rotary" / "lstm"   — rotary position-conditioned anchors via RotaryGroupLSTM
+    #   "query_lstm"        — similarity-based token selection + GRU (uses word embeddings)
+    #   "query_transformer" — similarity-based token selection + Transformer (uses word embeddings)
+    anchor_mode: "fixed"
+    # Anchor-child fusion strategy:
+    #   "linear" — linear projection of concatenated anchor + child (default)
+    #   "lstm"   — GRU-based recurrent processing (GLiNER2-style)
+    #   "mlp"    — multi-layer perceptron fusion
+    anchor_modeling: "linear"
+    # Number of learnable anchor slots (only used when anchor_mode="fixed")
+    num_fixed_slots: 10
+    # Maximum anchor count (used by rotary/query anchor modes)
+    max_count: 20
+    anchor_num_heads: 4
+    anchor_num_layers: 2
+    loss_coef: 1.0
+    # Whether to learn span-level representations (adds span-level scoring path alongside token-level BIO)
+    represent_spans: false
+    # Negative span sampling ratio (only used when represent_spans=true)
+    # neg_spans_ratio: 1.0
+    # Loss coefficient for span representation loss (only used when represent_spans=true)
+    # span_loss_coef: 1.0
+    # Number of cross-attention layers for anchor refinement (0 = disabled)
+    # anchor_refine_layers: 0
+    # Number of attention heads for anchor refinement
+    # anchor_refine_heads: 8
+
+data:
+  root_dir: logs/classification_open_relex
+  train_data: "data/classification_open_relex_train.json"
+  val_data: "none"
+
+training:
+  num_steps: 20000
+  train_batch_size: 4
+  eval_every: 1000
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"
+  focal_loss_alpha: 0.75
+  focal_loss_gamma: 0
+  loss_reduction: "sum"
+  lr_encoder: 1e-5
+  lr_others: 3e-5
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+  save_total_limit: 3
+  bf16: true

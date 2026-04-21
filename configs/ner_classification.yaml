@@ -1,0 +1,50 @@
+model:
+  model_name: microsoft/deberta-v3-small
+  name: "glinext"
+  max_width: 12
+  hidden_size: 768
+  dropout: 0.3
+  fine_tune: true
+  subtoken_pooling: first
+  span_mode: markerV0
+  max_types: 100
+  max_len: 512
+  max_neg_type_ratio: 1
+
+  ner_config:
+    scorer_type: "gliner"
+    loss_coef: 1.0
+    represent_spans: false
+
+  classification_config:
+    layer_type: "dot"
+    pooling_type: "mean"
+    loss_coef: 1.0
+
+  joint_relex_config: null
+  open_relex_config: null
+  structuring_config: null
+  count_config: null
+  embedding_config: null
+
+data:
+  root_dir: logs/ner_classification
+  train_data: "data/ner_cat_train.json"
+  val_data: "none"
+
+training:
+  num_steps: 20000
+  train_batch_size: 8
+  eval_every: 1000
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"
+  focal_loss_alpha: 0.75
+  focal_loss_gamma: 0
+  loss_reduction: "sum"
+  lr_encoder: 1e-5
+  lr_others: 3e-5
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+  save_total_limit: 3
+  bf16: true
