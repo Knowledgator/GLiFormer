@@ -18,6 +18,7 @@ class NERProcessor(SpanProcessor):
         super().__init__(config, tokenizer, words_splitter,
                          parent_token=getattr(config, 'ner_parent_token', None), **kwargs)
         self.ent_token = config.ent_token
+        self.rel_token = getattr(config, 'rel_token', None)
 
     @staticmethod
     def _build_class_to_id(labels, negatives, sample_neg, shuffle_labels):
@@ -85,6 +86,10 @@ class NERProcessor(SpanProcessor):
                         prompt.append(f"{self.ent_token} {ent}")
                 else:
                     prompt.append(f"{self.ent_token} ENTITY")
+                rel_map = ext_item.rel_class_to_id
+                if self.rel_token is not None and rel_map is not None and rel_map.class_to_id:
+                    for rel in rel_map.class_to_id:
+                        prompt.append(f"{self.rel_token} {rel}")
             prompt.append(self.sep_token)
         return prompt
 

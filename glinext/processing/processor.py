@@ -243,14 +243,16 @@ class GLiNextProcessor(BaseProcessor):
                 return result["ner_labels"], result["ner_batch_idx"]
         return None
 
-    def create_rel_labels(self, batch_list, classes_mapping):
-        return self.create_joint_rel_labels(batch_list, classes_mapping)
+    def create_rel_labels(self, batch_list, classes_mapping, max_seq_len=0):
+        return self.create_joint_rel_labels(batch_list, classes_mapping, max_seq_len=max_seq_len)
 
-    def create_joint_rel_labels(self, batch_list, classes_mapping):
+    def create_joint_rel_labels(self, batch_list, classes_mapping, max_seq_len=0):
         if "joint_relex" in self.task_processors:
-            result = self.task_processors["joint_relex"].create_labels(batch_list, classes_mapping)
+            result = self.task_processors["joint_relex"].create_labels(
+                batch_list, classes_mapping, max_seq_len=max_seq_len,
+            )
             if result is not None:
-                return result["rel_labels"], result["rel_mask"], result["rel_batch_idx"]
+                return result
         return None
 
     def create_open_rel_labels(self, batch_list, classes_mapping, max_seq_len):
@@ -591,10 +593,13 @@ class GLiNextProcessor(BaseProcessor):
             if ner_result is not None:
                 tokenized_input['ner_labels'], tokenized_input['ner_batch_idx'] = ner_result
 
-            rel_result = self.create_joint_rel_labels(batch_list, classes_mapping)
+            rel_result = self.create_joint_rel_labels(batch_list, classes_mapping, max_seq_len=max_seq_len)
             if rel_result is not None:
-                tokenized_input['rel_labels'], tokenized_input['rel_mask'] = rel_result[0], rel_result[1]
-                tokenized_input['rel_batch_idx'] = rel_result[2]
+                tokenized_input['rel_labels'] = rel_result['rel_labels']
+                tokenized_input['rel_mask'] = rel_result['rel_mask']
+                tokenized_input['rel_batch_idx'] = rel_result['rel_batch_idx']
+                tokenized_input['rel_span_idx'] = rel_result['rel_span_idx']
+                tokenized_input['rel_span_mask'] = rel_result['rel_span_mask']
 
             open_rel_result = self.create_open_rel_labels(batch_list, classes_mapping, max_seq_len)
             if open_rel_result is not None:

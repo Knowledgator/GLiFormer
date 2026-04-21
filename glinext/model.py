@@ -290,6 +290,78 @@ class GLiNExTModel(BaseModel):
         }
         return iters[task_name]
 
+    def _build_flat_rel_prompts(
+        self,
+        rel_prompts_batch: torch.Tensor,
+        rel_prompts_batch_mask: torch.Tensor,
+        classes_mapping,
+        embed_dim: int,
+        device,
+        dtype,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Split batch-level [REL] prompts into per-extraction-group tensors.
+
+        The prompt for each batch item concatenates [REL] tokens across its
+        extraction groups in group order, so we slice by per-group rel-class
+        counts to recover (BN, max_C_rel, D) aligned with the joint_relex
+        flat_inputs batch axis.
+        """
+        slices: List[Tuple[int, int, int]] = []
+        item_rel_offset: dict = {}
+        for _, batch_idx, group_idx, ext_mapping in classes_mapping.flat_extraction_iter():
+            rel_map = ext_mapping.rel_class_to_id
+            n_rel = len(rel_map.class_to_id) if rel_map is not None else 0
+            start = item_rel_offset.get(batch_idx, 0)
+            slices.append((batch_idx, start, start + n_rel))
+            item_rel_offset[batch_idx] = start + n_rel
+
+        BN = len(slices)
+        if BN == 0:
+            return None, None
+
+        max_C = max((ce - cs for _, cs, ce in slices), default=0)
+        flat = torch.zeros(BN, max_C, embed_dim, device=device, dtype=dtype)
+        flat_mask = torch.zeros(BN, max_C, device=device, dtype=rel_prompts_batch_mask.dtype)
+        for idx, (bi, cs, ce) in enumerate(slices):
+            n = ce - cs
+            if n > 0 and ce <= rel_prompts_batch.shape[1]:
+                flat[idx, :n] = rel_prompts_batch[bi, cs:ce]
+                flat_mask[idx, :n] = rel_prompts_batch_mask[bi, cs:ce]
+        return flat, flat_mask
+
+    def _build_flat_rel_prompts_from_label_embeds(
+        self,
+        rel_label_embeds: torch.Tensor,
+        label_group_sizes: Optional[torch.Tensor],
+        classes_mapping,
+        embed_dim: int,
+        device,
+        dtype,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Split labels-encoder rel embeds into per-group tensors via label_group_sizes."""
+        if label_group_sizes is None:
+            return None, None
+        BN = int(label_group_sizes.shape[0])
+        if BN == 0:
+            return None, None
+
+        batch_origins: List[int] = []
+        for _, batch_idx, _, _ in classes_mapping.flat_extraction_iter():
+            batch_origins.append(batch_idx)
+
+        cumsum = torch.cumsum(label_group_sizes, 0)
+        max_C = int(label_group_sizes.max().item()) if BN > 0 else 0
+        flat = torch.zeros(BN, max_C, embed_dim, device=device, dtype=dtype)
+        flat_mask = torch.zeros(BN, max_C, device=device, dtype=torch.long)
+        for g in range(BN):
+            c_start = 0 if g == 0 else int(cumsum[g - 1].item())
+            c_end = int(cumsum[g].item())
+            n = c_end - c_start
+            if n > 0 and c_end <= rel_label_embeds.shape[1]:
+                flat[g, :n] = rel_label_embeds[batch_origins[g], c_start:c_end]
+                flat_mask[g, :n] = 1
+        return flat, flat_mask
+
     def _build_flat_inputs(
         self,
         parent_embeds: torch.Tensor,
@@ -462,6 +534,8 @@ class GLiNExTModel(BaseModel):
         cat_labels: Optional[torch.Tensor] = None,
         # Joint Relex
         rel_labels: Optional[torch.Tensor] = None,
+        rel_span_idx: Optional[torch.Tensor] = None,
+        rel_span_mask: Optional[torch.Tensor] = None,
         # Open Relex
         open_rel_labels: Optional[torch.Tensor] = None,
         open_rel_count: Optional[torch.Tensor] = None,
@@ -582,6 +656,24 @@ class GLiNExTModel(BaseModel):
             cat_child_embeds = cat_label_embeds
             cat_child_mask = torch.ones(
                 cat_label_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device,
+            )
+
+        # Joint relex: per-group rel prompts (split per extraction group)
+        joint_rel_flat_prompts, joint_rel_flat_mask = None, None
+        if "joint_relex" in self.heads and rel_label_embeds is None and classes_mapping is not None:
+            jr_cfg = self.config.joint_relex_config
+            rel_prompts_batch, rel_prompts_batch_mask = extract_prompt_features(
+                jr_cfg.rel_token_index, token_embeds, input_ids, attention_mask,
+                batch_size, embed_dim, jr_cfg.embed_rel_token,
+            )
+            joint_rel_flat_prompts, joint_rel_flat_mask = self._build_flat_rel_prompts(
+                rel_prompts_batch, rel_prompts_batch_mask, classes_mapping, embed_dim,
+                device=words_embedding.device, dtype=rel_prompts_batch.dtype,
+            )
+        elif "joint_relex" in self.heads and rel_label_embeds is not None and classes_mapping is not None:
+            joint_rel_flat_prompts, joint_rel_flat_mask = self._build_flat_rel_prompts_from_label_embeds(
+                rel_label_embeds, kwargs.get("rel_labels_group_size"), classes_mapping,
+                embed_dim, device=words_embedding.device, dtype=rel_label_embeds.dtype,
             )
 
         # Open relex children
@@ -724,6 +816,7 @@ class GLiNExTModel(BaseModel):
         batch_kwargs = dict(
             ner_labels=ner_labels, span_idx=span_idx, span_mask=span_mask,
             span_labels=span_labels, cat_labels=cat_labels, rel_labels=rel_labels,
+            rel_span_idx=rel_span_idx, rel_span_mask=rel_span_mask,
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
             count_targets=count_targets,
             count_val=count_val, structuring_labels=structuring_labels,
@@ -759,6 +852,9 @@ class GLiNExTModel(BaseModel):
             # Pass task-specific label embeds for heads that use them directly
             if name == "joint_relex" and rel_label_embeds is not None:
                 extra_kwargs["rel_label_embeds"] = rel_label_embeds
+            if name == "joint_relex":
+                extra_kwargs["flat_rel_prompts"] = joint_rel_flat_prompts
+                extra_kwargs["flat_rel_prompts_mask"] = joint_rel_flat_mask
 
             # Pass base_loss_fn for heads that need it
             if name in ("ner", "joint_relex", "open_relex", "structuring"):

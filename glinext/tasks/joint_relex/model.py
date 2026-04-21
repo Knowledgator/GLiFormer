@@ -14,7 +14,9 @@ from torch.nn import functional as F
 from gliner.modeling.loss_functions import focal_loss_with_logits
 from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from gliner.modeling.multitask.triples_layers import TriplesScoreLayer
-from gliner.modeling.utils import build_entity_pairs, extract_prompt_features
+from gliner.modeling.utils import (
+    build_entity_pairs, extract_prompt_features, extract_spans_from_tokens,
+)
 
 from .. import TaskHeadOutput, SharedRepresentations
 from ..ner.model import NERHead
@@ -59,64 +61,60 @@ class JointRelexHead(NERHead):
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
                    shared_layers=shared_layers)
 
-    def _select_entity_spans(self, scores, words_embedding, ner_labels=None,
-                              threshold=0.5, top_k=None):
-        """Select entity span representations from NER scores."""
-        B, W, _, _ = scores.shape
-        D = words_embedding.shape[-1]
-        token_confidence = torch.sigmoid(scores).max(dim=-1).values.max(dim=-1).values
+    @staticmethod
+    def _pool_entity_spans(words_embedding, span_idx, span_mask):
+        """Mean-pool token embeddings over each [start, end] span (end inclusive)."""
+        B, E, _ = span_idx.shape
+        W = words_embedding.shape[1]
+        device = words_embedding.device
 
-        if ner_labels is not None:
-            keep = (ner_labels.sum(dim=(-1, -2)) > 0) if ner_labels.dim() == 4 else (ner_labels.sum(dim=-1) > 0)
-        else:
-            keep = token_confidence > threshold
+        start = span_idx[..., 0].clamp(min=0, max=max(W - 1, 0)).unsqueeze(-1)
+        end = span_idx[..., 1].clamp(min=0, max=max(W - 1, 0)).unsqueeze(-1)
+        positions = torch.arange(W, device=device).view(1, 1, W)
+        span_pos_mask = (positions >= start) & (positions <= end)
+        span_pos_mask = span_pos_mask & span_mask.unsqueeze(-1).bool()
+        span_pos_mask_f = span_pos_mask.to(words_embedding.dtype)
 
-        if top_k is not None:
-            sel_scores = token_confidence.masked_fill(~keep, -1.0)
-            top_idx = sel_scores.topk(k=min(top_k, W), dim=1).indices
-            keep = torch.zeros_like(keep)
-            keep.scatter_(1, top_idx, True)
+        summed = torch.einsum("BEW,BWD->BED", span_pos_mask_f, words_embedding)
+        counts = span_pos_mask_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        pooled = summed / counts
+        pooled = pooled * span_mask.unsqueeze(-1).to(pooled.dtype)
+        return pooled, span_mask.to(torch.long)
 
-        rep_mask = keep.long()
-        lengths = rep_mask.sum(dim=-1)
-        max_len = max(lengths.max().item(), 1)
+    def _get_rel_prompts(self, shared, rel_label_embeds, flat_rel_prompts, flat_rel_prompts_mask):
+        """Return per-group (BN, C_rel, D) [REL] embeddings.
 
-        target_rep = words_embedding.new_zeros(B, max_len, D)
-        target_mask = rep_mask.new_zeros(B, max_len)
-
-        if rep_mask.any():
-            new_col_idx = (rep_mask.cumsum(dim=1) - 1)
-            batch_idx, old_col_idx = torch.where(rep_mask.bool())
-            new_col = new_col_idx[rep_mask.bool()]
-            target_rep[batch_idx, new_col] = words_embedding[batch_idx, old_col_idx]
-            target_mask[batch_idx, new_col] = 1
-
-        return target_rep, target_mask
-
-    def _get_rel_prompts(self, shared, rel_label_embeds):
-        """Extract [REL] type embeddings from prompt or labels encoder."""
+        Prefers processor/model-provided flat tensors (already split per
+        extraction group). Falls back to batch-level extraction when those
+        aren't available (e.g. unit tests calling the head directly).
+        """
+        if flat_rel_prompts is not None:
+            return flat_rel_prompts, flat_rel_prompts_mask
         if rel_label_embeds is not None:
             rel_prompts = rel_label_embeds
             rel_mask = torch.ones(
                 rel_label_embeds.shape[:-1], dtype=shared.attention_mask.dtype,
                 device=shared.attention_mask.device,
             )
-        else:
-            batch_size = shared.token_embeds.shape[0]
-            embed_dim = shared.token_embeds.shape[2]
-            rel_prompts, rel_mask = extract_prompt_features(
-                self.rel_token_index, shared.token_embeds, shared.input_ids,
-                shared.attention_mask, batch_size, embed_dim, self.embed_rel_token,
-            )
+            return rel_prompts, rel_mask
+        batch_size = shared.token_embeds.shape[0]
+        embed_dim = shared.token_embeds.shape[2]
+        rel_prompts, rel_mask = extract_prompt_features(
+            self.rel_token_index, shared.token_embeds, shared.input_ids,
+            shared.attention_mask, batch_size, embed_dim, self.embed_rel_token,
+        )
         return rel_prompts, rel_mask
 
     def _forward_adjacency(self, shared, target_span_rep, target_span_mask,
-                            rel_labels, adjacency_threshold, rel_label_embeds):
+                            rel_labels, adjacency_threshold, rel_label_embeds,
+                            flat_rel_prompts=None, flat_rel_prompts_mask=None):
         """Adjacency matrix + entity pair relation scoring."""
         B, E_ent, D = target_span_rep.shape
         pred_adj_matrix = self.relations_rep_layer(target_span_rep, target_span_mask)
 
-        rel_prompts, rel_prompts_mask = self._get_rel_prompts(shared, rel_label_embeds)
+        rel_prompts, rel_prompts_mask = self._get_rel_prompts(
+            shared, rel_label_embeds, flat_rel_prompts, flat_rel_prompts_mask,
+        )
         C_rel = rel_prompts.size(1)
 
         if rel_labels is not None:
@@ -174,25 +172,45 @@ class JointRelexHead(NERHead):
         )
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, base_loss_fn=None,
-                rel_label_embeds=None, **batch):
+                rel_label_embeds=None, flat_rel_prompts=None, flat_rel_prompts_mask=None,
+                **batch):
         # 1. Run NER forward (inherited) — passes flat_inputs through
         ner_output = super().forward(
             shared, dependency_outputs, flat_inputs=flat_inputs, base_loss_fn=base_loss_fn, **batch,
         )
 
-        # 2. Select entity spans from NER scores
+        # 2. Select entity spans.
+        #    Training: use processor-provided per-entity spans so target_span_rep
+        #    is aligned with rel_labels' entity_id axis.
+        #    Inference: fall back to NER-extracted spans.
         ner_scores = ner_output.logits
         words_embedding = ner_output.extra.get("words_embedding", shared.words_embedding)
-        target_span_rep, target_span_mask = self._select_entity_spans(
-            ner_scores, words_embedding, batch.get("ner_labels"),
-            threshold=batch.get("threshold", 0.5),
-        )
+
+        rel_span_idx = batch.get("rel_span_idx")
+        rel_span_mask = batch.get("rel_span_mask")
+
+        if rel_span_idx is not None and rel_span_mask is not None:
+            target_span_rep, target_span_mask = self._pool_entity_spans(
+                words_embedding, rel_span_idx, rel_span_mask,
+            )
+        else:
+            span_idx = ner_output.extra.get("span_idx")
+            span_mask = ner_output.extra.get("span_mask")
+            if span_idx is None or span_mask is None:
+                span_idx, span_mask = extract_spans_from_tokens(
+                    ner_scores, labels=None, threshold=batch.get("threshold", 0.5),
+                )
+            target_span_rep, target_span_mask = self._pool_entity_spans(
+                words_embedding, span_idx, span_mask,
+            )
 
         # 3. Build adjacency + score relation types
         rel_output = self._forward_adjacency(
             shared, target_span_rep, target_span_mask,
             batch.get("rel_labels"), batch.get("adjacency_threshold", 0.5),
             rel_label_embeds,
+            flat_rel_prompts=flat_rel_prompts,
+            flat_rel_prompts_mask=flat_rel_prompts_mask,
         )
 
         # 4. Combine losses

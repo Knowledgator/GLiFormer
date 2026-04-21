@@ -102,7 +102,12 @@ class NERHead(TaskHead):
 
         # Optional span representation
         span_logits_out = None
-        if self.represent_spans and hasattr(self, "span_rep_layer"):
+        scores_W = scores.shape[1] if scores.dim() >= 2 else 0
+        scores_C = scores.shape[2] if scores.dim() >= 3 else 0
+        if (
+            self.represent_spans and hasattr(self, "span_rep_layer")
+            and scores_W > 0 and scores_C > 0
+        ):
             if span_idx is None:
                 span_idx, span_mask = extract_spans_from_tokens(scores, ner_labels, threshold)
                 span_idx = span_idx * span_mask.unsqueeze(-1).long()
