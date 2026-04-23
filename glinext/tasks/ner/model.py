@@ -1,34 +1,24 @@
 """NER task head."""
 
 import torch
-from torch import nn
 
-from gliner.modeling.utils import extract_spans_from_tokens
-
-from .. import TaskHead, TaskHeadOutput
-from ...layers import AnchoredSpanScorer
+from .. import TaskHeadOutput
+from ..anchored_extraction import AnchoredSpanExtractionHead
 
 
-class NERHead(TaskHead):
+class NERHead(AnchoredSpanExtractionHead):
     """Token-level NER scorer (start/end/inside) with anchor paradigm.
 
-    Always uses AnchoredSpanScorer with configurable anchor layer.
-    Default: parent anchor mode (single anchor = context embedding).
+    Uses the shared :class:`AnchoredSpanExtractionHead` pipeline. NER operates
+    with a single parent anchor (A=1), so the anchor dim is squeezed on output
+    to keep the canonical NER shape ``(BN, W, C, 3)``.
     """
 
     name = "ner"
     dependencies = []
 
     def __init__(self, config, hidden_size, dropout, shared_layers=None):
-        super().__init__()
-        self.config = config
-        ner_cfg = config.ner_config
-        self.loss_coef = ner_cfg.loss_coef
-        if shared_layers is None:
-            shared_layers = {}
-
-        self._init_anchor_pipeline(ner_cfg, config, hidden_size, dropout, shared_layers)
-        self.scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
+        super().__init__(config.ner_config, config, hidden_size, dropout, shared_layers)
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
@@ -41,16 +31,9 @@ class NERHead(TaskHead):
             shared_layers=shared_layers,
         )
 
-    def _ner_loss(self, scores, labels, prompts_embedding_mask, word_mask, base_loss_fn):
-        all_losses = base_loss_fn(scores, labels)
-        mask = word_mask.unsqueeze(-1) * prompts_embedding_mask.unsqueeze(1)
-        if all_losses.dim() == 4:
-            mask = mask.unsqueeze(-1)
-        all_losses = all_losses * mask
-        return all_losses.sum()
-
-    def _fit_length(self, tensor, mask, target_length):
-        """Pad or trim tensor and mask to target_length along dim=1."""
+    @staticmethod
+    def _fit_length(tensor, mask, target_length):
+        """Pad or trim ``tensor`` and ``mask`` to ``target_length`` along dim=1."""
         current = tensor.shape[1]
         if current == target_length:
             return tensor, mask
@@ -64,76 +47,74 @@ class NERHead(TaskHead):
         return tensor, mask
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, base_loss_fn=None, **batch):
-        words_embedding = flat_inputs.words_embedding       # (BN, W, D)
-        mask = flat_inputs.mask                              # (BN, W)
-        prompts_embedding = flat_inputs.child_embedding      # (BN, max_C, D)
-        prompts_embedding_mask = flat_inputs.child_mask      # (BN, max_C)
-
         ner_labels = batch.get("ner_labels")
         span_idx = batch.get("span_idx")
         span_mask = batch.get("span_mask")
         span_labels = batch.get("span_labels")
         threshold = batch.get("threshold", 0.5)
 
+        # Align word/prompt tensors to label dims (padding covers truncated inputs).
         if ner_labels is not None:
             target_W = ner_labels.shape[1]
-            words_embedding, mask = self._fit_length(words_embedding, mask, target_W)
-            target_C = max(prompts_embedding.size(1), ner_labels.size(-2))
-            prompts_embedding, prompts_embedding_mask = self._fit_length(
-                prompts_embedding, prompts_embedding_mask, target_C,
+            flat_inputs.words_embedding, flat_inputs.mask = self._fit_length(
+                flat_inputs.words_embedding, flat_inputs.mask, target_W,
+            )
+            target_C = max(flat_inputs.child_embedding.size(1), ner_labels.size(-2))
+            flat_inputs.child_embedding, flat_inputs.child_mask = self._fit_length(
+                flat_inputs.child_embedding, flat_inputs.child_mask, target_C,
             )
 
-        # Anchor paradigm: anchor_layer → anchor_refine → anchor_modeling → scorer
-        context = flat_inputs.parent_embedding  # (BN, D)
-        anchor_rep, anchor_mask = self.anchor_layer(
-            context, words_embedding,
+        scores, _anchors, anchor_mask, _fused_flat, (B, A, C, L) = self._compute_bio_scores(
+            flat_inputs, batch,
         )
-        if hasattr(self, "anchor_refine"):
-            anchor_rep = self.anchor_refine(anchor_rep, words_embedding, token_mask=mask)
-        fused = self.anchor_modeling(anchor_rep, prompts_embedding)
-        B_a, A, C, D = fused.shape
-        L = words_embedding.shape[1]
-        fused_flat = fused.view(B_a, A * C, D)
-        scores_flat = self.scorer(fused_flat, words_embedding, word_mask=mask)
-        scores = scores_flat.view(B_a, A, C, L, 3).permute(0, 1, 3, 2, 4)
-        # Squeeze anchor dim for parent mode (A=1) to maintain (B, W, C, 3) shape
-        scores = scores.squeeze(1)
+        # Parent anchor → A=1. Squeeze to (BN, L, C, 3) for backward compat.
+        logits = scores.squeeze(1) if A == 1 else scores
 
-        # Optional span-level rescoring — used as an auxiliary training signal
-        # only. At inference the decoder relies on the BIO path so the user's
-        # threshold maps directly onto BIO probabilities.
+        words_embedding = flat_inputs.words_embedding
+        word_mask = flat_inputs.mask
+        child_mask = flat_inputs.child_mask
+
+        # Optional span-level rescoring — auxiliary training signal only.
+        # NER scores spans directly against child embeddings (no anchor fusion)
+        # to preserve historical behavior.
         span_logits_out = None
-        scores_W = scores.shape[1] if scores.dim() >= 2 else 0
-        scores_C = scores.shape[2] if scores.dim() >= 3 else 0
         if (
             self.represent_spans and hasattr(self, "span_rep_layer")
-            and scores_W > 0 and scores_C > 0
             and ner_labels is not None
+            and logits.shape[1] > 0 and logits.shape[-2] > 0
         ):
-            if span_idx is None:
-                span_idx, span_mask = extract_spans_from_tokens(
-                    scores, ner_labels, threshold,
-                )
-                span_idx = span_idx * span_mask.unsqueeze(-1).long()
+            span_idx, span_mask = self._maybe_extract_spans(
+                logits, A=1, span_idx=span_idx, span_mask=span_mask,
+                threshold=threshold, labels=ner_labels,
+            )
             span_rep = self.span_rep_layer(words_embedding, span_idx)
-            span_logits_out = torch.einsum("BND,BCD->BNC", span_rep, prompts_embedding)
+            span_logits_out = torch.einsum("BND,BCD->BNC", span_rep, flat_inputs.child_embedding)
 
         loss = None
         if ner_labels is not None and base_loss_fn is not None:
-            loss = self._ner_loss(scores, ner_labels, prompts_embedding_mask, mask, base_loss_fn)
+            # NER has A=1 with all-ones anchor_mask → equivalent to word × child masking.
+            loss = self._bio_loss(
+                scores=scores, labels=ner_labels.unsqueeze(1),
+                anchor_mask=anchor_mask, word_mask=word_mask, child_mask=child_mask,
+                base_loss_fn=base_loss_fn,
+            )
             if span_labels is not None and span_logits_out is not None:
-                span_loss = self._ner_loss(span_logits_out, span_labels, prompts_embedding_mask, span_mask, base_loss_fn)
-                token_loss_coef = getattr(self.config, 'token_loss_coef', 1.0)
+                span_losses = base_loss_fn(span_logits_out, span_labels)
+                span_loss_mask = span_mask.unsqueeze(-1) * child_mask.unsqueeze(1)
+                if span_losses.dim() == 4:
+                    span_loss_mask = span_loss_mask.unsqueeze(-1)
+                span_loss = (span_losses * span_loss_mask).sum()
+                token_loss_coef = getattr(self.config, "token_loss_coef", 1.0)
                 loss = token_loss_coef * loss + self.span_loss_coef * span_loss
 
         return TaskHeadOutput(
             loss=loss,
-            logits=scores,
+            logits=logits,
             extra={
                 "span_logits": span_logits_out,
                 "span_idx": span_idx,
                 "span_mask": span_mask,
                 "words_embedding": words_embedding,
-                "mask": mask,
+                "mask": word_mask,
             },
         )

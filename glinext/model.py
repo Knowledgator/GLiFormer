@@ -898,7 +898,9 @@ class GLiNExTModel(BaseModel):
             if name in ("ner", "joint_relex", "open_relex", "structuring"):
                 extra_kwargs["base_loss_fn"] = self._loss
 
-            output = head(shared, dependency_outputs=dep_outputs, **extra_kwargs, **batch_kwargs)
+            call_kwargs = dict(batch_kwargs)
+            call_kwargs.update(extra_kwargs)
+            output = head(shared, dependency_outputs=dep_outputs, **call_kwargs)
             head_outputs[name] = output
 
             if output.loss is not None:

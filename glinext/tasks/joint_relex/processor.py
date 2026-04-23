@@ -68,21 +68,31 @@ class JointRelexProcessor(NERProcessor):
             mapping = ext_mapping.rel_class_to_id
             example = extraction_examples[group_idx]
 
-            for ent_id, ent in enumerate(example.get('ner', [])):
-                if ent_id >= max_entities:
+            # Compact valid entities into 0..n-1 so build_all_entity_pairs
+            # (which assumes contiguous indices) stays in sync with rel_labels.
+            # Track the remap so relation head/tail ids land in the right slot.
+            old_to_new = {}
+            for orig_id, ent in enumerate(example.get('ner', [])):
+                new_id = len(old_to_new)
+                if new_id >= max_entities:
                     break
                 start, end = ent[0], ent[1]
                 if max_seq_len and (start >= max_seq_len or end >= max_seq_len):
                     continue
-                rel_span_idx[flat_idx, ent_id, 0] = start
-                rel_span_idx[flat_idx, ent_id, 1] = end
-                rel_span_mask[flat_idx, ent_id] = True
+                rel_span_idx[flat_idx, new_id, 0] = start
+                rel_span_idx[flat_idx, new_id, 1] = end
+                rel_span_mask[flat_idx, new_id] = True
+                old_to_new[orig_id] = new_id
 
             for head_id, rel_type, tail_id in example.get('relations', []):
-                if rel_type in mapping.class_to_id:
-                    rel_class_idx = mapping.class_to_id[rel_type]
-                    if head_id < max_entities and tail_id < max_entities:
-                        rel_labels[flat_idx, head_id, tail_id, rel_class_idx] = 1.0
+                if rel_type not in mapping.class_to_id:
+                    continue
+                new_head = old_to_new.get(head_id)
+                new_tail = old_to_new.get(tail_id)
+                if new_head is None or new_tail is None:
+                    continue
+                rel_class_idx = mapping.class_to_id[rel_type]
+                rel_labels[flat_idx, new_head, new_tail, rel_class_idx] = 1.0
 
         return {
             "rel_labels": rel_labels,

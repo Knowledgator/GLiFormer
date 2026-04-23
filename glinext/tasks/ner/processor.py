@@ -57,7 +57,8 @@ class NERProcessor(SpanProcessor):
                 if 'all_rel_labels' in example:
                     rel_labels = list(example['all_rel_labels'])
                 else:
-                    rel_labels = list({rel[-1] for rel in example.get('relations', [])})
+                    # Relations are (head_id, rel_type, tail_id); rel_type lives at index 1.
+                    rel_labels = list({rel[1] for rel in example.get('relations', [])})
                 if rel_labels:
                     rel_class_to_id = self._build_class_to_id(rel_labels, rel_negatives, sample_neg, shuffle_labels)
                     rel_mapping = BaseClassMapping(
@@ -104,10 +105,39 @@ class NERProcessor(SpanProcessor):
 
         for ext_example in item.get('extraction', []):
             ner = ext_example.get('ner', [])
-            if ner and not (len(ner[0]) == 3 and isinstance(ner[0][0], int)):
-                ext_example['ner'] = self._resolve_entity_spans(
-                    text, tokens_with_spans, ner
+            if not ner or (len(ner[0]) == 3 and isinstance(ner[0][0], int)):
+                continue
+            # Resolve per-entity so we can track which originals survived.
+            # Relation head_id/tail_id reference positions in the input ner
+            # list — if resolution drops an entity, the remaining indices
+            # shift and labels get misaligned.
+            resolved = []
+            old_to_new = {}
+            for orig_idx, ent in enumerate(ner):
+                single = self._resolve_entity_spans(
+                    text, tokens_with_spans, [ent]
                 )
+                if single:
+                    old_to_new[orig_idx] = len(resolved)
+                    resolved.append(single[0])
+            ext_example['ner'] = resolved
+
+            relations = ext_example.get('relations', [])
+            if relations:
+                remapped = []
+                for rel in relations:
+                    new_h = old_to_new.get(rel[0])
+                    new_t = old_to_new.get(rel[2])
+                    if new_h is None or new_t is None:
+                        continue
+                    if isinstance(rel, tuple):
+                        remapped.append((new_h, rel[1], new_t))
+                    else:
+                        new_rel = list(rel)
+                        new_rel[0] = new_h
+                        new_rel[2] = new_t
+                        remapped.append(new_rel)
+                ext_example['relations'] = remapped
 
         self._sort_extraction_data(item)
 
@@ -115,9 +145,28 @@ class NERProcessor(SpanProcessor):
     def _sort_extraction_data(item):
         for ext_example in item.get('extraction', []):
             ner = ext_example.get('ner', [])
-            if ner:
-                ext_example['ner'] = sorted(ner, key=lambda x: (x[0], x[1]))
             relations = ext_example.get('relations', [])
+            if ner:
+                # Sort entities by (start, end); remap head/tail ids in relations
+                # so indices keep pointing to the same entity after reordering.
+                indexed = sorted(
+                    enumerate(ner), key=lambda pair: (pair[1][0], pair[1][1])
+                )
+                old_to_new = {old: new for new, (old, _) in enumerate(indexed)}
+                ext_example['ner'] = [ent for _, ent in indexed]
+                if relations:
+                    remapped = []
+                    for rel in relations:
+                        new_h = old_to_new.get(rel[0], rel[0])
+                        new_t = old_to_new.get(rel[2], rel[2])
+                        if isinstance(rel, tuple):
+                            remapped.append((new_h, rel[1], new_t))
+                        else:
+                            new_rel = list(rel)
+                            new_rel[0] = new_h
+                            new_rel[2] = new_t
+                            remapped.append(new_rel)
+                    relations = remapped
             if relations:
                 ext_example['relations'] = sorted(relations, key=lambda x: (x[0], x[2]))
 

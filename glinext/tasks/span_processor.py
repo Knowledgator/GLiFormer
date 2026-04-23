@@ -72,11 +72,14 @@ class SpanProcessor(TaskProcessor):
                 resolved.append(list(ent))
             else:
                 ent_text, label = ent[0], ent[-1]
+                # One input entity → at most one span. Multiple matches would
+                # shift relation head_id/tail_id indices computed upstream.
                 try:
                     for match in re.finditer(re.escape(ent_text), text, re.IGNORECASE):
                         s, e = match.start(), match.end()
                         if s in s2t and e in e2t:
                             resolved.append([s2t[s], e2t[e], label])
+                            break
                 except (ValueError, re.error):
                     continue
         return resolved
