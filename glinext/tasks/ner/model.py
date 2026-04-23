@@ -97,19 +97,23 @@ class NERHead(TaskHead):
         scores_flat = self.scorer(fused_flat, words_embedding, word_mask=mask)
         scores = scores_flat.view(B_a, A, C, L, 3).permute(0, 1, 3, 2, 4)
         # Squeeze anchor dim for parent mode (A=1) to maintain (B, W, C, 3) shape
-        if A == 1:
-            scores = scores.squeeze(1)
+        scores = scores.squeeze(1)
 
-        # Optional span representation
+        # Optional span-level rescoring — used as an auxiliary training signal
+        # only. At inference the decoder relies on the BIO path so the user's
+        # threshold maps directly onto BIO probabilities.
         span_logits_out = None
         scores_W = scores.shape[1] if scores.dim() >= 2 else 0
         scores_C = scores.shape[2] if scores.dim() >= 3 else 0
         if (
             self.represent_spans and hasattr(self, "span_rep_layer")
             and scores_W > 0 and scores_C > 0
+            and ner_labels is not None
         ):
             if span_idx is None:
-                span_idx, span_mask = extract_spans_from_tokens(scores, ner_labels, threshold)
+                span_idx, span_mask = extract_spans_from_tokens(
+                    scores, ner_labels, threshold,
+                )
                 span_idx = span_idx * span_mask.unsqueeze(-1).long()
             span_rep = self.span_rep_layer(words_embedding, span_idx)
             span_logits_out = torch.einsum("BND,BCD->BNC", span_rep, prompts_embedding)

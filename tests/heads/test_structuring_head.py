@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from glinext.tasks.structuring.model import StructuringHead
+import glinext.tasks.structuring.model as structuring_model
 from glinext.tasks import TaskHeadOutput
 from tests.heads.conftest import make_config, D, B, W, C
 from dataclasses import asdict
@@ -114,15 +115,30 @@ class TestStructuringHeadForward:
         span_idx[:, :, 0] = span_idx.min(dim=-1).values
         span_mask = torch.ones(BN, S, dtype=torch.bool)
 
+        # Labels required — span-level is a training-only signal.
+        out_infer = head(shared, {}, flat_inputs=flat_inputs)
+        BN_out, X, C_out, L, _ = out_infer.logits.shape
+        labels = torch.zeros(BN_out, X, L, C_out, 3)
+        span_labels = torch.zeros(BN_out, X, S, C_out)
+
         out = head(
             shared, {},
             flat_inputs=flat_inputs,
             structuring_span_idx=span_idx,
             structuring_span_mask=span_mask,
+            structuring_span_labels=span_labels,
+            structuring_labels=labels,
         )
         assert out.extra["span_logits"] is not None
         # span_logits: (B, X, S, C)
         assert out.extra["span_logits"].shape[2] == S
+
+    def test_span_representation_skipped_at_inference(self, shared, flat_inputs):
+        """At inference (no labels) the span-level head is skipped so the BIO
+        path drives decoding with consistent threshold semantics."""
+        head = _make_head(represent_spans=True)
+        out = head(shared, {}, flat_inputs=flat_inputs)
+        assert out.extra["span_logits"] is None
 
 
 class TestStructuringGradient:

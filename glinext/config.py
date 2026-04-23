@@ -42,7 +42,7 @@ class JointRelexHeadConfig(BaseHeadConfig):
     Inherits NER scoring from NERHead and adds adjacency-based
     entity pair scoring against [REL] type embeddings.
     """
-    layer_type: str = "dot"                # "dot", "weighted-dot", "mlp"
+    layer_type: str = "none"                # "dot", "weighted-dot", "mlp"
     pair_rep_type: str = "concat_proj"     # pair representation type
     triples_layer: Optional[str] = None    # optional triples scoring layer
     embed_rel_token: bool = True

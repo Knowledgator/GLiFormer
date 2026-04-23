@@ -191,16 +191,17 @@ class StructuringProcessor(SpanProcessor):
                     field_id = field_to_id[field_name]
                     if field_id >= max_fields:
                         continue
-                    if isinstance(value, dict):
-                        st = value.get('start', -1)
-                        ed = value.get('end', -1)
-                    else:
-                        continue
-                    if st < 0 or ed < 0 or st >= max_seq_len or ed >= max_seq_len:
-                        continue
-                    structuring_labels[flat_idx, inst_idx, st, field_id, 0] = 1.0
-                    structuring_labels[flat_idx, inst_idx, ed, field_id, 1] = 1.0
-                    structuring_labels[flat_idx, inst_idx, st:ed + 1, field_id, 2] = 1.0
+                    values = value if isinstance(value, list) else [value]
+                    for field_value in values:
+                        if not isinstance(field_value, dict):
+                            continue
+                        st = field_value.get('start', -1)
+                        ed = field_value.get('end', -1)
+                        if st < 0 or ed < 0 or st >= max_seq_len or ed >= max_seq_len:
+                            continue
+                        structuring_labels[flat_idx, inst_idx, st, field_id, 0] = 1.0
+                        structuring_labels[flat_idx, inst_idx, ed, field_id, 1] = 1.0
+                        structuring_labels[flat_idx, inst_idx, st:ed + 1, field_id, 2] = 1.0
 
         return {
             "structuring_labels": structuring_labels,
@@ -253,14 +254,16 @@ class StructuringProcessor(SpanProcessor):
                         if field_name not in field_to_id:
                             continue
                         field_id = field_to_id[field_name]
-                        if not isinstance(value, dict):
-                            continue
-                        st = value.get('start', -1)
-                        ed = value.get('end', -1)
-                        if 0 <= st < max_seq_len and 0 <= ed < max_seq_len:
-                            group_spans.append((st, ed, inst_idx, field_id))
-                            positive_spans.add((st, ed))
-                            has_any = True
+                        values = value if isinstance(value, list) else [value]
+                        for field_value in values:
+                            if not isinstance(field_value, dict):
+                                continue
+                            st = field_value.get('start', -1)
+                            ed = field_value.get('end', -1)
+                            if 0 <= st < max_seq_len and 0 <= ed < max_seq_len:
+                                group_spans.append((st, ed, inst_idx, field_id))
+                                positive_spans.add((st, ed))
+                                has_any = True
 
             neg_count = int(len(group_spans) * neg_ratio)
             if neg_count > 0 and max_seq_len > 0:

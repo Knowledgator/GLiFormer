@@ -111,6 +111,28 @@ class TestClassificationHeadForward:
         assert flat_inputs.words_embedding.grad is not None
         flat_inputs.words_embedding.requires_grad_(False)
 
+    def test_anchor_refine_uses_words_embedding(self, shared, flat_inputs):
+        head = _make_head(anchor_refine_layers=1)
+
+        class SpyRefine(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.token_emb = None
+                self.token_mask = None
+
+            def forward(self, anchor_rep, token_emb, token_mask=None):
+                self.token_emb = token_emb
+                self.token_mask = token_mask
+                return anchor_rep
+
+        spy = SpyRefine()
+        head.anchor_refine = spy
+
+        out = head(shared, {}, flat_inputs=flat_inputs)
+        assert out.logits is not None
+        assert spy.token_emb is flat_inputs.words_embedding
+        assert spy.token_mask is flat_inputs.mask
+
     @pytest.mark.parametrize("scorer_type", ["dot", "weighted-dot", "mlp", "hopfield"])
     def test_forward_all_scorers(self, shared, flat_inputs, scorer_type):
         head = _make_head(scorer_type=scorer_type)

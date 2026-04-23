@@ -20,6 +20,7 @@ class ClassificationProcessor(TaskProcessor):
 
     @staticmethod
     def _build_class_to_id(labels, negatives, sample_neg, shuffle_labels):
+        labels = list(dict.fromkeys(labels))
         if negatives is not None:
             label_set = set(labels)
             labels.extend(

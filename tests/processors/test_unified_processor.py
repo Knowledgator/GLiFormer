@@ -296,6 +296,30 @@ class TestCollateRawBatch:
         assert len(batch["tokens"]) == 2
         assert batch["seq_length"].shape[0] == 2
 
+    def test_represent_spans_adds_span_batch_fields(self, fake_tokenizer, words_splitter, ner_item_text_spans):
+        config = make_config(ner_config={"represent_spans": True, "neg_spans_ratio": 0.0})
+        proc = GLiNextProcessor(config, fake_tokenizer, words_splitter)
+        batch = proc.collate_raw_batch([ner_item_text_spans])
+        assert "span_idx" in batch
+        assert "span_label" in batch
+        assert "span_mask" in batch
+        assert batch["span_idx"].shape[0] == 1
+
+
+class TestTokenizeAndPrepareLabels:
+    def test_represent_spans_uses_model_span_keys(self, fake_tokenizer, words_splitter, ner_item_text_spans):
+        config = make_config(ner_config={"represent_spans": True, "neg_spans_ratio": 0.0})
+        proc = GLiNextProcessor(config, fake_tokenizer, words_splitter)
+        raw_batch = proc.collate_raw_batch([ner_item_text_spans])
+        model_input = proc.tokenize_and_prepare_labels(raw_batch, prepare_labels=True)
+
+        assert "span_idx" in model_input
+        assert "span_mask" in model_input
+        assert "span_labels" in model_input
+        assert "ner_span_idx" not in model_input
+        assert "ner_span_mask" not in model_input
+        assert "ner_span_labels" not in model_input
+
 
 class TestPrepareAllLabelEncoderInputs:
     def test_without_labels_tokenizer(self, ner_processor, ner_item):

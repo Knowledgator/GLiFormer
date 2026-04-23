@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from glinext.tasks.structuring.processor import StructuringProcessor
+from glinext.model import GLiNExTModel
 from tests.conftest import make_config, make_batch_classes_mapping, FakeWordsSplitter
 
 
@@ -162,6 +163,29 @@ class TestCreateLabels:
         result = struct_proc.create_labels([{"text": "hello"}], classes_mapping, max_seq_len=5)
         assert result is None
 
+    def test_list_values_create_multiple_positive_spans(self, struct_proc):
+        item = {
+            "text": "A B C",
+            "structuring": {
+                "schema": [
+                    {"items": [
+                        {"text": "A", "start": 0, "end": 0},
+                        {"text": "C", "start": 2, "end": 2},
+                    ]},
+                ],
+            },
+        }
+        mapping = struct_proc.get_classes_mapping([item])
+        classes_mapping = make_batch_classes_mapping(structuring_mappings=mapping)
+        result = struct_proc.create_labels([item], classes_mapping, max_seq_len=5)
+
+        field_id = mapping[0].items[0].field_class_to_id.class_to_id["items"]
+        labels = result["structuring_labels"]
+        assert labels[0, 0, 0, field_id, 0] == 1.0
+        assert labels[0, 0, 2, field_id, 0] == 1.0
+        assert labels[0, 0, 0, field_id, 1] == 1.0
+        assert labels[0, 0, 2, field_id, 1] == 1.0
+
 
 class TestCreateSpanLabels:
     def test_disabled_by_default(self, struct_proc, structuring_item):
@@ -188,3 +212,61 @@ class TestCreateSpanLabels:
         assert "structuring_span_idx" in result
         assert "structuring_span_labels" in result
         assert "structuring_span_mask" in result
+
+    def test_list_values_create_multiple_positive_span_labels(self):
+        config = make_config(structuring_config={"represent_spans": True, "neg_spans_ratio": 0.0})
+        proc = StructuringProcessor(config, words_splitter=FakeWordsSplitter())
+        item = {
+            "text": "A B C",
+            "structuring": {
+                "schema": [
+                    {"items": [
+                        {"text": "A", "start": 0, "end": 0},
+                        {"text": "C", "start": 2, "end": 2},
+                    ]},
+                ]
+            },
+        }
+        mapping = proc.get_classes_mapping([item])
+        classes_mapping = make_batch_classes_mapping(structuring_mappings=mapping)
+        result = proc.create_span_labels([item], classes_mapping, max_seq_len=5)
+
+        field_id = mapping[0].items[0].field_class_to_id.class_to_id["items"]
+        assert result is not None
+        assert result["structuring_span_mask"][0, 0] == True
+        assert result["structuring_span_mask"][0, 1] == True
+        assert torch.equal(result["structuring_span_idx"][0, :2], torch.tensor([[0, 0], [2, 2]]))
+        assert result["structuring_span_labels"][0, 0, 0, field_id] == 1.0
+        assert result["structuring_span_labels"][0, 1, 0, field_id] == 1.0
+
+
+class TestModelStructuringCountBridge:
+    def test_uses_tail_count_predictions_for_structuring_groups_regression(self):
+        model = object.__new__(GLiNExTModel)
+        model.config = make_config(count_config={"mode": "regression"})
+
+        flat_inputs_map = {
+            "count": type("Flat", (), {"batch_origin": torch.tensor([0, 0, 0, 1])})(),
+            "structuring": type("Flat", (), {"batch_origin": torch.tensor([0, 1])})(),
+        }
+        count_logits = torch.tensor([[1.0], [1.0], [2.6], [0.4]])
+
+        result = model._predict_structuring_counts_from_count_head(count_logits, flat_inputs_map)
+        assert torch.equal(result, torch.tensor([3, 0]))
+
+    def test_uses_tail_count_predictions_for_structuring_groups_classification(self):
+        model = object.__new__(GLiNExTModel)
+        model.config = make_config(count_config={"mode": "classification", "max_count": 5})
+
+        flat_inputs_map = {
+            "count": type("Flat", (), {"batch_origin": torch.tensor([0, 0, 0])})(),
+            "structuring": type("Flat", (), {"batch_origin": torch.tensor([0])})(),
+        }
+        count_logits = torch.tensor([
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 3.0],
+        ])
+
+        result = model._predict_structuring_counts_from_count_head(count_logits, flat_inputs_map)
+        assert torch.equal(result, torch.tensor([2]))

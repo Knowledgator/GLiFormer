@@ -53,13 +53,15 @@ class ClassificationHead(TaskHead):
 
         cat_embedding = flat_inputs.child_embedding      # (BN, max_C, D)
         cat_embedding_mask = flat_inputs.child_mask       # (BN, max_C)
-        text_rep = self.pooling(flat_inputs.words_embedding, flat_inputs.mask)
+        words_embedding = flat_inputs.words_embedding     # (BN, W, D)
+        mask = flat_inputs.mask                           # (BN, W)
+        text_rep = self.pooling(words_embedding, mask)
         context = flat_inputs.parent_embedding            # (BN, D)
 
         # Anchor paradigm: anchor_layer → anchor_modeling → dot product
         anchor_rep, anchor_mask = self.anchor_layer(context)
         if hasattr(self, "anchor_refine"):
-            anchor_rep = self.anchor_refine(anchor_rep, cat_embedding)
+            anchor_rep = self.anchor_refine(anchor_rep, words_embedding, token_mask=mask)
         fused = self.anchor_modeling(anchor_rep, cat_embedding)  # (B, 1, C, D)
         fused = fused.squeeze(1)  # (B, C, D) — parent mode always A=1
         scores = self.scorer(text_rep, fused)

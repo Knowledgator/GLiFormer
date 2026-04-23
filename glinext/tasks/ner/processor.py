@@ -22,6 +22,7 @@ class NERProcessor(SpanProcessor):
 
     @staticmethod
     def _build_class_to_id(labels, negatives, sample_neg, shuffle_labels):
+        labels = list(dict.fromkeys(labels))
         if negatives is not None:
             label_set = set(labels)
             labels.extend(
@@ -169,7 +170,9 @@ class NERProcessor(SpanProcessor):
             for start, end, label in ner:
                 if label in classes_to_id and end < num_tokens:
                     span_idx_list.append([start, end])
-                    span_label_list.append(classes_to_id[label])
+                    # 1-indexed: 0 is reserved for negative spans so
+                    # create_span_labels can distinguish them via `> 0`.
+                    span_label_list.append(classes_to_id[label] + 1)
                     positive_spans.add((start, end))
             neg_spans_ratio = getattr(self.config, 'neg_spans_ratio', 0)
             neg_spans_count = int(len(span_idx_list) * neg_spans_ratio)

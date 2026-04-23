@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+from gliner.modeling.utils import extract_spans_from_tokens
 
 from .. import TaskHead, TaskHeadOutput
 from ...layers import AnchoredSpanScorer
@@ -78,9 +79,20 @@ class StructuringHead(TaskHead):
         # Reshape and permute to (B, X, L, C, 3) to match labels and decoder
         structuring_logits = structuring_logits_flat.view(B, X, C, -1, 3).permute(0, 1, 3, 2, 4)
 
-        # Optional span representation
+        # Optional span-level rescoring — used as an auxiliary training signal
+        # only. At inference the decoder relies on the BIO path so the user's
+        # threshold maps directly onto BIO probabilities.
         span_logits_out = None
-        if self.represent_spans and hasattr(self, "span_rep_layer"):
+        if (
+            self.represent_spans and hasattr(self, "span_rep_layer")
+            and structuring_labels is not None
+        ):
+            if span_idx is None:
+                span_source_scores = structuring_logits.max(dim=1).values
+                span_idx, span_mask = extract_spans_from_tokens(
+                    span_source_scores, labels=None, threshold=threshold,
+                )
+                span_idx = span_idx * span_mask.unsqueeze(-1).long()
             if span_idx is not None:
                 span_rep = self.span_rep_layer(words_embedding, span_idx)  # (B, S, D)
                 # Score spans against fused (anchor+child) reps: (B, S, X*C)

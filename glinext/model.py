@@ -160,6 +160,36 @@ class GLiNExTModel(BaseModel):
         labels_embeds = self.token_rep_layer.encode_labels(label_input_ids, label_attention_mask)
         return labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
 
+    def _predict_structuring_counts_from_count_head(
+        self,
+        count_logits: Optional[torch.Tensor],
+        flat_inputs_map: Dict[str, TaskFlatInputs],
+    ) -> Optional[torch.Tensor]:
+        """Project count-head outputs onto structuring groups during inference.
+
+        The count head is built over a concatenated flat order of:
+        classification groups, extraction groups, then structuring groups.
+        Structuring counts therefore live in the final contiguous block.
+        """
+        if count_logits is None or "count" not in flat_inputs_map or "structuring" not in flat_inputs_map:
+            return None
+
+        struct_bn = flat_inputs_map["structuring"].batch_origin.shape[0]
+        if struct_bn == 0:
+            return None
+
+        count_cfg = self.config.count_config
+        if count_cfg and count_cfg.mode == "classification":
+            predicted = count_logits.argmax(dim=-1)
+        else:
+            predicted = count_logits.squeeze(-1).round().long()
+
+        predicted = predicted.clamp(min=0)
+        if predicted.shape[0] < struct_bn:
+            return None
+
+        return predicted[-struct_bn:]
+
     def _encode_all_labels_batched(
         self,
         batch_size: int,
@@ -849,6 +879,14 @@ class GLiNExTModel(BaseModel):
             if name in flat_inputs_map:
                 extra_kwargs["flat_inputs"] = flat_inputs_map[name]
 
+            if name == "structuring" and structuring_count is None:
+                predicted_structuring_count = self._predict_structuring_counts_from_count_head(
+                    head_outputs.get("count", TaskHeadOutput()).logits,
+                    flat_inputs_map,
+                )
+                if predicted_structuring_count is not None:
+                    extra_kwargs["structuring_count"] = predicted_structuring_count
+
             # Pass task-specific label embeds for heads that use them directly
             if name == "joint_relex" and rel_label_embeds is not None:
                 extra_kwargs["rel_label_embeds"] = rel_label_embeds
@@ -878,11 +916,13 @@ class GLiNExTModel(BaseModel):
         struct_out = head_outputs.get("structuring", TaskHeadOutput())
         emb_out = head_outputs.get("embedding", TaskHeadOutput())
 
-        # joint_relex NER logits override standalone NER if joint_relex is active
-        effective_ner_logits = joint_rel_out.logits if joint_rel_out.logits is not None else ner_out.logits
-        effective_ner_extra = joint_rel_out.extra if joint_rel_out.logits is not None else ner_out.extra
+        # Prefer the standalone NER head for exported NER outputs.
+        # Fall back to joint_relex only when NER is not active.
+        effective_ner_logits = ner_out.logits if ner_out.logits is not None else joint_rel_out.logits
+        effective_ner_extra = ner_out.extra if ner_out.logits is not None else joint_rel_out.extra
         effective_ner_origin = (
-            flat_inputs_map["joint_relex"].batch_origin if "joint_relex" in flat_inputs_map
+            flat_inputs_map["ner"].batch_origin if "ner" in flat_inputs_map
+            else flat_inputs_map["joint_relex"].batch_origin if "joint_relex" in flat_inputs_map
             else flat_inputs_map.get("ner", TaskFlatInputs(
                 words_embedding=words_embedding, mask=mask,
                 parent_embedding=torch.empty(0), child_embedding=torch.empty(0),

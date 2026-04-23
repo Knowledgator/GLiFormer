@@ -418,9 +418,16 @@ class GLiNextProcessor(BaseProcessor):
 
     # ── Preprocessing ───────────────────────────────────────────────────
 
-    def preprocess_example(self, item, classes_mapping):
+    def preprocess_example(self, item, extraction_mapping):
         text = item.get("text", "")
-        tokens = self.words_splitter(text)
+        if "tokenized_text" in item:
+            tokens = list(item["tokenized_text"])
+        else:
+            raw_tokens = list(self.words_splitter(text))
+            if raw_tokens and isinstance(raw_tokens[0], (list, tuple)):
+                tokens = [tok[0] for tok in raw_tokens]
+            else:
+                tokens = raw_tokens
         if len(tokens) == 0:
             tokens = ["[PAD]"]
         max_len = self.config.max_len
@@ -437,7 +444,11 @@ class GLiNextProcessor(BaseProcessor):
 
         for i, ext_example in enumerate(item.get('extraction', [])):
             ner = ext_example.get('ner', [])
-            classes_to_id = classes_mapping.extraction_mapping[i].items[0].ner_class_to_id.class_to_id
+            if i >= len(extraction_mapping.items):
+                item_span_idx.append(None)
+                item_span_label.append(None)
+                continue
+            classes_to_id = extraction_mapping.items[i].ner_class_to_id.class_to_id
             span_idx, span_label = self.prepare_span_idx(ner, classes_to_id, num_tokens)
             item_span_idx.append(span_idx)
             item_span_label.append(span_label)
@@ -445,7 +456,7 @@ class GLiNextProcessor(BaseProcessor):
         return {
             "tokens": tokens,
             "seq_length": len(tokens),
-            "entities": ext_example.get('ner', []) if item.get('extraction') else [],
+            "entities": item.get('extraction', []),
             "span_idx": item_span_idx,
             "span_label": item_span_label,
         }
@@ -532,7 +543,12 @@ class GLiNextProcessor(BaseProcessor):
 
         classes_mapping = self.batch_generate_class_mappings(batch_list, **kwargs)
 
-        texts = [item['tokenized_text'] for item in batch_list]
+        preprocessed = [
+            self.preprocess_example(item, classes_mapping.extraction_mapping[i])
+            for i, item in enumerate(batch_list)
+        ]
+
+        texts = [item['tokens'] for item in preprocessed]
         max_len = self.config.max_len
         truncated_texts = []
         for t in texts:
@@ -557,6 +573,8 @@ class GLiNextProcessor(BaseProcessor):
             'embedding': [item.get('embedding', []) for item in batch_list],
             'structuring': [item.get('structuring', {}) for item in batch_list],
             'open_relex': [item.get('open_relex', []) for item in batch_list],
+            'span_idx': [item.get('span_idx') for item in preprocessed],
+            'span_label': [item.get('span_label') for item in preprocessed],
         }
 
         return self.create_batch_dict(batch_dict, classes_mapping)
@@ -631,9 +649,9 @@ class GLiNextProcessor(BaseProcessor):
             if getattr(self.config, 'represent_spans', False):
                 ner_span_result = self.create_span_labels(batch)
                 if ner_span_result is not None:
-                    tokenized_input['ner_span_labels'] = ner_span_result[0]
-                    tokenized_input['ner_span_mask'] = ner_span_result[1]
-                    tokenized_input['ner_span_idx'] = batch['span_idx']
+                    tokenized_input['span_labels'] = ner_span_result[0]
+                    tokenized_input['span_mask'] = ner_span_result[1]
+                    tokenized_input['span_idx'] = batch['span_idx']
 
             if "structuring" in self.task_processors:
                 struct_span_result = self.task_processors["structuring"].create_span_labels(

@@ -179,7 +179,8 @@ class TestPrepareSpanIdx:
         span_idx, span_label = proc.prepare_span_idx(ner, classes_to_id, num_tokens=5)
         assert span_idx is not None
         assert span_idx.shape == (2, 2)
-        assert span_label.tolist() == [0, 1]
+        # 1-indexed labels (0 reserved for negative spans)
+        assert span_label.tolist() == [1, 2]
 
     def test_with_negative_spans(self):
         config = make_config(ner_config={"represent_spans": True, "neg_spans_ratio": 1.0})

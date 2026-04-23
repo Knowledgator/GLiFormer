@@ -39,6 +39,11 @@ class TestJointRelexHeadConstruction:
         head = _make_head()
         assert hasattr(head, "pair_rep_layer") or hasattr(head, "triples_score_layer")
 
+    def test_can_disable_relations_rep_layer(self):
+        head = _make_head(layer_type="none")
+        assert not hasattr(head, "relations_rep_layer")
+        assert hasattr(head, "pair_rep_layer") or hasattr(head, "triples_score_layer")
+
 
 # ── Forward ──────────────────────────────────────────────────────────────
 
@@ -69,12 +74,22 @@ class TestJointRelexHeadForward:
         rel_labels = torch.zeros(B, E, E, R)
         rel_label_embeds = torch.randn(B, R, D)
 
+        # Processor-provided per-entity spans (aligned with rel_labels' entity axis)
+        rel_span_idx = torch.zeros(B, E, 2, dtype=torch.long)
+        rel_span_mask = torch.zeros(B, E, dtype=torch.bool)
+        rel_span_idx[0, 0] = torch.tensor([0, 0])
+        rel_span_idx[0, 1] = torch.tensor([2, 3])
+        rel_span_mask[0, 0] = True
+        rel_span_mask[0, 1] = True
+
         from gliner.modeling.loss_functions import focal_loss_with_logits
         out = head(
             shared, {},
             flat_inputs=flat_inputs,
             ner_labels=ner_labels,
             rel_labels=rel_labels,
+            rel_span_idx=rel_span_idx,
+            rel_span_mask=rel_span_mask,
             rel_label_embeds=rel_label_embeds,
             base_loss_fn=focal_loss_with_logits,
         )
@@ -83,36 +98,65 @@ class TestJointRelexHeadForward:
         assert isinstance(out, TaskHeadOutput)
         assert out.logits is not None
 
+    def test_inference_without_relations_rep_layer_uses_all_pairs(self, shared, flat_inputs):
+        head = _make_head(layer_type="none")
+        R = 2
+        E = 2
+        rel_label_embeds = torch.randn(B, R, D)
+        rel_span_idx = torch.zeros(B, E, 2, dtype=torch.long)
+        rel_span_mask = torch.zeros(B, E, dtype=torch.bool)
+        rel_span_idx[0, 0] = torch.tensor([0, 0])
+        rel_span_idx[0, 1] = torch.tensor([2, 3])
+        rel_span_mask[0, 0] = True
+        rel_span_mask[0, 1] = True
 
-# ── Entity selection ─────────────────────────────────────────────────────
+        out = head(
+            shared, {},
+            flat_inputs=flat_inputs,
+            rel_span_idx=rel_span_idx,
+            rel_span_mask=rel_span_mask,
+            rel_label_embeds=rel_label_embeds,
+        )
 
-class TestSelectEntitySpans:
-    def test_basic(self, shared):
+        assert out.extra["rel_logits"] is not None
+        assert out.extra["rel_mask"] is not None
+        assert out.extra["rel_mask"][0].sum().item() == 2
+
+
+# ── Entity pooling ───────────────────────────────────────────────────────
+
+class TestPoolEntitySpans:
+    def test_single_token_span(self, shared):
         head = _make_head()
-        # Scores: (B, W, C, 3) with some strong signals
-        scores = torch.full((B, W, C, 3), -5.0)
-        scores[0, 0, 0, :] = 5.0  # entity at position 0 in batch 0
-        scores[0, 3, 1, :] = 5.0  # entity at position 3 in batch 0
+        E = 2
+        span_idx = torch.zeros(B, E, 2, dtype=torch.long)
+        span_idx[0, 0] = torch.tensor([0, 0])
+        span_idx[0, 1] = torch.tensor([3, 3])
+        span_mask = torch.zeros(B, E, dtype=torch.bool)
+        span_mask[0, 0] = True
+        span_mask[0, 1] = True
 
-        rep, mask = head._select_entity_spans(scores, shared.words_embedding)
-        assert rep.shape[0] == B
-        assert rep.shape[2] == D
-        assert mask.shape[0] == B
+        rep, mask = head._pool_entity_spans(shared.words_embedding, span_idx, span_mask)
+        assert rep.shape == (B, E, D)
+        assert mask.shape == (B, E)
+        assert torch.allclose(rep[0, 0], shared.words_embedding[0, 0])
+        assert torch.allclose(rep[0, 1], shared.words_embedding[0, 3])
+        assert mask[0].sum() == 2
+        assert mask[1].sum() == 0
 
-    def test_with_labels(self, shared):
+    def test_multi_token_span_is_mean(self, shared):
         head = _make_head()
-        scores = torch.randn(B, W, C, 3)
-        # Labels: nonzero at positions 0 and 3
-        ner_labels = torch.zeros(B, W, C, 3)
-        ner_labels[0, 0, 0, :] = 1.0
-        ner_labels[0, 3, 1, :] = 1.0
+        span_idx = torch.tensor([[[1, 3]], [[0, 0]]], dtype=torch.long)  # (B, 1, 2)
+        span_mask = torch.ones(B, 1, dtype=torch.bool)
 
-        rep, mask = head._select_entity_spans(scores, shared.words_embedding, ner_labels=ner_labels)
-        assert mask[0].sum() >= 2  # at least 2 entities in batch 0
+        rep, _ = head._pool_entity_spans(shared.words_embedding, span_idx, span_mask)
+        expected = shared.words_embedding[0, 1:4].mean(dim=0)
+        assert torch.allclose(rep[0, 0], expected, atol=1e-5)
 
-    def test_no_entities(self, shared):
+    def test_masked_entity_is_zero(self, shared):
         head = _make_head()
-        scores = torch.full((B, W, C, 3), -10.0)
-        rep, mask = head._select_entity_spans(scores, shared.words_embedding, threshold=0.9)
-        # Should return at least shape (B, 1, D) due to clamp
-        assert rep.shape[1] >= 1
+        span_idx = torch.tensor([[[0, 0]], [[0, 0]]], dtype=torch.long)
+        span_mask = torch.tensor([[False], [False]], dtype=torch.bool)
+
+        rep, _ = head._pool_entity_spans(shared.words_embedding, span_idx, span_mask)
+        assert torch.all(rep == 0)

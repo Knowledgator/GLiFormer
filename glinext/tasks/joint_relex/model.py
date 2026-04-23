@@ -1,8 +1,9 @@
 """Joint NER + Relation Extraction head (GLiNER-relex style).
 
-Inherits NER scoring from NERHead and adds adjacency-based entity pair
-scoring against [REL] type embeddings. Runs NER first, selects entity
-spans, builds an adjacency matrix, and scores entity pairs for relations.
+Inherits NER scoring from NERHead and adds relation scoring against [REL]
+type embeddings. When enabled, the adjacency layer filters candidate pairs;
+otherwise the head falls back to scoring all directed entity pairs, matching
+the original GLiNER behavior.
 """
 
 from typing import Dict, Optional
@@ -15,7 +16,10 @@ from gliner.modeling.loss_functions import focal_loss_with_logits
 from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from gliner.modeling.multitask.triples_layers import TriplesScoreLayer
 from gliner.modeling.utils import (
-    build_entity_pairs, extract_prompt_features, extract_spans_from_tokens,
+    build_all_entity_pairs,
+    build_entity_pairs,
+    extract_prompt_features,
+    extract_spans_from_tokens,
 )
 
 from .. import TaskHeadOutput, SharedRepresentations
@@ -24,12 +28,12 @@ from ...layers import PairRepLayer
 
 
 class JointRelexHead(NERHead):
-    """Joint NER + relation extraction via adjacency-based entity pair scoring.
+    """Joint NER + relation extraction with optional adjacency pair selection.
 
     Inherits NER forward pass from NERHead, then:
     1. Selects entity spans from NER scores
-    2. Builds adjacency matrix between entities
-    3. Scores entity pairs against [REL] type embeddings
+    2. Optionally builds an adjacency matrix between entities
+    3. Scores candidate entity pairs against [REL] type embeddings
     """
 
     name = "joint_relex"
@@ -43,10 +47,12 @@ class JointRelexHead(NERHead):
         self.rel_token_index = rel_cfg.rel_token_index
         self.embed_rel_token = rel_cfg.embed_rel_token
 
-        # Relation-specific layers (adjacency mode)
-        self.relations_rep_layer = RelationsRepLayer(
-            in_dim=hidden_size, relation_mode=rel_cfg.layer_type,
-        )
+        # ``layer_type='none'`` keeps the relation head active but skips
+        # adjacency prediction so all directed entity pairs are scored.
+        if rel_cfg.layer_type not in (None, "none"):
+            self.relations_rep_layer = RelationsRepLayer(
+                in_dim=hidden_size, relation_mode=rel_cfg.layer_type,
+            )
         if rel_cfg.triples_layer is not None:
             self.triples_score_layer = TriplesScoreLayer(rel_cfg.triples_layer)
         else:
@@ -105,12 +111,15 @@ class JointRelexHead(NERHead):
         )
         return rel_prompts, rel_mask
 
-    def _forward_adjacency(self, shared, target_span_rep, target_span_mask,
-                            rel_labels, adjacency_threshold, rel_label_embeds,
-                            flat_rel_prompts=None, flat_rel_prompts_mask=None):
-        """Adjacency matrix + entity pair relation scoring."""
+    def _forward_relations(self, shared, target_span_rep, target_span_mask,
+                           rel_labels, adjacency_threshold, rel_label_embeds,
+                           flat_rel_prompts=None, flat_rel_prompts_mask=None):
+        """Relation scoring with optional adjacency-based pair selection."""
         B, E_ent, D = target_span_rep.shape
-        pred_adj_matrix = self.relations_rep_layer(target_span_rep, target_span_mask)
+        use_adjacency = hasattr(self, "relations_rep_layer")
+        pred_adj_matrix = None
+        if use_adjacency:
+            pred_adj_matrix = self.relations_rep_layer(target_span_rep, target_span_mask)
 
         rel_prompts, rel_prompts_mask = self._get_rel_prompts(
             shared, rel_label_embeds, flat_rel_prompts, flat_rel_prompts_mask,
@@ -119,14 +128,18 @@ class JointRelexHead(NERHead):
 
         if rel_labels is not None:
             adj_matrix = (rel_labels.sum(dim=-1) > 0).float()
-            adj_for_selection = adj_matrix
         else:
             adj_matrix = None
-            adj_for_selection = pred_adj_matrix
 
-        pair_idx, pair_mask, head_rep, tail_rep = build_entity_pairs(
-            adj_for_selection, target_span_rep, threshold=adjacency_threshold,
-        )
+        if use_adjacency:
+            adj_for_selection = adj_matrix if adj_matrix is not None else pred_adj_matrix
+            pair_idx, pair_mask, head_rep, tail_rep = build_entity_pairs(
+                adj_for_selection, target_span_rep, threshold=adjacency_threshold,
+            )
+        else:
+            pair_idx, pair_mask, head_rep, tail_rep = build_all_entity_pairs(
+                target_span_rep, target_span_mask,
+            )
         N = head_rep.size(1)
         pair_scores = None
 
@@ -143,11 +156,6 @@ class JointRelexHead(NERHead):
 
         loss = None
         if rel_labels is not None and pair_scores is not None:
-            adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
-            adj_logits = pred_adj_matrix.unsqueeze(-1).view(B, -1, 1)
-            adj_labels = adj_matrix.unsqueeze(-1).view(B, -1, 1)
-            adj_loss = (focal_loss_with_logits(adj_logits, adj_labels) * adj_mask.unsqueeze(-1).view(B, -1, 1)).sum()
-
             head_indices = pair_idx[..., 0].clamp(min=0)
             tail_indices = pair_idx[..., 1].clamp(min=0)
             batch_idx_t = torch.arange(B, device=rel_labels.device).unsqueeze(1)
@@ -163,7 +171,17 @@ class JointRelexHead(NERHead):
             combined = rel_mask_expanded * class_mask
             rel_loss = (focal_loss_with_logits(pair_scores, rel_matrix) * combined).sum()
 
-            loss = adj_loss * self.adjacency_loss_coef + rel_loss * self.rel_loss_coef
+            if use_adjacency and pred_adj_matrix is not None and adj_matrix is not None:
+                adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
+                adj_logits = pred_adj_matrix.unsqueeze(-1).view(B, -1, 1)
+                adj_labels = adj_matrix.unsqueeze(-1).view(B, -1, 1)
+                adj_loss = (
+                    focal_loss_with_logits(adj_logits, adj_labels)
+                    * adj_mask.unsqueeze(-1).view(B, -1, 1)
+                ).sum()
+                loss = adj_loss * self.adjacency_loss_coef + rel_loss * self.rel_loss_coef
+            else:
+                loss = rel_loss * self.rel_loss_coef
 
         return TaskHeadOutput(
             loss=loss,
@@ -204,8 +222,8 @@ class JointRelexHead(NERHead):
                 words_embedding, span_idx, span_mask,
             )
 
-        # 3. Build adjacency + score relation types
-        rel_output = self._forward_adjacency(
+        # 3. Build candidate pairs and score relation types
+        rel_output = self._forward_relations(
             shared, target_span_rep, target_span_mask,
             batch.get("rel_labels"), batch.get("adjacency_threshold", 0.5),
             rel_label_embeds,
