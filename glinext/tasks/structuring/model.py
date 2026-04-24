@@ -1,5 +1,7 @@
 """Structuring task head."""
 
+import torch
+
 from .. import TaskHeadOutput
 from ..anchored_extraction import AnchoredSpanExtractionHead
 
@@ -20,6 +22,7 @@ class StructuringHead(AnchoredSpanExtractionHead):
         struct_cfg = config.structuring_config
         self.child_token_index = struct_cfg.child_token_index
         self.embed_child_token = struct_cfg.embed_child_token
+        self.max_count = struct_cfg.max_count
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
@@ -49,6 +52,18 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
         if flat_inputs.child_embedding.shape[1] == 0:
             return TaskHeadOutput()
+
+        if (
+            structuring_labels is None
+            and batch.get("structuring_count") is None
+            and batch.get("count_val") is None
+            and not self.training
+        ):
+            batch["structuring_count"] = flat_inputs.parent_embedding.new_full(
+                (flat_inputs.parent_embedding.shape[0],),
+                self.max_count,
+                dtype=torch.long,
+            )
 
         scores, anchors, anchor_mask, fused_flat, (B, A, C, L) = self._compute_bio_scores(
             flat_inputs, batch,

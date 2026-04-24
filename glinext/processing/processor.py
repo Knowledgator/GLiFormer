@@ -614,6 +614,7 @@ class GLiNextProcessor(BaseProcessor):
             rel_result = self.create_joint_rel_labels(batch_list, classes_mapping, max_seq_len=max_seq_len)
             if rel_result is not None:
                 tokenized_input['rel_labels'] = rel_result['rel_labels']
+                tokenized_input['rel_pair_mask'] = rel_result.get('rel_pair_mask')
                 tokenized_input['rel_mask'] = rel_result['rel_mask']
                 tokenized_input['rel_batch_idx'] = rel_result['rel_batch_idx']
                 tokenized_input['rel_span_idx'] = rel_result['rel_span_idx']

@@ -70,6 +70,9 @@ class JointRelexDecoder(NERDecoder):
 
         # 2. Build relation class mappings
         rel_id_to_classes = self._get_rel_id_to_classes(classes_mapping)
+        entity_index_maps = self._build_entity_index_maps(
+            flat_entities, getattr(model_output, "joint_rel_entity_spans", None),
+        )
 
         # 3. Decode relation triples
         probs = torch.sigmoid(model_output.joint_rel_logits)
@@ -81,12 +84,17 @@ class JointRelexDecoder(NERDecoder):
         for bn in range(BN):
             triples = []
             batch_entities = flat_entities[bn] if bn < len(flat_entities) else []
+            rel_map = (
+                rel_id_to_classes[bn]
+                if isinstance(rel_id_to_classes, list) and bn < len(rel_id_to_classes)
+                else rel_id_to_classes
+            )
 
             for p in range(probs.shape[1]):
                 if pair_mask is not None and not pair_mask[bn, p]:
                     continue
                 for c in range(probs.shape[2]):
-                    if rel_id_to_classes and c not in rel_id_to_classes:
+                    if rel_map and c not in rel_map:
                         continue
                     score = probs[bn, p, c].item()
                     if score <= threshold:
@@ -94,6 +102,12 @@ class JointRelexDecoder(NERDecoder):
 
                     head_id = pair_idx[bn, p, 0].item()
                     tail_id = pair_idx[bn, p, 1].item()
+                    entity_index_map = entity_index_maps[bn] if bn < len(entity_index_maps) else None
+                    if entity_index_map is not None:
+                        head_id = entity_index_map.get(head_id)
+                        tail_id = entity_index_map.get(tail_id)
+                        if head_id is None or tail_id is None:
+                            continue
 
                     head_span = self._resolve_entity(
                         batch_entities, head_id, texts, bn,
@@ -102,7 +116,7 @@ class JointRelexDecoder(NERDecoder):
                         batch_entities, tail_id, texts, bn,
                     )
 
-                    rel_name = rel_id_to_classes.get(c, str(c))
+                    rel_name = rel_map.get(c, str(c))
 
                     triples.append({
                         "head": head_span,
@@ -144,6 +158,30 @@ class JointRelexDecoder(NERDecoder):
             "entity_idx": entity_id,
         }
 
+    def _build_entity_index_maps(self, flat_entities: List[List[Span]], entity_spans) -> List[Optional[Dict[int, int]]]:
+        """Map model entity indices to decoded entity indices by span boundary."""
+        if entity_spans is None:
+            return [None] * len(flat_entities)
+
+        maps: List[Optional[Dict[int, int]]] = []
+        for bn, entities in enumerate(flat_entities):
+            if bn >= entity_spans.shape[0]:
+                maps.append(None)
+                continue
+            boundary_to_idx = {}
+            for decoded_idx, span in enumerate(entities):
+                boundary_to_idx.setdefault((span.start, span.end), decoded_idx)
+
+            model_to_decoded = {}
+            for entity_idx in range(entity_spans.shape[1]):
+                start = int(entity_spans[bn, entity_idx, 0].item())
+                end = int(entity_spans[bn, entity_idx, 1].item())
+                decoded_idx = boundary_to_idx.get((start, end))
+                if decoded_idx is not None:
+                    model_to_decoded[entity_idx] = decoded_idx
+            maps.append(model_to_decoded)
+        return maps
+
     def _get_ner_id_to_classes(self, classes_mapping) -> Union[Dict[int, str], List[Dict[int, str]]]:
         """Extract NER id→class mappings from BatchClassesMapping.
 
@@ -160,18 +198,18 @@ class JointRelexDecoder(NERDecoder):
                 maps.append(item.ner_class_to_id.get_reverse_mapping())
         return maps
 
-    def _get_rel_id_to_classes(self, classes_mapping) -> Dict[int, str]:
-        """Extract relation id→class mappings from BatchClassesMapping."""
+    def _get_rel_id_to_classes(self, classes_mapping) -> Union[Dict[int, str], List[Dict[int, str]]]:
+        """Extract BN-aligned relation id→class mappings from BatchClassesMapping."""
         if classes_mapping is None:
             return {}
         if not hasattr(classes_mapping, 'extraction_mapping'):
             return {}
 
-        # Joint relex: relation classes are in extraction_mapping items
-        merged = {}
+        maps = []
         for em in classes_mapping.extraction_mapping:
             for item in em.items:
                 if item.rel_class_to_id is not None:
-                    merged.update(item.rel_class_to_id.get_reverse_mapping())
-        return merged
-
+                    maps.append(item.rel_class_to_id.get_reverse_mapping())
+                else:
+                    maps.append({})
+        return maps

@@ -48,6 +48,7 @@ class GLiNExTOutput(ModelOutput):
     joint_rel_batch_origin: Optional[torch.LongTensor] = None
     joint_rel_idx: Optional[torch.LongTensor] = None
     joint_rel_mask: Optional[torch.Tensor] = None
+    joint_rel_entity_spans: Optional[torch.LongTensor] = None
     # Open Relex (anchor-based relation extraction)
     open_rel_logits: Optional[torch.FloatTensor] = None
     open_rel_batch_origin: Optional[torch.LongTensor] = None
@@ -189,6 +190,56 @@ class GLiNExTModel(BaseModel):
             return None
 
         return predicted[-struct_bn:]
+
+    def _task_config_for_loss(self, task_name: str):
+        if task_name == "ner":
+            return self.config.ner_config
+        if task_name == "classification":
+            return self.config.classification_config
+        if task_name == "joint_relex":
+            return self.config.joint_relex_config
+        if task_name == "open_relex":
+            return self.config.open_relex_config
+        if task_name == "structuring":
+            return self.config.structuring_config
+        return None
+
+    @staticmethod
+    def _runtime_loss_value(runtime_kwargs: dict, focal_name: str, short_name: str):
+        if focal_name in runtime_kwargs and runtime_kwargs[focal_name] is not None:
+            return runtime_kwargs[focal_name]
+        if short_name in runtime_kwargs and runtime_kwargs[short_name] is not None:
+            return runtime_kwargs[short_name]
+        return None
+
+    def _resolve_task_focal_loss_kwargs(self, task_name: str, runtime_kwargs: dict) -> dict:
+        task_cfg = self._task_config_for_loss(task_name)
+        resolved = {}
+        for cfg_name, loss_name in (
+            ("focal_loss_alpha", "alpha"),
+            ("focal_loss_gamma", "gamma"),
+            ("focal_loss_prob_margin", "prob_margin"),
+        ):
+            value = getattr(task_cfg, cfg_name, None) if task_cfg is not None else None
+            if value is None:
+                value = self._runtime_loss_value(runtime_kwargs, cfg_name, loss_name)
+            if value is not None:
+                resolved[loss_name] = value
+        return resolved
+
+    def _make_task_loss_fn(self, task_name: str, runtime_kwargs: dict):
+        focal_kwargs = self._resolve_task_focal_loss_kwargs(task_name, runtime_kwargs)
+        if not focal_kwargs:
+            return self._loss
+
+        def task_loss_fn(logits, labels, **call_kwargs):
+            merged_kwargs = dict(focal_kwargs)
+            merged_kwargs.update(
+                {key: value for key, value in call_kwargs.items() if value is not None}
+            )
+            return self._loss(logits, labels, **merged_kwargs)
+
+        return task_loss_fn
 
     def _encode_all_labels_batched(
         self,
@@ -564,6 +615,7 @@ class GLiNExTModel(BaseModel):
         cat_labels: Optional[torch.Tensor] = None,
         # Joint Relex
         rel_labels: Optional[torch.Tensor] = None,
+        rel_pair_mask: Optional[torch.Tensor] = None,
         rel_span_idx: Optional[torch.Tensor] = None,
         rel_span_mask: Optional[torch.Tensor] = None,
         # Open Relex
@@ -846,6 +898,7 @@ class GLiNExTModel(BaseModel):
         batch_kwargs = dict(
             ner_labels=ner_labels, span_idx=span_idx, span_mask=span_mask,
             span_labels=span_labels, cat_labels=cat_labels, rel_labels=rel_labels,
+            rel_pair_mask=rel_pair_mask,
             rel_span_idx=rel_span_idx, rel_span_mask=rel_span_mask,
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
             count_targets=count_targets,
@@ -894,9 +947,9 @@ class GLiNExTModel(BaseModel):
                 extra_kwargs["flat_rel_prompts"] = joint_rel_flat_prompts
                 extra_kwargs["flat_rel_prompts_mask"] = joint_rel_flat_mask
 
-            # Pass base_loss_fn for heads that need it
-            if name in ("ner", "joint_relex", "open_relex", "structuring"):
-                extra_kwargs["base_loss_fn"] = self._loss
+            # Pass loss function for heads that use focal loss.
+            if name in ("ner", "classification", "joint_relex", "open_relex", "structuring"):
+                extra_kwargs["base_loss_fn"] = self._make_task_loss_fn(name, kwargs)
 
             call_kwargs = dict(batch_kwargs)
             call_kwargs.update(extra_kwargs)
@@ -946,6 +999,7 @@ class GLiNExTModel(BaseModel):
             joint_rel_batch_origin=flat_inputs_map["joint_relex"].batch_origin if "joint_relex" in flat_inputs_map else None,
             joint_rel_idx=joint_rel_out.extra.get("rel_idx"),
             joint_rel_mask=joint_rel_out.extra.get("rel_mask"),
+            joint_rel_entity_spans=joint_rel_out.extra.get("rel_entity_spans"),
             open_rel_logits=open_rel_out.logits,
             open_rel_batch_origin=flat_inputs_map["open_relex"].batch_origin if "open_relex" in flat_inputs_map else None,
             open_rel_anchor_mask=open_rel_out.extra.get("anchor_mask"),

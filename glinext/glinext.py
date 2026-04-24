@@ -997,7 +997,59 @@ class GLiNExT(BaseEncoderGLiNER):
         if hasattr(self.model, "rnn"):
             components["rnn"] = self.model.rnn
 
+        # Other shared representation/joint layers
+        if hasattr(self.model, "cross_fuser"):
+            components["cross_fuser"] = self.model.cross_fuser
+        if hasattr(self.model, "shared_anchor_modeling"):
+            components["shared_anchor_modeling"] = self.model.shared_anchor_modeling
+        if hasattr(self.model, "shared_anchor_refine"):
+            components["shared_anchor_refine"] = self.model.shared_anchor_refine
+
         return components
+
+    def train_head_only_parameters(self) -> Dict[str, int]:
+        """Freeze shared model parameters and leave only head-owned parameters trainable.
+
+        Shared modules that are referenced by heads, such as shared anchor
+        modeling/refinement layers, stay frozen because they are not
+        head-specific even though they appear under task head modules.
+        """
+        if not hasattr(self, "model") or not hasattr(self.model, "heads"):
+            raise ValueError("Head-only training requires an initialized GLiNExT model with task heads.")
+
+        self.model.requires_grad_(False)
+
+        shared_param_ids = set()
+        for module_name in ("shared_anchor_modeling", "shared_anchor_refine"):
+            module = getattr(self.model, module_name, None)
+            if module is not None:
+                shared_param_ids.update(id(param) for param in module.parameters())
+
+        trainable_param_ids = set()
+        frozen_shared_param_ids = set()
+        for head in self.model.heads.values():
+            for param in head.parameters():
+                if id(param) in shared_param_ids:
+                    frozen_shared_param_ids.add(id(param))
+                    continue
+                param.requires_grad_(True)
+                trainable_param_ids.add(id(param))
+
+        params_by_id = {id(param): param for param in self.model.parameters()}
+        trainable_params = sum(params_by_id[param_id].numel() for param_id in trainable_param_ids)
+        frozen_shared_params = sum(
+            params_by_id[param_id].numel()
+            for param_id in frozen_shared_param_ids
+            if param_id in params_by_id
+        )
+        frozen_params = sum(
+            param.numel() for param in self.model.parameters() if not param.requires_grad
+        )
+        return {
+            "trainable_params": trainable_params,
+            "frozen_params": frozen_params,
+            "frozen_shared_head_params": frozen_shared_params,
+        }
 
     def train_model(
         self,
@@ -1005,6 +1057,7 @@ class GLiNExT(BaseEncoderGLiNER):
         eval_dataset=None,
         training_args=None,
         freeze_components: Optional[List[str]] = None,
+        train_head_only: bool = False,
         compile_model: bool = False,
         output_dir: Optional[Union[str, Path]] = None,
         **training_kwargs,
@@ -1025,6 +1078,8 @@ class GLiNExT(BaseEncoderGLiNER):
             freeze_components: Components to freeze during training. Options:
                 ``"text_encoder"``, ``"labels_encoder"``, ``"rnn"``, or any
                 task head name (``"ner"``, ``"classification"``, etc.).
+            train_head_only: Freeze encoders and shared/joint layers, training
+                only parameters owned by task heads.
             compile_model: Whether to compile the model with ``torch.compile``.
             output_dir: Output directory for checkpoints (required if
                 ``training_args`` is None).
@@ -1066,6 +1121,14 @@ class GLiNExT(BaseEncoderGLiNER):
 
         if compile_model:
             self.compile()
+
+        if train_head_only:
+            freeze_stats = self.train_head_only_parameters()
+            logger.info(
+                "Head-only training enabled: %s trainable params, %s frozen params",
+                freeze_stats["trainable_params"],
+                freeze_stats["frozen_params"],
+            )
 
         if freeze_components:
             for component_name in freeze_components:

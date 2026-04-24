@@ -15,6 +15,7 @@ from torch.nn import functional as F
 from gliner.modeling.loss_functions import focal_loss_with_logits
 from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from gliner.modeling.multitask.triples_layers import TriplesScoreLayer
+from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import (
     build_all_entity_pairs,
     build_entity_pairs,
@@ -42,10 +43,20 @@ class JointRelexHead(NERHead):
     def __init__(self, config, hidden_size, dropout, shared_layers=None):
         super().__init__(config, hidden_size, dropout, shared_layers=shared_layers)
         rel_cfg = config.joint_relex_config
+        self.ner_loss_coef = getattr(config.ner_config, "loss_coef", 1.0)
         self.rel_loss_coef = rel_cfg.loss_coef
         self.adjacency_loss_coef = rel_cfg.adjacency_loss_coef
         self.rel_token_index = rel_cfg.rel_token_index
         self.embed_rel_token = rel_cfg.embed_rel_token
+        # This head combines its own NER and relation losses internally. Keep
+        # the orchestrator from multiplying the combined loss a second time.
+        self.loss_coef = 1.0
+        self.rel_span_rep_layer = SpanRepLayer(
+            span_mode="token_level",
+            hidden_size=hidden_size,
+            max_width=getattr(config, "max_width", 12),
+            dropout=dropout,
+        )
 
         # ``layer_type='none'`` keeps the relation head active but skips
         # adjacency prediction so all directed entity pairs are scored.
@@ -67,25 +78,12 @@ class JointRelexHead(NERHead):
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
                    shared_layers=shared_layers)
 
-    @staticmethod
-    def _pool_entity_spans(words_embedding, span_idx, span_mask):
-        """Mean-pool token embeddings over each [start, end] span (end inclusive)."""
-        B, E, _ = span_idx.shape
-        W = words_embedding.shape[1]
-        device = words_embedding.device
-
-        start = span_idx[..., 0].clamp(min=0, max=max(W - 1, 0)).unsqueeze(-1)
-        end = span_idx[..., 1].clamp(min=0, max=max(W - 1, 0)).unsqueeze(-1)
-        positions = torch.arange(W, device=device).view(1, 1, W)
-        span_pos_mask = (positions >= start) & (positions <= end)
-        span_pos_mask = span_pos_mask & span_mask.unsqueeze(-1).bool()
-        span_pos_mask_f = span_pos_mask.to(words_embedding.dtype)
-
-        summed = torch.einsum("BEW,BWD->BED", span_pos_mask_f, words_embedding)
-        counts = span_pos_mask_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        pooled = summed / counts
-        pooled = pooled * span_mask.unsqueeze(-1).to(pooled.dtype)
-        return pooled, span_mask.to(torch.long)
+    def _pool_entity_spans(self, words_embedding, span_idx, span_mask):
+        """Represent entity spans with GLiNER-relex's token-level SpanRepLayer."""
+        span_idx = span_idx * span_mask.unsqueeze(-1).long()
+        span_rep = self.rel_span_rep_layer(words_embedding, span_idx)
+        span_rep = span_rep * span_mask.unsqueeze(-1).to(span_rep.dtype)
+        return span_rep, span_mask.to(torch.long)
 
     def _get_rel_prompts(self, shared, rel_label_embeds, flat_rel_prompts, flat_rel_prompts_mask):
         """Return per-group (BN, C_rel, D) [REL] embeddings.
@@ -113,7 +111,8 @@ class JointRelexHead(NERHead):
 
     def _forward_relations(self, shared, target_span_rep, target_span_mask,
                            rel_labels, adjacency_threshold, rel_label_embeds,
-                           flat_rel_prompts=None, flat_rel_prompts_mask=None):
+                           flat_rel_prompts=None, flat_rel_prompts_mask=None,
+                           rel_pair_mask=None, base_loss_fn=None, loss_kwargs=None):
         """Relation scoring with optional adjacency-based pair selection."""
         B, E_ent, D = target_span_rep.shape
         use_adjacency = hasattr(self, "relations_rep_layer")
@@ -127,7 +126,11 @@ class JointRelexHead(NERHead):
         C_rel = rel_prompts.size(1)
 
         if rel_labels is not None:
-            adj_matrix = (rel_labels.sum(dim=-1) > 0).float()
+            positive_adj_matrix = (rel_labels.sum(dim=-1) > 0).float()
+            if rel_pair_mask is not None:
+                adj_matrix = rel_pair_mask.float()
+            else:
+                adj_matrix = positive_adj_matrix
         else:
             adj_matrix = None
 
@@ -169,16 +172,21 @@ class JointRelexHead(NERHead):
             rel_mask_expanded = pair_mask.unsqueeze(-1).expand(B, N, C_rel)
             class_mask = rel_prompts_mask.unsqueeze(1).expand(B, N, C_rel)
             combined = rel_mask_expanded * class_mask
-            rel_loss = (focal_loss_with_logits(pair_scores, rel_matrix) * combined).sum()
+            if loss_kwargs is None:
+                loss_kwargs = {}
+            rel_losses = self._call_elementwise_loss(
+                base_loss_fn, pair_scores, rel_matrix, normalize_prob=True, **loss_kwargs,
+            )
+            rel_loss = (rel_losses * combined).sum()
 
             if use_adjacency and pred_adj_matrix is not None and adj_matrix is not None:
                 adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
                 adj_logits = pred_adj_matrix.unsqueeze(-1).view(B, -1, 1)
                 adj_labels = adj_matrix.unsqueeze(-1).view(B, -1, 1)
-                adj_loss = (
-                    focal_loss_with_logits(adj_logits, adj_labels)
-                    * adj_mask.unsqueeze(-1).view(B, -1, 1)
-                ).sum()
+                adj_losses = self._call_elementwise_loss(
+                    base_loss_fn, adj_logits, adj_labels, normalize_prob=False, **loss_kwargs,
+                )
+                adj_loss = (adj_losses * adj_mask.unsqueeze(-1).view(B, -1, 1)).sum()
                 loss = adj_loss * self.adjacency_loss_coef + rel_loss * self.rel_loss_coef
             else:
                 loss = rel_loss * self.rel_loss_coef
@@ -187,6 +195,49 @@ class JointRelexHead(NERHead):
             loss=loss,
             logits=pair_scores,
             extra={"rel_idx": pair_idx, "rel_mask": pair_mask},
+        )
+
+    @staticmethod
+    def _relation_loss_kwargs(batch):
+        """Mirror GLiNER-relex relation-loss kwargs, including rel_* overrides."""
+        kwargs = {}
+        for out_key, sources in (
+            ("alpha", ("rel_alpha", "alpha")),
+            ("gamma", ("rel_gamma", "gamma")),
+            ("prob_margin", ("rel_prob_margin", "prob_margin")),
+            ("label_smoothing", ("rel_label_smoothing", "label_smoothing")),
+            ("negatives", ("rel_negatives", "negatives")),
+            ("masking", ("rel_masking", "masking")),
+        ):
+            for source in sources:
+                value = batch.get(source)
+                if value is not None:
+                    kwargs[out_key] = value
+                    break
+        return kwargs
+
+    @staticmethod
+    def _call_elementwise_loss(loss_fn, logits, labels, normalize_prob=True, **kwargs):
+        """Call BaseModel._loss when available, falling back to focal loss.
+
+        Unit tests sometimes pass focal_loss_with_logits directly; production
+        GLiNExTModel passes BaseModel._loss, which supports negative sampling.
+        """
+        if loss_fn is not None:
+            try:
+                return loss_fn(logits, labels, normalize_prob=normalize_prob, **kwargs)
+            except TypeError:
+                supported = {
+                    "alpha", "gamma", "prob_margin", "label_smoothing",
+                }
+                fallback_kwargs = {k: v for k, v in kwargs.items() if k in supported}
+                return loss_fn(logits, labels, normalize_prob=normalize_prob, **fallback_kwargs)
+        supported = {
+            "alpha", "gamma", "prob_margin", "label_smoothing",
+        }
+        fallback_kwargs = {k: v for k, v in kwargs.items() if k in supported}
+        return focal_loss_with_logits(
+            logits, labels, normalize_prob=normalize_prob, **fallback_kwargs,
         )
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, base_loss_fn=None,
@@ -229,12 +280,15 @@ class JointRelexHead(NERHead):
             rel_label_embeds,
             flat_rel_prompts=flat_rel_prompts,
             flat_rel_prompts_mask=flat_rel_prompts_mask,
+            rel_pair_mask=batch.get("rel_pair_mask"),
+            base_loss_fn=base_loss_fn,
+            loss_kwargs=self._relation_loss_kwargs(batch),
         )
 
         # 4. Combine losses
         combined_loss = None
         if ner_output.loss is not None or rel_output.loss is not None:
-            ner_loss = ner_output.loss if ner_output.loss is not None else 0.0
+            ner_loss = ner_output.loss * self.ner_loss_coef if ner_output.loss is not None else 0.0
             rel_loss = rel_output.loss if rel_output.loss is not None else 0.0
             combined_loss = ner_loss + rel_loss
 
@@ -247,5 +301,6 @@ class JointRelexHead(NERHead):
                 "rel_logits": rel_output.logits,
                 "rel_idx": rel_output.extra.get("rel_idx"),
                 "rel_mask": rel_output.extra.get("rel_mask"),
+                "rel_entity_spans": rel_span_idx if rel_span_idx is not None else span_idx,
             },
         )

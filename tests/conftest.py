@@ -142,8 +142,6 @@ def joint_relex_item():
     """Joint NER + relation extraction item.
 
     Format: [head_id, rel_type, tail_id].
-    Note: NER processor builds rel_class_to_id using rel[-1] (tail_id),
-    while JointRelex uses rel[1] (rel_type) — there's a format mismatch.
     """
     return {
         "text": "John lives in New York",

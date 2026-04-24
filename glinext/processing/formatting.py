@@ -218,13 +218,43 @@ class StructuringOutputFormatter:
         field_name: str,
     ) -> Any:
         """Convert a single value according to its FieldType."""
-        # Already a list of values (multi-span field)
+        if ft.type_name == "list":
+            return self._convert_list_value(value, ft)
+
+        # GLiNER2 treats non-list fields as scalar: when multiple spans were
+        # decoded for a scalar field, keep the highest-ranked/first value.
         if isinstance(value, list):
-            return [
-                self._convert_single(v, ft, schema_name, field_name)
-                for v in value
-            ]
+            if not value:
+                return ft.default if ft.default is not None else None
+            return self._convert_single(value[0], ft, schema_name, field_name)
+
         return self._convert_single(value, ft, schema_name, field_name)
+
+    def _extract_text(self, value: Any) -> str:
+        """Extract raw text from a decoded field value."""
+        if isinstance(value, dict) and "text" in value:
+            return str(value["text"])
+        return str(value) if value is not None else ""
+
+    def _convert_list_value(self, value: Any, ft: FieldType) -> List:
+        """Convert a field declared as list, preserving multi-span values."""
+        raw_values = value if isinstance(value, list) else [value]
+        item_ft = FieldType(type_name=ft.list_item_type)
+        result = []
+
+        for raw_value in raw_values:
+            raw_text = self._extract_text(raw_value)
+            for part in re.split(ft.list_separator, raw_text):
+                part = part.strip()
+                if not part:
+                    continue
+                if ft.list_item_type == "str":
+                    result.append(part)
+                else:
+                    converted = self._apply_builtin(part, ft.list_item_type, item_ft)
+                    result.append(converted if converted is not None else part)
+
+        return result
 
     def _convert_single(
         self,
@@ -234,11 +264,7 @@ class StructuringOutputFormatter:
         field_name: str,
     ) -> Any:
         """Convert a single (non-list) value."""
-        # If value is a dict with text/start/end, extract text for conversion
-        if isinstance(value, dict) and "text" in value:
-            raw_text = str(value["text"])
-        else:
-            raw_text = str(value) if value is not None else ""
+        raw_text = self._extract_text(value)
 
         type_name = ft.type_name
 

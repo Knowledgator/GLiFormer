@@ -122,6 +122,43 @@ class TestJointRelexHeadForward:
         assert out.extra["rel_mask"] is not None
         assert out.extra["rel_mask"][0].sum().item() == 2
 
+    def test_adjacency_training_uses_candidate_pair_mask(self, shared, flat_inputs):
+        head = _make_head(layer_type="dot")
+        R = 1
+        E = 3
+        ner_labels = torch.zeros(B, W, C, 3)
+        rel_labels = torch.zeros(B, E, E, R)
+        rel_labels[0, 0, 1, 0] = 1.0
+        rel_pair_mask = torch.zeros(B, E, E)
+        rel_pair_mask[0, 0, 1] = 1.0  # positive relation
+        rel_pair_mask[0, 1, 0] = 1.0  # sampled no-relation candidate
+
+        rel_label_embeds = torch.randn(B, R, D)
+        rel_span_idx = torch.tensor([
+            [[0, 0], [1, 1], [2, 2]],
+            [[0, 0], [0, 0], [0, 0]],
+        ], dtype=torch.long)
+        rel_span_mask = torch.tensor([
+            [True, True, True],
+            [False, False, False],
+        ])
+
+        from gliner.modeling.loss_functions import focal_loss_with_logits
+        out = head(
+            shared, {},
+            flat_inputs=flat_inputs,
+            ner_labels=ner_labels,
+            rel_labels=rel_labels,
+            rel_pair_mask=rel_pair_mask,
+            rel_span_idx=rel_span_idx,
+            rel_span_mask=rel_span_mask,
+            rel_label_embeds=rel_label_embeds,
+            base_loss_fn=focal_loss_with_logits,
+        )
+
+        assert out.extra["rel_mask"][0].sum().item() == 2
+        assert out.loss is not None
+
 
 # ── Entity pooling ───────────────────────────────────────────────────────
 
@@ -139,19 +176,17 @@ class TestPoolEntitySpans:
         rep, mask = head._pool_entity_spans(shared.words_embedding, span_idx, span_mask)
         assert rep.shape == (B, E, D)
         assert mask.shape == (B, E)
-        assert torch.allclose(rep[0, 0], shared.words_embedding[0, 0])
-        assert torch.allclose(rep[0, 1], shared.words_embedding[0, 3])
         assert mask[0].sum() == 2
         assert mask[1].sum() == 0
 
-    def test_multi_token_span_is_mean(self, shared):
+    def test_multi_token_span_uses_span_rep_layer(self, shared):
         head = _make_head()
         span_idx = torch.tensor([[[1, 3]], [[0, 0]]], dtype=torch.long)  # (B, 1, 2)
         span_mask = torch.ones(B, 1, dtype=torch.bool)
 
-        rep, _ = head._pool_entity_spans(shared.words_embedding, span_idx, span_mask)
-        expected = shared.words_embedding[0, 1:4].mean(dim=0)
-        assert torch.allclose(rep[0, 0], expected, atol=1e-5)
+        rep, mask = head._pool_entity_spans(shared.words_embedding, span_idx, span_mask)
+        assert rep.shape == (B, 1, D)
+        assert mask.sum().item() == B
 
     def test_masked_entity_is_zero(self, shared):
         head = _make_head()

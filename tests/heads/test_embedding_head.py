@@ -2,9 +2,9 @@
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from glinext.tasks.embedding.model import EmbeddingHead, EmbeddingLoss, MSELoss, ContrastiveLoss, TripletLoss
-from glinext.tasks import TaskHeadOutput
 from tests.heads.conftest import make_config, D, B, W, C
 from dataclasses import asdict
 from glinext.config import EmbeddingHeadConfig
@@ -75,6 +75,18 @@ class TestEmbeddingHeadConstruction:
         config = make_config(embedding_config=asdict(EmbeddingHeadConfig(similarity_fn="l2")))
         head = EmbeddingHead.from_config(config)
         assert head.similarity_fn == "l2"
+
+    def test_from_config_projection_dim(self):
+        config = make_config(embedding_config=asdict(EmbeddingHeadConfig(projection_dim=32)))
+        head = EmbeddingHead.from_config(config)
+        assert head.projection is not None
+        pair_idx = torch.tensor([[0, 1]])
+        shared = SimpleNamespace(
+            words_embedding=torch.randn(B, W, D),
+            mask=torch.ones(B, W, dtype=torch.long),
+        )
+        out = head(shared, {}, embedding_pair_idx=pair_idx)
+        assert out.logits.shape == (1,)
 
 
 # ── EmbeddingHead forward ───────────────────────────────────────────────

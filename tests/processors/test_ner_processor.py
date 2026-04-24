@@ -43,9 +43,9 @@ class TestGetClassesMapping:
         mapping = ner_proc.get_classes_mapping([joint_relex_item])
         ext_item = mapping[0].items[0]
         assert ext_item.rel_class_to_id is not None
-        # NER processor extracts rel[-1] from relations, which is the tail_id (int)
-        # for format [head_id, rel_type, tail_id]
-        assert 1 in ext_item.rel_class_to_id.class_to_id
+        # Relations are [head_id, rel_type, tail_id]; the mapping must key on
+        # rel_type (the string) so create_labels can look it up by name.
+        assert "lives_in" in ext_item.rel_class_to_id.class_to_id
 
     def test_negative_sampling(self, ner_proc, ner_item):
         negatives = ["org", "event", "date"]

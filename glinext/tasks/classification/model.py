@@ -50,6 +50,7 @@ class ClassificationHead(TaskHead):
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
         cat_labels = batch.get("cat_labels")
+        base_loss_fn = batch.get("base_loss_fn")
 
         cat_embedding = flat_inputs.child_embedding      # (BN, max_C, D)
         cat_embedding_mask = flat_inputs.child_mask       # (BN, max_C)
@@ -68,7 +69,8 @@ class ClassificationHead(TaskHead):
 
         loss = None
         if cat_labels is not None:
-            all_losses = focal_loss_with_logits(scores, cat_labels)
+            loss_fn = base_loss_fn or focal_loss_with_logits
+            all_losses = loss_fn(scores, cat_labels)
             valid_mask = cat_embedding_mask
             all_losses = all_losses * valid_mask
             loss = all_losses.sum()

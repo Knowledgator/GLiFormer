@@ -11,6 +11,10 @@ from gliner.config import BaseGLiNERConfig
 class BaseHeadConfig:
     """Base config for all task heads that use the anchor paradigm."""
     loss_coef: float = 1.0
+    # None means inherit the global focal loss value supplied by training args.
+    focal_loss_alpha: Optional[float] = None
+    focal_loss_gamma: Optional[float] = None
+    focal_loss_prob_margin: Optional[float] = None
     anchor_mode: str = "parent"
     anchor_modeling: str = "linear"
     anchor_refine_layers: int = 0
@@ -90,6 +94,7 @@ class EmbeddingHeadConfig:
     pooling_type: str = "mean"  # "mean", "cls", "max", "weighted"
     similarity_fn: str = "cosine"  # "cosine", "dot", "l2"
     loss_fn: str = "mse"  # "mse", "contrastive", "triplet"
+    projection_dim: Optional[int] = None
 
 
 class GLiNextConfig(BaseGLiNERConfig):

@@ -1,5 +1,6 @@
 """Joint relex task processor."""
 
+import random
 from typing import Dict, List, Optional
 
 import torch
@@ -50,12 +51,19 @@ class JointRelexProcessor(NERProcessor):
             total_groups, max_entities, max_entities, max_rel_classes,
             dtype=torch.float
         )
+        # Candidate-pair adjacency used by the GLiNER-relex algorithm:
+        # positives plus sampled no-relation pairs. This is intentionally
+        # distinct from rel_labels.sum(-1), which marks only positive relations.
+        rel_pair_mask = torch.zeros(total_groups, max_entities, max_entities, dtype=torch.float)
         rel_mask = torch.zeros(total_groups, dtype=torch.bool)
         rel_batch_idx = torch.zeros(total_groups, dtype=torch.long)
         rel_span_idx = torch.zeros(total_groups, max_entities, 2, dtype=torch.long)
         rel_span_mask = torch.zeros(total_groups, max_entities, dtype=torch.bool)
 
         max_seq_len = kwargs.get("max_seq_len", 0)
+        add_reversed_negatives = kwargs.get("add_reversed_negatives", True)
+        add_random_negatives = kwargs.get("add_random_negatives", True)
+        negative_ratio = kwargs.get("negative_ratio", (1.0, 10.0))
 
         for flat_idx, batch_idx, group_idx, ext_mapping in classes_mapping.flat_extraction_iter():
             rel_batch_idx[flat_idx] = batch_idx
@@ -84,6 +92,7 @@ class JointRelexProcessor(NERProcessor):
                 rel_span_mask[flat_idx, new_id] = True
                 old_to_new[orig_id] = new_id
 
+            positive_pairs = set()
             for head_id, rel_type, tail_id in example.get('relations', []):
                 if rel_type not in mapping.class_to_id:
                     continue
@@ -93,9 +102,43 @@ class JointRelexProcessor(NERProcessor):
                     continue
                 rel_class_idx = mapping.class_to_id[rel_type]
                 rel_labels[flat_idx, new_head, new_tail, rel_class_idx] = 1.0
+                if new_head != new_tail:
+                    positive_pairs.add((new_head, new_tail))
+
+            n_valid = len(old_to_new)
+            negative_pairs = set()
+            if n_valid > 1:
+                if add_reversed_negatives:
+                    for head, tail in positive_pairs:
+                        reversed_pair = (tail, head)
+                        if reversed_pair not in positive_pairs:
+                            negative_pairs.add(reversed_pair)
+
+                if add_random_negatives:
+                    if isinstance(negative_ratio, (tuple, list)):
+                        ratio = random.uniform(float(negative_ratio[0]), float(negative_ratio[1]))
+                    else:
+                        ratio = float(negative_ratio)
+                    target_negatives = max(1, int(len(positive_pairs) * ratio))
+                    attempts = 0
+                    max_attempts = max(target_negatives * 10, 0)
+                    while len(negative_pairs) < target_negatives and attempts < max_attempts:
+                        attempts += 1
+                        head = random.randint(0, n_valid - 1)
+                        tail = random.randint(0, n_valid - 1)
+                        if head == tail:
+                            continue
+                        pair = (head, tail)
+                        if pair in positive_pairs or pair in negative_pairs:
+                            continue
+                        negative_pairs.add(pair)
+
+            for head, tail in positive_pairs | negative_pairs:
+                rel_pair_mask[flat_idx, head, tail] = 1.0
 
         return {
             "rel_labels": rel_labels,
+            "rel_pair_mask": rel_pair_mask,
             "rel_mask": rel_mask,
             "rel_batch_idx": rel_batch_idx,
             "rel_span_idx": rel_span_idx,

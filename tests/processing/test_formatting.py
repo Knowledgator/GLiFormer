@@ -176,7 +176,19 @@ class TestStructuringOutputFormatter:
         """When decoder returns a list for a field (multiple spans)."""
         fmt = StructuringOutputFormatter({"person": {"name": "str", "age": "int"}})
         result = fmt.format({"person": [{"name": "Alice", "age": ["25", "26"]}]})
-        assert result == {"person": [{"name": "Alice", "age": [25, 26]}]}
+        assert result == {"person": [{"name": "Alice", "age": 25}]}
+
+    def test_list_field_preserves_multiple_decoded_spans(self):
+        fmt = StructuringOutputFormatter({
+            "person": {"skills": FieldType("list", list_item_type="str")}
+        })
+        result = fmt.format({"person": [{"skills": ["python", "java"]}]})
+        assert result == {"person": [{"skills": ["python", "java"]}]}
+
+    def test_scalar_str_field_collapses_multiple_decoded_spans(self):
+        fmt = StructuringOutputFormatter({"person": {"name": "str"}})
+        result = fmt.format({"person": [{"name": ["Alice", "Bob"]}]})
+        assert result == {"person": [{"name": "Alice"}]}
 
     def test_dict_value_with_text(self):
         """Values that are still in {text, start, end} format."""
