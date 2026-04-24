@@ -870,7 +870,8 @@ class GLiNExT(BaseEncoderGLiNER):
 
             # Pool using EmbeddingHead's pooling layer — same as training
             if embedding_head is not None:
-                pooled = embedding_head.pooling(token_embeds, attention_mask)
+                projected = embedding_head._project(token_embeds)
+                pooled = embedding_head.pooling(projected, attention_mask)
             else:
                 # Fallback: mean pooling
                 mask_f = attention_mask.unsqueeze(-1).float()

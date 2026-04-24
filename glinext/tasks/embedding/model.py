@@ -52,6 +52,51 @@ class ContrastiveLoss(EmbeddingLoss, loss_fn="contrastive"):
         return (positive + negative).mean()
 
 
+class CosineSimilarityLoss(EmbeddingLoss, loss_fn="cosine"):
+    """PyTorch-style CosineEmbeddingLoss on pre-computed cosine similarities.
+
+    Labels: +1 for similar pairs, -1 for dissimilar. A label of 0 is
+    treated as -1 for compatibility with binary {0, 1} targets.
+    """
+
+    def __init__(self, margin: float = 0.0, **kwargs):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, similarities, labels):
+        labels = labels.float()
+        labels = torch.where(labels == 0, torch.full_like(labels, -1.0), labels)
+        positive = (labels == 1).float() * (1 - similarities)
+        negative = (labels == -1).float() * F.relu(similarities - self.margin)
+        return (positive + negative).mean()
+
+
+class RankingLogSumExpLoss(EmbeddingLoss, loss_fn="rank_logsumexp"):
+    """Smooth pairwise-of-pairs ranking loss via LogSumExp.
+
+    For every ordered pair of input pairs (p, q) with strictly greater expected
+    similarity for p (``y_p > y_q``), penalize predicted inversions:
+
+        loss = log(1 + sum_{p,q : y_p > y_q} exp(s_q - s_p))
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+
+    def forward(self, similarities, labels):
+        sims = similarities.flatten()
+        labs = labels.float().flatten()
+
+        label_diff = labs.unsqueeze(1) - labs.unsqueeze(0)
+        valid_mask = label_diff > 0
+
+        sim_diff = sims.unsqueeze(0) - sims.unsqueeze(1)
+        terms = sim_diff[valid_mask]
+
+        zero = sims.new_zeros(1)
+        return torch.logsumexp(torch.cat([zero, terms]), dim=0)
+
+
 class TripletLoss(EmbeddingLoss, loss_fn="triplet"):
     """Falls back to MSE without explicit triplets."""
 
@@ -129,8 +174,6 @@ class EmbeddingHead(TaskHead):
         if embedding_encodings is not None and embedding_pair_idx is not None:
             mask = embedding_encoding_mask.bool() if embedding_encoding_mask is not None else None
             pooled = self.pooling(self._project(embedding_encodings), mask)
-            if self.similarity_fn == "cosine":
-                pooled = F.normalize(pooled, p=2, dim=-1)
 
             idx_a = embedding_pair_idx[:, 0]
             idx_b = embedding_pair_idx[:, 1]
@@ -151,8 +194,6 @@ class EmbeddingHead(TaskHead):
             mask = shared.mask
 
             pooled = self.pooling(self._project(words_embedding), mask)
-            if self.similarity_fn == "cosine":
-                pooled = F.normalize(pooled, p=2, dim=-1)
 
             idx_a = embedding_pair_idx[:, 0]
             idx_b = embedding_pair_idx[:, 1]
