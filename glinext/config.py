@@ -79,6 +79,11 @@ class StructuringHeadConfig(BaseHeadConfig):
     num_fixed_slots: int = 10  # number of learnable anchor slots (for anchor_mode="fixed")
     child_token_index: int = -1
     embed_child_token: bool = True
+    # When True, BIO/span loss is computed against the optimal Hungarian
+    # assignment of predicted anchors → gold instances per sample, removing
+    # the spurious order signal of the data. When False, falls back to the
+    # original positional loss.
+    use_anchor_matching: bool = True
 
 
 @dataclass

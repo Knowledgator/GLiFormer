@@ -81,6 +81,7 @@ def main(cfg_path: str):
         # Batch & optimization
         per_device_train_batch_size=cfg.training.train_batch_size,
         per_device_eval_batch_size=cfg.training.train_batch_size,
+        gradient_accumulation_steps=int(getattr(cfg.training, "gradient_accumulation_steps", 1)),
         learning_rate=float(cfg.training.lr_encoder),
         others_lr=float(cfg.training.lr_others),
         weight_decay=float(cfg.training.weight_decay_encoder),

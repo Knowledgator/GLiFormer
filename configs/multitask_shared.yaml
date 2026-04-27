@@ -18,11 +18,12 @@ model:
   shared_anchor_refine_layers: 2
   shared_anchor_refine_heads: 8
 
-  # ── Task heads ──
-
   ner_config:
     scorer_type: "gliner"
     loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
     anchor_mode: "parent"
     represent_spans: true
     neg_spans_ratio: 1.0
@@ -32,24 +33,18 @@ model:
     layer_type: "dot"
     pooling_type: "mean"
     loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
 
   joint_relex_config:
     layer_type: "dot"
     pair_rep_type: "concat_proj"
     loss_coef: 1.0
     adjacency_loss_coef: 1.0
-
-  open_relex_config:
-    anchor_mode: "fixed"
-    anchor_modeling: "linear"
-    num_fixed_slots: 10
-    max_count: 20
-    anchor_num_heads: 4
-    anchor_num_layers: 2
-    loss_coef: 1.0
-    represent_spans: true
-    neg_spans_ratio: 1.0
-    span_loss_coef: 0.5
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
 
   structuring_config:
     anchor_mode: "lstm"
@@ -59,39 +54,47 @@ model:
     max_count: 20
     num_fixed_slots: 10
     loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
     represent_spans: true
     neg_spans_ratio: 1.0
     span_loss_coef: 0.5
+    use_anchor_matching: true
 
   count_config:
-    mode: "regression"
-    max_count: 20
+    mode: "classification"
+    max_count: 30
     loss_coef: 0.5
 
   embedding_config:
     pooling_type: "mean"
     similarity_fn: "cosine"
     loss_fn: "mse"
+    projection_dim: 512
     loss_coef: 0.5
 
 data:
   root_dir: logs/multitask_shared
-  train_data: "data/multitask_train.json"
+  train_data: "data/extraction_multi.json"
   val_data: "none"
 
 training:
+  prev_path: /home/ingvar/GLiNext/GLiNext/logs/multitask_shared/130k                 # path to a GLiNExT checkpoint to init from (null = from scratch)
   num_steps: 50000
   train_batch_size: 2
+  gradient_accumulation_steps: 1
   eval_every: 1000
   warmup_ratio: 0.05
   scheduler_type: "cosine"
-  focal_loss_alpha: 0.75
+  focal_loss_alpha: 0.9
   focal_loss_gamma: 0
   loss_reduction: "sum"
   lr_encoder: 1e-5
   lr_others: 3e-5
-  weight_decay_encoder: 0.1
+  weight_decay_encoder: 0.01
   weight_decay_other: 0.01
   max_grad_norm: 10.0
   save_total_limit: 3
+  train_head_only: true
   bf16: true

@@ -140,6 +140,39 @@ class TestStructuringHeadForward:
         out = head(shared, {}, flat_inputs=flat_inputs)
         assert out.extra["span_logits"] is None
 
+    def test_structuring_loss_matches_permuted_anchors(self):
+        head = _make_head(num_fixed_slots=2)
+
+        def squared_loss(pred, labels):
+            return (pred - labels) ** 2
+
+        scores = torch.zeros(1, 2, 2, 1, 3)
+        labels = torch.zeros(1, 2, 2, 1, 3)
+        labels[0, 0, 0, 0, 0] = 1.0
+        labels[0, 1, 1, 0, 0] = 1.0
+        scores[0, 0, 1, 0, 0] = 1.0
+        scores[0, 1, 0, 0, 0] = 1.0
+
+        anchor_mask = torch.ones(1, 2, dtype=torch.bool)
+        word_mask = torch.ones(1, 2, dtype=torch.bool)
+        child_mask = torch.ones(1, 1, dtype=torch.bool)
+
+        direct_loss = head._bio_loss(
+            scores=scores, labels=labels,
+            anchor_mask=anchor_mask, word_mask=word_mask, child_mask=child_mask,
+            base_loss_fn=squared_loss,
+        )
+        matched_loss, matches, _ = head._anchor_matched_bio_loss(
+            scores=scores, labels=labels,
+            anchor_mask=anchor_mask, word_mask=word_mask, child_mask=child_mask,
+            base_loss_fn=squared_loss,
+            label_count=torch.tensor([2]),
+        )
+
+        assert direct_loss.item() > 0
+        assert matched_loss.item() == pytest.approx(0.0)
+        assert sorted(matches[0]) == [(0, 1), (1, 0)]
+
 
 class TestStructuringGradient:
     def test_gradient_flows(self, shared, flat_inputs):

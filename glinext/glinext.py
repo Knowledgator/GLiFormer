@@ -288,6 +288,7 @@ class GLiNExT(BaseEncoderGLiNER):
         threshold: float = 0.5,
         multi_label: bool = False,
         batch_size: int = 8,
+        manual_structuring_count: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -357,6 +358,8 @@ class GLiNExT(BaseEncoderGLiNER):
         )
 
         # Process batches
+        if manual_structuring_count is not None:
+            kwargs["manual_structuring_count"] = manual_structuring_count
         all_decoded, all_classes_mappings = self._process_multitask_batches(
             data_loader, threshold, flat_ner, multi_label, **kwargs,
         )
@@ -400,8 +403,8 @@ class GLiNExT(BaseEncoderGLiNER):
                     # classes_mapping, tokens, etc. — pass through
                     model_batch[k] = v
 
-            # Forward
-            model_output = self.model(**model_batch, threshold=threshold)
+            # Forward — kwargs (e.g. manual_structuring_count) flow through to model.forward
+            model_output = self.model(**model_batch, threshold=threshold, **kwargs)
 
             # Decode
             classes_mapping = batch.get("classes_mapping")

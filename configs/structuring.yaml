@@ -14,14 +14,18 @@ model:
   ner_config: null
 
   structuring_config:
-    anchor_mode: "lstm"
-    anchor_modeling: "linear"
+    anchor_mode: "fixed_lstm"
+    anchor_modeling: "lstm"
     anchor_num_heads: 4
     anchor_num_layers: 2
-    max_count: 20
+    max_count: 10
     num_fixed_slots: 10
     loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
     represent_spans: false
+    use_anchor_matching: true
 
   classification_config: null
   joint_relex_config: null
@@ -31,22 +35,25 @@ model:
 
 data:
   root_dir: logs/structuring
-  train_data: "data/structuring_train.json"
+  train_data: "data/extraction_multi.json"
   val_data: "none"
 
 training:
-  num_steps: 20000
-  train_batch_size: 4
-  eval_every: 500
+  prev_path: null                 # path to a GLiNExT checkpoint to init from (null = from scratch)
+  num_steps: 200000
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  eval_every: 1000
   warmup_ratio: 0.05
   scheduler_type: "cosine"
   focal_loss_alpha: 0.75
   focal_loss_gamma: 0
   loss_reduction: "sum"
-  lr_encoder: 1e-5
-  lr_others: 3e-5
-  weight_decay_encoder: 0.1
+  lr_encoder: 3e-5
+  lr_others: 5e-5
+  weight_decay_encoder: 0.01
   weight_decay_other: 0.01
   max_grad_norm: 10.0
   save_total_limit: 3
+  train_head_only: false
   bf16: true

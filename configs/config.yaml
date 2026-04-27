@@ -20,6 +20,9 @@ model:
   ner_config:
     scorer_type: "gliner"         # "gliner" (GLiNER Scorer), "anchored" (AnchoredSpanScorer)
     loss_coef: 1.0
+    focal_loss_alpha: null        # null = use training.focal_loss_alpha
+    focal_loss_gamma: null        # null = use training.focal_loss_gamma
+    focal_loss_prob_margin: null  # null = use training.focal_loss_prob_margin
     anchor_mode: "parent"         # "parent", "fixed" (only used when scorer_type="anchored")
     anchor_modeling: "linear"     # "linear", "lstm", "mlp" (only used when scorer_type="anchored")
     anchor_refine_layers: 0       # cross-attention layers for anchor refinement (0 = disabled)
@@ -35,6 +38,9 @@ model:
   #   cat_token_index: -1
   #   embed_cat_token: true
   #   loss_coef: 1.0
+  #   focal_loss_alpha: null
+  #   focal_loss_gamma: null
+  #   focal_loss_prob_margin: null
 
   joint_relex_config: null
   # joint_relex_config:
@@ -45,6 +51,9 @@ model:
   #   rel_token_index: -1
   #   loss_coef: 1.0
   #   adjacency_loss_coef: 1.0
+  #   focal_loss_alpha: null
+  #   focal_loss_gamma: null
+  #   focal_loss_prob_margin: null
 
   open_relex_config: null
   # open_relex_config:
@@ -57,6 +66,9 @@ model:
   #   rel_token_index: -1
   #   embed_rel_token: true
   #   loss_coef: 1.0
+  #   focal_loss_alpha: null
+  #   focal_loss_gamma: null
+  #   focal_loss_prob_margin: null
   #   represent_spans: false
   #   neg_spans_ratio: 1.0
   #   span_loss_coef: 1.0
@@ -74,11 +86,15 @@ model:
   #   child_token_index: -1
   #   embed_child_token: true
   #   loss_coef: 1.0
+  #   focal_loss_alpha: null
+  #   focal_loss_gamma: null
+  #   focal_loss_prob_margin: null
   #   represent_spans: false
   #   neg_spans_ratio: 1.0
   #   span_loss_coef: 1.0
   #   anchor_refine_layers: 0
   #   anchor_refine_heads: 8
+  #   use_anchor_matching: true   # Hungarian-matched permutation-invariant BIO/span loss
 
   count_config: null
   # count_config:
@@ -91,6 +107,7 @@ model:
   #   pooling_type: "mean"        # "mean", "cls", "max", "weighted"
   #   similarity_fn: "cosine"     # "cosine", "dot", "l2"
   #   loss_fn: "mse"              # "mse", "contrastive", "triplet"
+  #   projection_dim: null        # optional output dimension for embedding projections
   #   loss_coef: 1.0
 
 data:
@@ -105,6 +122,7 @@ training:
   # Training schedule
   num_steps: 15000
   train_batch_size: 2
+  gradient_accumulation_steps: 1
   eval_every: 500
   warmup_ratio: 0.05
   scheduler_type: "cosine"        # linear, cosine, constant
@@ -128,6 +146,7 @@ training:
   save_total_limit: 3
 
   # Freezing
+  train_head_only: false          # true = train only head-specific parameters
   freeze_components: null         # e.g. ["text_encoder"] or ["text_encoder", "ner"]
 
   # Precision

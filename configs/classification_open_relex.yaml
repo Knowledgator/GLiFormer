@@ -23,6 +23,9 @@ model:
     # Text pooling strategy: "mean", "cls", "max"
     pooling_type: "mean"
     loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
 
   open_relex_config:
     # Anchor acquisition strategy:
@@ -43,6 +46,9 @@ model:
     anchor_num_heads: 4
     anchor_num_layers: 2
     loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
     # Whether to learn span-level representations (adds span-level scoring path alongside token-level BIO)
     represent_spans: false
     # Negative span sampling ratio (only used when represent_spans=true)
@@ -60,8 +66,10 @@ data:
   val_data: "none"
 
 training:
+  prev_path: null                 # path to a GLiNExT checkpoint to init from (null = from scratch)
   num_steps: 20000
   train_batch_size: 4
+  gradient_accumulation_steps: 1
   eval_every: 1000
   warmup_ratio: 0.05
   scheduler_type: "cosine"
@@ -74,4 +82,5 @@ training:
   weight_decay_other: 0.01
   max_grad_norm: 10.0
   save_total_limit: 3
+  train_head_only: false
   bf16: true

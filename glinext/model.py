@@ -182,14 +182,21 @@ class GLiNExTModel(BaseModel):
         count_cfg = self.config.count_config
         if count_cfg and count_cfg.mode == "classification":
             predicted = count_logits.argmax(dim=-1)
+            print(f"[DEBUG count_head] mode=classification logits.shape={tuple(count_logits.shape)} "
+                  f"top3_argmax_per_row={count_logits.topk(min(3, count_logits.shape[-1]), dim=-1).indices.tolist()} "
+                  f"top3_probs_per_row={count_logits.softmax(dim=-1).topk(min(3, count_logits.shape[-1]), dim=-1).values.tolist()}")
         else:
             predicted = count_logits.squeeze(-1).round().long()
+            print(f"[DEBUG count_head] mode=regression raw={count_logits.squeeze(-1).tolist()}")
 
         predicted = predicted.clamp(min=0)
+        print(f"[DEBUG count_head] all_predicted={predicted.tolist()} (struct_bn={struct_bn})")
         if predicted.shape[0] < struct_bn:
             return None
 
-        return predicted[-struct_bn:]
+        struct_predicted = predicted[-struct_bn:]
+        print(f"[DEBUG count_head] structuring_count={struct_predicted.tolist()}")
+        return struct_predicted
 
     def _task_config_for_loss(self, task_name: str):
         if task_name == "ner":
@@ -650,6 +657,9 @@ class GLiNExTModel(BaseModel):
         # Misc
         threshold: float = 0.5,
         adjacency_threshold: float = 0.5,
+        # Debug / manual override — when set, ignores the count-head prediction
+        # and uses this constant value as the structuring anchor count.
+        manual_structuring_count: Optional[int] = None,
         **kwargs,
     ) -> GLiNExTOutput:
 
@@ -933,12 +943,21 @@ class GLiNExTModel(BaseModel):
                 extra_kwargs["flat_inputs"] = flat_inputs_map[name]
 
             if name == "structuring" and structuring_count is None:
-                predicted_structuring_count = self._predict_structuring_counts_from_count_head(
-                    head_outputs.get("count", TaskHeadOutput()).logits,
-                    flat_inputs_map,
-                )
-                if predicted_structuring_count is not None:
-                    extra_kwargs["structuring_count"] = predicted_structuring_count
+                if manual_structuring_count is not None and "structuring" in flat_inputs_map:
+                    struct_bn = flat_inputs_map["structuring"].batch_origin.shape[0]
+                    forced = flat_inputs_map["structuring"].parent_embedding.new_full(
+                        (struct_bn,), int(manual_structuring_count), dtype=torch.long,
+                    )
+                    extra_kwargs["structuring_count"] = forced
+                    print(f"[DEBUG model.forward] manual_structuring_count={int(manual_structuring_count)} "
+                          f"applied to {struct_bn} groups (overrides count head)")
+                else:
+                    predicted_structuring_count = self._predict_structuring_counts_from_count_head(
+                        head_outputs.get("count", TaskHeadOutput()).logits,
+                        flat_inputs_map,
+                    )
+                    if predicted_structuring_count is not None:
+                        extra_kwargs["structuring_count"] = predicted_structuring_count
 
             # Pass task-specific label embeds for heads that use them directly
             if name == "joint_relex" and rel_label_embeds is not None:

@@ -14,6 +14,9 @@ model:
   ner_config:
     scorer_type: "gliner"
     loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
     represent_spans: false
 
   structuring_config:
@@ -24,7 +27,11 @@ model:
     max_count: 20
     num_fixed_slots: 10
     loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
     represent_spans: false
+    use_anchor_matching: true
 
   classification_config: null
   joint_relex_config: null
@@ -38,8 +45,10 @@ data:
   val_data: "none"
 
 training:
+  prev_path: null                 # path to a GLiNExT checkpoint to init from (null = from scratch)
   num_steps: 20000
   train_batch_size: 4
+  gradient_accumulation_steps: 1
   eval_every: 1000
   warmup_ratio: 0.05
   scheduler_type: "cosine"
@@ -52,4 +61,5 @@ training:
   weight_decay_other: 0.01
   max_grad_norm: 10.0
   save_total_limit: 3
+  train_head_only: false
   bf16: true

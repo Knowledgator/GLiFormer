@@ -18,6 +18,16 @@ class StructuringProcessor(SpanProcessor):
         super().__init__(config, tokenizer, words_splitter,
                          parent_token=getattr(config, 'struct_parent_token', None), **kwargs)
         self.child_token = config.child_token
+        # Fixed-slot anchors always emit ``num_slots`` anchors; labels must be
+        # padded to that size so Hungarian sees unmatched slots and trains
+        # them as negatives.
+        struct_cfg = getattr(config, 'structuring_config', None)
+        anchor_mode = getattr(struct_cfg, 'anchor_mode', '') if struct_cfg else ''
+        self._fixed_slot_pad = (
+            getattr(struct_cfg, 'num_fixed_slots', 0)
+            if anchor_mode in ('fixed', 'fixed_lstm', 'fixed_transformer')
+            else 0
+        )
 
     @staticmethod
     def _instance_sort_key(instance):
@@ -162,6 +172,9 @@ class StructuringProcessor(SpanProcessor):
         if not has_any or max_instances == 0 or max_fields == 0:
             return None
 
+        if self._fixed_slot_pad:
+            max_instances = max(max_instances, self._fixed_slot_pad)
+
         structuring_labels = torch.zeros(
             total_groups, max_instances, max_seq_len, max_fields, 3,
             dtype=torch.float,
@@ -275,6 +288,9 @@ class StructuringProcessor(SpanProcessor):
 
         if not has_any or max_instances == 0 or max_fields == 0:
             return None
+
+        if self._fixed_slot_pad:
+            max_instances = max(max_instances, self._fixed_slot_pad)
 
         max_spans = max((len(s) for s in all_group_spans), default=0)
         if max_spans == 0:
