@@ -1,9 +1,14 @@
 """Structuring task head."""
 
+import logging
+
 import torch
+from torch import nn
 
 from .. import TaskHeadOutput
 from ..anchored_extraction import AnchoredSpanExtractionHead
+
+logger = logging.getLogger(__name__)
 
 
 class StructuringHead(AnchoredSpanExtractionHead):
@@ -33,6 +38,34 @@ class StructuringHead(AnchoredSpanExtractionHead):
         # supervision Hungarian needs for unmatched slots — so we keep all
         # slots active and let the matcher decide which fire.
         self._anchor_uses_fixed_slots = hasattr(self.anchor_layer, "num_slots")
+
+        # Loss-shaping config
+        self.bio_loss_reduction = getattr(struct_cfg, "bio_loss_reduction", "sum")
+        self.negatives = getattr(struct_cfg, "negatives", 1.0)
+        self.masking_mode = getattr(struct_cfg, "masking", "none")
+
+        # Diagnostic logging
+        self.log_loss_stats = getattr(struct_cfg, "log_loss_stats", False)
+        self.log_loss_stats_every = max(1, getattr(struct_cfg, "log_loss_stats_every", 50))
+        self.register_buffer(
+            "_log_step", torch.zeros(1, dtype=torch.long), persistent=False,
+        )
+
+        # Anchor objectness head
+        self.use_anchor_objectness = getattr(struct_cfg, "anchor_objectness", False)
+        self.anchor_objectness_loss_coef = getattr(
+            struct_cfg, "anchor_objectness_loss_coef", 1.0,
+        )
+        self.anchor_objectness_threshold = getattr(
+            struct_cfg, "anchor_objectness_threshold", 0.5,
+        )
+        if self.use_anchor_objectness:
+            self.objectness_head = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_size, 1),
+            )
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
@@ -87,6 +120,11 @@ class StructuringHead(AnchoredSpanExtractionHead):
             flat_inputs, batch,
         )
 
+        # Anchor-objectness logits (one sigmoid score per anchor slot).
+        objectness_logits = None
+        if self.use_anchor_objectness:
+            objectness_logits = self.objectness_head(anchors).squeeze(-1)  # (BN, A)
+
         # Optional span-level rescoring — auxiliary training signal only.
         span_logits_out = None
         if (
@@ -102,12 +140,13 @@ class StructuringHead(AnchoredSpanExtractionHead):
                 )
 
         loss = None
+        loss_stats = None
         if structuring_labels is not None and base_loss_fn is not None:
             if self.use_anchor_matching:
                 label_count = batch.get("structuring_count")
                 if label_count is None:
                     label_count = batch.get("count_val")
-                loss, anchor_matches, supervised_anchor_mask = self._anchor_matched_bio_loss(
+                loss, anchor_matches, supervised_anchor_mask, loss_stats = self._anchor_matched_bio_loss(
                     scores=scores, labels=structuring_labels,
                     anchor_mask=anchor_mask,
                     word_mask=flat_inputs.mask,
@@ -124,8 +163,17 @@ class StructuringHead(AnchoredSpanExtractionHead):
                         child_mask=flat_inputs.child_mask, base_loss_fn=base_loss_fn,
                     )
                     loss = loss + self.span_loss_coef * span_loss
+                if objectness_logits is not None:
+                    obj_loss = self._objectness_loss(
+                        objectness_logits=objectness_logits,
+                        anchor_matches=anchor_matches,
+                        supervised_anchor_mask=supervised_anchor_mask,
+                    )
+                    loss = loss + self.anchor_objectness_loss_coef * obj_loss
+                    if loss_stats is not None:
+                        loss_stats["objectness_loss"] = float(obj_loss.detach().item())
             else:
-                loss = self._bio_loss(
+                loss, loss_stats = self._bio_loss_with_stats(
                     scores=scores, labels=structuring_labels,
                     anchor_mask=anchor_mask,
                     word_mask=flat_inputs.mask,
@@ -139,6 +187,28 @@ class StructuringHead(AnchoredSpanExtractionHead):
                         child_mask=flat_inputs.child_mask, base_loss_fn=base_loss_fn,
                     )
                     loss = loss + self.span_loss_coef * span_loss
+                if objectness_logits is not None:
+                    # Without matching, supervise objectness against the
+                    # heuristic gold-anchor mask (slots < label_count).
+                    label_count = batch.get("structuring_count")
+                    if label_count is None:
+                        label_count = batch.get("count_val")
+                    if label_count is not None:
+                        gold_mask = self._label_anchor_mask(
+                            structuring_labels, label_count,
+                        )
+                        obj_loss = self._objectness_loss(
+                            objectness_logits=objectness_logits,
+                            anchor_matches=None,
+                            supervised_anchor_mask=anchor_mask.bool(),
+                            gold_mask=gold_mask,
+                        )
+                        loss = loss + self.anchor_objectness_loss_coef * obj_loss
+                        if loss_stats is not None:
+                            loss_stats["objectness_loss"] = float(obj_loss.detach().item())
+
+            if loss_stats is not None and self.log_loss_stats and self.training:
+                self._maybe_log_stats(loss_stats)
 
         return TaskHeadOutput(
             loss=loss,
@@ -146,11 +216,98 @@ class StructuringHead(AnchoredSpanExtractionHead):
             extra={
                 "groups_output": anchors,
                 "anchor_mask": anchor_mask,
+                "objectness_logits": objectness_logits,
                 "span_logits": span_logits_out,
                 "span_idx": span_idx,
                 "span_mask": span_mask,
+                "loss_stats": loss_stats,
             },
         )
+
+    # ── Loss reduction & negative masking ────────────────────────────
+
+    def _build_negative_mask(self, labels):
+        """GLiNER-style negative sampling mask, adapted to BIO/span shapes.
+
+        Positives (``labels > 0``) are always kept (mask=1). Negatives are
+        kept independently with probability ``self.negatives`` according to
+        ``self.masking_mode``:
+
+        - ``"none"``    → mask is 1 everywhere (no sampling).
+        - ``"global"``  → element-wise Bernoulli over labels==0.
+        - ``"label"``   → drop negatives only at (anchor, field) cells whose
+                          labels sum to 0 across the (sequence, BIO) dims.
+        - ``"span"``    → drop negatives only at (anchor, token) positions
+                          whose labels sum to 0 across the (field, BIO) dims.
+        - ``"anchor"``  → drop negatives only for anchor slots that have no
+                          positives anywhere — the structuring use-case.
+
+        Always returns a tensor with the same shape as ``labels`` (or
+        ``None`` when no sampling is needed, which keeps the fast path).
+        """
+        if self.masking_mode == "none" or self.negatives >= 1.0:
+            return None
+
+        keep = float(self.negatives)
+        labels_pos = labels > 0  # treat any non-zero as positive
+        rand = torch.rand_like(labels)
+        sampled = (rand < keep).to(labels.dtype)
+
+        if self.masking_mode == "global":
+            return torch.where(labels_pos, torch.ones_like(labels), sampled)
+
+        if self.masking_mode == "anchor":
+            # labels: (BN, A, L, C, 3) for BIO, (BN, A, S, C) for span-level.
+            # Pure-negative anchor: no positives across (L, C, 3) / (S, C).
+            collapse_dims = tuple(range(2, labels.dim()))
+            pure_neg_anchor = labels_pos.float().sum(dim=collapse_dims) == 0  # (BN, A)
+            shape = [1] * labels.dim()
+            shape[0] = labels.shape[0]
+            shape[1] = labels.shape[1]
+            pure_neg_anchor = pure_neg_anchor.view(shape).expand_as(labels)
+            return torch.where(pure_neg_anchor, sampled, torch.ones_like(labels))
+
+        if self.masking_mode == "label":
+            # (BN, A, L, C, 3): collapse over (L, BIO) → keep (BN, A, C).
+            if labels.dim() == 5:
+                pure_neg = labels_pos.float().sum(dim=(2, 4)) == 0  # (BN, A, C)
+                shape = [labels.shape[0], labels.shape[1], 1, labels.shape[3], 1]
+                pure_neg = pure_neg.view(shape).expand_as(labels)
+            elif labels.dim() == 4:
+                pure_neg = labels_pos.float().sum(dim=2) == 0       # (BN, A, C)
+                shape = [labels.shape[0], labels.shape[1], 1, labels.shape[3]]
+                pure_neg = pure_neg.view(shape).expand_as(labels)
+            else:
+                return None
+            return torch.where(pure_neg, sampled, torch.ones_like(labels))
+
+        if self.masking_mode == "span":
+            # (BN, A, L, C, 3): collapse over (C, BIO) → keep (BN, A, L).
+            if labels.dim() == 5:
+                pure_neg = labels_pos.float().sum(dim=(3, 4)) == 0  # (BN, A, L)
+                shape = [labels.shape[0], labels.shape[1], labels.shape[2], 1, 1]
+                pure_neg = pure_neg.view(shape).expand_as(labels)
+            elif labels.dim() == 4:
+                pure_neg = labels_pos.float().sum(dim=3) == 0       # (BN, A, S)
+                shape = [labels.shape[0], labels.shape[1], labels.shape[2], 1]
+                pure_neg = pure_neg.view(shape).expand_as(labels)
+            else:
+                return None
+            return torch.where(pure_neg, sampled, torch.ones_like(labels))
+
+        return None
+
+    def _reduce(self, weighted_losses, full_mask):
+        """Apply configured reduction over masked element-wise losses.
+
+        ``weighted_losses`` is the focal loss already multiplied by any
+        per-element weights (negative-sampling, etc.). ``full_mask`` is the
+        structural mask (anchor / token / field validity).
+        """
+        if self.bio_loss_reduction == "mean":
+            denom = full_mask.sum().clamp(min=1.0)
+            return (weighted_losses * full_mask).sum() / denom
+        return (weighted_losses * full_mask).sum()
 
     # ── Anchor-matched losses ────────────────────────────────────────
 
@@ -200,12 +357,19 @@ class StructuringHead(AnchoredSpanExtractionHead):
                 target[b, pred_anchor] = lbl[b, label_anchor]
 
         losses = base_loss_fn(pred, target)
+        neg_mask = self._build_negative_mask(target)
+        if neg_mask is not None:
+            losses = losses * neg_mask
         full_mask = (
             pred_anchor_mask.float()[:, :, None, None, None]
             * word_mask_f[:, None, :, None, None]
             * child_mask_f[:, None, None, :, None]
         )
-        return (losses * full_mask).sum(), matches, pred_anchor_mask
+        loss_stats = self._compute_loss_stats(
+            losses=losses, target=target, full_mask=full_mask,
+            pred_anchor_mask=pred_anchor_mask, matches=matches,
+        )
+        return self._reduce(losses, full_mask), matches, pred_anchor_mask, loss_stats
 
     def _anchor_matched_span_loss(
         self,
@@ -237,12 +401,154 @@ class StructuringHead(AnchoredSpanExtractionHead):
                     target[b, pred_anchor] = labels[b, :, label_anchor, :]
 
         losses = base_loss_fn(pred, target)
+        neg_mask = self._build_negative_mask(target)
+        if neg_mask is not None:
+            losses = losses * neg_mask
         full_mask = (
             supervised_anchor_mask[:, :min_A].float()[:, :, None, None]
             * span_mask[:, :min_S].float()[:, None, :, None]
             * child_mask[:, :min_C].float()[:, None, None, :]
         )
-        return (losses * full_mask).sum()
+        return self._reduce(losses, full_mask)
+
+    # ── Positional (non-matched) losses with stats ───────────────────
+
+    def _bio_loss_with_stats(self, scores, labels, anchor_mask, word_mask,
+                             child_mask, base_loss_fn):
+        """Positional BIO loss + diagnostic stats (no Hungarian matching)."""
+        min_A = min(scores.shape[1], labels.shape[1])
+        min_L = min(scores.shape[2], labels.shape[2])
+        min_C = min(scores.shape[3], labels.shape[3])
+
+        pred = scores[:, :min_A, :min_L, :min_C, :]
+        lbl = labels[:, :min_A, :min_L, :min_C, :]
+
+        losses = base_loss_fn(pred, lbl)
+        neg_mask = self._build_negative_mask(lbl)
+        if neg_mask is not None:
+            losses = losses * neg_mask
+        full_mask = (
+            anchor_mask[:, :min_A].float()[:, :, None, None, None]
+            * word_mask[:, :min_L].float()[:, None, :, None, None]
+            * child_mask[:, :min_C].float()[:, None, None, :, None]
+        )
+        loss_stats = self._compute_loss_stats(
+            losses=losses, target=lbl, full_mask=full_mask,
+            pred_anchor_mask=anchor_mask[:, :min_A].bool(), matches=None,
+        )
+        return self._reduce(losses, full_mask), loss_stats
+
+    # ── Anchor objectness ────────────────────────────────────────────
+
+    def _objectness_loss(self, objectness_logits, anchor_matches,
+                        supervised_anchor_mask, gold_mask=None):
+        """BCE loss for the per-anchor "is this slot used?" head.
+
+        When ``anchor_matches`` is provided, the target is built from the
+        Hungarian assignment: matched predicted slots → 1, others → 0. When
+        ``gold_mask`` is provided instead (no matching), it is used directly.
+        Loss is averaged over the supervised-anchor mask so it stays
+        comparable across batches with varying valid-anchor counts.
+        """
+        target = torch.zeros_like(objectness_logits)
+        if anchor_matches is not None:
+            for b, batch_matches in enumerate(anchor_matches):
+                for pred_anchor, _ in batch_matches:
+                    if pred_anchor < target.shape[1]:
+                        target[b, pred_anchor] = 1.0
+        elif gold_mask is not None:
+            min_A = min(target.shape[1], gold_mask.shape[1])
+            target[:, :min_A] = gold_mask[:, :min_A].to(target.dtype)
+
+        losses = nn.functional.binary_cross_entropy_with_logits(
+            objectness_logits, target, reduction="none",
+        )
+        mask = supervised_anchor_mask.float()
+        denom = mask.sum().clamp(min=1.0)
+        return (losses * mask).sum() / denom
+
+    # ── Diagnostic loss-stat helpers ─────────────────────────────────
+
+    def _compute_loss_stats(self, losses, target, full_mask, pred_anchor_mask,
+                            matches=None):
+        """Per-batch positive/negative loss totals split by anchor partition.
+
+        Returned dict contains floats (detached from the graph). Computed
+        unconditionally because the cost is negligible relative to the
+        forward pass; logging cadence is controlled by ``log_loss_stats``.
+        """
+        with torch.no_grad():
+            pos_elem = (target > 0).to(losses.dtype) * full_mask
+            neg_elem = (target == 0).to(losses.dtype) * full_mask
+
+            if matches is not None:
+                # Build a (B, A) mask: 1 where a slot was matched to a gold instance.
+                matched = torch.zeros(
+                    losses.shape[0], losses.shape[1],
+                    device=losses.device, dtype=losses.dtype,
+                )
+                for b, batch_matches in enumerate(matches):
+                    for pred_anchor, _ in batch_matches:
+                        matched[b, pred_anchor] = 1.0
+                unmatched = (pred_anchor_mask.to(losses.dtype) - matched).clamp(min=0)
+            else:
+                matched = pred_anchor_mask.to(losses.dtype)
+                unmatched = torch.zeros_like(matched)
+
+            # Broadcast (B, A) anchor partition to losses shape.
+            shape = [losses.shape[0], losses.shape[1]] + [1] * (losses.dim() - 2)
+            matched_b = matched.view(shape)
+            unmatched_b = unmatched.view(shape)
+
+            pos_matched = (losses * pos_elem * matched_b).sum().item()
+            neg_matched = (losses * neg_elem * matched_b).sum().item()
+            pos_unmatched = (losses * pos_elem * unmatched_b).sum().item()
+            neg_unmatched = (losses * neg_elem * unmatched_b).sum().item()
+
+            pos_count = pos_elem.sum().item()
+            neg_count = neg_elem.sum().item()
+            matched_anchors = matched.sum().item()
+            unmatched_anchors = unmatched.sum().item()
+
+        return {
+            "pos_loss_matched": pos_matched,
+            "neg_loss_matched": neg_matched,
+            "pos_loss_unmatched": pos_unmatched,
+            "neg_loss_unmatched": neg_unmatched,
+            "pos_count": pos_count,
+            "neg_count": neg_count,
+            "matched_anchors": matched_anchors,
+            "unmatched_anchors": unmatched_anchors,
+        }
+
+    def _maybe_log_stats(self, stats):
+        """Log diagnostic stats every ``log_loss_stats_every`` training calls."""
+        step = int(self._log_step.item())
+        self._log_step += 1
+        if step % self.log_loss_stats_every != 0:
+            return
+
+        pos_total = stats["pos_loss_matched"] + stats["pos_loss_unmatched"]
+        neg_total = stats["neg_loss_matched"] + stats["neg_loss_unmatched"]
+        pos_count = max(stats["pos_count"], 1.0)
+        neg_count = max(stats["neg_count"], 1.0)
+        ratio = neg_total / max(pos_total, 1e-9)
+        per_pos = pos_total / pos_count
+        per_neg = neg_total / neg_count
+
+        logger.info(
+            "[structuring/loss-stats step=%d] "
+            "pos=%.3f (matched=%.3f, unmatched=%.3f, count=%.0f, per-elem=%.4g) | "
+            "neg=%.3f (matched=%.3f, unmatched=%.3f, count=%.0f, per-elem=%.4g) | "
+            "neg/pos=%.2fx | anchors matched=%.0f unmatched=%.0f",
+            step,
+            pos_total, stats["pos_loss_matched"], stats["pos_loss_unmatched"],
+            pos_count, per_pos,
+            neg_total, stats["neg_loss_matched"], stats["neg_loss_unmatched"],
+            neg_count, per_neg,
+            ratio,
+            stats["matched_anchors"], stats["unmatched_anchors"],
+        )
 
     # ── Matching helpers ─────────────────────────────────────────────
 

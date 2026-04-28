@@ -9,10 +9,10 @@ All layers accept context_embedding of shape (B, D) — a single context vector 
 Strategies:
 - ParentAnchorLayer: returns context as single anchor (NER, Classification default)
 - FixedAnchorLayer: learnable nn.Embedding table conditioned on context
-- FixedLSTMAnchorLayer: learnable slots conditioned on context via GRU
+- FixedRNNAnchorLayer: learnable slots conditioned on context via GRU
 - FixedTransformerAnchorLayer: learnable slots conditioned on context via transformer
-- RotaryAnchorLayer: wraps RotaryGroupLSTM
-- QueryLSTMAnchorLayer: wraps QueryGroupLSTM
+- RotaryAnchorLayer: wraps RotaryGroupRNN
+- QueryRNNAnchorLayer: wraps QueryGroupRNN
 - QueryTransformerAnchorLayer: wraps QueryGroupTransformer
 """
 
@@ -22,7 +22,7 @@ import torch
 from torch import nn
 
 from .mlp import create_mlp
-from .groups import RotaryGroupLSTM, QueryGroupLSTM, QueryGroupTransformer
+from .groups import RotaryGroupRNN, QueryGroupRNN, QueryGroupTransformer
 
 
 class AnchorLayer(nn.Module):
@@ -121,7 +121,7 @@ class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
         return anchors, mask
 
 
-class FixedLSTMAnchorLayer(AnchorLayer, anchor_mode="fixed_lstm"):
+class FixedRNNAnchorLayer(AnchorLayer, anchor_mode="fixed_rnn"):
     """Learnable fixed slots conditioned on context via GRU.
 
     Fixed slot embeddings are fed as input sequence to a GRU whose initial hidden
@@ -198,11 +198,11 @@ class FixedTransformerAnchorLayer(AnchorLayer, anchor_mode="fixed_transformer"):
 
 
 class RotaryAnchorLayer(AnchorLayer, anchor_mode="rotary"):
-    """Wraps RotaryGroupLSTM — rotary position-conditioned anchor generation."""
+    """Wraps RotaryGroupRNN — rotary position-conditioned anchor generation."""
 
     def __init__(self, hidden_size: int, max_count: int = 20, **kwargs):
         super().__init__()
-        self.groups_layer = RotaryGroupLSTM(hidden_size=hidden_size, max_count=max_count)
+        self.groups_layer = RotaryGroupRNN(hidden_size=hidden_size, max_count=max_count)
 
     def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
         B, D = context_embedding.shape
@@ -212,7 +212,7 @@ class RotaryAnchorLayer(AnchorLayer, anchor_mode="rotary"):
         for b in range(B):
             c = count[b].item() if count is not None else 1
             c = max(int(c), 1)
-            # (1, D) single context vector as field_emb for RotaryGroupLSTM
+            # (1, D) single context vector as field_emb for RotaryGroupRNN
             out = self.groups_layer(context_embedding[b].unsqueeze(0), c)  # (count, 1, D)
             outputs.append(out.squeeze(1))  # (count, D)
 
@@ -227,16 +227,16 @@ class RotaryAnchorLayer(AnchorLayer, anchor_mode="rotary"):
         return anchors, mask
 
 
-# Backward compat: "lstm" alias for "rotary"
-AnchorLayer._registry["lstm"] = RotaryAnchorLayer
+# Backward compat: "rnn" alias for "rotary"
+AnchorLayer._registry["rnn"] = RotaryAnchorLayer
 
 
-class QueryLSTMAnchorLayer(AnchorLayer, anchor_mode="query_lstm"):
-    """Wraps QueryGroupLSTM — similarity-based token selection + GRU."""
+class QueryRNNAnchorLayer(AnchorLayer, anchor_mode="query_rnn"):
+    """Wraps QueryGroupRNN — similarity-based token selection + GRU."""
 
     def __init__(self, hidden_size: int, max_count: int = 20, **kwargs):
         super().__init__()
-        self.groups_layer = QueryGroupLSTM(hidden_size=hidden_size, max_count=max_count)
+        self.groups_layer = QueryGroupRNN(hidden_size=hidden_size, max_count=max_count)
 
     def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
         if word_embeddings is None:

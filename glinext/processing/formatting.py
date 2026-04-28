@@ -21,6 +21,10 @@ class FieldType:
         list_separator: Separator pattern for list-typed fields (default: comma).
         list_item_type: Type name for individual items within a list field.
         date_formats: Date/datetime format strings to try in order.
+        required: Whether the field must always be present in the output.
+            Acts as a post-processing filter: any instance where this field
+            comes back as ``None`` is dropped from the output. Decoding is
+            unaffected.
     """
 
     def __init__(
@@ -30,11 +34,13 @@ class FieldType:
         list_separator: str = r"\s*,\s*",
         list_item_type: str = "str",
         date_formats: Optional[List[str]] = None,
+        required: bool = False,
     ):
         self.type_name = type_name
         self.default = default
         self.list_separator = list_separator
         self.list_item_type = list_item_type
+        self.required = required
         self.date_formats = date_formats or [
             "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
             "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y",
@@ -204,6 +210,10 @@ class StructuringOutputFormatter:
             ft = field_types.get(field_name)
             if ft is None:
                 formatted[field_name] = value
+                continue
+            # Preserve None for missing optional fields — don't try to convert.
+            if value is None:
+                formatted[field_name] = None
                 continue
             formatted[field_name] = self._convert_value(
                 value, ft, schema_name, field_name,

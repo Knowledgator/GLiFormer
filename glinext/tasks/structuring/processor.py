@@ -25,7 +25,7 @@ class StructuringProcessor(SpanProcessor):
         anchor_mode = getattr(struct_cfg, 'anchor_mode', '') if struct_cfg else ''
         self._fixed_slot_pad = (
             getattr(struct_cfg, 'num_fixed_slots', 0)
-            if anchor_mode in ('fixed', 'fixed_lstm', 'fixed_transformer')
+            if anchor_mode in ('fixed', 'fixed_rnn', 'fixed_transformer')
             else 0
         )
 

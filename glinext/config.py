@@ -61,7 +61,7 @@ class OpenRelexHeadConfig(BaseHeadConfig):
     Standalone head — no NER dependency. Uses configurable anchor layers
     to extract head/tail spans directly per (anchor, rel_type) pair.
     """
-    anchor_mode: str = "fixed"          # "fixed", "rotary", "query_lstm", "query_transformer"
+    anchor_mode: str = "fixed"          # "fixed", "rotary", "query_rnn", "query_transformer"
     num_fixed_slots: int = 10
     max_count: int = 20
     anchor_num_heads: int = 4
@@ -72,7 +72,7 @@ class OpenRelexHeadConfig(BaseHeadConfig):
 
 @dataclass
 class StructuringHeadConfig(BaseHeadConfig):
-    anchor_mode: str = "lstm"  # "lstm", "query_lstm", "query_transformer", "fixed"
+    anchor_mode: str = "rnn"  # "rnn", "query_rnn", "query_transformer", "fixed"
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
     max_count: int = 20
@@ -84,6 +84,35 @@ class StructuringHeadConfig(BaseHeadConfig):
     # the spurious order signal of the data. When False, falls back to the
     # original positional loss.
     use_anchor_matching: bool = True
+    # Loss reduction over the masked BIO/span tensor. "sum" matches GLiNER
+    # behaviour; "mean" normalises by the number of valid elements which
+    # decouples gradient magnitude from anchor count and sequence length.
+    bio_loss_reduction: str = "sum"  # "sum" | "mean"
+    # GLiNER-style negative sampling on BIO/span losses. ``negatives`` is the
+    # keep-rate for negative-labelled positions; ``masking`` selects the
+    # granularity at which negatives are sampled.
+    #   "none"   — no sampling (keep all negatives)
+    #   "global" — Bernoulli per-element over labels==0
+    #   "label"  — drop negatives only for (anchor, field) cells with no
+    #              positives anywhere in the sequence
+    #   "span"   — drop negatives only for (anchor, token) positions with no
+    #              positives across fields
+    #   "anchor" — drop negatives only for anchor slots with no positives
+    #              (pure-negative anchors). Matches the structuring use-case
+    #              where most unmatched fixed slots are pure negatives.
+    negatives: float = 1.0
+    masking: str = "none"
+    # Anchor-objectness head: per-anchor sigmoid score "is this slot used?"
+    # supervised against the Hungarian-matched mask. At inference, anchors
+    # with sigmoid(logit) < threshold are filtered out before BIO decoding.
+    anchor_objectness: bool = False
+    anchor_objectness_loss_coef: float = 1.0
+    anchor_objectness_threshold: float = 0.5
+    # Diagnostic logging: when True, the head emits per-batch positive vs
+    # negative loss totals split between matched and unmatched anchors. Used
+    # to diagnose the imbalance behind "many fields return None".
+    log_loss_stats: bool = False
+    log_loss_stats_every: int = 50  # log cadence in optimiser steps
 
 
 @dataclass
@@ -117,7 +146,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         count_config: Optional[dict] = None,
         embedding_config: Optional[dict] = None,
         # Shared layers across tasks (None = each task creates its own)
-        shared_anchor_modeling: Optional[str] = None,  # "linear", "lstm", "mlp" — shared AnchorModeling layer
+        shared_anchor_modeling: Optional[str] = None,  # "linear", "rnn", "mlp" — shared AnchorModeling layer
         shared_anchor_refine_layers: int = 0,  # shared AnchorCrossAttentionLayer (0 = disabled)
         shared_anchor_refine_heads: int = 8,
         # Labels encoder (bi-encoder style)

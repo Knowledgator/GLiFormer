@@ -64,7 +64,7 @@ class TaskHead(ABC, nn.Module):
               self.span_loss_coef, and optionally self.anchor_refine, self.span_rep_layer.
         """
         anchor_mode = getattr(task_cfg, "anchor_mode", "parent")
-        if anchor_mode == "lstm":
+        if anchor_mode == "rnn":
             anchor_mode = "rotary"
 
         self.anchor_layer = AnchorLayer.from_config(

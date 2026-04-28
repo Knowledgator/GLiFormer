@@ -6,7 +6,7 @@ anchor and child representations are combined before scoring. This is the config
 
 Strategies:
 - LinearAnchorModeling: linear projection of concatenated anchor + child
-- LSTMAnchorModeling: recurrent processing (GLiNER2-style)
+- RNNAnchorModeling: recurrent processing (GLiNER2-style)
 - MLPAnchorModeling: multi-layer perceptron fusion
 - TransformerAnchorModeling: self-attention over anchor sequence conditioned on child reps
 """
@@ -92,7 +92,7 @@ class MLPAnchorModeling(AnchorModeling, modeling_type="mlp"):
         combined = torch.cat([anchor_exp, child_exp], dim=-1)
         return self.mlp(combined)
     
-class LSTMAnchorModeling(AnchorModeling, modeling_type="lstm"):
+class RNNAnchorModeling(AnchorModeling, modeling_type="rnn"):
     """Recurrent processing of anchor-child pairs (GLiNER2-style).
 
     Uses child representations as h0 (initial hidden state) for the GRU,
@@ -135,7 +135,7 @@ class TransformerAnchorModeling(AnchorModeling, modeling_type="transformer"):
 
     Uses child representations as conditioning: concatenates child embedding
     to each anchor position, applies self-attention over the anchor sequence,
-    then projects back. Analogous to LSTMAnchorModeling but replaces the GRU
+    then projects back. Analogous to RNNAnchorModeling but replaces the GRU
     with a transformer encoder for parallel, attention-based fusion.
     """
 

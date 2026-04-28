@@ -66,6 +66,7 @@ class GLiNExTOutput(ModelOutput):
     structuring_logits: Optional[torch.FloatTensor] = None
     structuring_batch_origin: Optional[torch.LongTensor] = None
     structuring_anchor_mask: Optional[torch.Tensor] = None
+    structuring_objectness_logits: Optional[torch.FloatTensor] = None
     structuring_span_logits: Optional[torch.FloatTensor] = None
     structuring_span_idx: Optional[torch.LongTensor] = None
     structuring_span_mask: Optional[torch.Tensor] = None
@@ -1032,6 +1033,7 @@ class GLiNExTModel(BaseModel):
             structuring_logits=struct_out.logits,
             structuring_batch_origin=flat_inputs_map["structuring"].batch_origin if "structuring" in flat_inputs_map else None,
             structuring_anchor_mask=struct_out.extra.get("anchor_mask"),
+            structuring_objectness_logits=struct_out.extra.get("objectness_logits"),
             structuring_span_logits=struct_out.extra.get("span_logits"),
             structuring_span_idx=struct_out.extra.get("span_idx"),
             structuring_span_mask=struct_out.extra.get("span_mask"),

@@ -67,6 +67,53 @@ class GLiNExT(BaseEncoderGLiNER):
         self.model = GLiNExTModel(config, from_pretrained=backbone_from_pretrained, cache_dir=cache_dir, **kwargs)
         return self.model
 
+    @classmethod
+    def from_pretrained(cls, *args, allow_mismatched_sizes: bool = False, **kwargs):
+        """Load a pretrained checkpoint, optionally tolerating shape mismatches.
+
+        When ``allow_mismatched_sizes=True``, any state-dict entry whose tensor
+        shape disagrees with the freshly-built model is dropped (the model
+        keeps its initialized weights for those keys). This mirrors the
+        ``transformers`` flag of the same name and is useful when reloading a
+        prior checkpoint after the task heads, vocab size, or label space have
+        changed.
+        """
+        if not allow_mismatched_sizes:
+            return super().from_pretrained(*args, **kwargs)
+
+        # Localized monkey-patch: filter mismatched-shape entries from the
+        # state dict during this load only. Parent's from_pretrained calls
+        # ``instance.model.load_state_dict(state_dict, strict=strict)`` once;
+        # we wrap that method on GLiNExTModel so only this call is affected.
+        original = GLiNExTModel.__dict__.get("load_state_dict")
+
+        def filtered_load_state_dict(self, state_dict, strict=True, **lkw):
+            own_sd = self.state_dict()
+            kept = {}
+            skipped = []
+            for k, v in state_dict.items():
+                if k in own_sd and hasattr(v, "shape") and own_sd[k].shape != v.shape:
+                    skipped.append((k, tuple(own_sd[k].shape), tuple(v.shape)))
+                    continue
+                kept[k] = v
+            for k, expected, actual in skipped:
+                logger.warning(
+                    "Skipping '%s' due to shape mismatch (model: %s, checkpoint: %s)",
+                    k, expected, actual,
+                )
+            # Force strict=False because dropped keys would otherwise show up
+            # as missing and trip strict loading.
+            return super(GLiNExTModel, self).load_state_dict(kept, strict=False, **lkw)
+
+        GLiNExTModel.load_state_dict = filtered_load_state_dict
+        try:
+            return super().from_pretrained(*args, **kwargs)
+        finally:
+            if original is None:
+                del GLiNExTModel.load_state_dict
+            else:
+                GLiNExTModel.load_state_dict = original
+
     def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
         """Create processor, loading labels tokenizer for bi-encoder mode."""
         labels_tokenizer = None
@@ -275,6 +322,32 @@ class GLiNExT(BaseEncoderGLiNER):
             input_x.append(item)
         return input_x
 
+    @staticmethod
+    def _extract_structuring_meta(
+        structures: Optional[Dict[str, Union[List[str], dict]]],
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """Split structures spec into ``{schema: fields}`` and ``{schema: required_fields}``."""
+        if not structures:
+            return {}, {}
+
+        schema_fields: Dict[str, List[str]] = {}
+        schema_required: Dict[str, List[str]] = {}
+        for schema_name, spec in structures.items():
+            if isinstance(spec, list):
+                fields = list(spec)
+                required: List[str] = []
+            elif isinstance(spec, dict):
+                fields = list(spec.get("fields", []))
+                required = list(spec.get("required_fields") or [])
+            else:
+                fields = []
+                required = []
+            schema_fields[schema_name] = fields
+            # Drop unknown names so a typo in required_fields is a no-op,
+            # not a hard error.
+            schema_required[schema_name] = [f for f in required if f in fields]
+        return schema_fields, schema_required
+
     @torch.no_grad()
     def inference(
         self,
@@ -289,6 +362,7 @@ class GLiNExT(BaseEncoderGLiNER):
         multi_label: bool = False,
         batch_size: int = 8,
         manual_structuring_count: Optional[int] = None,
+        structuring_dedup: bool = True,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -360,8 +434,12 @@ class GLiNExT(BaseEncoderGLiNER):
         # Process batches
         if manual_structuring_count is not None:
             kwargs["manual_structuring_count"] = manual_structuring_count
+
+        schema_fields, schema_required = self._extract_structuring_meta(structures)
+
         all_decoded, all_classes_mappings = self._process_multitask_batches(
-            data_loader, threshold, flat_ner, multi_label, **kwargs,
+            data_loader, threshold, flat_ner, multi_label,
+            **kwargs,
         )
 
         # Map results back to original text indices
@@ -373,6 +451,9 @@ class GLiNExT(BaseEncoderGLiNER):
             valid_texts,
             num_original,
             all_classes_mappings,
+            schema_fields=schema_fields,
+            schema_required_fields=schema_required,
+            structuring_dedup=structuring_dedup,
         )
 
     def _process_multitask_batches(
@@ -442,6 +523,9 @@ class GLiNExT(BaseEncoderGLiNER):
         valid_texts: List[str],
         num_original: int,
         all_classes_mappings: Optional[list] = None,
+        schema_fields: Optional[Dict[str, List[str]]] = None,
+        schema_required_fields: Optional[Dict[str, List[str]]] = None,
+        structuring_dedup: bool = True,
     ) -> Dict[str, List]:
         """Map decoded results back to original text indices and char positions."""
         results = {}
@@ -462,6 +546,9 @@ class GLiNExT(BaseEncoderGLiNER):
                     task_results, valid_to_orig_idx, all_start_maps,
                     all_end_maps, valid_texts, num_original,
                     all_classes_mappings,
+                    schema_fields=schema_fields,
+                    schema_required_fields=schema_required_fields,
+                    structuring_dedup=structuring_dedup,
                 )
             else:
                 # classification, embedding, count — no span mapping needed
@@ -575,6 +662,9 @@ class GLiNExT(BaseEncoderGLiNER):
         valid_texts: List[str],
         num_original: int,
         all_classes_mappings: Optional[list] = None,
+        schema_fields: Optional[Dict[str, List[str]]] = None,
+        schema_required_fields: Optional[Dict[str, List[str]]] = None,
+        structuring_dedup: bool = True,
     ) -> List[Dict[str, List[Dict]]]:
         """Map structuring results into schema-keyed JSON output.
 
@@ -586,9 +676,14 @@ class GLiNExT(BaseEncoderGLiNER):
 
             {schema_name: [{field1: value1, field2: value2}, ...]}
 
-        with char-level positions for each value.
+        with char-level positions for each value. Missing fields are emitted
+        as ``None`` so every schema field appears in every instance, and
+        near-duplicate instances are pruned via NMS-like dedup keyed on
+        non-``None`` field agreement.
         """
         output: List[Dict[str, List[Dict]]] = [{} for _ in range(num_original)]
+        schema_fields = schema_fields or {}
+        schema_required_fields = schema_required_fields or {}
 
         for valid_i, per_text_groups in enumerate(task_results):
             orig_i = valid_to_orig_idx[valid_i]
@@ -612,36 +707,189 @@ class GLiNExT(BaseEncoderGLiNER):
                 if schema_name not in result_dict:
                     result_dict[schema_name] = []
 
+                schema_field_list = schema_fields.get(schema_name, [])
+                required_for_schema = schema_required_fields.get(schema_name, [])
+
                 # group is a list of instances (each instance = list of field dicts)
                 instances = group if isinstance(group, list) else [group]
+                schema_instances: List[Dict[str, object]] = []
                 for instance in instances:
                     if isinstance(instance, list):
-                        # Instance is a list of field dicts → assemble into one dict
-                        instance_dict = {}
-                        for field in instance:
-                            mapped = self._map_field_to_value(
-                                field, start_map, end_map, text,
-                            )
-                            if mapped is not None:
-                                field_name = mapped["field"]
-                                value = mapped["value"]
-                                # Multiple values for same field → aggregate into list
-                                if field_name in instance_dict:
-                                    existing = instance_dict[field_name]
-                                    if not isinstance(existing, list):
-                                        instance_dict[field_name] = [existing, value]
-                                    else:
-                                        existing.append(value)
-                                else:
-                                    instance_dict[field_name] = value
-                        if instance_dict:
-                            result_dict[schema_name].append(instance_dict)
+                        instance_dict = self._assemble_instance_dict(
+                            instance, start_map, end_map, text, schema_field_list,
+                        )
+                        if instance_dict is not None:
+                            schema_instances.append(instance_dict)
                     elif isinstance(instance, dict):
-                        # Already a flat dict (shouldn't normally happen)
-                        result_dict[schema_name].append(instance)
+                        # Already a flat dict; still ensure all schema fields are present.
+                        schema_instances.append(self._fill_missing_fields(instance, schema_field_list))
+
+                # Required fields are a post-processing filter only: drop any
+                # instance where a required field came back as None.
+                if required_for_schema:
+                    schema_instances = [
+                        inst for inst in schema_instances
+                        if all(inst.get(f) is not None for f in required_for_schema)
+                    ]
+
+                if structuring_dedup and len(schema_instances) > 1:
+                    schema_instances = self._dedup_similar_instances(
+                        schema_instances, schema_field_list,
+                    )
+
+                result_dict[schema_name].extend(schema_instances)
 
             output[orig_i] = result_dict
         return output
+
+    @staticmethod
+    def _fill_missing_fields(
+        instance: Dict[str, object], schema_field_list: List[str],
+    ) -> Dict[str, object]:
+        """Ensure every schema field appears, defaulting missing ones to ``None``."""
+        if not schema_field_list:
+            return dict(instance)
+        filled = {f: instance.get(f, None) for f in schema_field_list}
+        # Carry through any extra keys (e.g. legacy field names) untouched.
+        for k, v in instance.items():
+            if k not in filled:
+                filled[k] = v
+        return filled
+
+    def _assemble_instance_dict(
+        self,
+        instance_fields: list,
+        start_map: List[int],
+        end_map: List[int],
+        text: str,
+        schema_field_list: List[str],
+    ) -> Optional[Dict[str, object]]:
+        """Build ``{field: value}`` dict from a list of decoded field dicts.
+
+        Multiple spans for the same field aggregate into a list. Returns
+        ``None`` only when the input contains no usable fields *and* no
+        schema fields are defined (so we'd produce an empty dict). When a
+        schema field list is provided, missing fields are filled with
+        ``None`` so every schema field appears in the output.
+        """
+        instance_dict: Dict[str, object] = {}
+        for field in instance_fields:
+            mapped = self._map_field_to_value(field, start_map, end_map, text)
+            if mapped is None:
+                continue
+            field_name = mapped["field"]
+            value = mapped["value"]
+            if field_name in instance_dict and instance_dict[field_name] is not None:
+                existing = instance_dict[field_name]
+                if not isinstance(existing, list):
+                    instance_dict[field_name] = [existing, value]
+                else:
+                    existing.append(value)
+            else:
+                instance_dict[field_name] = value
+
+        if schema_field_list:
+            instance_dict = self._fill_missing_fields(instance_dict, schema_field_list)
+            # Drop entirely-empty instances so callers don't get rows of all-None.
+            if all(v is None for v in instance_dict.values()):
+                return None
+            return instance_dict
+
+        if not instance_dict:
+            return None
+        return instance_dict
+
+    @staticmethod
+    def _value_dedup_key(value):
+        """Hashable, normalised key used to compare field values during NMS dedup.
+
+        ``None`` stays ``None`` so NMS treats it as "missing" and skips the
+        comparison. Every other value is reduced to a ``frozenset`` of
+        normalised scalar tokens — a scalar therefore matches its
+        single-element list form, repeated entries collapse, and string
+        values compare case- and whitespace-insensitively. This is what we
+        want for "are these two structures describing the same record?".
+        """
+        if value is None:
+            return None
+        raw = value if isinstance(value, list) else [value]
+        items = []
+        for v in raw:
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                if "text" in v:
+                    v = v["text"]
+                else:
+                    items.append((v.get("start"), v.get("end")))
+                    continue
+            if isinstance(v, str):
+                v = v.strip().lower()
+            items.append(v)
+        if not items:
+            return None
+        return frozenset(items)
+
+    @classmethod
+    def _dominates(
+        cls, richer: Dict[str, object], poorer: Dict[str, object],
+        schema_field_list: List[str],
+    ) -> bool:
+        """``richer`` dominates ``poorer`` when every non-``None`` value in
+        ``poorer`` is contained in the corresponding value of ``richer``.
+
+        Operates on the normalised dedup keys: each value is a ``frozenset``
+        of normalised tokens, so multi-span fields and single-span fields
+        are compared by set inclusion. ``None`` in ``poorer`` is "no
+        constraint"; ``None`` in ``richer`` while ``poorer`` is non-``None``
+        means ``richer`` is missing info that ``poorer`` has → no
+        domination.
+        """
+        keys = schema_field_list or list({*richer.keys(), *poorer.keys()})
+        for k in keys:
+            kp = cls._value_dedup_key(poorer.get(k))
+            if kp is None:
+                continue
+            kr = cls._value_dedup_key(richer.get(k))
+            if kr is None:
+                return False
+            if not kp.issubset(kr):
+                return False
+        return True
+
+    @classmethod
+    def _dedup_similar_instances(
+        cls, instances: List[Dict[str, object]], schema_field_list: List[str],
+    ) -> List[Dict[str, object]]:
+        """NMS-like dedup: drop instances dominated by a richer survivor.
+
+        "Richness" is the total number of normalised tokens across all
+        non-``None`` fields — a multi-valued field counts as many tokens as
+        it has, so ``name=[Tesla, SpaceX]`` outranks ``name=Tesla`` and
+        absorbs it. We process the richest first and drop any subsequent
+        instance whose non-``None`` values are subsumed by an already-kept
+        one. Equally-rich identical instances also collapse (the first one
+        wins).
+        """
+        def richness(inst):
+            total = 0
+            for v in inst.values():
+                key = cls._value_dedup_key(v)
+                if key is None:
+                    continue
+                total += len(key) if isinstance(key, frozenset) else 1
+            return total
+
+        ordered = sorted(
+            enumerate(instances),
+            key=lambda iv: (-richness(iv[1]), iv[0]),
+        )
+        kept: List[Dict[str, object]] = []
+        for _, inst in ordered:
+            if any(cls._dominates(k, inst, schema_field_list) for k in kept):
+                continue
+            kept.append(inst)
+        return kept
 
     @staticmethod
     def _map_field_to_value(field, start_map, end_map, text):

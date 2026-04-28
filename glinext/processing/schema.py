@@ -17,7 +17,9 @@ def _pydantic_to_field_types(
 
     Supports common scalar types (str, int, float, bool, date, datetime) and
     ``list``/``List[T]`` with typed items.  ``Optional[T]`` is unwrapped to
-    ``T`` with ``default=None``.
+    ``T`` with ``default=None``. Pydantic fields without a default and not
+    wrapped in ``Optional`` are flagged as required on the resulting
+    ``FieldType``.
     """
     _SCALAR_MAP: Dict[type, str] = {
         str: "str",
@@ -34,13 +36,23 @@ def _pydantic_to_field_types(
         annotation = field_info.annotation
         default = field_info.default
 
-        # Unwrap Optional[T] (Union[T, None] or T | None)
+        # Detect required: no default value AND not wrapped in Optional.
+        is_optional_annotation = False
         origin = get_origin(annotation)
         if origin is Union or (sys.version_info >= (3, 10) and isinstance(annotation, types.UnionType)):
-            args = [a for a in get_args(annotation) if a is not type(None)]
-            if len(args) == 1:
-                annotation = args[0]
+            args = list(get_args(annotation))
+            is_optional_annotation = type(None) in args
+            non_none = [a for a in args if a is not type(None)]
+            if len(non_none) == 1:
+                annotation = non_none[0]
                 origin = get_origin(annotation)
+
+        try:
+            has_default = field_info.is_required() is False
+        except Exception:
+            # Pydantic v1 fallback: a sentinel "PydanticUndefined" indicates no default
+            has_default = default is not None and repr(default) != "PydanticUndefined"
+        required = (not has_default) and (not is_optional_annotation)
 
         # List[T] or list[T]
         if origin is list:
@@ -52,6 +64,7 @@ def _pydantic_to_field_types(
                 "list",
                 list_item_type=item_type,
                 default=[] if default is None else default,
+                required=required,
             )
             continue
 
@@ -60,15 +73,17 @@ def _pydantic_to_field_types(
             ft_kwargs: Dict[str, Any] = {"type_name": _SCALAR_MAP[annotation]}
             if default is not None:
                 ft_kwargs["default"] = default
-            # Use plain string for simple cases (no custom default)
-            if "default" not in ft_kwargs:
+            if required:
+                ft_kwargs["required"] = True
+            # Use plain string for simple cases (no custom default, not required)
+            if "default" not in ft_kwargs and not required:
                 field_types[name] = _SCALAR_MAP[annotation]
             else:
                 field_types[name] = FieldType(**ft_kwargs)
             continue
 
         # Fallback — treat as str
-        field_types[name] = "str"
+        field_types[name] = FieldType("str", required=required) if required else "str"
 
     return field_types
 
@@ -189,6 +204,7 @@ class GLiNExTSchema:
         schema_name: str,
         fields: Union[List[str], Dict[str, Union[str, FieldType, Callable]], Type],
         description: Optional[str] = None,
+        required_fields: Optional[List[str]] = None,
     ) -> "GLiNExTSchema":
         """Add a structuring schema for JSON extraction.
 
@@ -224,6 +240,12 @@ class GLiNExTSchema:
                 Supported type names: str, int, float, bool, list, date,
                 datetime. For advanced control, use FieldType or a callable.
             description: Optional description of the schema.
+            required_fields: Field names that must appear in every emitted
+                instance. Acts as a post-processing filter: any instance
+                where a required field is ``None`` is dropped from the
+                output. Decoding itself is unaffected. If ``None``, the
+                required set is auto-derived from ``FieldType.required`` or
+                from Pydantic fields without a default.
         """
         # Pydantic BaseModel class
         if isinstance(fields, type) and hasattr(fields, "model_fields"):
@@ -236,10 +258,24 @@ class GLiNExTSchema:
             field_names = list(fields)
             field_types = None
 
+        derived_required: List[str] = []
+        if field_types is not None:
+            for name, type_spec in field_types.items():
+                if isinstance(type_spec, FieldType) and type_spec.required:
+                    derived_required.append(name)
+
+        if required_fields is not None:
+            # Explicit list overrides auto-detection. Filter to known fields
+            # so user typos surface as missing rather than silent.
+            resolved_required = [f for f in required_fields if f in field_names]
+        else:
+            resolved_required = derived_required
+
         self._structure_schemas[schema_name] = {
             "fields": field_names,
             "field_types": field_types,
             "description": description,
+            "required_fields": resolved_required,
         }
         return self
 
@@ -296,7 +332,10 @@ class GLiNExTSchema:
 
         if self._structure_schemas:
             kwargs["structures"] = {
-                name: schema["fields"]
+                name: {
+                    "fields": schema["fields"],
+                    "required_fields": list(schema.get("required_fields") or []),
+                }
                 for name, schema in self._structure_schemas.items()
             }
 

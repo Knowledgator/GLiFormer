@@ -65,7 +65,7 @@ class AnchorCrossAttentionLayer(nn.Module):
             anchor_rep = layer(anchor_rep, token_emb, token_mask)
         return anchor_rep
 
-class RotaryGroupLSTM(nn.Module):
+class RotaryGroupRNN(nn.Module):
     def __init__(self, hidden_size, max_count=20, rope_base=10_000.0):
         """
         Initializes the module with a learned positional embedding for count steps and a GRU,
@@ -127,7 +127,7 @@ class RotaryGroupLSTM(nn.Module):
         return self.projector(torch.cat([output, field_broadcast], dim=-1))
 
 
-class QueryGroupLSTM(nn.Module):
+class QueryGroupRNN(nn.Module):
     """Similarity-based token selection + GRU anchor generation.
 
     Accepts batched context_embedding (B, D) and token_emb (B, L, D).
