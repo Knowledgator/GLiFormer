@@ -46,10 +46,27 @@ class StructuringProcessor(SpanProcessor):
                             min_start = min(min_start, st)
         return min_start
 
+    @staticmethod
+    def _instance_has_valid_span(instance, max_seq_len=0):
+        for value in instance.values():
+            values = value if isinstance(value, list) else [value]
+            for field_value in values:
+                if not isinstance(field_value, dict):
+                    continue
+                st = field_value.get('start', -1)
+                ed = field_value.get('end', -1)
+                if st < 0 or ed < 0:
+                    continue
+                if max_seq_len > 0 and (st >= max_seq_len or ed >= max_seq_len):
+                    continue
+                return True
+        return False
+
     def get_classes_mapping(self, batch_list, shuffle_labels=False, **kwargs):
         structuring_mapping = []
         for item in batch_list:
             structuring_data = item.get('structuring', {})
+            prompt = item.get('prompt')
             item_mappings = []
             for schema_name, instances in structuring_data.items():
                 field_names = []
@@ -62,11 +79,24 @@ class StructuringProcessor(SpanProcessor):
                 if shuffle_labels:
                     random.shuffle(field_names)
                 field_class_to_id = {name: idx for idx, name in enumerate(field_names)}
+                if isinstance(prompt, dict):
+                    description = prompt.get(schema_name)
+                elif isinstance(prompt, str):
+                    description = prompt
+                else:
+                    description = None
+                if not isinstance(description, str) or not description.strip():
+                    description = None
+                else:
+                    description = description.strip()
                 item_mappings.append(StructuringItemMapping(
                     field_class_to_id=BaseClassMapping(
-                        class_to_id=field_class_to_id, name=schema_name,
+                        class_to_id=field_class_to_id,
+                        name=schema_name,
+                        description=description,
                     ),
                     name=schema_name,
+                    description=description,
                 ))
             structuring_mapping.append(StructuringClassMapping(items=item_mappings))
         return structuring_mapping
@@ -89,6 +119,28 @@ class StructuringProcessor(SpanProcessor):
                     prompt.append(f"{self.child_token} {field_name}")
             prompt.append(self.sep_token)
         return prompt
+
+    @staticmethod
+    def _structure_fields(fields):
+        return fields if isinstance(fields, list) else fields.get("fields", [])
+
+    def contribute_inference_input(self, item, structures=None, **kwargs):
+        if not structures:
+            return
+
+        structuring = {}
+        structuring_schema = {}
+        for schema_name, fields in structures.items():
+            field_list = self._structure_fields(fields)
+            structuring[schema_name] = [dict.fromkeys(field_list, "")] if field_list else []
+            structuring_schema[schema_name] = field_list
+        item["structuring"] = structuring
+        item["structuring_schema"] = structuring_schema
+
+    def empty_inference_result(self, num_texts: int, structures=None, **kwargs):
+        if structures is None:
+            return None
+        return {"structuring": [{} for _ in range(num_texts)]}
 
     def _normalize_field_value(self, text, tokens_with_spans, field_name, value, first_only=False):
         value_text = value.get('text') if isinstance(value, dict) else value
@@ -156,7 +208,7 @@ class StructuringProcessor(SpanProcessor):
 
         max_instances = 0
         max_fields = 0
-        has_any = False
+        has_schema = False
 
         for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
             structuring_data = batch_list[batch_idx].get('structuring', {})
@@ -165,12 +217,18 @@ class StructuringProcessor(SpanProcessor):
                 continue
             instances = structuring_data[schema_name]
             if instances:
-                has_any = True
-                max_instances = max(max_instances, len(instances))
+                has_schema = True
+                valid_instances = [
+                    instance for instance in instances
+                    if self._instance_has_valid_span(instance, max_seq_len)
+                ]
+                max_instances = max(max_instances, len(valid_instances))
                 max_fields = max(max_fields, len(struct_item.field_class_to_id.class_to_id))
 
-        if not has_any or max_instances == 0 or max_fields == 0:
+        if not has_schema or max_fields == 0:
             return None
+        if max_instances == 0:
+            max_instances = 1
 
         if self._fixed_slot_pad:
             max_instances = max(max_instances, self._fixed_slot_pad)
@@ -190,7 +248,11 @@ class StructuringProcessor(SpanProcessor):
             if schema_name not in structuring_data:
                 continue
 
-            instances = sorted(structuring_data[schema_name], key=self._instance_sort_key)
+            instances = [
+                instance for instance in structuring_data[schema_name]
+                if self._instance_has_valid_span(instance, max_seq_len)
+            ]
+            instances = sorted(instances, key=self._instance_sort_key)
             field_to_id = struct_item.field_class_to_id.class_to_id
             structuring_mask[flat_idx] = True
             structuring_count[flat_idx] = len(instances)

@@ -137,12 +137,40 @@ class TaskDecoder(ABC):
         """Decode model output into structured predictions."""
         ...
 
+    def map_results(
+        self,
+        task_results: list,
+        valid_to_orig_idx: List[int],
+        all_start_maps: List[List[int]],
+        all_end_maps: List[List[int]],
+        valid_texts: List[str],
+        num_original: int,
+        **kwargs,
+    ) -> List:
+        """Map decoded task results back to original input order."""
+        output = [[] for _ in range(num_original)]
+        for valid_i, result in enumerate(task_results):
+            orig_i = valid_to_orig_idx[valid_i]
+            output[orig_i] = result
+        return output
+
 
 class TaskProcessor(ABC):
     """Abstract base class for task-specific data processors."""
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
         self.config = config
+
+    @staticmethod
+    def _normalize_label_groups(labels) -> Dict[str, List[str]]:
+        """Normalize ``List[str]`` or ``Dict[str, List[str]]`` to dict form."""
+        if labels is None:
+            return {}
+        if isinstance(labels, list):
+            return {None: list(dict.fromkeys(labels))}
+        if isinstance(labels, dict):
+            return {k: list(dict.fromkeys(v)) for k, v in labels.items()}
+        raise TypeError(f"Expected list or dict for labels, got {type(labels)}")
 
     @abstractmethod
     def get_classes_mapping(self, batch_list, **kwargs):
@@ -161,6 +189,14 @@ class TaskProcessor(ABC):
     def resolve_spans(self, item):
         """Resolve text spans to token indices (task-specific)."""
         pass
+
+    def contribute_inference_input(self, item: Dict[str, Any], **kwargs):
+        """Add task-specific inference stubs to one collator input item."""
+        return None
+
+    def empty_inference_result(self, num_texts: int, **kwargs) -> Optional[Dict[str, List]]:
+        """Return this task's empty inference result when requested."""
+        return None
 
     def prepare_label_encoder_inputs(self, classes_mapping, labels_tokenizer) -> Optional[Dict]:
         """Tokenize label strings for the labels encoder."""

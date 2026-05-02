@@ -67,52 +67,6 @@ class GLiNExT(BaseEncoderGLiNER):
         self.model = GLiNExTModel(config, from_pretrained=backbone_from_pretrained, cache_dir=cache_dir, **kwargs)
         return self.model
 
-    @classmethod
-    def from_pretrained(cls, *args, allow_mismatched_sizes: bool = False, **kwargs):
-        """Load a pretrained checkpoint, optionally tolerating shape mismatches.
-
-        When ``allow_mismatched_sizes=True``, any state-dict entry whose tensor
-        shape disagrees with the freshly-built model is dropped (the model
-        keeps its initialized weights for those keys). This mirrors the
-        ``transformers`` flag of the same name and is useful when reloading a
-        prior checkpoint after the task heads, vocab size, or label space have
-        changed.
-        """
-        if not allow_mismatched_sizes:
-            return super().from_pretrained(*args, **kwargs)
-
-        # Localized monkey-patch: filter mismatched-shape entries from the
-        # state dict during this load only. Parent's from_pretrained calls
-        # ``instance.model.load_state_dict(state_dict, strict=strict)`` once;
-        # we wrap that method on GLiNExTModel so only this call is affected.
-        original = GLiNExTModel.__dict__.get("load_state_dict")
-
-        def filtered_load_state_dict(self, state_dict, strict=True, **lkw):
-            own_sd = self.state_dict()
-            kept = {}
-            skipped = []
-            for k, v in state_dict.items():
-                if k in own_sd and hasattr(v, "shape") and own_sd[k].shape != v.shape:
-                    skipped.append((k, tuple(own_sd[k].shape), tuple(v.shape)))
-                    continue
-                kept[k] = v
-            for k, expected, actual in skipped:
-                logger.warning(
-                    "Skipping '%s' due to shape mismatch (model: %s, checkpoint: %s)",
-                    k, expected, actual,
-                )
-            # Force strict=False because dropped keys would otherwise show up
-            # as missing and trip strict loading.
-            return super(GLiNExTModel, self).load_state_dict(kept, strict=False, **lkw)
-
-        GLiNExTModel.load_state_dict = filtered_load_state_dict
-        try:
-            return super().from_pretrained(*args, **kwargs)
-        finally:
-            if original is None:
-                del GLiNExTModel.load_state_dict
-            else:
-                GLiNExTModel.load_state_dict = original
 
     def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
         """Create processor, loading labels tokenizer for bi-encoder mode."""
@@ -217,20 +171,6 @@ class GLiNExT(BaseEncoderGLiNER):
             if hasattr(self.config, "encoder_config") and self.config.encoder_config is not None:
                 self.config.encoder_config.vocab_size = model_embeds.num_embeddings
 
-    @staticmethod
-    def _normalize_label_groups(labels) -> Dict[str, List[str]]:
-        """Normalize ``List[str]`` or ``Dict[str, List[str]]`` to dict form.
-
-        A plain list becomes a single unnamed group ``{None: labels}``.
-        """
-        if labels is None:
-            return {}
-        if isinstance(labels, list):
-            return {None: list(dict.fromkeys(labels))}
-        if isinstance(labels, dict):
-            return {k: list(dict.fromkeys(v)) for k, v in labels.items()}
-        raise TypeError(f"Expected list or dict for labels, got {type(labels)}")
-
     def _build_inference_input(
         self,
         all_tokens: List[List[str]],
@@ -246,107 +186,21 @@ class GLiNExT(BaseEncoderGLiNER):
         annotation stubs that tell the processor which tasks are active and
         what their label spaces are.
         """
-        entity_groups = self._normalize_label_groups(entities)
-        class_groups = self._normalize_label_groups(classes)
-        relation_groups = self._normalize_label_groups(relations)
-
         input_x = []
+        task_processors = self.data_processor.task_processors.values()
         for tokens in all_tokens:
             item: Dict[str, Any] = {"tokenized_text": tokens}
-
-            # NER / Joint Relex
-            if entity_groups or joint_relations:
-                extraction = []
-                for parent_name, ent_labels in entity_groups.items():
-                    entry = {
-                        "name": parent_name,
-                        "ner": [],
-                    }
-                    # If this is a joint group, also add relations
-                    if joint_relations and parent_name in joint_relations:
-                        entry["relations"] = []
-                        entry["all_rel_labels"] = joint_relations[parent_name].get("relations", [])
-                    entry["all_labels"] = ent_labels
-                    extraction.append(entry)
-
-                # Joint-only groups (no NER labels)
-                if joint_relations:
-                    for parent_name, jconf in joint_relations.items():
-                        if parent_name not in entity_groups:
-                            extraction.append({
-                                "name": parent_name,
-                                "ner": [],
-                                "relations": [],
-                                "all_labels": jconf.get("entities", []),
-                                "all_rel_labels": jconf.get("relations", []),
-                            })
-
-                item["extraction"] = extraction
-
-            # Classification
-            if class_groups:
-                classification = []
-                for parent_name, cls_labels in class_groups.items():
-                    classification.append({
-                        "name": parent_name,
-                        "all_labels": cls_labels,
-                        "true_labels": [],
-                    })
-                item["classification"] = classification
-
-            # Open Relation Extraction
-            if relation_groups:
-                open_relex = []
-                for parent_name, rel_labels in relation_groups.items():
-                    open_relex.append({
-                        "name": parent_name,
-                        "relations": [],
-                        "all_labels": rel_labels,
-                    })
-                item["open_relex"] = open_relex
-
-            # Structuring
-            if structures:
-                structuring = {}
-                for schema_name, fields in structures.items():
-                    field_list = fields if isinstance(fields, list) else fields.get("fields", [])
-                    # Dummy instance with all field names so the processor
-                    # can build the class mapping during inference
-                    structuring[schema_name] = [dict.fromkeys(field_list, "")] if field_list else []
-                item["structuring"] = structuring
-                item["structuring_schema"] = {
-                    schema_name: fields if isinstance(fields, list) else fields.get("fields", [])
-                    for schema_name, fields in structures.items()
-                }
-
+            for processor in task_processors:
+                processor.contribute_inference_input(
+                    item,
+                    entities=entities,
+                    classes=classes,
+                    relations=relations,
+                    joint_relations=joint_relations,
+                    structures=structures,
+                )
             input_x.append(item)
         return input_x
-
-    @staticmethod
-    def _extract_structuring_meta(
-        structures: Optional[Dict[str, Union[List[str], dict]]],
-    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
-        """Split structures spec into ``{schema: fields}`` and ``{schema: required_fields}``."""
-        if not structures:
-            return {}, {}
-
-        schema_fields: Dict[str, List[str]] = {}
-        schema_required: Dict[str, List[str]] = {}
-        for schema_name, spec in structures.items():
-            if isinstance(spec, list):
-                fields = list(spec)
-                required: List[str] = []
-            elif isinstance(spec, dict):
-                fields = list(spec.get("fields", []))
-                required = list(spec.get("required_fields") or [])
-            else:
-                fields = []
-                required = []
-            schema_fields[schema_name] = fields
-            # Drop unknown names so a typo in required_fields is a no-op,
-            # not a hard error.
-            schema_required[schema_name] = [f for f in required if f in fields]
-        return schema_fields, schema_required
 
     @torch.no_grad()
     def inference(
@@ -406,7 +260,14 @@ class GLiNExT(BaseEncoderGLiNER):
         # Filter empty texts
         valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
         if not valid_texts:
-            return self._empty_results(num_original, entities, classes, relations, structures)
+            return self.data_processor.empty_inference_results(
+                num_original,
+                entities=entities,
+                classes=classes,
+                relations=relations,
+                joint_relations=joint_relations,
+                structures=structures,
+            )
 
         # Tokenize
         all_tokens, all_start_maps, all_end_maps = self.prepare_inputs(valid_texts)
@@ -435,8 +296,6 @@ class GLiNExT(BaseEncoderGLiNER):
         if manual_structuring_count is not None:
             kwargs["manual_structuring_count"] = manual_structuring_count
 
-        schema_fields, schema_required = self._extract_structuring_meta(structures)
-
         all_decoded, all_classes_mappings = self._process_multitask_batches(
             data_loader, threshold, flat_ner, multi_label,
             **kwargs,
@@ -451,8 +310,7 @@ class GLiNExT(BaseEncoderGLiNER):
             valid_texts,
             num_original,
             all_classes_mappings,
-            schema_fields=schema_fields,
-            schema_required_fields=schema_required,
+            structures=structures,
             structuring_dedup=structuring_dedup,
         )
 
@@ -504,7 +362,7 @@ class GLiNExT(BaseEncoderGLiNER):
             if classes_mapping is not None:
                 batch_size = len(tokens) if tokens else 0
                 for i in range(batch_size):
-                    all_classes_mappings.append(classes_mapping)
+                    all_classes_mappings.append((classes_mapping, i))
 
             # Accumulate decoded results
             for task_name, task_results in decoded.items():
@@ -523,453 +381,21 @@ class GLiNExT(BaseEncoderGLiNER):
         valid_texts: List[str],
         num_original: int,
         all_classes_mappings: Optional[list] = None,
-        schema_fields: Optional[Dict[str, List[str]]] = None,
-        schema_required_fields: Optional[Dict[str, List[str]]] = None,
+        structures: Optional[Dict[str, Union[List[str], dict]]] = None,
         structuring_dedup: bool = True,
     ) -> Dict[str, List]:
         """Map decoded results back to original text indices and char positions."""
-        results = {}
-
-        for task_name, task_results in decoded.items():
-            if task_name in ("ner", "joint_relex"):
-                results[task_name] = self._map_span_results(
-                    task_results, valid_to_orig_idx, all_start_maps,
-                    all_end_maps, valid_texts, num_original,
-                )
-            elif task_name in ("open_relex",):
-                results[task_name] = self._map_relex_results(
-                    task_results, valid_to_orig_idx, all_start_maps,
-                    all_end_maps, valid_texts, num_original,
-                )
-            elif task_name in ("structuring",):
-                results[task_name] = self._map_structuring_results(
-                    task_results, valid_to_orig_idx, all_start_maps,
-                    all_end_maps, valid_texts, num_original,
-                    all_classes_mappings,
-                    schema_fields=schema_fields,
-                    schema_required_fields=schema_required_fields,
-                    structuring_dedup=structuring_dedup,
-                )
-            else:
-                # classification, embedding, count — no span mapping needed
-                results[task_name] = self._map_passthrough_results(
-                    task_results, valid_to_orig_idx, num_original,
-                )
-
-        return results
-
-    def _map_span_results(
-        self,
-        task_results: list,
-        valid_to_orig_idx: List[int],
-        all_start_maps: List[List[int]],
-        all_end_maps: List[List[int]],
-        valid_texts: List[str],
-        num_original: int,
-    ) -> List[List[Dict]]:
-        """Map NER-style span results (token indices → char positions)."""
-        output = [[] for _ in range(num_original)]
-
-        for valid_i, per_text_groups in enumerate(task_results):
-            orig_i = valid_to_orig_idx[valid_i]
-            start_map = all_start_maps[valid_i]
-            end_map = all_end_maps[valid_i]
-            text = valid_texts[valid_i]
-
-            entities = []
-            # per_text_groups is List[List[Span]] (groups of spans)
-            groups = per_text_groups if isinstance(per_text_groups, list) else [per_text_groups]
-            for group in groups:
-                if not isinstance(group, list):
-                    group = [group]
-                for span in group:
-                    if hasattr(span, 'start') and hasattr(span, 'entity_type'):
-                        # Span object
-                        if span.start < len(start_map) and span.end < len(end_map):
-                            start_char = start_map[span.start]
-                            end_char = end_map[span.end]
-                            entity = {
-                                "start": start_char,
-                                "end": end_char,
-                                "text": text[start_char:end_char],
-                                "label": span.entity_type,
-                                "score": span.score,
-                            }
-                            if span.class_probs is not None:
-                                entity["class_probs"] = span.class_probs
-                            entities.append(entity)
-                    elif isinstance(span, dict):
-                        entities.append(span)
-
-            output[orig_i] = entities
-        return output
-
-    def _map_relex_results(
-        self,
-        task_results: list,
-        valid_to_orig_idx: List[int],
-        all_start_maps: List[List[int]],
-        all_end_maps: List[List[int]],
-        valid_texts: List[str],
-        num_original: int,
-    ) -> List[List[Dict]]:
-        """Map open relex results (triples with token-level head/tail → char)."""
-        output = [[] for _ in range(num_original)]
-
-        for valid_i, per_text_groups in enumerate(task_results):
-            orig_i = valid_to_orig_idx[valid_i]
-            start_map = all_start_maps[valid_i]
-            end_map = all_end_maps[valid_i]
-            text = valid_texts[valid_i]
-
-            triples = []
-            groups = per_text_groups if isinstance(per_text_groups, list) else [per_text_groups]
-            for group in groups:
-                if isinstance(group, list):
-                    for triple in group:
-                        triples.append(self._map_triple_chars(triple, start_map, end_map, text))
-                elif isinstance(group, dict):
-                    triples.append(self._map_triple_chars(group, start_map, end_map, text))
-
-            output[orig_i] = triples
-        return output
-
-    @staticmethod
-    def _map_triple_chars(triple, start_map, end_map, text):
-        """Map a single relation triple from token indices to char positions."""
-        mapped = dict(triple)
-        for role in ("head", "tail"):
-            if role in mapped and isinstance(mapped[role], dict):
-                span = mapped[role]
-                st = span.get("start", 0)
-                ed = span.get("end", 0)
-                if st < len(start_map) and ed < len(end_map):
-                    start_char = start_map[st]
-                    end_char = end_map[ed]
-                    mapped[role] = {
-                        "start": start_char,
-                        "end": end_char,
-                        "text": text[start_char:end_char],
-                    }
-        return mapped
-
-    def _map_structuring_results(
-        self,
-        task_results: list,
-        valid_to_orig_idx: List[int],
-        all_start_maps: List[List[int]],
-        all_end_maps: List[List[int]],
-        valid_texts: List[str],
-        num_original: int,
-        all_classes_mappings: Optional[list] = None,
-        schema_fields: Optional[Dict[str, List[str]]] = None,
-        schema_required_fields: Optional[Dict[str, List[str]]] = None,
-        structuring_dedup: bool = True,
-    ) -> List[Dict[str, List[Dict]]]:
-        """Map structuring results into schema-keyed JSON output.
-
-        The decoder returns per-text groups where each group corresponds to a
-        schema (identified via ``classes_mapping.structuring_mapping``). Each
-        group contains instances, and each instance is a list of field dicts.
-
-        This method assembles them into::
-
-            {schema_name: [{field1: value1, field2: value2}, ...]}
-
-        with char-level positions for each value. Missing fields are emitted
-        as ``None`` so every schema field appears in every instance, and
-        near-duplicate instances are pruned via NMS-like dedup keyed on
-        non-``None`` field agreement.
-        """
-        output: List[Dict[str, List[Dict]]] = [{} for _ in range(num_original)]
-        schema_fields = schema_fields or {}
-        schema_required_fields = schema_required_fields or {}
-
-        for valid_i, per_text_groups in enumerate(task_results):
-            orig_i = valid_to_orig_idx[valid_i]
-            start_map = all_start_maps[valid_i]
-            end_map = all_end_maps[valid_i]
-            text = valid_texts[valid_i]
-
-            # Resolve schema names from classes_mapping
-            schema_names = self._get_structuring_schema_names(
-                all_classes_mappings, valid_i,
-            )
-
-            result_dict: Dict[str, List[Dict]] = {}
-            groups = per_text_groups if isinstance(per_text_groups, list) else [per_text_groups]
-
-            for group_idx, group in enumerate(groups):
-                schema_name = (schema_names[group_idx]
-                               if group_idx < len(schema_names)
-                               else f"schema_{group_idx}")
-
-                if schema_name not in result_dict:
-                    result_dict[schema_name] = []
-
-                schema_field_list = schema_fields.get(schema_name, [])
-                required_for_schema = schema_required_fields.get(schema_name, [])
-
-                # group is a list of instances (each instance = list of field dicts)
-                instances = group if isinstance(group, list) else [group]
-                schema_instances: List[Dict[str, object]] = []
-                for instance in instances:
-                    if isinstance(instance, list):
-                        instance_dict = self._assemble_instance_dict(
-                            instance, start_map, end_map, text, schema_field_list,
-                        )
-                        if instance_dict is not None:
-                            schema_instances.append(instance_dict)
-                    elif isinstance(instance, dict):
-                        # Already a flat dict; still ensure all schema fields are present.
-                        schema_instances.append(self._fill_missing_fields(instance, schema_field_list))
-
-                # Required fields are a post-processing filter only: drop any
-                # instance where a required field came back as None.
-                if required_for_schema:
-                    schema_instances = [
-                        inst for inst in schema_instances
-                        if all(inst.get(f) is not None for f in required_for_schema)
-                    ]
-
-                if structuring_dedup and len(schema_instances) > 1:
-                    schema_instances = self._dedup_similar_instances(
-                        schema_instances, schema_field_list,
-                    )
-
-                result_dict[schema_name].extend(schema_instances)
-
-            output[orig_i] = result_dict
-        return output
-
-    @staticmethod
-    def _fill_missing_fields(
-        instance: Dict[str, object], schema_field_list: List[str],
-    ) -> Dict[str, object]:
-        """Ensure every schema field appears, defaulting missing ones to ``None``."""
-        if not schema_field_list:
-            return dict(instance)
-        filled = {f: instance.get(f, None) for f in schema_field_list}
-        # Carry through any extra keys (e.g. legacy field names) untouched.
-        for k, v in instance.items():
-            if k not in filled:
-                filled[k] = v
-        return filled
-
-    def _assemble_instance_dict(
-        self,
-        instance_fields: list,
-        start_map: List[int],
-        end_map: List[int],
-        text: str,
-        schema_field_list: List[str],
-    ) -> Optional[Dict[str, object]]:
-        """Build ``{field: value}`` dict from a list of decoded field dicts.
-
-        Multiple spans for the same field aggregate into a list. Returns
-        ``None`` only when the input contains no usable fields *and* no
-        schema fields are defined (so we'd produce an empty dict). When a
-        schema field list is provided, missing fields are filled with
-        ``None`` so every schema field appears in the output.
-        """
-        instance_dict: Dict[str, object] = {}
-        # Sort by score descending so scalar fields (which downstream pick
-        # value[0]) take the highest-scoring span, and list fields end up
-        # score-ordered.
-        ordered_fields = sorted(
-            instance_fields,
-            key=lambda f: -(f.get("score", 0.0) if isinstance(f, dict) else 0.0),
+        return self.decoder.map_results(
+            decoded,
+            valid_to_orig_idx=valid_to_orig_idx,
+            all_start_maps=all_start_maps,
+            all_end_maps=all_end_maps,
+            valid_texts=valid_texts,
+            num_original=num_original,
+            all_classes_mappings=all_classes_mappings,
+            structures=structures,
+            structuring_dedup=structuring_dedup,
         )
-        for field in ordered_fields:
-            mapped = self._map_field_to_value(field, start_map, end_map, text)
-            if mapped is None:
-                continue
-            field_name = mapped["field"]
-            value = mapped["value"]
-            if field_name in instance_dict and instance_dict[field_name] is not None:
-                existing = instance_dict[field_name]
-                if not isinstance(existing, list):
-                    instance_dict[field_name] = [existing, value]
-                else:
-                    existing.append(value)
-            else:
-                instance_dict[field_name] = value
-
-        if schema_field_list:
-            instance_dict = self._fill_missing_fields(instance_dict, schema_field_list)
-            # Drop entirely-empty instances so callers don't get rows of all-None.
-            if all(v is None for v in instance_dict.values()):
-                return None
-            return instance_dict
-
-        if not instance_dict:
-            return None
-        return instance_dict
-
-    @staticmethod
-    def _value_dedup_key(value):
-        """Hashable, normalised key used to compare field values during NMS dedup.
-
-        ``None`` stays ``None`` so NMS treats it as "missing" and skips the
-        comparison. Every other value is reduced to a ``frozenset`` of
-        normalised scalar tokens — a scalar therefore matches its
-        single-element list form, repeated entries collapse, and string
-        values compare case- and whitespace-insensitively. This is what we
-        want for "are these two structures describing the same record?".
-        """
-        if value is None:
-            return None
-        raw = value if isinstance(value, list) else [value]
-        items = []
-        for v in raw:
-            if v is None:
-                continue
-            if isinstance(v, dict):
-                if "text" in v:
-                    v = v["text"]
-                else:
-                    items.append((v.get("start"), v.get("end")))
-                    continue
-            if isinstance(v, str):
-                v = v.strip().lower()
-            items.append(v)
-        if not items:
-            return None
-        return frozenset(items)
-
-    @classmethod
-    def _dominates(
-        cls, richer: Dict[str, object], poorer: Dict[str, object],
-        schema_field_list: List[str],
-    ) -> bool:
-        """``richer`` dominates ``poorer`` when every non-``None`` value in
-        ``poorer`` is contained in the corresponding value of ``richer``.
-
-        Operates on the normalised dedup keys: each value is a ``frozenset``
-        of normalised tokens, so multi-span fields and single-span fields
-        are compared by set inclusion. ``None`` in ``poorer`` is "no
-        constraint"; ``None`` in ``richer`` while ``poorer`` is non-``None``
-        means ``richer`` is missing info that ``poorer`` has → no
-        domination.
-        """
-        keys = schema_field_list or list({*richer.keys(), *poorer.keys()})
-        for k in keys:
-            kp = cls._value_dedup_key(poorer.get(k))
-            if kp is None:
-                continue
-            kr = cls._value_dedup_key(richer.get(k))
-            if kr is None:
-                return False
-            if not kp.issubset(kr):
-                return False
-        return True
-
-    @classmethod
-    def _dedup_similar_instances(
-        cls, instances: List[Dict[str, object]], schema_field_list: List[str],
-    ) -> List[Dict[str, object]]:
-        """NMS-like dedup: drop instances dominated by a richer survivor.
-
-        "Richness" is the total number of normalised tokens across all
-        non-``None`` fields — a multi-valued field counts as many tokens as
-        it has, so ``name=[Tesla, SpaceX]`` outranks ``name=Tesla`` and
-        absorbs it. We process the richest first and drop any subsequent
-        instance whose non-``None`` values are subsumed by an already-kept
-        one. Equally-rich identical instances also collapse (the first one
-        wins).
-        """
-        def richness(inst):
-            total = 0
-            for v in inst.values():
-                key = cls._value_dedup_key(v)
-                if key is None:
-                    continue
-                total += len(key) if isinstance(key, frozenset) else 1
-            return total
-
-        ordered = sorted(
-            enumerate(instances),
-            key=lambda iv: (-richness(iv[1]), iv[0]),
-        )
-        kept: List[Dict[str, object]] = []
-        for _, inst in ordered:
-            if any(cls._dominates(k, inst, schema_field_list) for k in kept):
-                continue
-            kept.append(inst)
-        return kept
-
-    @staticmethod
-    def _map_field_to_value(field, start_map, end_map, text):
-        """Map a field dict to {field, value} with char-level text extraction.
-
-        Returns:
-            Dict with 'field' (name) and 'value' (extracted text), or None.
-        """
-        if not isinstance(field, dict) or "field" not in field:
-            return None
-        st = field.get("start", 0)
-        ed = field.get("end", 0)
-        if st < len(start_map) and ed < len(end_map):
-            start_char = start_map[st]
-            end_char = end_map[ed]
-            return {
-                "field": field["field"],
-                "value": text[start_char:end_char],
-            }
-        # Fallback: use token-level text if available
-        return {
-            "field": field["field"],
-            "value": field.get("text", ""),
-        }
-
-    @staticmethod
-    def _get_structuring_schema_names(
-        all_classes_mappings: Optional[list],
-        valid_idx: int,
-    ) -> List[str]:
-        """Extract schema names for a batch item from accumulated classes_mappings."""
-        if not all_classes_mappings or valid_idx >= len(all_classes_mappings):
-            return []
-        cm = all_classes_mappings[valid_idx]
-        if cm is None or not hasattr(cm, "structuring_mapping"):
-            return []
-        # The valid_idx corresponds to a batch item within its original batch.
-        # Since we accumulate one mapping per item, structuring_mapping[0] has
-        # the schema items for this text (the mapping is batch-level, but each
-        # item in the DataLoader batch shares the same mapping).
-        # We return all schema names across all batch items in this mapping.
-        names = []
-        for sm in cm.structuring_mapping:
-            for item in sm.items:
-                names.append(getattr(item, "name", None) or f"schema_{len(names)}")
-        return names
-
-    @staticmethod
-    def _map_passthrough_results(
-        task_results: list,
-        valid_to_orig_idx: List[int],
-        num_original: int,
-    ) -> List:
-        """Map results that don't need span→char conversion."""
-        output = [[] for _ in range(num_original)]
-        for valid_i, result in enumerate(task_results):
-            orig_i = valid_to_orig_idx[valid_i]
-            output[orig_i] = result
-        return output
-
-    @staticmethod
-    def _empty_results(num_texts, entities, classes, relations, structures):
-        """Return empty results dict when there's nothing to process."""
-        results = {}
-        if entities is not None:
-            results["ner"] = [[] for _ in range(num_texts)]
-        if classes is not None:
-            results["classification"] = [[] for _ in range(num_texts)]
-        if relations is not None:
-            results["open_relex"] = [[] for _ in range(num_texts)]
-        if structures is not None:
-            results["structuring"] = [{} for _ in range(num_texts)]
-        return results
 
     # ── Per-task convenience methods ───────────────────────────────────
 

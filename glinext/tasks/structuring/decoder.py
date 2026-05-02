@@ -253,3 +253,241 @@ class StructuringDecoder(SpanDecoder):
         if len(maps) < batch_size:
             maps.extend({} for _ in range(batch_size - len(maps)))
         return maps[:batch_size]
+
+    def map_results(
+        self,
+        task_results: list,
+        valid_to_orig_idx: List[int],
+        all_start_maps: List[List[int]],
+        all_end_maps: List[List[int]],
+        valid_texts: List[str],
+        num_original: int,
+        all_classes_mappings: Optional[list] = None,
+        structures=None,
+        structuring_dedup: bool = True,
+        **kwargs,
+    ) -> List[Dict[str, List[Dict]]]:
+        output: List[Dict[str, List[Dict]]] = [{} for _ in range(num_original)]
+        schema_fields, schema_required_fields = self._extract_structuring_meta(structures)
+
+        for valid_i, per_text_groups in enumerate(task_results):
+            orig_i = valid_to_orig_idx[valid_i]
+            start_map = all_start_maps[valid_i]
+            end_map = all_end_maps[valid_i]
+            text = valid_texts[valid_i]
+            schema_names = self._get_structuring_schema_names(
+                all_classes_mappings, valid_i,
+            )
+
+            result_dict: Dict[str, List[Dict]] = {}
+            groups = per_text_groups if isinstance(per_text_groups, list) else [per_text_groups]
+
+            for group_idx, group in enumerate(groups):
+                schema_name = (
+                    schema_names[group_idx]
+                    if group_idx < len(schema_names)
+                    else f"schema_{group_idx}"
+                )
+                result_dict.setdefault(schema_name, [])
+
+                schema_field_list = schema_fields.get(schema_name, [])
+                required_for_schema = schema_required_fields.get(schema_name, [])
+
+                instances = group if isinstance(group, list) else [group]
+                schema_instances: List[Dict[str, object]] = []
+                for instance in instances:
+                    if isinstance(instance, list):
+                        instance_dict = self._assemble_instance_dict(
+                            instance, start_map, end_map, text, schema_field_list,
+                        )
+                        if instance_dict is not None:
+                            schema_instances.append(instance_dict)
+                    elif isinstance(instance, dict):
+                        schema_instances.append(self._fill_missing_fields(instance, schema_field_list))
+
+                if required_for_schema:
+                    schema_instances = [
+                        inst for inst in schema_instances
+                        if all(inst.get(f) is not None for f in required_for_schema)
+                    ]
+
+                if structuring_dedup and len(schema_instances) > 1:
+                    schema_instances = self._dedup_similar_instances(
+                        schema_instances, schema_field_list,
+                    )
+
+                result_dict[schema_name].extend(schema_instances)
+
+            output[orig_i] = result_dict
+        return output
+
+    @staticmethod
+    def _extract_structuring_meta(structures):
+        if not structures:
+            return {}, {}
+
+        schema_fields: Dict[str, List[str]] = {}
+        schema_required: Dict[str, List[str]] = {}
+        for schema_name, spec in structures.items():
+            if isinstance(spec, list):
+                fields = list(spec)
+                required = []
+            elif isinstance(spec, dict):
+                fields = list(spec.get("fields", []))
+                required = list(spec.get("required_fields") or [])
+            else:
+                fields = []
+                required = []
+            schema_fields[schema_name] = fields
+            schema_required[schema_name] = [f for f in required if f in fields]
+        return schema_fields, schema_required
+
+    @staticmethod
+    def _fill_missing_fields(instance: Dict[str, object], schema_field_list: List[str]) -> Dict[str, object]:
+        if not schema_field_list:
+            return dict(instance)
+        filled = {f: instance.get(f, None) for f in schema_field_list}
+        for k, v in instance.items():
+            if k not in filled:
+                filled[k] = v
+        return filled
+
+    def _assemble_instance_dict(
+        self,
+        instance_fields: list,
+        start_map: List[int],
+        end_map: List[int],
+        text: str,
+        schema_field_list: List[str],
+    ) -> Optional[Dict[str, object]]:
+        instance_dict: Dict[str, object] = {}
+        ordered_fields = sorted(
+            instance_fields,
+            key=lambda f: -(f.get("score", 0.0) if isinstance(f, dict) else 0.0),
+        )
+        for field in ordered_fields:
+            mapped = self._map_field_to_value(field, start_map, end_map, text)
+            if mapped is None:
+                continue
+            field_name = mapped["field"]
+            value = mapped["value"]
+            if field_name in instance_dict and instance_dict[field_name] is not None:
+                existing = instance_dict[field_name]
+                if not isinstance(existing, list):
+                    instance_dict[field_name] = [existing, value]
+                else:
+                    existing.append(value)
+            else:
+                instance_dict[field_name] = value
+
+        if schema_field_list:
+            instance_dict = self._fill_missing_fields(instance_dict, schema_field_list)
+            if all(v is None for v in instance_dict.values()):
+                return None
+            return instance_dict
+
+        if not instance_dict:
+            return None
+        return instance_dict
+
+    @staticmethod
+    def _value_dedup_key(value):
+        if value is None:
+            return None
+        raw = value if isinstance(value, list) else [value]
+        items = []
+        for v in raw:
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                if "text" in v:
+                    v = v["text"]
+                else:
+                    items.append((v.get("start"), v.get("end")))
+                    continue
+            if isinstance(v, str):
+                v = v.strip().lower()
+            items.append(v)
+        if not items:
+            return None
+        return frozenset(items)
+
+    @classmethod
+    def _dominates(
+        cls, richer: Dict[str, object], poorer: Dict[str, object],
+        schema_field_list: List[str],
+    ) -> bool:
+        keys = schema_field_list or list({*richer.keys(), *poorer.keys()})
+        for k in keys:
+            kp = cls._value_dedup_key(poorer.get(k))
+            if kp is None:
+                continue
+            kr = cls._value_dedup_key(richer.get(k))
+            if kr is None:
+                return False
+            if not kp.issubset(kr):
+                return False
+        return True
+
+    @classmethod
+    def _dedup_similar_instances(
+        cls, instances: List[Dict[str, object]], schema_field_list: List[str],
+    ) -> List[Dict[str, object]]:
+        def richness(inst):
+            total = 0
+            for v in inst.values():
+                key = cls._value_dedup_key(v)
+                if key is None:
+                    continue
+                total += len(key) if isinstance(key, frozenset) else 1
+            return total
+
+        ordered = sorted(
+            enumerate(instances),
+            key=lambda iv: (-richness(iv[1]), iv[0]),
+        )
+        kept: List[Dict[str, object]] = []
+        for _, inst in ordered:
+            if any(cls._dominates(k, inst, schema_field_list) for k in kept):
+                continue
+            kept.append(inst)
+        return kept
+
+    @staticmethod
+    def _map_field_to_value(field, start_map, end_map, text):
+        if not isinstance(field, dict) or "field" not in field:
+            return None
+        st = field.get("start", 0)
+        ed = field.get("end", 0)
+        if st < len(start_map) and ed < len(end_map):
+            start_char = start_map[st]
+            end_char = end_map[ed]
+            return {
+                "field": field["field"],
+                "value": text[start_char:end_char],
+            }
+        return {
+            "field": field["field"],
+            "value": field.get("text", ""),
+        }
+
+    @staticmethod
+    def _get_structuring_schema_names(all_classes_mappings: Optional[list], valid_idx: int) -> List[str]:
+        if not all_classes_mappings or valid_idx >= len(all_classes_mappings):
+            return []
+        entry = all_classes_mappings[valid_idx]
+        if isinstance(entry, tuple):
+            cm, item_idx = entry
+        else:
+            cm, item_idx = entry, None
+        if cm is None or not hasattr(cm, "structuring_mapping"):
+            return []
+
+        names = []
+        mappings = cm.structuring_mapping
+        if item_idx is not None and item_idx < len(mappings):
+            mappings = [mappings[item_idx]]
+        for sm in mappings:
+            for item in sm.items:
+                names.append(getattr(item, "name", None) or f"schema_{len(names)}")
+        return names

@@ -28,6 +28,33 @@ class JointRelexProcessor(NERProcessor):
         # REL tokens are already included by NERProcessor within extraction groups
         return []
 
+    def contribute_inference_input(self, item, joint_relations=None, **kwargs):
+        if not joint_relations:
+            return
+
+        extraction = item.setdefault('extraction', [])
+        by_name = {
+            group.get('name'): group
+            for group in extraction
+        }
+        for parent_name, jconf in joint_relations.items():
+            entry = by_name.get(parent_name)
+            if entry is None:
+                entry = {
+                    "name": parent_name,
+                    "ner": [],
+                }
+                extraction.append(entry)
+                by_name[parent_name] = entry
+            entry["relations"] = []
+            entry["all_labels"] = jconf.get("entities", [])
+            entry["all_rel_labels"] = jconf.get("relations", [])
+
+    def empty_inference_result(self, num_texts: int, joint_relations=None, **kwargs):
+        if joint_relations is None:
+            return None
+        return {"joint_relex": [[] for _ in range(num_texts)]}
+
     def create_labels(self, batch_list, classes_mapping, **kwargs):
         total_groups = classes_mapping.total_extraction_groups()
         if total_groups == 0:

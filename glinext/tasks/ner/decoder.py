@@ -90,3 +90,55 @@ class NERDecoder(SpanDecoder):
         return unflatten_by_batch_origin(
             flat_results, model_output.ner_batch_origin, model_output.batch_size,
         )
+
+    def map_results(
+        self,
+        task_results: list,
+        valid_to_orig_idx: List[int],
+        all_start_maps: List[List[int]],
+        all_end_maps: List[List[int]],
+        valid_texts: List[str],
+        num_original: int,
+        **kwargs,
+    ) -> List[List[Dict]]:
+        output = [[] for _ in range(num_original)]
+
+        for valid_i, per_text_groups in enumerate(task_results):
+            orig_i = valid_to_orig_idx[valid_i]
+            start_map = all_start_maps[valid_i]
+            end_map = all_end_maps[valid_i]
+            text = valid_texts[valid_i]
+
+            entities = []
+            groups = per_text_groups if isinstance(per_text_groups, list) else [per_text_groups]
+            for group in groups:
+                if not isinstance(group, list):
+                    group = [group]
+                for span in group:
+                    mapped = self._map_span(span, start_map, end_map, text)
+                    if mapped is not None:
+                        entities.append(mapped)
+
+            output[orig_i] = entities
+        return output
+
+    @staticmethod
+    def _map_span(span, start_map, end_map, text):
+        if hasattr(span, 'start') and hasattr(span, 'entity_type'):
+            if span.start >= len(start_map) or span.end >= len(end_map):
+                return None
+            start_char = start_map[span.start]
+            end_char = end_map[span.end]
+            entity = {
+                "start": start_char,
+                "end": end_char,
+                "text": text[start_char:end_char],
+                "label": span.entity_type,
+                "score": span.score,
+            }
+            if span.class_probs is not None:
+                entity["class_probs"] = span.class_probs
+            return entity
+        if isinstance(span, dict):
+            return span
+        return None

@@ -148,6 +148,14 @@ class GLiNextProcessor(BaseProcessor):
                 result.update(enc)
         return result
 
+    def empty_inference_results(self, num_texts: int, **kwargs):
+        results = {}
+        for proc in self.task_processors.values():
+            empty = proc.empty_inference_result(num_texts, **kwargs)
+            if empty:
+                results.update(empty)
+        return results
+
     # ── Tokenization ────────────────────────────────────────────────────
 
     def tokenize_inputs(self, texts, classes_mapping, **kwargs):
@@ -186,21 +194,14 @@ class GLiNextProcessor(BaseProcessor):
             self.task_processors["open_relex"].resolve_spans(item)
         return item
 
-    # ── Span index preparation ──────────────────────────────────────────
-
-    def prepare_span_idx(self, ner, classes_to_id, num_tokens):
-        if "ner" in self.task_processors:
-            return self.task_processors["ner"].prepare_span_idx(ner, classes_to_id, num_tokens)
-        return None, None
-
-    def _generate_negative_spans(self, positive_spans, num_tokens, num_negatives, max_width=None):
-        if "ner" in self.task_processors:
-            return self.task_processors["ner"]._generate_negative_spans(
-                positive_spans, num_tokens, num_negatives, max_width
-            )
-        return []
-
     # ── Generic label creation ────────────────────────────────────────────
+
+    def create_labels(self, batch_list, classes_mapping=None, max_seq_len=0):
+        if classes_mapping is None:
+            raise ValueError("classes_mapping is required; use create_all_labels for raw batches.")
+        return self.create_all_labels(
+            batch_list, classes_mapping, max_seq_len=max_seq_len,
+        )
 
     def create_all_labels(self, batch_list, classes_mapping, max_seq_len=0):
         """Create labels from all task processors in a single call.
@@ -220,15 +221,6 @@ class GLiNextProcessor(BaseProcessor):
             if result is not None:
                 all_labels.update(result)
         return all_labels
-
-    # ── Legacy compatibility methods ────────────────────────────────────
-
-    def sort_extraction_data(self, item):
-        if "ner" in self.task_processors:
-            NERProcessor._sort_extraction_data(item)
-
-    def resolve_entity_spans(self, text, tokens_with_spans, ner):
-        return NERProcessor._resolve_entity_spans(text, tokens_with_spans, ner)
 
     # ── Label creation (delegates to task processors) ───────────────────
 
@@ -297,141 +289,16 @@ class GLiNextProcessor(BaseProcessor):
                         result["structuring_batch_idx"], result["structuring_count"])
         return None
 
-    # ── Span labels (NER + structuring) ─────────────────────────────────
-
-    def create_span_labels(self, batch):
-        if "span_label" not in batch or "span_mask" not in batch:
-            return None
-
-        span_label = batch["span_label"]
-        span_mask = batch["span_mask"]
-        classes_mapping = batch["classes_mapping"]
-
-        max_num_classes = max(
-            len(item.ner_class_to_id.class_to_id)
-            for em in classes_mapping.extraction_mapping
-            for item in em.items
-        ) if any(em.items for em in classes_mapping.extraction_mapping) else 0
-
-        if max_num_classes == 0:
-            return None
-
-        total_groups, max_spans = span_label.shape
-        labels_one_hot = torch.zeros(total_groups, max_spans, max_num_classes, dtype=torch.float)
-
-        valid = span_mask & (span_label > 0)
-        class_indices = (span_label - 1).clamp(min=0)
-
-        if valid.any():
-            flat_indices = valid.nonzero(as_tuple=False)
-            row = flat_indices[:, 0]
-            col = flat_indices[:, 1]
-            cls = class_indices[row, col]
-            in_range = cls < max_num_classes
-            labels_one_hot[row[in_range], col[in_range], cls[in_range]] = 1.0
-
-        return labels_one_hot, span_mask
-
-    def create_structuring_span_labels(self, batch_list, classes_mapping, max_seq_len):
-        """Create span-level structuring labels — kept in orchestrator for backward compat."""
-        total_groups = classes_mapping.total_structuring_groups()
-        if total_groups == 0:
-            return None
-
-        max_instances = 0
-        max_fields = 0
-        has_any = False
-
-        all_group_spans = []
-        batch_indices = []
-
-        for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
-            structuring_data = batch_list[batch_idx].get('structuring', {})
-            schema_name = struct_item.name
-            field_to_id = struct_item.field_class_to_id.class_to_id
-            max_fields = max(max_fields, len(field_to_id))
-            batch_indices.append(batch_idx)
-
-            group_spans = []
-            positive_spans = set()
-
-            if schema_name in structuring_data:
-                instances = structuring_data[schema_name]
-                max_instances = max(max_instances, len(instances))
-
-                for inst_idx, instance in enumerate(instances):
-                    for field_name, value in instance.items():
-                        if field_name not in field_to_id:
-                            continue
-                        field_id = field_to_id[field_name]
-                        if not isinstance(value, dict):
-                            continue
-                        st = value.get('start', -1)
-                        ed = value.get('end', -1)
-                        if 0 <= st < max_seq_len and 0 <= ed < max_seq_len:
-                            group_spans.append((st, ed, inst_idx, field_id))
-                            positive_spans.add((st, ed))
-                            has_any = True
-
-            neg_ratio = getattr(self.config, 'neg_spans_ratio', 0)
-            neg_count = int(len(group_spans) * neg_ratio)
-            if neg_count > 0 and max_seq_len > 0:
-                negatives = self._generate_negative_spans(
-                    positive_spans, max_seq_len, neg_count
-                )
-                for st, ed in negatives:
-                    group_spans.append((st, ed, -1, -1))
-
-            all_group_spans.append(group_spans)
-
-        if not has_any or max_instances == 0 or max_fields == 0:
-            return None
-
-        max_spans = max((len(s) for s in all_group_spans), default=0)
-        if max_spans == 0:
-            return None
-
-        span_idx = torch.zeros(total_groups, max_spans, 2, dtype=torch.long)
-        span_labels = torch.zeros(total_groups, max_spans, max_instances, max_fields, dtype=torch.float)
-        span_mask = torch.zeros(total_groups, max_spans, dtype=torch.bool)
-        span_batch_idx = torch.tensor(batch_indices, dtype=torch.long)
-
-        for g, group_spans in enumerate(all_group_spans):
-            for s, (st, ed, inst_idx, field_id) in enumerate(group_spans):
-                span_idx[g, s, 0] = st
-                span_idx[g, s, 1] = ed
-                span_mask[g, s] = True
-                if inst_idx >= 0 and field_id >= 0:
-                    span_labels[g, s, inst_idx, field_id] = 1.0
-
-        return span_idx, span_labels, span_mask, span_batch_idx
-
-    # ── Legacy create_labels for single-task NER ────────────────────────
-
-    def create_labels(self, batch):
-        batch_size = len(batch["tokens"])
-        seq_len = batch["seq_length"].max().item()
-        num_classes = max(len(cid) for cid in batch["classes_to_id"])
-
-        word_labels = torch.zeros(batch_size, seq_len, num_classes, 3, dtype=torch.float)
-
-        for i, sentence_entities in enumerate(batch["entities"]):
-            for st, ed, sp_label in sentence_entities:
-                if sp_label not in batch["classes_to_id"][i]:
-                    continue
-                lbl = batch["classes_to_id"][i][sp_label]
-                class_idx = lbl - 1
-                if st >= seq_len or ed >= seq_len:
-                    continue
-                word_labels[i, st, class_idx, 0] = 1
-                word_labels[i, ed, class_idx, 1] = 1
-                word_labels[i, st:ed + 1, class_idx, 2] = 1
-
-        return word_labels
-
     # ── Preprocessing ───────────────────────────────────────────────────
 
-    def preprocess_example(self, item, extraction_mapping):
+    def preprocess_example(self, item, extraction_mapping=None):
+        if "ner" in self.task_processors and extraction_mapping is not None:
+            return self.task_processors["ner"].preprocess_example(
+                item, extraction_mapping,
+            )
+        return self._preprocess_text_only(item)
+
+    def _preprocess_text_only(self, item):
         text = item.get("text", "")
         if "tokenized_text" in item:
             tokens = list(item["tokenized_text"])
@@ -451,34 +318,15 @@ class GLiNextProcessor(BaseProcessor):
             )
             tokens = tokens[:max_len]
 
-        num_tokens = len(tokens)
-        item_span_idx = []
-        item_span_label = []
-
-        for i, ext_example in enumerate(item.get('extraction', [])):
-            ner = ext_example.get('ner', [])
-            if i >= len(extraction_mapping.items):
-                item_span_idx.append(None)
-                item_span_label.append(None)
-                continue
-            classes_to_id = extraction_mapping.items[i].ner_class_to_id.class_to_id
-            span_idx, span_label = self.prepare_span_idx(ner, classes_to_id, num_tokens)
-            item_span_idx.append(span_idx)
-            item_span_label.append(span_label)
-
         return {
             "tokens": tokens,
             "seq_length": len(tokens),
-            "entities": item.get('extraction', []),
-            "span_idx": item_span_idx,
-            "span_label": item_span_label,
         }
 
     # ── Batch dict creation ─────────────────────────────────────────────
 
     def create_batch_dict(self, batch, classes_mapping):
         batch_size = len(batch["tokens"])
-        total_groups = classes_mapping.total_extraction_groups()
 
         batch_dict = {
             "tokens": batch["tokens"],
@@ -491,58 +339,12 @@ class GLiNextProcessor(BaseProcessor):
             "open_relex": batch.get("open_relex", [[] for _ in range(batch_size)]),
         }
 
-        if total_groups == 0:
-            return batch_dict
-
-        span_idx_nested = batch.get("span_idx")
-        span_label_nested = batch.get("span_label")
-
-        if span_idx_nested is None:
-            return batch_dict
-
-        has_spans = any(
-            si is not None and si.numel() > 0
-            for item_spans in span_idx_nested
-            for si in item_spans
-        )
-        if not has_spans:
-            return batch_dict
-
-        flat_span_idx = []
-        flat_span_label = []
-        max_spans = 0
-
-        for _, batch_idx, group_idx, _ in classes_mapping.flat_extraction_iter():
-            if batch_idx < len(span_idx_nested) and group_idx < len(span_idx_nested[batch_idx]):
-                si = span_idx_nested[batch_idx][group_idx]
-                sl = span_label_nested[batch_idx][group_idx]
-                if si is not None and si.numel() > 0:
-                    max_spans = max(max_spans, si.size(0))
-                    flat_span_idx.append(si)
-                    flat_span_label.append(sl)
-                    continue
-            flat_span_idx.append(torch.zeros(0, 2, dtype=torch.long))
-            flat_span_label.append(torch.zeros(0, dtype=torch.long))
-
-        if max_spans == 0:
-            return batch_dict
-
-        span_idx = torch.zeros(total_groups, max_spans, 2, dtype=torch.long)
-        span_label = torch.full((total_groups, max_spans), -1, dtype=torch.long)
-        span_mask = torch.zeros(total_groups, max_spans, dtype=torch.bool)
-
-        for idx in range(total_groups):
-            si = flat_span_idx[idx]
-            sl = flat_span_label[idx]
-            if si.numel() > 0:
-                count = si.size(0)
-                span_idx[idx, :count] = si
-                span_label[idx, :count] = sl
-                span_mask[idx, :count] = True
-
-        batch_dict["span_idx"] = span_idx
-        batch_dict["span_label"] = span_label
-        batch_dict["span_mask"] = span_mask
+        if "ner" in self.task_processors:
+            batch_dict["span_idx"] = batch.get("span_idx")
+            batch_dict["span_label"] = batch.get("span_label")
+            batch_dict = self.task_processors["ner"].add_span_batch_fields(
+                batch_dict, classes_mapping,
+            )
 
         return batch_dict
 
@@ -556,29 +358,21 @@ class GLiNextProcessor(BaseProcessor):
 
         classes_mapping = self.batch_generate_class_mappings(batch_list, **kwargs)
 
-        preprocessed = [
-            self.preprocess_example(item, classes_mapping.extraction_mapping[i])
-            for i, item in enumerate(batch_list)
-        ]
+        if "ner" in self.task_processors:
+            preprocessed = [
+                self.task_processors["ner"].preprocess_example(
+                    item, classes_mapping.extraction_mapping[i],
+                )
+                for i, item in enumerate(batch_list)
+            ]
+        else:
+            preprocessed = [self._preprocess_text_only(item) for item in batch_list]
 
         texts = [item['tokens'] for item in preprocessed]
-        max_len = self.config.max_len
-        truncated_texts = []
-        for t in texts:
-            if len(t) == 0:
-                t = ["[PAD]"]
-            if len(t) > max_len:
-                warnings.warn(
-                    f"Sentence of length {len(t)} has been truncated to {max_len}",
-                    stacklevel=2
-                )
-                t = t[:max_len]
-            truncated_texts.append(t)
-
-        seq_lengths = [len(t) for t in truncated_texts]
+        seq_lengths = [len(t) for t in texts]
 
         batch_dict = {
-            'tokens': truncated_texts,
+            'tokens': texts,
             'seq_length': torch.LongTensor(seq_lengths).unsqueeze(-1),
             'classes_mapping': classes_mapping,
             'classification': [item.get('classification', []) for item in batch_list],
@@ -659,12 +453,12 @@ class GLiNextProcessor(BaseProcessor):
                 tokenized_input['embedding_labels'] = embedding_result['embedding_labels']
                 tokenized_input['embedding_pair_idx'] = embedding_result['embedding_pair_idx']
 
-            if getattr(self.config, 'represent_spans', False):
-                ner_span_result = self.create_span_labels(batch)
+            if getattr(self.config, 'represent_spans', False) and "ner" in self.task_processors:
+                ner_span_result = self.task_processors["ner"].create_span_labels(
+                    batch, classes_mapping,
+                )
                 if ner_span_result is not None:
-                    tokenized_input['span_labels'] = ner_span_result[0]
-                    tokenized_input['span_mask'] = ner_span_result[1]
-                    tokenized_input['span_idx'] = batch['span_idx']
+                    tokenized_input.update(ner_span_result)
 
             if "structuring" in self.task_processors:
                 struct_span_result = self.task_processors["structuring"].create_span_labels(

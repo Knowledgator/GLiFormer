@@ -88,3 +88,13 @@ class GLiNExTDecoder:
             if decoded is not None and decoded != []:
                 results[name] = decoded
         return results
+
+    def map_results(self, decoded: Dict[str, list], **kwargs) -> Dict[str, List]:
+        """Map decoded task results back through task-specific decoders."""
+        results = {}
+        for name, task_results in decoded.items():
+            decoder = self.task_decoders.get(name)
+            if decoder is None:
+                continue
+            results[name] = decoder.map_results(task_results, **kwargs)
+        return results

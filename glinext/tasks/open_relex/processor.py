@@ -70,6 +70,25 @@ class OpenRelexProcessor(SpanProcessor):
             prompt.append(self.sep_token)
         return prompt
 
+    def contribute_inference_input(self, item, relations=None, **kwargs):
+        relation_groups = self._normalize_label_groups(relations)
+        if not relation_groups:
+            return
+
+        item["open_relex"] = [
+            {
+                "name": parent_name,
+                "relations": [],
+                "all_labels": rel_labels,
+            }
+            for parent_name, rel_labels in relation_groups.items()
+        ]
+
+    def empty_inference_result(self, num_texts: int, relations=None, **kwargs):
+        if relations is None:
+            return None
+        return {"open_relex": [[] for _ in range(num_texts)]}
+
     def _normalize_endpoint(self, text, tokens_with_spans, value):
         if isinstance(value, dict):
             endpoint_text = value.get('text')

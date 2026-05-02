@@ -65,6 +65,25 @@ class ClassificationProcessor(TaskProcessor):
             prompt.append(self.sep_token)
         return prompt
 
+    def contribute_inference_input(self, item, classes=None, **kwargs):
+        class_groups = self._normalize_label_groups(classes)
+        if not class_groups:
+            return
+
+        item["classification"] = [
+            {
+                "name": parent_name,
+                "all_labels": cls_labels,
+                "true_labels": [],
+            }
+            for parent_name, cls_labels in class_groups.items()
+        ]
+
+    def empty_inference_result(self, num_texts: int, classes=None, **kwargs):
+        if classes is None:
+            return None
+        return {"classification": [[] for _ in range(num_texts)]}
+
     def create_labels(self, batch_list, classes_mapping, **kwargs):
         total_groups = classes_mapping.total_cat_groups()
         if total_groups == 0:

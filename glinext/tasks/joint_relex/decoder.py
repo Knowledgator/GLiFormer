@@ -10,6 +10,7 @@ import torch
 
 from ..span_decoder import Span  # noqa: F401 — re-exported
 from ..ner.decoder import NERDecoder
+from ..open_relex.decoder import OpenRelexDecoder
 from ...processing.decoder import unflatten_by_batch_origin
 
 
@@ -181,6 +182,9 @@ class JointRelexDecoder(NERDecoder):
                     model_to_decoded[entity_idx] = decoded_idx
             maps.append(model_to_decoded)
         return maps
+
+    def map_results(self, task_results: list, **kwargs):
+        return OpenRelexDecoder.map_results(self, task_results, **kwargs)
 
     def _get_ner_id_to_classes(self, classes_mapping) -> Union[Dict[int, str], List[Dict[int, str]]]:
         """Extract NER id→class mappings from BatchClassesMapping.

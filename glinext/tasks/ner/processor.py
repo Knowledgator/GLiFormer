@@ -1,6 +1,7 @@
 """NER task processor."""
 
 import random
+import warnings
 from typing import Dict, List, Optional
 
 import torch
@@ -106,6 +107,32 @@ class NERProcessor(SpanProcessor):
                         prompt.append(f"{self.rel_token} {rel}")
             prompt.append(self.sep_token)
         return prompt
+
+    def contribute_inference_input(self, item, entities=None, **kwargs):
+        entity_groups = self._normalize_label_groups(entities)
+        if not entity_groups:
+            return
+
+        extraction = item.setdefault('extraction', [])
+        by_name = {
+            group.get('name'): group
+            for group in extraction
+        }
+        for parent_name, ent_labels in entity_groups.items():
+            entry = by_name.get(parent_name)
+            if entry is None:
+                entry = {
+                    "name": parent_name,
+                    "ner": [],
+                }
+                extraction.append(entry)
+                by_name[parent_name] = entry
+            entry["all_labels"] = ent_labels
+
+    def empty_inference_result(self, num_texts: int, entities=None, **kwargs):
+        if entities is None:
+            return None
+        return {"ner": [[] for _ in range(num_texts)]}
 
     def resolve_spans(self, item):
         if item.get('_glinext_extraction_spans_resolved'):
@@ -258,6 +285,143 @@ class NERProcessor(SpanProcessor):
         else:
             span_idx, span_label = None, None
         return span_idx, span_label
+
+    def preprocess_example(self, item, extraction_mapping):
+        text = item.get("text", "")
+        if "tokenized_text" in item:
+            tokens = list(item["tokenized_text"])
+        else:
+            raw_tokens = list(self.words_splitter(text))
+            if raw_tokens and isinstance(raw_tokens[0], (list, tuple)):
+                tokens = [tok[0] for tok in raw_tokens]
+            else:
+                tokens = raw_tokens
+        if len(tokens) == 0:
+            tokens = ["[PAD]"]
+        max_len = self.config.max_len
+        if len(tokens) > max_len:
+            warnings.warn(
+                f"Sentence of length {len(tokens)} has been truncated to {max_len}",
+                stacklevel=2
+            )
+            tokens = tokens[:max_len]
+
+        num_tokens = len(tokens)
+        item_span_idx = []
+        item_span_label = []
+
+        for i, ext_example in enumerate(item.get('extraction', [])):
+            ner = ext_example.get('ner', [])
+            if i >= len(extraction_mapping.items):
+                item_span_idx.append(None)
+                item_span_label.append(None)
+                continue
+            classes_to_id = extraction_mapping.items[i].ner_class_to_id.class_to_id
+            span_idx, span_label = self.prepare_span_idx(ner, classes_to_id, num_tokens)
+            item_span_idx.append(span_idx)
+            item_span_label.append(span_label)
+
+        return {
+            "tokens": tokens,
+            "seq_length": len(tokens),
+            "entities": item.get('extraction', []),
+            "span_idx": item_span_idx,
+            "span_label": item_span_label,
+        }
+
+    def add_span_batch_fields(self, batch_dict, classes_mapping):
+        total_groups = classes_mapping.total_extraction_groups()
+        if total_groups == 0:
+            return batch_dict
+
+        span_idx_nested = batch_dict.get("span_idx")
+        span_label_nested = batch_dict.get("span_label")
+
+        if span_idx_nested is None:
+            return batch_dict
+
+        has_spans = any(
+            si is not None and si.numel() > 0
+            for item_spans in span_idx_nested
+            for si in item_spans
+        )
+        if not has_spans:
+            return batch_dict
+
+        flat_span_idx = []
+        flat_span_label = []
+        max_spans = 0
+
+        for _, batch_idx, group_idx, _ in classes_mapping.flat_extraction_iter():
+            if batch_idx < len(span_idx_nested) and group_idx < len(span_idx_nested[batch_idx]):
+                si = span_idx_nested[batch_idx][group_idx]
+                sl = span_label_nested[batch_idx][group_idx]
+                if si is not None and si.numel() > 0:
+                    max_spans = max(max_spans, si.size(0))
+                    flat_span_idx.append(si)
+                    flat_span_label.append(sl)
+                    continue
+            flat_span_idx.append(torch.zeros(0, 2, dtype=torch.long))
+            flat_span_label.append(torch.zeros(0, dtype=torch.long))
+
+        if max_spans == 0:
+            return batch_dict
+
+        span_idx = torch.zeros(total_groups, max_spans, 2, dtype=torch.long)
+        span_label = torch.full((total_groups, max_spans), -1, dtype=torch.long)
+        span_mask = torch.zeros(total_groups, max_spans, dtype=torch.bool)
+
+        for idx in range(total_groups):
+            si = flat_span_idx[idx]
+            sl = flat_span_label[idx]
+            if si.numel() > 0:
+                count = si.size(0)
+                span_idx[idx, :count] = si
+                span_label[idx, :count] = sl
+                span_mask[idx, :count] = True
+
+        batch_dict["span_idx"] = span_idx
+        batch_dict["span_label"] = span_label
+        batch_dict["span_mask"] = span_mask
+
+        return batch_dict
+
+    def create_span_labels(self, batch, classes_mapping=None):
+        if "span_label" not in batch or "span_mask" not in batch:
+            return None
+
+        span_label = batch["span_label"]
+        span_mask = batch["span_mask"]
+        classes_mapping = classes_mapping or batch["classes_mapping"]
+
+        max_num_classes = max(
+            len(item.ner_class_to_id.class_to_id)
+            for em in classes_mapping.extraction_mapping
+            for item in em.items
+        ) if any(em.items for em in classes_mapping.extraction_mapping) else 0
+
+        if max_num_classes == 0:
+            return None
+
+        total_groups, max_spans = span_label.shape
+        labels_one_hot = torch.zeros(total_groups, max_spans, max_num_classes, dtype=torch.float)
+
+        valid = span_mask & (span_label > 0)
+        class_indices = (span_label - 1).clamp(min=0)
+
+        if valid.any():
+            flat_indices = valid.nonzero(as_tuple=False)
+            row = flat_indices[:, 0]
+            col = flat_indices[:, 1]
+            cls = class_indices[row, col]
+            in_range = cls < max_num_classes
+            labels_one_hot[row[in_range], col[in_range], cls[in_range]] = 1.0
+
+        return {
+            "span_labels": labels_one_hot,
+            "span_mask": span_mask,
+            "span_idx": batch["span_idx"],
+        }
 
     def prepare_label_encoder_inputs(self, classes_mapping, labels_tokenizer):
         if labels_tokenizer is None:

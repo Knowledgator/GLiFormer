@@ -196,6 +196,56 @@ class OpenRelexDecoder(SpanDecoder):
                     "score": score,
                 })
 
+    def map_results(
+        self,
+        task_results: list,
+        valid_to_orig_idx: List[int],
+        all_start_maps: List[List[int]],
+        all_end_maps: List[List[int]],
+        valid_texts: List[str],
+        num_original: int,
+        **kwargs,
+    ) -> List[List[Dict]]:
+        output = [[] for _ in range(num_original)]
+
+        for valid_i, per_text_groups in enumerate(task_results):
+            orig_i = valid_to_orig_idx[valid_i]
+            start_map = all_start_maps[valid_i]
+            end_map = all_end_maps[valid_i]
+            text = valid_texts[valid_i]
+
+            triples = []
+            groups = per_text_groups if isinstance(per_text_groups, list) else [per_text_groups]
+            for group in groups:
+                if isinstance(group, list):
+                    for triple in group:
+                        triples.append(self._map_triple_chars(triple, start_map, end_map, text))
+                elif isinstance(group, dict):
+                    triples.append(self._map_triple_chars(group, start_map, end_map, text))
+
+            output[orig_i] = triples
+        return output
+
+    @staticmethod
+    def _map_triple_chars(triple, start_map, end_map, text):
+        mapped = dict(triple)
+        for role in ("head", "tail"):
+            if role not in mapped or not isinstance(mapped[role], dict):
+                continue
+            span = dict(mapped[role])
+            st = span.get("start", 0)
+            ed = span.get("end", 0)
+            if st < len(start_map) and ed < len(end_map):
+                start_char = start_map[st]
+                end_char = end_map[ed]
+                span.update({
+                    "start": start_char,
+                    "end": end_char,
+                    "text": text[start_char:end_char],
+                })
+            mapped[role] = span
+        return mapped
+
     def _build_rel_class_maps(self, classes_mapping, batch_size: int) -> List[Dict[int, str]]:
         """Build per-batch-item id->relation_name mappings from BatchClassesMapping."""
         if classes_mapping is None:
