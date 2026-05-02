@@ -70,8 +70,33 @@ class OpenRelexProcessor(SpanProcessor):
             prompt.append(self.sep_token)
         return prompt
 
+    def _normalize_endpoint(self, text, tokens_with_spans, value):
+        if isinstance(value, dict):
+            endpoint_text = value.get('text')
+            if endpoint_text is None and 'start' in value and 'end' in value:
+                try:
+                    endpoint_text = text[int(value['start']):int(value['end'])]
+                except (TypeError, ValueError):
+                    endpoint_text = ''
+            spans = self._resolve_labeled_span(
+                text, tokens_with_spans, value, label='entity',
+            )
+        else:
+            endpoint_text = value
+            spans = self._resolve_labeled_span(
+                text, tokens_with_spans, {'text': str(value)}, label='entity',
+            )
+
+        if not spans:
+            return {'text': str(endpoint_text), 'start': -1, 'end': -1}
+
+        start, end, _ = spans[0]
+        return {'text': str(endpoint_text), 'start': start, 'end': end}
+
     def resolve_spans(self, item):
         """Resolve head/tail text mentions to token indices."""
+        if item.get('_glinext_open_relex_spans_resolved'):
+            return
         open_relex_data = item.get('open_relex', [])
         if not open_relex_data:
             return
@@ -87,16 +112,8 @@ class OpenRelexProcessor(SpanProcessor):
                     value = rel.get(role)
                     if value is None:
                         continue
-                    if isinstance(value, str):
-                        start, end = self._resolve_text_span(text, tokens_with_spans, value)
-                        rel[role] = {'text': value, 'start': start, 'end': end}
-                    elif isinstance(value, dict) and 'text' in value:
-                        if 'start' not in value or not isinstance(value['start'], int):
-                            start, end = self._resolve_text_span(
-                                text, tokens_with_spans, str(value['text']),
-                            )
-                            value['start'] = start
-                            value['end'] = end
+                    rel[role] = self._normalize_endpoint(text, tokens_with_spans, value)
+        item['_glinext_open_relex_spans_resolved'] = True
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
         """Create label tensors for open relex.
@@ -107,6 +124,9 @@ class OpenRelexProcessor(SpanProcessor):
         Anchor assignment: relations are grouped by unique (head_text, tail_text) pairs
         within each group, with each unique pair becoming an anchor slot.
         """
+        for item in batch_list:
+            self.resolve_spans(item)
+
         total_groups = classes_mapping.total_open_relex_groups()
         if total_groups == 0:
             return None
@@ -225,6 +245,9 @@ class OpenRelexProcessor(SpanProcessor):
         cfg = getattr(self.config, 'open_relex_config', None)
         if cfg is None or not getattr(cfg, 'represent_spans', False):
             return None
+
+        for item in batch_list:
+            self.resolve_spans(item)
 
         total_groups = classes_mapping.total_open_relex_groups()
         if total_groups == 0:

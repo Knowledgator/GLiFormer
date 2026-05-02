@@ -7,6 +7,7 @@ from torch import nn
 
 from .. import TaskHeadOutput
 from ..anchored_extraction import AnchoredSpanExtractionHead
+from ...layers.mlp import create_mlp
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +61,12 @@ class StructuringHead(AnchoredSpanExtractionHead):
             struct_cfg, "anchor_objectness_threshold", 0.5,
         )
         if self.use_anchor_objectness:
-            self.objectness_head = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_size, 1),
+            self.objectness_head = create_mlp(
+                input_dim=hidden_size,
+                intermediate_dims=[hidden_size],
+                output_dim=1,
+                dropout=dropout,
+                activation="gelu",
             )
 
     @classmethod

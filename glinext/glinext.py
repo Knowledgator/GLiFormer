@@ -773,7 +773,14 @@ class GLiNExT(BaseEncoderGLiNER):
         ``None`` so every schema field appears in the output.
         """
         instance_dict: Dict[str, object] = {}
-        for field in instance_fields:
+        # Sort by score descending so scalar fields (which downstream pick
+        # value[0]) take the highest-scoring span, and list fields end up
+        # score-ordered.
+        ordered_fields = sorted(
+            instance_fields,
+            key=lambda f: -(f.get("score", 0.0) if isinstance(f, dict) else 0.0),
+        )
+        for field in ordered_fields:
             mapped = self._map_field_to_value(field, start_map, end_map, text)
             if mapped is None:
                 continue
@@ -1347,8 +1354,8 @@ class GLiNExT(BaseEncoderGLiNER):
 
             train_data = [
                 {
-                    "tokenized_text": ["Apple", "is", "a", "company"],
-                    "extraction": [{"name": None, "ner": [["Apple", 0, 0, "company"]]}],
+                    "text": "Apple is a company",
+                    "extraction": [{"name": None, "ner": [["Apple", "company"]]}],
                     "classification": [{"all_labels": ["tech"], "true_labels": ["tech"]}],
                 },
                 ...

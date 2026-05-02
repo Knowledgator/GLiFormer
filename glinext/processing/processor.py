@@ -207,6 +207,11 @@ class GLiNextProcessor(BaseProcessor):
 
         Returns a flat dict of all label tensors from all active tasks.
         """
+        for item in batch_list:
+            for proc in self.task_processors.values():
+                if hasattr(proc, "resolve_spans"):
+                    proc.resolve_spans(item)
+
         all_labels = {}
         for name, proc in self.task_processors.items():
             result = proc.create_labels(
@@ -235,6 +240,8 @@ class GLiNextProcessor(BaseProcessor):
         return None
 
     def create_ner_labels(self, batch_list, classes_mapping, max_seq_len):
+        for item in batch_list:
+            self.resolve_extraction_spans(item)
         if "ner" in self.task_processors:
             result = self.task_processors["ner"].create_labels(
                 batch_list, classes_mapping, max_seq_len=max_seq_len
@@ -247,6 +254,8 @@ class GLiNextProcessor(BaseProcessor):
         return self.create_joint_rel_labels(batch_list, classes_mapping, max_seq_len=max_seq_len)
 
     def create_joint_rel_labels(self, batch_list, classes_mapping, max_seq_len=0):
+        for item in batch_list:
+            self.resolve_extraction_spans(item)
         if "joint_relex" in self.task_processors:
             result = self.task_processors["joint_relex"].create_labels(
                 batch_list, classes_mapping, max_seq_len=max_seq_len,
@@ -256,6 +265,8 @@ class GLiNextProcessor(BaseProcessor):
         return None
 
     def create_open_rel_labels(self, batch_list, classes_mapping, max_seq_len):
+        for item in batch_list:
+            self.resolve_open_relex_spans(item)
         if "open_relex" in self.task_processors:
             return self.task_processors["open_relex"].create_labels(
                 batch_list, classes_mapping, max_seq_len=max_seq_len,
@@ -275,6 +286,8 @@ class GLiNextProcessor(BaseProcessor):
         return None
 
     def create_structuring_labels(self, batch_list, classes_mapping, max_seq_len):
+        for item in batch_list:
+            self.resolve_structuring_spans(item)
         if "structuring" in self.task_processors:
             result = self.task_processors["structuring"].create_labels(
                 batch_list, classes_mapping, max_seq_len=max_seq_len
@@ -637,7 +650,6 @@ class GLiNextProcessor(BaseProcessor):
                 emb_texts = embedding_result.pop('embedding_texts')
                 emb_tokenized = self.transformer_tokenizer(
                     emb_texts,
-                    is_split_into_words=True,
                     return_tensors="pt",
                     truncation=True,
                     padding="longest",

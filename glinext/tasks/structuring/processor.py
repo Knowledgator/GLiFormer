@@ -90,7 +90,36 @@ class StructuringProcessor(SpanProcessor):
             prompt.append(self.sep_token)
         return prompt
 
+    def _normalize_field_value(self, text, tokens_with_spans, field_name, value, first_only=False):
+        value_text = value.get('text') if isinstance(value, dict) else value
+        if value_text is None and isinstance(value, dict) and 'start' in value and 'end' in value:
+            try:
+                value_text = text[int(value['start']):int(value['end'])]
+            except (TypeError, ValueError):
+                value_text = ''
+
+        spans = self._resolve_labeled_span(
+            text, tokens_with_spans, value, label=field_name, first_only=first_only,
+        )
+        if not spans:
+            return [{
+                'text': str(value_text),
+                'start': -1,
+                'end': -1,
+            }]
+
+        return [
+            {
+                'text': str(value_text),
+                'start': start,
+                'end': end,
+            }
+            for start, end, _ in spans
+        ]
+
     def resolve_spans(self, item):
+        if item.get('_glinext_structuring_spans_resolved'):
+            return
         structuring = item.get('structuring', {})
         if not structuring:
             return
@@ -103,53 +132,24 @@ class StructuringProcessor(SpanProcessor):
         for schema_name, instances in structuring.items():
             for instance in instances:
                 for field_name, value in list(instance.items()):
-                    if isinstance(value, dict) and 'text' in value:
-                        if 'start' not in value or not isinstance(value['start'], int):
-                            text_val = str(value['text'])
-                            resolved = self._resolve_entity_spans(
-                                text, tokens_with_spans, [[text_val, field_name]]
-                            )
-                            if resolved:
-                                value['start'] = resolved[0][0]
-                                value['end'] = resolved[0][1]
-                            else:
-                                value['start'] = -1
-                                value['end'] = -1
-                    elif isinstance(value, list):
+                    if isinstance(value, list):
                         resolved_list = []
                         for v in value:
-                            v_str = str(v)
-                            resolved = self._resolve_entity_spans(
-                                text, tokens_with_spans, [[v_str, field_name]]
-                            )
-                            if resolved:
-                                resolved_list.append({
-                                    'text': v_str,
-                                    'start': resolved[0][0],
-                                    'end': resolved[0][1],
-                                })
-                            else:
-                                resolved_list.append({
-                                    'text': v_str, 'start': -1, 'end': -1,
-                                })
+                            resolved_list.extend(self._normalize_field_value(
+                                text, tokens_with_spans, field_name, v,
+                            ))
                         instance[field_name] = resolved_list
                     else:
-                        text_val = str(value)
-                        resolved = self._resolve_entity_spans(
-                            text, tokens_with_spans, [[text_val, field_name]]
+                        normalized = self._normalize_field_value(
+                            text, tokens_with_spans, field_name, value,
                         )
-                        if resolved:
-                            instance[field_name] = {
-                                'text': text_val,
-                                'start': resolved[0][0],
-                                'end': resolved[0][1],
-                            }
-                        else:
-                            instance[field_name] = {
-                                'text': text_val, 'start': -1, 'end': -1,
-                            }
+                        instance[field_name] = normalized[0] if len(normalized) == 1 else normalized
+        item['_glinext_structuring_spans_resolved'] = True
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
+        for item in batch_list:
+            self.resolve_spans(item)
+
         total_groups = classes_mapping.total_structuring_groups()
         if total_groups == 0:
             return None
@@ -235,6 +235,9 @@ class StructuringProcessor(SpanProcessor):
         struct_cfg = getattr(self.config, 'structuring_config', None)
         if struct_cfg is None or not getattr(struct_cfg, 'represent_spans', False):
             return None
+
+        for item in batch_list:
+            self.resolve_spans(item)
 
         total_groups = classes_mapping.total_structuring_groups()
         if total_groups == 0:

@@ -21,8 +21,16 @@ class NERProcessor(SpanProcessor):
         self.rel_token = getattr(config, 'rel_token', None)
 
     @staticmethod
+    def _entity_label(entity):
+        if isinstance(entity, dict):
+            return entity.get('label', entity.get('type', entity.get('entity_type')))
+        if isinstance(entity, (list, tuple)) and entity:
+            return entity[-1]
+        return None
+
+    @staticmethod
     def _build_class_to_id(labels, negatives, sample_neg, shuffle_labels):
-        labels = list(dict.fromkeys(labels))
+        labels = [label for label in dict.fromkeys(labels) if label is not None]
         if negatives is not None:
             label_set = set(labels)
             labels.extend(
@@ -45,7 +53,11 @@ class NERProcessor(SpanProcessor):
                 if 'all_labels' in example:
                     ner_labels = list(example['all_labels'])
                 else:
-                    ner_labels = list({ent[-1] for ent in example.get('ner', [])})
+                    ner_labels = list({
+                        self._entity_label(ent)
+                        for ent in example.get('ner', [])
+                        if self._entity_label(ent) is not None
+                    })
                 ner_class_to_id = self._build_class_to_id(ner_labels, ner_negatives, sample_neg, shuffle_labels)
                 name = example.get('name', None)
                 description = example.get('description', None)
@@ -96,6 +108,8 @@ class NERProcessor(SpanProcessor):
         return prompt
 
     def resolve_spans(self, item):
+        if item.get('_glinext_extraction_spans_resolved'):
+            return
         if not item.get('extraction') or not item.get('text'):
             return
         text = item.get('text', '')
@@ -105,7 +119,7 @@ class NERProcessor(SpanProcessor):
 
         for ext_example in item.get('extraction', []):
             ner = ext_example.get('ner', [])
-            if not ner or (len(ner[0]) == 3 and isinstance(ner[0][0], int)):
+            if not ner:
                 continue
             # Resolve per-entity so we can track which originals survived.
             # Relation head_id/tail_id reference positions in the input ner
@@ -114,9 +128,7 @@ class NERProcessor(SpanProcessor):
             resolved = []
             old_to_new = {}
             for orig_idx, ent in enumerate(ner):
-                single = self._resolve_entity_spans(
-                    text, tokens_with_spans, [ent]
-                )
+                single = self._resolve_labeled_span(text, tokens_with_spans, ent)
                 if single:
                     old_to_new[orig_idx] = len(resolved)
                     resolved.append(single[0])
@@ -140,6 +152,7 @@ class NERProcessor(SpanProcessor):
                 ext_example['relations'] = remapped
 
         self._sort_extraction_data(item)
+        item['_glinext_extraction_spans_resolved'] = True
 
     @staticmethod
     def _sort_extraction_data(item):
@@ -171,6 +184,9 @@ class NERProcessor(SpanProcessor):
                 ext_example['relations'] = sorted(relations, key=lambda x: (x[0], x[2]))
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
+        for item in batch_list:
+            self.resolve_spans(item)
+
         total_groups = classes_mapping.total_extraction_groups()
         if total_groups == 0:
             return None
