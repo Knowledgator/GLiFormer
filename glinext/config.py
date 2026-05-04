@@ -6,6 +6,9 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from gliner.config import BaseGLiNERConfig
 
+from . import backbones as _layout_backbones  # noqa: F401 - registers custom AutoConfig entries
+from .backbones import get_backbone, normalize_backbone_type
+
 
 @dataclass
 class BaseHeadConfig:
@@ -37,6 +40,64 @@ class ClassificationHeadConfig(BaseHeadConfig):
     embed_cat_token: bool = True
     pooling_type: str = "mean"  # "mean", "cls", "max"
     scorer_type: str = "dot"  # "dot", "weighted-dot", "mlp", "hopfield"
+
+
+@dataclass
+class ImageClassificationHeadConfig(BaseHeadConfig):
+    obj_token_index: int = -1
+    embed_obj_token: bool = True
+    pooling_type: str = "mean"
+    scorer_type: str = "dot"
+
+
+@dataclass
+class AudioClassificationHeadConfig(BaseHeadConfig):
+    obj_token_index: int = -1
+    embed_obj_token: bool = True
+    pooling_type: str = "mean"
+    scorer_type: str = "dot"
+
+
+@dataclass
+class ObjectDetectionHeadConfig(BaseHeadConfig):
+    anchor_mode: str = "fixed"
+    num_fixed_slots: int = 100
+    max_count: int = 100
+    anchor_num_heads: int = 4
+    anchor_num_layers: int = 2
+    obj_token_index: int = -1
+    embed_obj_token: bool = True
+    bbox_loss_coef: float = 5.0
+    class_loss_coef: float = 1.0
+    objectness_loss_coef: float = 1.0
+    matcher_class_cost: float = 1.0
+    matcher_bbox_cost: float = 5.0
+
+
+@dataclass
+class SegmentationHeadConfig(ObjectDetectionHeadConfig):
+    num_prototypes: int = 32
+    mask_size: int = 128
+    mask_loss_coef: float = 1.0
+
+
+@dataclass
+class AudioSegmentationHeadConfig(BaseHeadConfig):
+    anchor_mode: str = "fixed"
+    num_fixed_slots: int = 100
+    max_count: int = 100
+    anchor_num_heads: int = 4
+    anchor_num_layers: int = 2
+    obj_token_index: int = -1
+    embed_obj_token: bool = True
+    segment_loss_coef: float = 5.0
+    class_loss_coef: float = 1.0
+    objectness_loss_coef: float = 1.0
+    matcher_class_cost: float = 1.0
+    matcher_segment_cost: float = 5.0
+    num_prototypes: int = 32
+    mask_size: int = 256
+    mask_loss_coef: float = 1.0
 
 
 @dataclass
@@ -139,6 +200,11 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Per-task sub-configs (None = disabled, dict or dataclass = enabled)
         ner_config: Optional[dict] = None,
         classification_config: Optional[dict] = None,
+        image_classification_config: Optional[dict] = None,
+        audio_classification_config: Optional[dict] = None,
+        object_detection_config: Optional[dict] = None,
+        segmentation_config: Optional[dict] = None,
+        audio_segmentation_config: Optional[dict] = None,
         relations_config: Optional[dict] = None,  # backward compat alias for joint_relex_config
         joint_relex_config: Optional[dict] = None,
         open_relex_config: Optional[dict] = None,
@@ -152,12 +218,33 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Labels encoder (bi-encoder style)
         labels_encoder: Optional[str] = None,
         labels_encoder_config: Optional[dict] = None,
+        # Model variant / multimodal fusion
+        backbone_type: str = "auto",
+        model_variant: str = "text-only",
+        multimodal_fusion: str = "uni-encoder",
+        use_layout: bool = False,
+        # Optional multimodal encoders
+        vision_model_name: Optional[str] = None,
+        vision_encoder_type: Optional[str] = None,
+        vision_encoder_config: Optional[dict] = None,
+        vision_in_channels: int = 3,
+        vision_patch_size: int = 16,
+        vision_num_layers: int = 3,
+        vision_stride: int = 2,
+        audio_model_name: Optional[str] = None,
+        audio_encoder_type: Optional[str] = None,
+        audio_encoder_config: Optional[dict] = None,
+        audio_in_channels: int = 1,
+        audio_num_layers: int = 3,
+        audio_stride: int = 4,
+        omni_modalities: Optional[list[str]] = None,
         # Special tokens
         seq_token: str = "[SEQ]",
         cat_token: str = "[CAT]",
         rel_token: str = "[REL]",
         parent_token: str = "[PARENT]",
         child_token: str = "[CHILD]",
+        obj_token: str = "[OBJ]",
         # Per-task parent tokens
         per_task_parents: Optional[bool] = None,  # True = distinct per-task tokens; False = shared [PARENT]; None = auto-detect
         ner_parent_token: Optional[str] = None,
@@ -185,6 +272,11 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Loss coefficients (flat)
         ner_loss_coef: float = 1.0,
         cat_loss_coef: float = 1.0,
+        image_classification_loss_coef: float = 1.0,
+        audio_classification_loss_coef: float = 1.0,
+        object_detection_loss_coef: float = 1.0,
+        segmentation_loss_coef: float = 1.0,
+        audio_segmentation_loss_coef: float = 1.0,
         rel_loss_coef: float = 1.0,
         adjacency_loss_coef: float = 1.0,
         count_loss_coef: float = 1.0,
@@ -204,6 +296,9 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Structuring (flat)
         child_token_index: int = -1,
         embed_child_token: bool = True,
+        obj_token_index: int = -1,
+        embed_obj_token: bool = True,
+        image_size: int = 224,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -235,6 +330,36 @@ class GLiNextConfig(BaseGLiNERConfig):
             self.classification_config = ClassificationHeadConfig(**classification_config)
         else:
             self.classification_config = classification_config
+
+        if isinstance(image_classification_config, dict):
+            image_classification_config.setdefault("loss_coef", image_classification_loss_coef)
+            self.image_classification_config = ImageClassificationHeadConfig(**image_classification_config)
+        else:
+            self.image_classification_config = image_classification_config
+
+        if isinstance(audio_classification_config, dict):
+            audio_classification_config.setdefault("loss_coef", audio_classification_loss_coef)
+            self.audio_classification_config = AudioClassificationHeadConfig(**audio_classification_config)
+        else:
+            self.audio_classification_config = audio_classification_config
+
+        if isinstance(object_detection_config, dict):
+            object_detection_config.setdefault("loss_coef", object_detection_loss_coef)
+            self.object_detection_config = ObjectDetectionHeadConfig(**object_detection_config)
+        else:
+            self.object_detection_config = object_detection_config
+
+        if isinstance(segmentation_config, dict):
+            segmentation_config.setdefault("loss_coef", segmentation_loss_coef)
+            self.segmentation_config = SegmentationHeadConfig(**segmentation_config)
+        else:
+            self.segmentation_config = segmentation_config
+
+        if isinstance(audio_segmentation_config, dict):
+            audio_segmentation_config.setdefault("loss_coef", audio_segmentation_loss_coef)
+            self.audio_segmentation_config = AudioSegmentationHeadConfig(**audio_segmentation_config)
+        else:
+            self.audio_segmentation_config = audio_segmentation_config
 
         # Joint Relex (backward compat: relations_config → joint_relex_config)
         if joint_relex_config is None and relations_config is not None:
@@ -304,6 +429,52 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.labels_encoder = labels_encoder
         self.labels_encoder_config = labels_encoder_config
 
+        self.backbone_type = normalize_backbone_type(backbone_type)
+        if self.backbone_type != "auto":
+            get_backbone(self.backbone_type)
+
+        vision_tasks_enabled = (
+            self.image_classification_config is not None
+            or self.object_detection_config is not None
+            or self.segmentation_config is not None
+        )
+        if vision_tasks_enabled and vision_model_name is None and vision_encoder_type is None:
+            vision_encoder_type = "patch"
+        audio_tasks_enabled = (
+            self.audio_classification_config is not None
+            or self.audio_segmentation_config is not None
+        )
+        if audio_tasks_enabled and audio_model_name is None and audio_encoder_type is None:
+            audio_encoder_type = "conv"
+
+        self.model_variant = model_variant
+        self.multimodal_fusion = multimodal_fusion
+        self.use_layout = use_layout
+
+        # Multimodal encoder config
+        if isinstance(vision_encoder_config, dict):
+            if "model_type" not in vision_encoder_config:
+                raise ValueError("vision_encoder_config requires a model_type")
+            vision_encoder_config = CONFIG_MAPPING[vision_encoder_config["model_type"]](**vision_encoder_config)
+        if isinstance(audio_encoder_config, dict):
+            if "model_type" not in audio_encoder_config:
+                raise ValueError("audio_encoder_config requires a model_type")
+            audio_encoder_config = CONFIG_MAPPING[audio_encoder_config["model_type"]](**audio_encoder_config)
+        self.vision_model_name = vision_model_name
+        self.vision_encoder_type = vision_encoder_type
+        self.vision_encoder_config = vision_encoder_config
+        self.vision_in_channels = vision_in_channels
+        self.vision_patch_size = vision_patch_size
+        self.vision_num_layers = vision_num_layers
+        self.vision_stride = vision_stride
+        self.audio_model_name = audio_model_name
+        self.audio_encoder_type = audio_encoder_type
+        self.audio_encoder_config = audio_encoder_config
+        self.audio_in_channels = audio_in_channels
+        self.audio_num_layers = audio_num_layers
+        self.audio_stride = audio_stride
+        self.omni_modalities = tuple(omni_modalities) if omni_modalities is not None else None
+
         # Projector
         self.projector_hidden_act = kwargs.pop("projector_hidden_act", "gelu")
 
@@ -315,6 +486,10 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.parent_token_index = parent_token_index
         self.embed_parent_token = embed_parent_token
         self.child_token = child_token
+        self.obj_token = obj_token
+        self.obj_token_index = obj_token_index
+        self.embed_obj_token = embed_obj_token
+        self.image_size = image_size
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -350,6 +525,21 @@ class GLiNextConfig(BaseGLiNERConfig):
 
         self.cat_token_index = self.classification_config.cat_token_index if self.classification_config else cat_token_index
         self.embed_cat_token = self.classification_config.embed_cat_token if self.classification_config else embed_cat_token
+        if self.image_classification_config:
+            self.image_classification_config.obj_token_index = obj_token_index
+            self.image_classification_config.embed_obj_token = embed_obj_token
+        if self.audio_classification_config:
+            self.audio_classification_config.obj_token_index = obj_token_index
+            self.audio_classification_config.embed_obj_token = embed_obj_token
+        if self.object_detection_config:
+            self.object_detection_config.obj_token_index = obj_token_index
+            self.object_detection_config.embed_obj_token = embed_obj_token
+        if self.segmentation_config:
+            self.segmentation_config.obj_token_index = obj_token_index
+            self.segmentation_config.embed_obj_token = embed_obj_token
+        if self.audio_segmentation_config:
+            self.audio_segmentation_config.obj_token_index = obj_token_index
+            self.audio_segmentation_config.embed_obj_token = embed_obj_token
 
         self.represent_spans = self.ner_config.represent_spans if self.ner_config else represent_spans
         self.neg_spans_ratio = self.ner_config.neg_spans_ratio if self.ner_config else neg_spans_ratio
@@ -365,6 +555,26 @@ class GLiNextConfig(BaseGLiNERConfig):
 
         self.ner_loss_coef = self.ner_config.loss_coef if self.ner_config else ner_loss_coef
         self.cat_loss_coef = self.classification_config.loss_coef if self.classification_config else cat_loss_coef
+        self.image_classification_loss_coef = (
+            self.image_classification_config.loss_coef
+            if self.image_classification_config else image_classification_loss_coef
+        )
+        self.audio_classification_loss_coef = (
+            self.audio_classification_config.loss_coef
+            if self.audio_classification_config else audio_classification_loss_coef
+        )
+        self.object_detection_loss_coef = (
+            self.object_detection_config.loss_coef
+            if self.object_detection_config else object_detection_loss_coef
+        )
+        self.segmentation_loss_coef = (
+            self.segmentation_config.loss_coef
+            if self.segmentation_config else segmentation_loss_coef
+        )
+        self.audio_segmentation_loss_coef = (
+            self.audio_segmentation_config.loss_coef
+            if self.audio_segmentation_config else audio_segmentation_loss_coef
+        )
         self.rel_loss_coef = self.joint_relex_config.loss_coef if self.joint_relex_config else rel_loss_coef
         self.adjacency_loss_coef = self.joint_relex_config.adjacency_loss_coef if self.joint_relex_config else adjacency_loss_coef
         self.count_loss_coef = self.count_config.loss_coef if self.count_config else count_loss_coef

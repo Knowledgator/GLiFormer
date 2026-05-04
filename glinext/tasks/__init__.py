@@ -21,6 +21,11 @@ class SharedRepresentations:
     mask: torch.Tensor                   # (B, W) valid word mask
     prompts_embedding: torch.Tensor      # (B, C, D) prompt embeddings
     prompts_embedding_mask: torch.Tensor # (B, C) prompt mask
+    vision_embedding: Optional[torch.Tensor] = None  # (B, V, D) visual token embeddings
+    vision_mask: Optional[torch.Tensor] = None        # (B, V) valid visual token mask
+    audio_embedding: Optional[torch.Tensor] = None    # (B, A, D) audio token embeddings
+    audio_mask: Optional[torch.Tensor] = None         # (B, A) valid audio token mask
+    image_sizes: Optional[torch.Tensor] = None        # (B, 2) original image sizes as (height, width)
 
 
 @dataclass

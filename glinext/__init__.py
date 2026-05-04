@@ -3,13 +3,30 @@ from .config import (
     BaseHeadConfig,
     NERHeadConfig,
     ClassificationHeadConfig,
+    ImageClassificationHeadConfig,
+    AudioClassificationHeadConfig,
+    ObjectDetectionHeadConfig,
+    SegmentationHeadConfig,
+    AudioSegmentationHeadConfig,
     JointRelexHeadConfig,
     OpenRelexHeadConfig,
     StructuringHeadConfig,
     CountHeadConfig,
     EmbeddingHeadConfig,
 )
-from .model import GLiNExTModel, GLiNExTOutput
+from .model import (
+    BaseGLiNextModel,
+    GLiNExTOmniModel,
+    GLiNExTModel,
+    GLiNExTOutput,
+    GLiNExTTextAudioModel,
+    GLiNExTTextAudioUniEncoderModel,
+    GLiNExTTextModel,
+    GLiNExTTextVisionBiEncoderModel,
+    GLiNExTTextVisionLayoutModel,
+    GLiNExTTextVisionUniEncoderModel,
+    resolve_glinext_model_class,
+)
 from .processing.processor import GLiNextProcessor
 from .processing.decoder import GLiNExTDecoder
 from .processing.collator import GLiNExTDataCollator
@@ -24,6 +41,8 @@ from .processing.mappings import (
     StructuringClassMapping,
     OpenRelexItemMapping,
     OpenRelexClassMapping,
+    VisionItemMapping,
+    VisionClassMapping,
     BatchClassesMapping,
 )
 from .glinext import GLiNExT

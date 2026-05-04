@@ -58,11 +58,29 @@ class OpenRelexClassMapping:
 
 
 @dataclass
+class VisionItemMapping:
+    """Mapping for a single image-level vision task group."""
+    class_to_id: BaseClassMapping
+    name: Optional[str] = None
+
+
+@dataclass
+class VisionClassMapping:
+    """Per-example image task mappings: one or more label groups."""
+    items: List[VisionItemMapping] = field(default_factory=list)
+
+
+@dataclass
 class BatchClassesMapping:
     cat_mapping: List[CatClassMapping]
     extraction_mapping: List[ExtractionClassMapping]
     structuring_mapping: List[StructuringClassMapping] = field(default_factory=list)
     open_relex_mapping: List[OpenRelexClassMapping] = field(default_factory=list)
+    image_classification_mapping: List[VisionClassMapping] = field(default_factory=list)
+    audio_classification_mapping: List[VisionClassMapping] = field(default_factory=list)
+    object_detection_mapping: List[VisionClassMapping] = field(default_factory=list)
+    segmentation_mapping: List[VisionClassMapping] = field(default_factory=list)
+    audio_segmentation_mapping: List[VisionClassMapping] = field(default_factory=list)
 
     def get_item_mapping(self, index: int) -> Tuple[CatClassMapping, ExtractionClassMapping]:
         return self.cat_mapping[index], self.extraction_mapping[index]
@@ -114,3 +132,41 @@ class BatchClassesMapping:
             for group_idx, item_mapping in enumerate(sm.items):
                 yield flat_idx, batch_idx, group_idx, item_mapping
                 flat_idx += 1
+
+    @staticmethod
+    def _flat_vision_iter(mapping_list):
+        flat_idx = 0
+        for batch_idx, vm in enumerate(mapping_list):
+            for group_idx, item_mapping in enumerate(vm.items):
+                yield flat_idx, batch_idx, group_idx, item_mapping
+                flat_idx += 1
+
+    def total_image_classification_groups(self) -> int:
+        return sum(len(vm.items) for vm in self.image_classification_mapping)
+
+    def total_object_detection_groups(self) -> int:
+        return sum(len(vm.items) for vm in self.object_detection_mapping)
+
+    def total_segmentation_groups(self) -> int:
+        return sum(len(vm.items) for vm in self.segmentation_mapping)
+
+    def total_audio_classification_groups(self) -> int:
+        return sum(len(vm.items) for vm in self.audio_classification_mapping)
+
+    def total_audio_segmentation_groups(self) -> int:
+        return sum(len(vm.items) for vm in self.audio_segmentation_mapping)
+
+    def flat_image_classification_iter(self):
+        yield from self._flat_vision_iter(self.image_classification_mapping)
+
+    def flat_audio_classification_iter(self):
+        yield from self._flat_vision_iter(self.audio_classification_mapping)
+
+    def flat_object_detection_iter(self):
+        yield from self._flat_vision_iter(self.object_detection_mapping)
+
+    def flat_segmentation_iter(self):
+        yield from self._flat_vision_iter(self.segmentation_mapping)
+
+    def flat_audio_segmentation_iter(self):
+        yield from self._flat_vision_iter(self.audio_segmentation_mapping)

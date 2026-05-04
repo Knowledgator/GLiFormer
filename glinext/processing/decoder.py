@@ -72,6 +72,26 @@ class GLiNExTDecoder:
             if hasattr(CountDecoder, 'from_config'):
                 self.task_decoders["count"] = CountDecoder.from_config(config)
 
+        if config.image_classification_config is not None:
+            from ..tasks.vision.decoder import ImageClassificationDecoder
+            self.task_decoders["image_classification"] = ImageClassificationDecoder.from_config(config)
+
+        if config.audio_classification_config is not None:
+            from ..tasks.audio.decoder import AudioClassificationDecoder
+            self.task_decoders["audio_classification"] = AudioClassificationDecoder.from_config(config)
+
+        if config.object_detection_config is not None:
+            from ..tasks.vision.decoder import ObjectDetectionDecoder
+            self.task_decoders["object_detection"] = ObjectDetectionDecoder.from_config(config)
+
+        if config.segmentation_config is not None:
+            from ..tasks.vision.decoder import SegmentationDecoder
+            self.task_decoders["segmentation"] = SegmentationDecoder.from_config(config)
+
+        if config.audio_segmentation_config is not None:
+            from ..tasks.audio.decoder import AudioSegmentationDecoder
+            self.task_decoders["audio_segmentation"] = AudioSegmentationDecoder.from_config(config)
+
     def decode(self, model_output, classes_mapping=None, **kwargs) -> Dict:
         """Decode model output into structured predictions per task.
 

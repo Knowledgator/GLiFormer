@@ -11,6 +11,7 @@ from .mappings import (
     ExtractionClassMapping,
     StructuringClassMapping,
     OpenRelexClassMapping,
+    VisionClassMapping,
     BatchClassesMapping,
 )
 from ..tasks.ner.processor import NERProcessor
@@ -20,6 +21,8 @@ from ..tasks.open_relex.processor import OpenRelexProcessor
 from ..tasks.count.processor import CountProcessor
 from ..tasks.structuring.processor import StructuringProcessor
 from ..tasks.embedding.processor import EmbeddingProcessor
+from ..tasks.vision.processor import VisionProcessor
+from ..tasks.audio.processor import AudioProcessor
 
 
 class GLiNextProcessor(BaseProcessor):
@@ -53,6 +56,16 @@ class GLiNextProcessor(BaseProcessor):
             self.task_processors["structuring"] = StructuringProcessor(config, tokenizer, words_splitter)
         if config.embedding_config is not None:
             self.task_processors["embedding"] = EmbeddingProcessor(config)
+        if config.image_classification_config is not None:
+            self.task_processors["image_classification"] = VisionProcessor(config, "image_classification")
+        if config.audio_classification_config is not None:
+            self.task_processors["audio_classification"] = AudioProcessor(config, "audio_classification")
+        if config.object_detection_config is not None:
+            self.task_processors["object_detection"] = VisionProcessor(config, "object_detection")
+        if config.segmentation_config is not None:
+            self.task_processors["segmentation"] = VisionProcessor(config, "segmentation")
+        if config.audio_segmentation_config is not None:
+            self.task_processors["audio_segmentation"] = AudioProcessor(config, "audio_segmentation")
 
     # ── Class mappings ──────────────────────────────────────────────────
 
@@ -61,6 +74,11 @@ class GLiNextProcessor(BaseProcessor):
         extraction_mapping = []
         structuring_mapping = []
         open_relex_mapping = []
+        image_classification_mapping = []
+        audio_classification_mapping = []
+        object_detection_mapping = []
+        segmentation_mapping = []
+        audio_segmentation_mapping = []
 
         if "classification" in self.task_processors:
             cat_mapping = self.task_processors["classification"].get_classes_mapping(
@@ -90,11 +108,51 @@ class GLiNextProcessor(BaseProcessor):
         else:
             open_relex_mapping = [OpenRelexClassMapping() for _ in batch_list]
 
+        if "image_classification" in self.task_processors:
+            image_classification_mapping = self.task_processors["image_classification"].get_classes_mapping(
+                batch_list, **kwargs
+            )
+        else:
+            image_classification_mapping = [VisionClassMapping() for _ in batch_list]
+
+        if "audio_classification" in self.task_processors:
+            audio_classification_mapping = self.task_processors["audio_classification"].get_classes_mapping(
+                batch_list, **kwargs
+            )
+        else:
+            audio_classification_mapping = [VisionClassMapping() for _ in batch_list]
+
+        if "object_detection" in self.task_processors:
+            object_detection_mapping = self.task_processors["object_detection"].get_classes_mapping(
+                batch_list, **kwargs
+            )
+        else:
+            object_detection_mapping = [VisionClassMapping() for _ in batch_list]
+
+        if "segmentation" in self.task_processors:
+            segmentation_mapping = self.task_processors["segmentation"].get_classes_mapping(
+                batch_list, **kwargs
+            )
+        else:
+            segmentation_mapping = [VisionClassMapping() for _ in batch_list]
+
+        if "audio_segmentation" in self.task_processors:
+            audio_segmentation_mapping = self.task_processors["audio_segmentation"].get_classes_mapping(
+                batch_list, **kwargs
+            )
+        else:
+            audio_segmentation_mapping = [VisionClassMapping() for _ in batch_list]
+
         return BatchClassesMapping(
             cat_mapping=cat_mapping,
             extraction_mapping=extraction_mapping,
             structuring_mapping=structuring_mapping,
             open_relex_mapping=open_relex_mapping,
+            image_classification_mapping=image_classification_mapping,
+            audio_classification_mapping=audio_classification_mapping,
+            object_detection_mapping=object_detection_mapping,
+            segmentation_mapping=segmentation_mapping,
+            audio_segmentation_mapping=audio_segmentation_mapping,
         )
 
     # ── Prompt construction ─────────────────────────────────────────────
@@ -127,6 +185,15 @@ class GLiNextProcessor(BaseProcessor):
                 prompt.extend(self.task_processors["structuring"].contribute_prompt(
                     classes_mapping, i, use_labels_encoder,
                 ))
+
+            for name in (
+                "image_classification", "object_detection", "segmentation",
+                "audio_classification", "audio_segmentation",
+            ):
+                if name in self.task_processors:
+                    prompt.extend(self.task_processors[name].contribute_prompt(
+                        classes_mapping, i, use_labels_encoder,
+                    ))
 
             prompt.append(self.sep_token)
             prompt_lengths.append(len(prompt))
@@ -337,6 +404,12 @@ class GLiNextProcessor(BaseProcessor):
             "embedding": batch.get("embedding", [[] for _ in range(batch_size)]),
             "structuring": batch.get("structuring", [{} for _ in range(batch_size)]),
             "open_relex": batch.get("open_relex", [[] for _ in range(batch_size)]),
+            "objects": batch.get("objects", [[] for _ in range(batch_size)]),
+            "image": batch.get("image", [None for _ in range(batch_size)]),
+            "pixel_values": batch.get("pixel_values"),
+            "image_sizes": batch.get("image_sizes"),
+            "input_values": batch.get("input_values"),
+            "audio_attention_mask": batch.get("audio_attention_mask"),
         }
 
         if "ner" in self.task_processors:
@@ -357,6 +430,45 @@ class GLiNextProcessor(BaseProcessor):
                 proc.resolve_spans(item)
 
         classes_mapping = self.batch_generate_class_mappings(batch_list, **kwargs)
+
+        if any(name in self.task_processors for name in ("image_classification", "object_detection", "segmentation")):
+            image_tensors = []
+            image_sizes = []
+            vision_proc = next(
+                proc for name, proc in self.task_processors.items()
+                if name in ("image_classification", "object_detection", "segmentation")
+            )
+            for item in batch_list:
+                tensor, image_size = vision_proc.load_image(item, self.config.image_size)
+                item["_image_size"] = image_size
+                image_tensors.append(tensor)
+                image_sizes.append(image_size)
+            pixel_values = torch.stack(image_tensors)
+            image_sizes_t = torch.tensor(image_sizes, dtype=torch.long)
+        else:
+            pixel_values = None
+            image_sizes_t = None
+
+        if any(name in self.task_processors for name in ("audio_classification", "audio_segmentation")):
+            audio_tensors = []
+            audio_proc = next(
+                proc for name, proc in self.task_processors.items()
+                if name in ("audio_classification", "audio_segmentation")
+            )
+            max_audio_len = 0
+            for item in batch_list:
+                tensor, num_samples = audio_proc.load_audio(item)
+                item["_audio_num_samples"] = num_samples
+                audio_tensors.append(tensor)
+                max_audio_len = max(max_audio_len, tensor.numel())
+            input_values = torch.zeros(len(audio_tensors), max_audio_len, dtype=torch.float)
+            audio_attention_mask = torch.zeros(len(audio_tensors), max_audio_len, dtype=torch.long)
+            for i, tensor in enumerate(audio_tensors):
+                input_values[i, :tensor.numel()] = tensor
+                audio_attention_mask[i, :tensor.numel()] = 1
+        else:
+            input_values = None
+            audio_attention_mask = None
 
         if "ner" in self.task_processors:
             preprocessed = [
@@ -380,6 +492,12 @@ class GLiNextProcessor(BaseProcessor):
             'embedding': [item.get('embedding', []) for item in batch_list],
             'structuring': [item.get('structuring', {}) for item in batch_list],
             'open_relex': [item.get('open_relex', []) for item in batch_list],
+            'objects': [item.get('objects', []) for item in batch_list],
+            'image': [item.get('image') for item in batch_list],
+            'pixel_values': pixel_values,
+            'image_sizes': image_sizes_t,
+            'input_values': input_values,
+            'audio_attention_mask': audio_attention_mask,
             'span_idx': [item.get('span_idx') for item in preprocessed],
             'span_label': [item.get('span_label') for item in preprocessed],
         }
@@ -402,11 +520,20 @@ class GLiNextProcessor(BaseProcessor):
                     'classification': batch['classification'][i],
                     'extraction': batch['extraction'][i],
                     'embedding': batch['embedding'][i],
+                    'objects': batch.get('objects', [[]])[i],
                 }
                 if 'structuring' in batch and i < len(batch['structuring']):
                     item['structuring'] = batch['structuring'][i]
                 if 'open_relex' in batch and i < len(batch['open_relex']):
                     item['open_relex'] = batch['open_relex'][i]
+                if 'image' in batch and i < len(batch['image']):
+                    item['image'] = batch['image'][i]
+                if 'image_sizes' in batch and batch['image_sizes'] is not None:
+                    item['_image_size'] = tuple(int(v) for v in batch['image_sizes'][i].tolist())
+                if 'input_values' in batch and batch['input_values'] is not None:
+                    item['input_values'] = batch['input_values'][i]
+                if 'audio_attention_mask' in batch and batch['audio_attention_mask'] is not None:
+                    item['_audio_num_samples'] = int(batch['audio_attention_mask'][i].sum().item())
                 batch_list.append(item)
 
             # Delegate label creation to task processors via wrapper methods
@@ -474,12 +601,32 @@ class GLiNextProcessor(BaseProcessor):
                 if open_rel_span_result is not None:
                     tokenized_input.update(open_rel_span_result)
 
+            for name in (
+                "image_classification", "object_detection", "segmentation",
+                "audio_classification", "audio_segmentation",
+            ):
+                if name in self.task_processors:
+                    result = self.task_processors[name].create_labels(
+                        batch_list, classes_mapping, max_seq_len=max_seq_len,
+                    )
+                    if result is not None:
+                        tokenized_input.update(result)
+
             structuring_result = self.create_structuring_labels(batch_list, classes_mapping, max_seq_len)
             if structuring_result is not None:
                 tokenized_input['structuring_labels'] = structuring_result[0]
                 tokenized_input['structuring_mask'] = structuring_result[1]
                 tokenized_input['structuring_batch_idx'] = structuring_result[2]
                 tokenized_input['structuring_count'] = structuring_result[3]
+
+        if batch.get("pixel_values") is not None:
+            tokenized_input["pixel_values"] = batch["pixel_values"]
+        if batch.get("image_sizes") is not None:
+            tokenized_input["image_sizes"] = batch["image_sizes"]
+        if batch.get("input_values") is not None:
+            tokenized_input["input_values"] = batch["input_values"]
+        if batch.get("audio_attention_mask") is not None:
+            tokenized_input["audio_attention_mask"] = batch["audio_attention_mask"]
 
         return tokenized_input
 

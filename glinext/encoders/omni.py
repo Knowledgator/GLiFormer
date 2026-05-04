@@ -1,0 +1,403 @@
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
+
+import torch
+from torch import nn
+
+from .audio import AudioEncoder
+from .text import TextBiEncoder, TextEncoder
+from .vision import VisionEncoder
+
+
+@dataclass
+class OmniEncoderOutput:
+    embeddings: torch.Tensor
+    attention_mask: torch.Tensor
+    modality_order: Tuple[str, ...]
+    modality_lengths: Dict[str, int]
+    modality_spans: Dict[str, Tuple[int, int]]
+    text_embeddings: Optional[torch.Tensor] = None
+    text_attention_mask: Optional[torch.Tensor] = None
+    vision_embeddings: Optional[torch.Tensor] = None
+    vision_attention_mask: Optional[torch.Tensor] = None
+    audio_embeddings: Optional[torch.Tensor] = None
+    audio_attention_mask: Optional[torch.Tensor] = None
+    labels_embeddings: Optional[torch.Tensor] = None
+
+
+def _get_config_value(config: Any, name: str, default: Any = None) -> Any:
+    return getattr(config, name, default) if config is not None else default
+
+
+def _ones_mask(embeddings: torch.Tensor) -> torch.Tensor:
+    return torch.ones(
+        embeddings.shape[:2],
+        dtype=torch.long,
+        device=embeddings.device,
+    )
+
+
+def _resize_mask(mask: Optional[torch.Tensor], embeddings: torch.Tensor) -> torch.Tensor:
+    if mask is None:
+        return _ones_mask(embeddings)
+    if mask.shape[-1] == embeddings.shape[1]:
+        return mask.to(device=embeddings.device)
+    return _ones_mask(embeddings)
+
+
+_TRANSFORMER_KWARGS = {
+    "pair_attention_mask",
+    "token_type_ids",
+    "position_ids",
+    "head_mask",
+    "output_attentions",
+    "output_hidden_states",
+    "return_dict",
+    "packing_config",
+    "token_lengths",
+}
+
+
+class OmniEncoder(nn.Module):
+    """Omni encoder that contextualizes all modalities with the GLiNER text encoder.
+
+    Text token ids are converted with the text backbone input embedding table.
+    Vision/audio backbones produce modality tokens, those tokens are projected
+    into the text transformer's embedding dimension, and the combined sequence is
+    encoded through ``inputs_embeds``.
+    """
+
+    modalities: Tuple[str, ...] = ("text", "vision", "audio")
+    text_encoder_cls = TextEncoder
+
+    def __init__(
+        self,
+        config: Any,
+        from_pretrained: bool = False,
+        cache_dir: Optional[Union[str, Path]] = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.text_encoder = self.text_encoder_cls(
+            config,
+            from_pretrained=from_pretrained,
+            cache_dir=cache_dir,
+        )
+        self.model_hidden_size = self.text_encoder.model_hidden_size
+        self.output_hidden_size = int(_get_config_value(config, "hidden_size", self.model_hidden_size))
+
+        enabled_modalities = _get_config_value(config, "omni_modalities", self.modalities)
+        if enabled_modalities is None:
+            enabled_modalities = self.modalities
+        self.enabled_modalities = set(enabled_modalities)
+
+        self.feature_encoders = nn.ModuleDict()
+        if "vision" in self.enabled_modalities:
+            self.feature_encoders["vision"] = VisionEncoder(
+                config,
+                from_pretrained=from_pretrained,
+                cache_dir=cache_dir,
+            )
+        if "audio" in self.enabled_modalities:
+            self.feature_encoders["audio"] = AudioEncoder(
+                config,
+                from_pretrained=from_pretrained,
+                cache_dir=cache_dir,
+            )
+
+        if "text" not in self.enabled_modalities and not self.feature_encoders:
+            raise ValueError("At least one omni modality must be enabled")
+
+        self.input_projections = nn.ModuleDict()
+        if "vision" in self.feature_encoders and self.output_hidden_size != self.model_hidden_size:
+            self.input_projections["vision"] = nn.Linear(self.output_hidden_size, self.model_hidden_size)
+        if "audio" in self.feature_encoders and self.output_hidden_size != self.model_hidden_size:
+            self.input_projections["audio"] = nn.Linear(self.output_hidden_size, self.model_hidden_size)
+
+        self.modality_embeddings = nn.ParameterDict(
+            {
+                name: nn.Parameter(torch.zeros(self.model_hidden_size))
+                for name in self.enabled_modalities
+            }
+        )
+
+    def resize_token_embeddings(
+        self,
+        new_num_tokens: int,
+        pad_to_multiple_of: Optional[int] = None,
+    ) -> nn.Embedding:
+        return self.text_encoder.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.text_encoder.get_input_embeddings()
+
+    def _add_modality_embedding(self, name: str, embeddings: torch.Tensor) -> torch.Tensor:
+        return embeddings + self.modality_embeddings[name].view(1, 1, -1).to(dtype=embeddings.dtype)
+
+    def _project_inputs(self, name: str, embeddings: torch.Tensor) -> torch.Tensor:
+        if name in self.input_projections:
+            return self.input_projections[name](embeddings)
+        return embeddings
+
+    def _text_inputs(
+        self,
+        input_ids: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if "text" not in self.enabled_modalities:
+            return None, None
+        if inputs_embeds is None:
+            if input_ids is None:
+                return None, None
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+        return self._add_modality_embedding("text", inputs_embeds), _resize_mask(attention_mask, inputs_embeds)
+
+    def _vision_inputs(
+        self,
+        pixel_values: Optional[torch.Tensor],
+        vision_attention_mask: Optional[torch.Tensor],
+        kwargs: Dict[str, Any],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if "vision" not in self.feature_encoders or pixel_values is None:
+            return None, None
+        vision_kwargs = {
+            key.removeprefix("vision_"): value
+            for key, value in kwargs.items()
+            if key.startswith("vision_")
+        }
+        embeddings = self.feature_encoders["vision"](pixel_values, **vision_kwargs)
+        mask = _resize_mask(vision_attention_mask, embeddings)
+        embeddings = self._project_inputs("vision", embeddings)
+        return self._add_modality_embedding("vision", embeddings), mask
+
+    def _audio_inputs(
+        self,
+        input_values: Optional[torch.Tensor],
+        audio_attention_mask: Optional[torch.Tensor],
+        kwargs: Dict[str, Any],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if "audio" not in self.feature_encoders or input_values is None:
+            return None, None
+        audio_kwargs = {
+            key.removeprefix("audio_"): value
+            for key, value in kwargs.items()
+            if key.startswith("audio_")
+        }
+        embeddings = self.feature_encoders["audio"](
+            input_values,
+            attention_mask=audio_attention_mask,
+            **audio_kwargs,
+        )
+        mask = _resize_mask(audio_attention_mask, embeddings)
+        embeddings = self._project_inputs("audio", embeddings)
+        return self._add_modality_embedding("audio", embeddings), mask
+
+    @staticmethod
+    def _modality_spans(order: Tuple[str, ...], lengths: Dict[str, int]) -> Dict[str, Tuple[int, int]]:
+        spans: Dict[str, Tuple[int, int]] = {}
+        offset = 0
+        for name in order:
+            length = lengths[name]
+            spans[name] = (offset, offset + length)
+            offset += length
+        return spans
+
+    @staticmethod
+    def _split_encoded(
+        encoded: torch.Tensor,
+        spans: Dict[str, Tuple[int, int]],
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        chunks: Dict[str, Optional[torch.Tensor]] = {"text": None, "vision": None, "audio": None}
+        for name, (start, end) in spans.items():
+            chunks[name] = encoded[:, start:end]
+        return chunks
+
+    @staticmethod
+    def _resize_bbox(bbox: torch.Tensor, length: int) -> torch.Tensor:
+        if bbox.shape[1] == length:
+            return bbox
+        bbox = bbox[:, :length]
+        if bbox.shape[1] < length:
+            pad = length - bbox.shape[1]
+            bbox = torch.nn.functional.pad(bbox, (0, 0, 0, pad))
+        return bbox
+
+    @staticmethod
+    def _get_layout_bbox(kwargs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        for key in ("bbox", "word_bboxes", "text_bbox", "text_word_bboxes"):
+            value = kwargs.get(key)
+            if value is not None:
+                return value
+        return None
+
+    def _combined_bbox(
+        self,
+        kwargs: Dict[str, Any],
+        active_parts: list[tuple[str, torch.Tensor, torch.Tensor]],
+        combined_inputs: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        bbox = self._get_layout_bbox(kwargs)
+        if bbox is None:
+            return None
+        if not isinstance(bbox, torch.Tensor):
+            bbox = torch.as_tensor(bbox)
+        if bbox.dim() != 3 or bbox.shape[-1] != 4:
+            raise ValueError(f"bbox must have shape (batch, seq_len, 4), got {tuple(bbox.shape)}")
+        if bbox.shape[0] != combined_inputs.shape[0]:
+            raise ValueError(
+                f"bbox batch size {bbox.shape[0]} does not match omni batch size {combined_inputs.shape[0]}"
+            )
+        if bbox.shape[1] == combined_inputs.shape[1]:
+            return bbox.to(device=combined_inputs.device)
+
+        chunks = []
+        for name, embeds, _ in active_parts:
+            length = int(embeds.shape[1])
+            if name == "text":
+                chunk = self._resize_bbox(bbox, length)
+                chunk = chunk.to(device=combined_inputs.device)
+            else:
+                chunk = torch.zeros(
+                    bbox.shape[0],
+                    length,
+                    4,
+                    dtype=bbox.dtype,
+                    device=combined_inputs.device,
+                )
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=1)
+
+    def encode_omni(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        vision_attention_mask: Optional[torch.Tensor] = None,
+        input_values: Optional[torch.Tensor] = None,
+        audio_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> OmniEncoderOutput:
+        text_inputs, text_mask = self._text_inputs(input_ids, inputs_embeds, attention_mask)
+        vision_inputs, vision_mask = self._vision_inputs(pixel_values, vision_attention_mask, kwargs)
+        audio_inputs, audio_mask = self._audio_inputs(input_values, audio_attention_mask, kwargs)
+
+        parts = [
+            ("text", text_inputs, text_mask),
+            ("vision", vision_inputs, vision_mask),
+            ("audio", audio_inputs, audio_mask),
+        ]
+        active_parts = [(name, embeds, mask) for name, embeds, mask in parts if embeds is not None]
+        if not active_parts:
+            raise ValueError("No enabled omni encoder received inputs")
+
+        combined_inputs = torch.cat([embeds for _, embeds, _ in active_parts], dim=1)
+        combined_mask = torch.cat([mask for _, _, mask in active_parts], dim=1)
+        modality_order = tuple(name for name, _, _ in active_parts)
+        modality_lengths = {name: int(embeds.shape[1]) for name, embeds, _ in active_parts}
+        modality_spans = self._modality_spans(modality_order, modality_lengths)
+
+        text_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in _TRANSFORMER_KWARGS
+        }
+        text_kwargs.update({
+            key.removeprefix("text_"): value
+            for key, value in kwargs.items()
+            if key.startswith("text_")
+        })
+        text_kwargs.pop("word_bboxes", None)
+        combined_bbox = self._combined_bbox(kwargs, active_parts, combined_inputs)
+        if combined_bbox is not None:
+            text_kwargs["bbox"] = combined_bbox
+        encoded = self.text_encoder.encode_inputs_embeds(
+            combined_inputs,
+            combined_mask,
+            **text_kwargs,
+        )
+        chunks = self._split_encoded(encoded, modality_spans)
+
+        return OmniEncoderOutput(
+            embeddings=encoded,
+            attention_mask=combined_mask,
+            modality_order=modality_order,
+            modality_lengths=modality_lengths,
+            modality_spans=modality_spans,
+            text_embeddings=chunks["text"],
+            text_attention_mask=text_mask,
+            vision_embeddings=chunks["vision"],
+            vision_attention_mask=vision_mask,
+            audio_embeddings=chunks["audio"],
+            audio_attention_mask=audio_mask,
+        )
+
+    def forward(
+        self,
+        return_dict: bool = True,
+        **kwargs: Any,
+    ) -> Union[OmniEncoderOutput, Tuple[torch.Tensor, torch.Tensor]]:
+        output = self.encode_omni(**kwargs)
+        if not return_dict:
+            return output.embeddings, output.attention_mask
+        return output
+
+
+class OmniBiEncoder(OmniEncoder):
+    """Omni encoder with GLiNER bi-encoder label support."""
+
+    text_encoder_cls = TextBiEncoder
+
+    def encode_labels(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return self.text_encoder.encode_labels(input_ids, attention_mask, **kwargs)
+
+    def forward(
+        self,
+        labels_input_ids: Optional[torch.Tensor] = None,
+        labels_attention_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+        **kwargs: Any,
+    ) -> Union[OmniEncoderOutput, Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        output = self.encode_omni(**kwargs)
+        labels_embeddings = None
+        if labels_input_ids is not None and labels_attention_mask is not None:
+            labels_embeddings = self.encode_labels(labels_input_ids, labels_attention_mask)
+        output.labels_embeddings = labels_embeddings
+        if not return_dict:
+            return output.embeddings, output.attention_mask, labels_embeddings
+        return output
+
+
+class TextVisionOmniEncoder(OmniEncoder):
+    modalities = ("text", "vision")
+
+
+class TextVisionOmniBiEncoder(OmniBiEncoder):
+    modalities = ("text", "vision")
+
+
+class TextAudioOmniEncoder(OmniEncoder):
+    modalities = ("text", "audio")
+
+
+class TextAudioOmniBiEncoder(OmniBiEncoder):
+    modalities = ("text", "audio")
+
+
+class VisionAudioOmniEncoder(OmniEncoder):
+    modalities = ("vision", "audio")
+
+
+class TriOmniEncoder(OmniEncoder):
+    modalities = ("text", "vision", "audio")
+
+
+class TriOmniBiEncoder(OmniBiEncoder):
+    modalities = ("text", "vision", "audio")

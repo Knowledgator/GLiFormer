@@ -13,7 +13,7 @@ from gliner.model import BaseEncoderGLiNER
 from gliner.data_processing.tokenizer import WordsSplitter
 
 from .config import GLiNextConfig
-from .model import GLiNExTModel
+from .model import GLiNExTModel, resolve_glinext_model_class
 from .processing.processor import GLiNextProcessor
 from .processing.decoder import GLiNExTDecoder
 from .processing.collator import GLiNExTDataCollator
@@ -64,7 +64,8 @@ class GLiNExT(BaseEncoderGLiNER):
     # ── Setup overrides ────────────────────────────────────────���───────
 
     def _create_model(self, config, backbone_from_pretrained, cache_dir, **kwargs):
-        self.model = GLiNExTModel(config, from_pretrained=backbone_from_pretrained, cache_dir=cache_dir, **kwargs)
+        model_cls = resolve_glinext_model_class(config)
+        self.model = model_cls(config, from_pretrained=backbone_from_pretrained, cache_dir=cache_dir, **kwargs)
         return self.model
 
 
@@ -111,6 +112,13 @@ class GLiNExT(BaseEncoderGLiNER):
         if self.config.structuring_config is not None:
             tokens.append(self.config.child_token)
 
+        if (self.config.image_classification_config is not None
+                or self.config.object_detection_config is not None
+                or self.config.segmentation_config is not None
+                or self.config.audio_classification_config is not None
+                or self.config.audio_segmentation_config is not None):
+            tokens.append(self.config.obj_token)
+
         return tokens
 
     def set_class_indices(self):
@@ -136,6 +144,13 @@ class GLiNExT(BaseEncoderGLiNER):
             self.config.open_relex_config.parent_token_index = _idx(self.config.open_rel_parent_token)
         if self.config.structuring_config is not None:
             self.config.structuring_config.parent_token_index = _idx(self.config.struct_parent_token)
+        for cfg_name in (
+            "image_classification_config", "object_detection_config", "segmentation_config",
+            "audio_classification_config", "audio_segmentation_config",
+        ):
+            cfg = getattr(self.config, cfg_name, None)
+            if cfg is not None:
+                cfg.parent_token_index = _idx(self.config.parent_token)
 
         # Per-task child token indices
         if self.config.classification_config is not None:
@@ -157,6 +172,21 @@ class GLiNExT(BaseEncoderGLiNER):
             child_idx = _idx(self.config.child_token)
             self.config.structuring_config.child_token_index = child_idx
             self.config.child_token_index = child_idx
+
+        if (self.config.image_classification_config is not None
+                or self.config.object_detection_config is not None
+                or self.config.segmentation_config is not None
+                or self.config.audio_classification_config is not None
+                or self.config.audio_segmentation_config is not None):
+            obj_idx = _idx(self.config.obj_token)
+            self.config.obj_token_index = obj_idx
+            for cfg_name in (
+                "image_classification_config", "object_detection_config", "segmentation_config",
+                "audio_classification_config", "audio_segmentation_config",
+            ):
+                cfg = getattr(self.config, cfg_name, None)
+                if cfg is not None:
+                    cfg.obj_token_index = obj_idx
 
     def resize_embeddings(self, set_class_token_index=True):
         """Resize token embeddings to match tokenizer vocabulary."""
@@ -201,6 +231,45 @@ class GLiNExT(BaseEncoderGLiNER):
                 )
             input_x.append(item)
         return input_x
+
+    def _require_task_heads(self, *task_names: str):
+        missing = [
+            task_name for task_name in task_names
+            if getattr(self.config, f"{task_name}_config", None) is None
+        ]
+        if missing:
+            configured = [
+                name for name in (
+                    "ner", "classification", "joint_relex", "open_relex",
+                    "structuring", "image_classification", "object_detection",
+                    "segmentation", "audio_classification", "audio_segmentation",
+                    "count", "embedding",
+                )
+                if getattr(self.config, f"{name}_config", None) is not None
+            ]
+            raise ValueError(
+                "Requested task head is not enabled in config: "
+                f"{', '.join(missing)}. Enabled heads: {configured or 'none'}."
+            )
+
+    def _validate_requested_inference_heads(
+        self,
+        entities=None,
+        classes=None,
+        relations=None,
+        joint_relations=None,
+        structures=None,
+    ):
+        if entities is not None:
+            self._require_task_heads("ner")
+        if classes is not None:
+            self._require_task_heads("classification")
+        if relations is not None:
+            self._require_task_heads("open_relex")
+        if joint_relations is not None:
+            self._require_task_heads("joint_relex")
+        if structures is not None:
+            self._require_task_heads("structuring")
 
     @torch.no_grad()
     def inference(
@@ -251,6 +320,13 @@ class GLiNExT(BaseEncoderGLiNER):
                 }
         """
         self.eval()
+        self._validate_requested_inference_heads(
+            entities=entities,
+            classes=classes,
+            relations=relations,
+            joint_relations=joint_relations,
+            structures=structures,
+        )
 
         # Normalize input
         if isinstance(texts, str):
@@ -268,6 +344,8 @@ class GLiNExT(BaseEncoderGLiNER):
                 joint_relations=joint_relations,
                 structures=structures,
             )
+
+        kwargs = self._select_valid_forward_kwargs(kwargs, valid_to_orig_idx, num_original)
 
         # Tokenize
         all_tokens, all_start_maps, all_end_maps = self.prepare_inputs(valid_texts)
@@ -314,6 +392,30 @@ class GLiNExT(BaseEncoderGLiNER):
             structuring_dedup=structuring_dedup,
         )
 
+    @staticmethod
+    def _select_valid_forward_kwargs(
+        kwargs: Dict[str, Any],
+        valid_to_orig_idx: List[int],
+        num_original: int,
+    ) -> Dict[str, Any]:
+        result = dict(kwargs)
+        for key in ("pixel_values", "vision_attention_mask", "input_values", "audio_attention_mask", "word_bboxes", "bbox"):
+            value = result.get(key)
+            if isinstance(value, torch.Tensor) and value.shape[0] == num_original:
+                index = torch.tensor(valid_to_orig_idx, dtype=torch.long, device=value.device)
+                result[key] = value.index_select(0, index)
+        return result
+
+    @staticmethod
+    def _batch_forward_kwargs(kwargs: Dict[str, Any], offset: int, batch_size: int, total: int) -> Dict[str, Any]:
+        result = {}
+        for key, value in kwargs.items():
+            if isinstance(value, torch.Tensor) and value.shape[0] == total:
+                result[key] = value[offset:offset + batch_size]
+            else:
+                result[key] = value
+        return result
+
     def _process_multitask_batches(
         self,
         data_loader: DataLoader,
@@ -331,6 +433,8 @@ class GLiNExT(BaseEncoderGLiNER):
         device = self.device
         accumulated: Dict[str, list] = {}
         all_classes_mappings: list = []
+        total_items = len(data_loader.dataset) if hasattr(data_loader, "dataset") else 0
+        offset = 0
 
         for batch in data_loader:
             # Move tensors to device
@@ -342,8 +446,12 @@ class GLiNExT(BaseEncoderGLiNER):
                     # classes_mapping, tokens, etc. — pass through
                     model_batch[k] = v
 
-            # Forward — kwargs (e.g. manual_structuring_count) flow through to model.forward
-            model_output = self.model(**model_batch, threshold=threshold, **kwargs)
+            batch_size = len(batch.get("tokens") or model_batch.get("input_ids", []))
+            batch_kwargs = self._batch_forward_kwargs(kwargs, offset, batch_size, total_items)
+
+            # Forward — kwargs (e.g. manual_structuring_count, multimodal tensors) flow through.
+            model_output = self.model(**model_batch, threshold=threshold, **batch_kwargs)
+            offset += batch_size
 
             # Decode
             classes_mapping = batch.get("classes_mapping")
@@ -516,6 +624,7 @@ class GLiNExT(BaseEncoderGLiNER):
         Returns:
             Tensor of shape (N, D) with pooled text embeddings.
         """
+        self._require_task_heads("embedding")
         self.eval()
         if isinstance(texts, str):
             texts = [texts]
@@ -550,7 +659,7 @@ class GLiNExT(BaseEncoderGLiNER):
             attention_mask = batch["attention_mask"].to(device)
 
             # Encode through shared encoder — same as training
-            token_embeds = self.model.token_rep_layer(input_ids, attention_mask)
+            token_embeds = self.model.encode_embedding_tokens(input_ids, attention_mask)
 
             # Pool using EmbeddingHead's pooling layer — same as training
             if embedding_head is not None:
@@ -595,11 +704,9 @@ class GLiNExT(BaseEncoderGLiNER):
                 "embed_labels requires a bi-encoder model (set labels_encoder in config)."
             )
 
-        from gliner.modeling.encoder import BiEncoder
-
         self.eval()
-        if not isinstance(self.model.token_rep_layer, BiEncoder):
-            raise NotImplementedError("embed_labels requires BiEncoder token_rep_layer.")
+        if not hasattr(self.model.token_rep_layer, "encode_labels"):
+            raise NotImplementedError("embed_labels requires a labels-capable token_rep_layer.")
 
         labels_tokenizer = self.data_processor.labels_tokenizer
         data_loader = DataLoader(labels, batch_size=batch_size, collate_fn=lambda x: x)
@@ -666,12 +773,35 @@ class GLiNExT(BaseEncoderGLiNER):
                 and hasattr(self.model, "token_rep_layer")
                 and hasattr(self.model.token_rep_layer, "bert_layer")):
             components["text_encoder"] = self.model.token_rep_layer.bert_layer.model
+        elif (hasattr(self, "model")
+              and hasattr(self.model, "token_rep_layer")
+              and hasattr(self.model.token_rep_layer, "text_encoder")
+              and hasattr(self.model.token_rep_layer.text_encoder, "bert_layer")):
+            components["text_encoder"] = self.model.token_rep_layer.text_encoder.bert_layer.model
 
         # Labels encoder (bi-encoder)
         if (self.config.labels_encoder is not None
                 and hasattr(self.model, "token_rep_layer")
                 and hasattr(self.model.token_rep_layer, "labels_encoder")):
             components["labels_encoder"] = self.model.token_rep_layer.labels_encoder.model
+        elif (self.config.labels_encoder is not None
+              and hasattr(self.model, "token_rep_layer")
+              and hasattr(self.model.token_rep_layer, "text_encoder")
+              and hasattr(self.model.token_rep_layer.text_encoder, "labels_encoder")):
+            components["labels_encoder"] = self.model.token_rep_layer.text_encoder.labels_encoder.model
+
+        if hasattr(self.model, "vision_encoder"):
+            components["vision_encoder"] = self.model.vision_encoder
+        if hasattr(self.model, "audio_encoder"):
+            components["audio_encoder"] = self.model.audio_encoder
+        if hasattr(self.model, "vision_fusion"):
+            components["vision_fusion"] = self.model.vision_fusion
+        if hasattr(self.model, "audio_fusion"):
+            components["audio_fusion"] = self.model.audio_fusion
+        if (hasattr(self.model, "token_rep_layer")
+                and hasattr(self.model.token_rep_layer, "feature_encoders")):
+            for name, module in self.model.token_rep_layer.feature_encoders.items():
+                components[f"{name}_encoder"] = module
 
         # Individual task heads
         if hasattr(self.model, "heads"):
