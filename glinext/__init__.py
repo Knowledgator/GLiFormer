@@ -1,10 +1,15 @@
 from .config import (
     GLiNextConfig,
+    GLiNextAudioConfig,
     BaseHeadConfig,
     NERHeadConfig,
     ClassificationHeadConfig,
     ImageClassificationHeadConfig,
     AudioClassificationHeadConfig,
+    GLiNextLayoutConfig,
+    GLiNextOmniConfig,
+    GLiNextTextConfig,
+    GLiNextVisionConfig,
     ObjectDetectionHeadConfig,
     SegmentationHeadConfig,
     AudioSegmentationHeadConfig,
@@ -16,20 +21,32 @@ from .config import (
 )
 from .model import (
     BaseGLiNextModel,
+    GLiNExTAudioModel,
+    GLiNExTAudioOutput,
+    GLiNExTLayoutModel,
+    GLiNExTLayoutOutput,
     GLiNExTOmniModel,
+    GLiNExTOmniOutput,
     GLiNExTModel,
     GLiNExTOutput,
-    GLiNExTTextAudioModel,
-    GLiNExTTextAudioUniEncoderModel,
     GLiNExTTextModel,
-    GLiNExTTextVisionBiEncoderModel,
-    GLiNExTTextVisionLayoutModel,
-    GLiNExTTextVisionUniEncoderModel,
+    GLiNExTTextOutput,
+    GLiNExTVisionModel,
+    GLiNExTVisionOutput,
     resolve_glinext_model_class,
 )
 from .processing.processor import GLiNextProcessor
 from .processing.decoder import GLiNExTDecoder
-from .processing.collator import GLiNExTDataCollator
+from .processing.collator import (
+    BaseGLiNExTDataCollator,
+    GLiNExTAudioDataCollator,
+    GLiNExTDataCollator,
+    GLiNExTLayoutDataCollator,
+    GLiNExTOmniDataCollator,
+    GLiNExTTextDataCollator,
+    GLiNExTVisionDataCollator,
+    resolve_glinext_collator_class,
+)
 from .processing.schema import GLiNExTSchema
 from .processing.formatting import StructuringOutputFormatter, FieldType
 from .processing.mappings import (
@@ -45,7 +62,16 @@ from .processing.mappings import (
     VisionClassMapping,
     BatchClassesMapping,
 )
-from .glinext import GLiNExT
+from .glinext import (
+    BaseGLiNeXT,
+    BaseGLiNExT,
+    GLiNExT,
+    GLiNExTAudio,
+    GLiNExTLayout,
+    GLiNExTOmni,
+    GLiNExTText,
+    GLiNExTVision,
+)
 from .training import GLiNExTTrainer
 
 # Backward compat alias

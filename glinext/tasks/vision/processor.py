@@ -118,9 +118,9 @@ class VisionProcessor(TaskProcessor):
         total = self._total_groups(classes_mapping)
         if total == 0:
             return None
-        max_classes = max(len(m.class_to_id.class_to_id) for _, _, _, m in self._mapping_iter())
+        max_classes = max(len(m.class_to_id.class_to_id) for _, _, _, m in self._mapping_iter(classes_mapping))
         labels = torch.zeros(total, max_classes, dtype=torch.float)
-        for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter():
+        for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
             label_to_id = mapping.class_to_id.class_to_id
             for label in self.true_labels_from_item(batch_list[batch_idx]):
                 if label in label_to_id:
@@ -181,7 +181,7 @@ class VisionProcessor(TaskProcessor):
         mask_labels = torch.zeros(total, max_objects, self.mask_size, self.mask_size, dtype=torch.float)
 
         image_sizes = [item.get("_image_size") for item in batch_list]
-        for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter():
+        for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
             label_to_id = mapping.class_to_id.class_to_id
             objects = batch_list[batch_idx].get("objects", [])[:max_objects]
             image_size = image_sizes[batch_idx]

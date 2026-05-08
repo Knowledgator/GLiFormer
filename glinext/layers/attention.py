@@ -3,6 +3,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 class SelfAttentionBlock(nn.Module):
@@ -98,3 +99,38 @@ class LayerwiseAttention(nn.Module):
         output = self.output_projection(U_sum)  # [B, L, output_size]
 
         return output
+
+
+class CrossModalTokenFusion(nn.Module):
+    """Fuse non-text modality tokens into text word embeddings without changing word length."""
+
+    def __init__(self, hidden_size: int, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(
+            hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(
+        self,
+        text_embeddings: torch.Tensor,
+        modality_embeddings: torch.Tensor,
+        modality_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if modality_embeddings is None or modality_embeddings.shape[1] == 0:
+            return text_embeddings
+        key_padding_mask = None
+        if modality_mask is not None:
+            key_padding_mask = ~modality_mask.bool()
+        attended, _ = self.attention(
+            text_embeddings,
+            modality_embeddings,
+            modality_embeddings,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return self.norm(text_embeddings + self.dropout(attended))

@@ -32,6 +32,7 @@ class AudioProcessor(TaskProcessor):
         cfg = getattr(config, f"{task_name}_config", None)
         self.max_count = int(getattr(cfg, "max_count", 100))
         self.mask_size = int(getattr(cfg, "mask_size", 256))
+        self.feature_encoder_types = {"mel", "spectrogram", "conv2d", "mel_conv", "spectrogram_conv", "conv_2d"}
 
     @staticmethod
     def _segments(item: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -208,17 +209,40 @@ class AudioProcessor(TaskProcessor):
             f"{self.task_name}_labels_group_size": torch.LongTensor(group_sizes),
         }
 
-    @staticmethod
-    def load_audio(item: Dict[str, Any]) -> Tuple[torch.Tensor, int]:
-        if "input_values" in item:
-            tensor = torch.as_tensor(item["input_values"], dtype=torch.float)
-            if tensor.dim() > 1:
+    def _expects_feature_input(self, item: Dict[str, Any]) -> bool:
+        audio_format = str(item.get("audio_format") or item.get("audio_input_format") or "").lower().replace("-", "_")
+        encoder_type = str(getattr(self.config, "audio_encoder_type", "") or "").lower().replace("-", "_")
+        return (
+            encoder_type in self.feature_encoder_types
+            or audio_format in self.feature_encoder_types
+            or any(key in item for key in ("mel_values", "mel_spectrogram", "audio_features"))
+        )
+
+    def _time_length(self, tensor: torch.Tensor) -> int:
+        if tensor.dim() <= 1:
+            return int(tensor.numel())
+        input_format = str(getattr(self.config, "audio_input_format", "freq_first") or "freq_first")
+        if input_format == "time_first":
+            return int(tensor.shape[-2])
+        return int(tensor.shape[-1])
+
+    def load_audio(self, item: Dict[str, Any]) -> Tuple[torch.Tensor, int]:
+        feature_key = next(
+            (key for key in ("mel_values", "mel_spectrogram", "audio_features") if key in item),
+            None,
+        )
+        if feature_key is not None or "audio_values" in item:
+            tensor = torch.as_tensor(
+                item[feature_key] if feature_key is not None else item["audio_values"],
+                dtype=torch.float,
+            )
+            if tensor.dim() > 1 and not self._expects_feature_input(item):
                 tensor = tensor.reshape(-1)
-            return tensor, int(tensor.numel())
+            return tensor, self._time_length(tensor)
 
         path = item.get("audio")
         if path is None:
-            raise ValueError("Audio tasks require each item to contain 'audio' or 'input_values'.")
+            raise ValueError("Audio tasks require each item to contain 'audio' or 'audio_values'.")
         path = Path(path)
         if path.suffix.lower() != ".wav":
             raise ValueError("Only WAV files are supported without an external audio backend.")

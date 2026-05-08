@@ -59,6 +59,162 @@ _TRANSFORMER_KWARGS = {
 }
 
 
+class LayoutEncoder(TextEncoder):
+    """Text encoder for document-layout backbones.
+
+    Layout-aware Hugging Face models such as LayoutLMv3 accept ``bbox`` and
+    optionally ``pixel_values``. Custom GLiNExT backbones such as
+    ``LayoutDebertaModel`` accept the same ``bbox`` argument and ignore
+    unsupported image inputs through their ``**kwargs``.
+    """
+
+    @classmethod
+    def _pop_bbox(cls, kwargs: Dict[str, Any], bbox: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        value = kwargs.pop("bbox", None)
+        if bbox is None and value is not None:
+            bbox = value
+        return bbox
+
+    @staticmethod
+    def _text_length(input_ids: Optional[torch.Tensor], attention_mask: Optional[torch.Tensor]) -> Optional[int]:
+        if input_ids is not None:
+            return int(input_ids.shape[1])
+        if attention_mask is not None:
+            return int(attention_mask.shape[1])
+        return None
+
+    @staticmethod
+    def _resize_bbox(
+        bbox: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        text_length = LayoutEncoder._text_length(input_ids, attention_mask)
+        if text_length is None or bbox.shape[1] == text_length:
+            return bbox
+        bbox = bbox[:, :text_length]
+        if bbox.shape[1] < text_length:
+            bbox = torch.nn.functional.pad(bbox, (0, 0, 0, text_length - bbox.shape[1]))
+        return bbox
+
+    @staticmethod
+    def _truncate_to_text_tokens(
+        token_embeddings: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        text_length = LayoutEncoder._text_length(input_ids, attention_mask)
+        if text_length is not None and token_embeddings.shape[1] > text_length:
+            return token_embeddings[:, :text_length]
+        return token_embeddings
+
+    def _encode_layout_tokens(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        bbox: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        bbox = LayoutEncoder._pop_bbox(kwargs, bbox)
+        model_kwargs = dict(kwargs)
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask
+        if bbox is not None:
+            if not isinstance(bbox, torch.Tensor):
+                bbox = torch.as_tensor(bbox)
+            if input_ids is not None:
+                bbox = bbox.to(device=input_ids.device)
+            elif attention_mask is not None:
+                bbox = bbox.to(device=attention_mask.device)
+            bbox = LayoutEncoder._resize_bbox(bbox, input_ids, attention_mask)
+            model_kwargs["bbox"] = bbox
+        if pixel_values is not None:
+            model_kwargs["pixel_values"] = pixel_values
+        if inputs_embeds is not None:
+            model_kwargs["inputs_embeds"] = inputs_embeds
+
+        token_embeddings = self.bert_layer(
+            input_ids=input_ids,
+            **model_kwargs,
+        )
+        token_embeddings = LayoutEncoder._truncate_to_text_tokens(token_embeddings, input_ids, attention_mask)
+        if hasattr(self, "projection"):
+            token_embeddings = self.projection(token_embeddings)
+        return token_embeddings
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        bbox: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return self._encode_layout_tokens(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            bbox=bbox,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+
+    def encode_inputs_embeds(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        kwargs.pop("packing_config", None)
+        kwargs.pop("token_lengths", None)
+        if args:
+            raise TypeError("LayoutEncoder.encode_inputs_embeds only accepts keyword layout arguments")
+        return LayoutEncoder._encode_layout_tokens(
+            self,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+
+
+class LayoutBiEncoder(TextBiEncoder):
+    """Layout encoder with optional text-label bi-encoder support."""
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels_input_ids: Optional[torch.Tensor] = None,
+        labels_attention_mask: Optional[torch.Tensor] = None,
+        bbox: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        token_embeddings = LayoutEncoder._encode_layout_tokens(
+            self,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            bbox=bbox,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+        if labels_input_ids is None or labels_attention_mask is None:
+            return token_embeddings
+        labels_embeddings = self.encode_labels(labels_input_ids, labels_attention_mask)
+        return token_embeddings, labels_embeddings
+
+    def encode_inputs_embeds(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return LayoutEncoder.encode_inputs_embeds(self, inputs_embeds, attention_mask, *args, **kwargs)
+
+
 class OmniEncoder(nn.Module):
     """Omni encoder that contextualizes all modalities with the GLiNER text encoder.
 
@@ -162,33 +318,22 @@ class OmniEncoder(nn.Module):
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if "vision" not in self.feature_encoders or pixel_values is None:
             return None, None
-        vision_kwargs = {
-            key.removeprefix("vision_"): value
-            for key, value in kwargs.items()
-            if key.startswith("vision_")
-        }
-        embeddings = self.feature_encoders["vision"](pixel_values, **vision_kwargs)
+        embeddings = self.feature_encoders["vision"](pixel_values)
         mask = _resize_mask(vision_attention_mask, embeddings)
         embeddings = self._project_inputs("vision", embeddings)
         return self._add_modality_embedding("vision", embeddings), mask
 
     def _audio_inputs(
         self,
-        input_values: Optional[torch.Tensor],
+        audio_values: Optional[torch.Tensor],
         audio_attention_mask: Optional[torch.Tensor],
         kwargs: Dict[str, Any],
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if "audio" not in self.feature_encoders or input_values is None:
+        if "audio" not in self.feature_encoders or audio_values is None:
             return None, None
-        audio_kwargs = {
-            key.removeprefix("audio_"): value
-            for key, value in kwargs.items()
-            if key.startswith("audio_")
-        }
         embeddings = self.feature_encoders["audio"](
-            input_values,
+            audio_values,
             attention_mask=audio_attention_mask,
-            **audio_kwargs,
         )
         mask = _resize_mask(audio_attention_mask, embeddings)
         embeddings = self._project_inputs("audio", embeddings)
@@ -226,11 +371,7 @@ class OmniEncoder(nn.Module):
 
     @staticmethod
     def _get_layout_bbox(kwargs: Dict[str, Any]) -> Optional[torch.Tensor]:
-        for key in ("bbox", "word_bboxes", "text_bbox", "text_word_bboxes"):
-            value = kwargs.get(key)
-            if value is not None:
-                return value
-        return None
+        return kwargs.get("bbox")
 
     def _combined_bbox(
         self,
@@ -276,13 +417,13 @@ class OmniEncoder(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         vision_attention_mask: Optional[torch.Tensor] = None,
-        input_values: Optional[torch.Tensor] = None,
+        audio_values: Optional[torch.Tensor] = None,
         audio_attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> OmniEncoderOutput:
         text_inputs, text_mask = self._text_inputs(input_ids, inputs_embeds, attention_mask)
         vision_inputs, vision_mask = self._vision_inputs(pixel_values, vision_attention_mask, kwargs)
-        audio_inputs, audio_mask = self._audio_inputs(input_values, audio_attention_mask, kwargs)
+        audio_inputs, audio_mask = self._audio_inputs(audio_values, audio_attention_mask, kwargs)
 
         parts = [
             ("text", text_inputs, text_mask),
@@ -304,12 +445,6 @@ class OmniEncoder(nn.Module):
             for key, value in kwargs.items()
             if key in _TRANSFORMER_KWARGS
         }
-        text_kwargs.update({
-            key.removeprefix("text_"): value
-            for key, value in kwargs.items()
-            if key.startswith("text_")
-        })
-        text_kwargs.pop("word_bboxes", None)
         combined_bbox = self._combined_bbox(kwargs, active_parts, combined_inputs)
         if combined_bbox is not None:
             text_kwargs["bbox"] = combined_bbox

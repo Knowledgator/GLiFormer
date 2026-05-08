@@ -2,7 +2,8 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from importlib import import_module
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -206,3 +207,79 @@ class TaskProcessor(ABC):
     def prepare_label_encoder_inputs(self, classes_mapping, labels_tokenizer) -> Optional[Dict]:
         """Tokenize label strings for the labels encoder."""
         return None
+
+
+@dataclass(frozen=True)
+class TaskDefinition:
+    """Registry entry for a concrete GLiNExT task."""
+
+    name: str
+    head_module: str
+    head_class_name: str
+    modality: str
+
+    def load_head_class(self):
+        module = import_module(self.head_module)
+        return getattr(module, self.head_class_name)
+
+
+class TaskRegistry:
+    """Ordered task registry used by model orchestration."""
+
+    def __init__(self, definitions: List[TaskDefinition]):
+        self._definitions = tuple(definitions)
+        self._by_name = {definition.name: definition for definition in self._definitions}
+
+    def __iter__(self):
+        return iter(self._definitions)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._by_name
+
+    def get(self, name: str) -> Optional[TaskDefinition]:
+        return self._by_name.get(name)
+
+    @property
+    def execution_order(self) -> Tuple[str, ...]:
+        return tuple(definition.name for definition in self._definitions)
+
+    def task_names_for_modality(self, modality: str) -> Tuple[str, ...]:
+        return tuple(
+            definition.name
+            for definition in self._definitions
+            if definition.modality == modality
+        )
+
+    @property
+    def text_tasks(self) -> Tuple[str, ...]:
+        return self.task_names_for_modality("text")
+
+    @property
+    def vision_tasks(self) -> Tuple[str, ...]:
+        return self.task_names_for_modality("vision")
+
+    @property
+    def audio_tasks(self) -> Tuple[str, ...]:
+        return self.task_names_for_modality("audio")
+
+    def head_classes(self):
+        for definition in self._definitions:
+            yield definition.load_head_class()
+
+
+TASK_REGISTRY = TaskRegistry(
+    [
+        TaskDefinition("ner", "glinext.tasks.ner.model", "NERHead", "text"),
+        TaskDefinition("classification", "glinext.tasks.classification.model", "ClassificationHead", "text"),
+        TaskDefinition("count", "glinext.tasks.count.model", "CountHead", "text"),
+        TaskDefinition("joint_relex", "glinext.tasks.joint_relex.model", "JointRelexHead", "text"),
+        TaskDefinition("open_relex", "glinext.tasks.open_relex.model", "OpenRelexHead", "text"),
+        TaskDefinition("structuring", "glinext.tasks.structuring.model", "StructuringHead", "text"),
+        TaskDefinition("image_classification", "glinext.tasks.vision.model", "ImageClassificationHead", "vision"),
+        TaskDefinition("object_detection", "glinext.tasks.vision.model", "ObjectDetectionHead", "vision"),
+        TaskDefinition("segmentation", "glinext.tasks.vision.model", "SegmentationHead", "vision"),
+        TaskDefinition("audio_classification", "glinext.tasks.audio.model", "AudioClassificationHead", "audio"),
+        TaskDefinition("audio_segmentation", "glinext.tasks.audio.model", "AudioSegmentationHead", "audio"),
+        TaskDefinition("embedding", "glinext.tasks.embedding.model", "EmbeddingHead", "text"),
+    ]
+)

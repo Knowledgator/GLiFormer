@@ -1,5 +1,7 @@
-from .audio import AudioEncoder, ConvAudioEncoder
+from .audio import AudioBiEncoder, AudioEncoder, ConvAudioEncoder, MelConvAudioEncoder
 from .omni import (
+    LayoutBiEncoder,
+    LayoutEncoder,
     OmniBiEncoder,
     OmniEncoder,
     OmniEncoderOutput,
@@ -12,13 +14,17 @@ from .omni import (
     VisionAudioOmniEncoder,
 )
 from .text import BiEncoder, Encoder, TextBiEncoder, TextEncoder, TextTransformer, Transformer
-from .vision import VisionEncoder, VisionPathEmbeddings
+from .vision import VisionBiEncoder, VisionEncoder, VisionPathEmbeddings
 
 __all__ = [
+    "AudioBiEncoder",
     "AudioEncoder",
     "BiEncoder",
     "ConvAudioEncoder",
     "Encoder",
+    "LayoutBiEncoder",
+    "LayoutEncoder",
+    "MelConvAudioEncoder",
     "OmniBiEncoder",
     "OmniEncoder",
     "OmniEncoderOutput",
@@ -33,6 +39,7 @@ __all__ = [
     "TriOmniBiEncoder",
     "TriOmniEncoder",
     "VisionAudioOmniEncoder",
+    "VisionBiEncoder",
     "VisionEncoder",
     "VisionPathEmbeddings",
 ]

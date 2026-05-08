@@ -1,28 +1,54 @@
 """GLiNExT — main user-facing class for multi-task information extraction."""
 
+import json
 import logging
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
 import torch
+from torch import nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+from huggingface_hub import PyTorchModelHubMixin
 
-from gliner.model import BaseEncoderGLiNER
+from gliner.model import BaseGLiNER
 from gliner.data_processing.tokenizer import WordsSplitter
 
-from .config import GLiNextConfig
-from .model import GLiNExTModel, resolve_glinext_model_class
-from .processing.processor import GLiNextProcessor
+from .config import (
+    GLiNextAudioConfig,
+    GLiNextConfig,
+    GLiNextLayoutConfig,
+    GLiNextOmniConfig,
+    GLiNextTextConfig,
+    GLiNextVisionConfig,
+)
+from .model import (
+    GLiNExTAudioModel,
+    GLiNExTLayoutModel,
+    GLiNExTModel,
+    GLiNExTOmniModel,
+    GLiNExTTextModel,
+    GLiNExTVisionModel,
+    resolve_glinext_model_class,
+)
+from .processing.processor import GLiNextProcessor, resolve_glinext_processor_class
 from .processing.decoder import GLiNExTDecoder
-from .processing.collator import GLiNExTDataCollator
+from .processing.collator import (
+    GLiNExTAudioDataCollator,
+    GLiNExTDataCollator,
+    GLiNExTLayoutDataCollator,
+    GLiNExTOmniDataCollator,
+    GLiNExTTextDataCollator,
+    GLiNExTVisionDataCollator,
+    resolve_glinext_collator_class,
+)
 from .processing.schema import GLiNExTSchema
 
 logger = logging.getLogger(__name__)
 
 
-class GLiNExT(BaseEncoderGLiNER):
+class BaseGLiNExT(BaseGLiNER):
     """Unified multi-task information extraction model.
 
     Supports NER, classification, relation extraction (joint & open),
@@ -56,36 +82,49 @@ class GLiNExT(BaseEncoderGLiNER):
     """
 
     config_class = GLiNextConfig
-    model_class = GLiNExTModel
+    model_class = None
     data_processor_class = GLiNextProcessor
     data_collator_class = GLiNExTDataCollator
     decoder_class = GLiNExTDecoder
 
-    # ── Setup overrides ────────────────────────────────────────���───────
+    # ── Setup overrides ───────────────────────────────────────────────
 
     def _create_model(self, config, backbone_from_pretrained, cache_dir, **kwargs):
-        model_cls = resolve_glinext_model_class(config)
+        model_cls = self.model_class or resolve_glinext_model_class(config)
         self.model = model_cls(config, from_pretrained=backbone_from_pretrained, cache_dir=cache_dir, **kwargs)
         return self.model
 
-
     def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
         """Create processor, loading labels tokenizer for bi-encoder mode."""
-        labels_tokenizer = None
-        if config.labels_encoder is not None:
-            labels_tokenizer = AutoTokenizer.from_pretrained(config.labels_encoder, cache_dir=cache_dir)
-
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
             self._set_tokenizer_spec_tokens(tokenizer)
 
+        labels_tokenizer = None
+        if config.labels_encoder is not None:
+            labels_tokenizer = AutoTokenizer.from_pretrained(config.labels_encoder, cache_dir=cache_dir)
+        else:
+            variant = getattr(config, "model_variant", "")
+            if variant in {"vision", "audio"}:
+                labels_tokenizer = tokenizer
+
         if words_splitter is None:
             words_splitter = WordsSplitter(config.words_splitter_type)
 
-        self.data_processor = GLiNextProcessor(
+        processor_cls = resolve_glinext_processor_class(config)
+        self.data_processor = processor_cls(
             config, tokenizer, words_splitter, labels_tokenizer=labels_tokenizer,
         )
         return self.data_processor
+
+    def _create_data_collator(self, **kwargs):
+        collator_cls = self.data_collator_class or resolve_glinext_collator_class(self.config)
+        return collator_cls(
+            self.config,
+            data_processor=self.data_processor,
+            prepare_labels=True,
+            **kwargs,
+        )
 
     def _get_special_tokens(self):
         """Return special tokens to add to the tokenizer.
@@ -356,7 +395,8 @@ class GLiNExT(BaseEncoderGLiNER):
         )
 
         # Create collator (inference mode: no labels)
-        collator = GLiNExTDataCollator(
+        collator_cls = self.data_collator_class or resolve_glinext_collator_class(self.config)
+        collator = collator_cls(
             self.config,
             data_processor=self.data_processor,
             return_tokens=True,
@@ -393,13 +433,24 @@ class GLiNExT(BaseEncoderGLiNER):
         )
 
     @staticmethod
+    def _infer_batch_size(batch: Dict[str, Any], model_batch: Dict[str, Any]) -> int:
+        tokens = batch.get("tokens")
+        if tokens is not None:
+            return len(tokens)
+        for key in ("input_ids", "pixel_values", "audio_values"):
+            value = model_batch.get(key)
+            if isinstance(value, torch.Tensor):
+                return int(value.shape[0])
+        return 0
+
+    @staticmethod
     def _select_valid_forward_kwargs(
         kwargs: Dict[str, Any],
         valid_to_orig_idx: List[int],
         num_original: int,
     ) -> Dict[str, Any]:
         result = dict(kwargs)
-        for key in ("pixel_values", "vision_attention_mask", "input_values", "audio_attention_mask", "word_bboxes", "bbox"):
+        for key in ("pixel_values", "vision_attention_mask", "audio_values", "audio_attention_mask", "bbox"):
             value = result.get(key)
             if isinstance(value, torch.Tensor) and value.shape[0] == num_original:
                 index = torch.tensor(valid_to_orig_idx, dtype=torch.long, device=value.device)
@@ -446,7 +497,7 @@ class GLiNExT(BaseEncoderGLiNER):
                     # classes_mapping, tokens, etc. — pass through
                     model_batch[k] = v
 
-            batch_size = len(batch.get("tokens") or model_batch.get("input_ids", []))
+            batch_size = self._infer_batch_size(batch, model_batch)
             batch_kwargs = self._batch_forward_kwargs(kwargs, offset, batch_size, total_items)
 
             # Forward — kwargs (e.g. manual_structuring_count, multimodal tensors) flow through.
@@ -468,7 +519,6 @@ class GLiNExT(BaseEncoderGLiNER):
 
             # Accumulate per-item classes_mapping for schema name resolution
             if classes_mapping is not None:
-                batch_size = len(tokens) if tokens else 0
                 for i in range(batch_size):
                     all_classes_mappings.append((classes_mapping, i))
 
@@ -991,3 +1041,214 @@ class GLiNExT(BaseEncoderGLiNER):
             "Multi-task evaluation is not yet implemented. "
             "Use task-specific evaluation pipelines."
         )
+
+
+# Backward-compatible spelling used by existing imports/tests.
+BaseGLiNeXT = BaseGLiNExT
+
+
+class GLiNExTText(BaseGLiNExT):
+    """User-facing text GLiNExT wrapper."""
+
+    config_class = GLiNextTextConfig
+    model_class = GLiNExTTextModel
+    data_collator_class = GLiNExTTextDataCollator
+
+
+class GLiNExTVision(BaseGLiNExT):
+    """User-facing vision GLiNExT wrapper."""
+
+    config_class = GLiNextVisionConfig
+    model_class = GLiNExTVisionModel
+    data_collator_class = GLiNExTVisionDataCollator
+
+
+class GLiNExTAudio(BaseGLiNExT):
+    """User-facing audio GLiNExT wrapper."""
+
+    config_class = GLiNextAudioConfig
+    model_class = GLiNExTAudioModel
+    data_collator_class = GLiNExTAudioDataCollator
+
+
+class GLiNExTLayout(BaseGLiNExT):
+    """User-facing document-layout GLiNExT wrapper."""
+
+    config_class = GLiNextLayoutConfig
+    model_class = GLiNExTLayoutModel
+    data_collator_class = GLiNExTLayoutDataCollator
+
+
+class GLiNExTOmni(BaseGLiNExT):
+    """User-facing omni-modal GLiNExT wrapper."""
+
+    config_class = GLiNextOmniConfig
+    model_class = GLiNExTOmniModel
+    data_collator_class = GLiNExTOmniDataCollator
+
+
+_GLINEXT_MODEL_TO_WRAPPER = {
+    GLiNExTTextModel: GLiNExTText,
+    GLiNExTModel: GLiNExTText,
+    GLiNExTVisionModel: GLiNExTVision,
+    GLiNExTAudioModel: GLiNExTAudio,
+    GLiNExTLayoutModel: GLiNExTLayout,
+    GLiNExTOmniModel: GLiNExTOmni,
+}
+
+
+class GLiNExT(nn.Module, PyTorchModelHubMixin):
+    """Factory class that instantiates the appropriate GLiNExT wrapper.
+
+    Mirrors :class:`gliner.model.GLiNER`: the factory reads the config,
+    resolves the concrete GLiNExT type, delegates construction/loading to that
+    subclass, then replaces itself with the concrete instance.
+    """
+
+    def __init__(self, config: Union[str, Path, GLiNextConfig, dict], **kwargs):
+        super().__init__()
+        config = self._coerce_config(config)
+        glinext_class = self._get_glinext_class(config)
+        new_instance = glinext_class(config, **kwargs)
+        self.__class__ = type(new_instance)
+        self.__dict__ = new_instance.__dict__
+
+    @staticmethod
+    def _coerce_config(config: Union[str, Path, GLiNextConfig, dict]) -> GLiNextConfig:
+        if isinstance(config, (str, Path)):
+            config_path = Path(config)
+            if not config_path.exists():
+                raise FileNotFoundError(f"Config file not found: {config}")
+            with open(config_path) as f:
+                config_dict = json.load(f)
+            config_dict.pop("model_type", None)
+            return GLiNextConfig(**config_dict)
+        if isinstance(config, dict):
+            config_dict = config.copy()
+            config_dict.pop("model_type", None)
+            return GLiNextConfig(**config_dict)
+        if isinstance(config, GLiNextConfig):
+            return config
+        raise TypeError(f"config must be a GLiNextConfig object, path to config file, or dict. Got {type(config)}")
+
+    @staticmethod
+    def _get_glinext_class(config: GLiNextConfig):
+        model_cls = resolve_glinext_model_class(config)
+        try:
+            return _GLINEXT_MODEL_TO_WRAPPER[model_cls]
+        except KeyError as exc:
+            raise ValueError(f"No GLiNExT wrapper registered for model class {model_cls}") from exc
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_id: str,
+        model_dir: Optional[str] = None,
+        revision: Optional[str] = None,
+        cache_dir: Optional[Union[str, Path]] = None,
+        force_download: bool = False,
+        proxies: Optional[dict] = None,
+        resume_download: bool = False,
+        local_files_only: bool = False,
+        token: Union[str, bool, None] = None,
+        map_location: str = "cpu",
+        strict: bool = False,
+        load_tokenizer: Optional[bool] = None,
+        resize_token_embeddings: Optional[bool] = True,
+        compile_torch_model: Optional[bool] = False,
+        quantize: Optional[str] = None,
+        dtype: Optional[Union[str, torch.dtype]] = None,
+        load_onnx_model: Optional[bool] = False,
+        onnx_model_file: Optional[str] = "model.onnx",
+        session_options=None,
+        max_length: Optional[int] = None,
+        max_width: Optional[int] = None,
+        post_fusion_schema: Optional[str] = None,
+        _attn_implementation: Optional[str] = None,
+        **model_kwargs,
+    ):
+        if model_dir is None:
+            model_dir = BaseGLiNeXT._download_model(
+                model_id, revision, cache_dir, force_download, proxies, resume_download, token, local_files_only
+            )
+        else:
+            model_dir = Path(model_dir)
+
+        config_file = model_dir / "gliner_config.json"
+        if not config_file.exists():
+            raise FileNotFoundError(f"No config file found in {model_dir}")
+
+        config = BaseGLiNeXT._load_config(
+            config_file,
+            max_len=max_length,
+            max_width=max_width,
+            post_fusion_schema=post_fusion_schema,
+            _attn_implementation=_attn_implementation,
+        )
+        glinext_class = cls._get_glinext_class(config)
+        logger.info("Loading the following GLiNExT type: %s...", glinext_class)
+        return glinext_class.from_pretrained(
+            model_id=model_id,
+            model_dir=model_dir,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            local_files_only=local_files_only,
+            token=token,
+            map_location=map_location,
+            strict=strict,
+            load_tokenizer=load_tokenizer,
+            resize_token_embeddings=resize_token_embeddings,
+            compile_torch_model=compile_torch_model,
+            quantize=quantize,
+            dtype=dtype,
+            load_onnx_model=load_onnx_model,
+            onnx_model_file=onnx_model_file,
+            session_options=session_options,
+            max_length=max_length,
+            max_width=max_width,
+            post_fusion_schema=post_fusion_schema,
+            _attn_implementation=_attn_implementation,
+            **model_kwargs,
+        )
+
+    @classmethod
+    def load_from_config(
+        cls,
+        config: Union[str, Path, GLiNextConfig, dict],
+        cache_dir: Optional[Union[str, Path]] = None,
+        load_tokenizer: bool = True,
+        resize_token_embeddings: bool = True,
+        backbone_from_pretrained: bool = True,
+        compile_torch_model: bool = False,
+        quantize: Optional[str] = None,
+        map_location: str = "cpu",
+        max_length: Optional[int] = None,
+        max_width: Optional[int] = None,
+        post_fusion_schema: Optional[str] = None,
+        _attn_implementation: Optional[str] = None,
+        **model_kwargs,
+    ):
+        config_instance = cls._coerce_config(config)
+        glinext_class = cls._get_glinext_class(config_instance)
+        return glinext_class.load_from_config(
+            config=config,
+            cache_dir=cache_dir,
+            load_tokenizer=load_tokenizer,
+            resize_token_embeddings=resize_token_embeddings,
+            backbone_from_pretrained=backbone_from_pretrained,
+            compile_torch_model=compile_torch_model,
+            quantize=quantize,
+            map_location=map_location,
+            max_length=max_length,
+            max_width=max_width,
+            post_fusion_schema=post_fusion_schema,
+            _attn_implementation=_attn_implementation,
+            **model_kwargs,
+        )
+
+    @classmethod
+    def from_config(cls, *args, **kwargs):
+        return cls.load_from_config(*args, **kwargs)

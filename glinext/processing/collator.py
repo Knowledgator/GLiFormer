@@ -1,88 +1,75 @@
-"""GLiNExTDataCollator — multi-task data collator for training and inference."""
+"""Data collators for GLiNExT processor variants."""
 
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-from gliner.data_processing.collator import BaseDataCollator
+import torch
 
-from .processor import GLiNextProcessor
+from .processor import (
+    BaseGLiNextProcessor,
+    GLiNextAudioProcessor,
+    GLiNextLayoutProcessor,
+    GLiNextOmniProcessor,
+    GLiNextProcessor,
+    GLiNextTextProcessor,
+    GLiNextVisionProcessor,
+)
 
 
-class GLiNExTDataCollator(BaseDataCollator):
-    """Data collator for GLiNExT multi-task model.
+class BaseGLiNExTDataCollator(ABC):
+    """Common two-stage collation for all GLiNExT processors.
 
-    Delegates all multi-task complexity to :class:`GLiNextProcessor`.
-    Handles both training (with labels) and inference (without labels) modes.
-
-    Args:
-        config: GLiNextConfig instance.
-        data_processor: GLiNextProcessor that handles tokenization, prompt
-            construction, class mapping, and label creation.
-        return_tokens: Include original word tokens in output (for decoding).
-        return_id_to_classes: Include class ID → name mappings.
-        return_entities: Include raw entity annotations.
-        prepare_labels: Whether to create training label tensors.
+    Processors own variant-specific collation/tokenization. Collators keep the
+    DataLoader contract stable and attach model/decoder metadata that should
+    not be duplicated in every processor.
     """
 
     def __init__(
         self,
         config,
-        data_processor: Optional[GLiNextProcessor] = None,
+        data_processor: Optional[BaseGLiNextProcessor] = None,
         return_tokens: bool = False,
         return_id_to_classes: bool = False,
         return_entities: bool = False,
         prepare_labels: bool = True,
+        return_classes_mapping: bool = True,
     ):
-        super().__init__(
-            config,
-            data_processor=data_processor,
-            return_tokens=return_tokens,
-            return_id_to_classes=return_id_to_classes,
-            return_entities=return_entities,
+        self.config = config
+        self.data_processor = data_processor
+        self.return_tokens = return_tokens
+        self.return_id_to_classes = return_id_to_classes
+        self.return_entities = return_entities
+        self.prepare_labels = prepare_labels
+        self.return_classes_mapping = return_classes_mapping
+
+    def collate_batch(self, input_x: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+        if self.data_processor is None:
+            raise ValueError("data_processor must be provided for GLiNExT collation.")
+        return self.data_processor.collate_raw_batch(input_x, **kwargs)
+
+    def collate_function(self, raw_batch: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        if self.data_processor is None:
+            raise ValueError("data_processor must be provided for GLiNExT collation.")
+        prepare_labels = kwargs.pop("prepare_labels", self.prepare_labels)
+        return self.data_processor.tokenize_and_prepare_labels(
+            raw_batch,
             prepare_labels=prepare_labels,
+            **kwargs,
         )
 
-    def __call__(
-        self,
-        input_x: List[Dict[str, Any]],
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Collate a list of examples into a model-ready batch.
+    @staticmethod
+    def _add_precomputed_lengths(model_input: Dict[str, Any]) -> None:
+        attention_mask = model_input.get("attention_mask")
+        if isinstance(attention_mask, torch.Tensor) and "token_lengths" not in model_input:
+            model_input["token_lengths"] = attention_mask.sum(dim=-1, dtype=torch.int64).tolist()
 
-        Steps:
-            1. ``collate_raw_batch`` — resolve spans, build BatchClassesMapping,
-               truncate texts.
-            2. ``tokenize_and_prepare_labels`` — tokenize, construct prompts,
-               optionally create per-task label tensors.
-            3. Attach metadata needed by the model and decoder
-               (text_lengths, tokens, classes_mapping).
+        text_lengths = model_input.get("text_lengths")
+        if isinstance(text_lengths, torch.Tensor) and "word_lengths" not in model_input:
+            model_input["word_lengths"] = text_lengths.view(-1).tolist()
 
-        Args:
-            input_x: List of example dicts. Each has ``tokenized_text`` and
-                optional task-specific annotation keys (``extraction``,
-                ``classification``, ``open_relex``, ``structuring``,
-                ``embedding``).
-            **kwargs: Forwarded to the processor.
-
-        Returns:
-            Flat dict of tensors and metadata ready for ``GLiNExTModel.forward()``.
-        """
-        # 1. Raw batch via processor — spans resolved, classes mapped
-        raw_batch = self.data_processor.collate_raw_batch(input_x, **kwargs)
-
-        # 2. Tokenize + prepare labels (training) or just tokenize (inference)
-        model_input = self.data_processor.tokenize_and_prepare_labels(
-            raw_batch, prepare_labels=self.prepare_labels,
-        )
-
-        # 3. Attach fields needed by model / decoder
-        model_input["text_lengths"] = raw_batch["seq_length"]
-
-        # classes_mapping is needed by the model (for _build_flat_inputs)
-        # and by the decoder (for label name resolution)
-        if "classes_mapping" not in model_input:
+    def _add_common_returns(self, model_input: Dict[str, Any], raw_batch: Dict[str, Any]) -> None:
+        if self.return_classes_mapping and "classes_mapping" not in model_input:
             model_input["classes_mapping"] = raw_batch.get("classes_mapping")
-
-        # 4. Conditional returns
         if self.return_tokens:
             model_input["tokens"] = raw_batch.get("tokens")
         if self.return_id_to_classes:
@@ -90,4 +77,102 @@ class GLiNExTDataCollator(BaseDataCollator):
         if self.return_entities:
             model_input["entities"] = raw_batch.get("entities")
 
+    @staticmethod
+    def _filter_none_values(data: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: value for key, value in data.items() if value is not None}
+
+    @abstractmethod
+    def __call__(self, input_x: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class GLiNExTTextDataCollator(BaseGLiNExTDataCollator):
+    """Collator for text-only GLiNExT models."""
+
+    data_processor_type = GLiNextTextProcessor
+
+    def _add_text_fields(self, model_input: Dict[str, Any], raw_batch: Dict[str, Any]) -> None:
+        model_input["text_lengths"] = raw_batch.get("seq_length")
+
+    def __call__(self, input_x: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+        raw_batch = self.collate_batch(input_x, **kwargs)
+        model_input = self.collate_function(
+            raw_batch,
+            prepare_labels=self.prepare_labels,
+            **kwargs,
+        )
+        self._add_text_fields(model_input, raw_batch)
+        self._add_common_returns(model_input, raw_batch)
+        self._add_precomputed_lengths(model_input)
         return self._filter_none_values(model_input)
+
+
+class GLiNExTLayoutDataCollator(GLiNExTTextDataCollator):
+    """Collator for document-layout GLiNExT models.
+
+    Layout processors still use the text path, but may also provide ``bbox`` and
+    ``pixel_values`` fields. Those are already added by the processor.
+    """
+
+    data_processor_type = GLiNextLayoutProcessor
+
+
+class GLiNExTVisionDataCollator(BaseGLiNExTDataCollator):
+    """Collator for efficient vision-only bi-encoder models."""
+
+    data_processor_type = GLiNextVisionProcessor
+
+    def __call__(self, input_x: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+        raw_batch = self.collate_batch(input_x, **kwargs)
+        model_input = self.collate_function(
+            raw_batch,
+            prepare_labels=self.prepare_labels,
+            **kwargs,
+        )
+        self._add_common_returns(model_input, raw_batch)
+        return self._filter_none_values(model_input)
+
+
+class GLiNExTAudioDataCollator(BaseGLiNExTDataCollator):
+    """Collator for efficient audio-only bi-encoder models."""
+
+    data_processor_type = GLiNextAudioProcessor
+
+    def __call__(self, input_x: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+        raw_batch = self.collate_batch(input_x, **kwargs)
+        model_input = self.collate_function(
+            raw_batch,
+            prepare_labels=self.prepare_labels,
+            **kwargs,
+        )
+        self._add_common_returns(model_input, raw_batch)
+        return self._filter_none_values(model_input)
+
+
+class GLiNExTOmniDataCollator(GLiNExTTextDataCollator):
+    """Collator for omni-modal GLiNExT models."""
+
+    data_processor_type = GLiNextOmniProcessor
+
+
+class GLiNExTDataCollator(GLiNExTOmniDataCollator):
+    """Backward-compatible collator retaining the legacy all-capability path."""
+
+    data_processor_type = GLiNextProcessor
+
+
+def resolve_glinext_collator_class(config):
+    """Resolve the collator class matching ``config.model_variant``."""
+    variant = getattr(config, "model_variant", None) or "text"
+    if variant == "text":
+        return GLiNExTTextDataCollator
+    if variant == "layout":
+        return GLiNExTLayoutDataCollator
+    if variant == "vision":
+        return GLiNExTVisionDataCollator
+    if variant == "audio":
+        return GLiNExTAudioDataCollator
+    if variant == "omni":
+        return GLiNExTOmniDataCollator
+    raise ValueError(f"Unknown GLiNExT model_variant: {variant!r}")
+

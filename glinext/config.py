@@ -194,11 +194,26 @@ class EmbeddingHeadConfig:
 
 class GLiNextConfig(BaseGLiNERConfig):
     model_type = "glinext"
+    TASK_CONFIG_ATTRS = {
+        "ner": "ner_config",
+        "classification": "classification_config",
+        "image_classification": "image_classification_config",
+        "audio_classification": "audio_classification_config",
+        "object_detection": "object_detection_config",
+        "segmentation": "segmentation_config",
+        "audio_segmentation": "audio_segmentation_config",
+        "joint_relex": "joint_relex_config",
+        "open_relex": "open_relex_config",
+        "structuring": "structuring_config",
+        "count": "count_config",
+        "embedding": "embedding_config",
+    }
 
     def __init__(
         self,
         # Per-task sub-configs (None = disabled, dict or dataclass = enabled)
         ner_config: Optional[dict] = None,
+        default_ner_config: Optional[bool] = None,
         classification_config: Optional[dict] = None,
         image_classification_config: Optional[dict] = None,
         audio_classification_config: Optional[dict] = None,
@@ -220,7 +235,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         labels_encoder_config: Optional[dict] = None,
         # Model variant / multimodal fusion
         backbone_type: str = "auto",
-        model_variant: str = "text-only",
+        model_variant: str = "text",
         multimodal_fusion: str = "uni-encoder",
         use_layout: bool = False,
         # Optional multimodal encoders
@@ -237,6 +252,20 @@ class GLiNextConfig(BaseGLiNERConfig):
         audio_in_channels: int = 1,
         audio_num_layers: int = 3,
         audio_stride: int = 4,
+        audio_freq_stride: int = 2,
+        audio_time_stride: Optional[int] = None,
+        audio_input_format: str = "freq_first",
+        audio_processor_type: str = "custom",
+        audio_processor_name: Optional[str] = None,
+        audio_sampling_rate: Optional[int] = None,
+        audio_do_resample: bool = True,
+        audio_processor_output_format: str = "raw",
+        audio_do_normalize: bool = False,
+        audio_n_fft: int = 400,
+        audio_hop_length: Optional[int] = None,
+        audio_win_length: Optional[int] = None,
+        audio_n_mels: int = 80,
+        audio_power: float = 2.0,
         omni_modalities: Optional[list[str]] = None,
         # Special tokens
         seq_token: str = "[SEQ]",
@@ -299,14 +328,69 @@ class GLiNextConfig(BaseGLiNERConfig):
         obj_token_index: int = -1,
         embed_obj_token: bool = True,
         image_size: int = 224,
+        vision_processor_type: str = "custom",
+        vision_processor_name: Optional[str] = None,
+        vision_resize_size: Optional[Any] = None,
+        vision_center_crop_size: Optional[Any] = None,
+        vision_interpolation: str = "bilinear",
+        vision_do_rescale: bool = True,
+        vision_do_normalize: bool = False,
+        vision_image_mean: Optional[list[float]] = None,
+        vision_image_std: Optional[list[float]] = None,
         **kwargs,
     ):
+        deprecated_processor_fields = {
+            "image_processor_name",
+            "audio_feature_type",
+            "audio_log_mel",
+        }
+        deprecated_present = sorted(deprecated_processor_fields.intersection(kwargs))
+        if deprecated_present:
+            raise ValueError(
+                "Unsupported processor config field(s): "
+                f"{', '.join(deprecated_present)}. Use canonical processor fields only."
+            )
+
+        allowed_processor_types = {"custom", "auto"}
+        if vision_processor_type not in allowed_processor_types:
+            raise ValueError(
+                "vision_processor_type must be one of "
+                f"{sorted(allowed_processor_types)}, got {vision_processor_type!r}."
+            )
+        if audio_processor_type not in allowed_processor_types:
+            raise ValueError(
+                "audio_processor_type must be one of "
+                f"{sorted(allowed_processor_types)}, got {audio_processor_type!r}."
+            )
+        allowed_audio_formats = {
+            "raw",
+            "spectrogram",
+            "mel_spectrogram",
+            "log_mel_spectrogram",
+        }
+        if audio_processor_output_format not in allowed_audio_formats:
+            raise ValueError(
+                "audio_processor_output_format must be one of "
+                f"{sorted(allowed_audio_formats)}, got {audio_processor_output_format!r}."
+            )
+
         super().__init__(**kwargs)
 
         # ── Migrate flat params to sub-configs if sub-configs not provided ──
 
-        # NER: always on by default (use flat params if no sub-config)
-        if ner_config is None:
+        allowed_model_variants = {"text", "vision", "audio", "omni", "layout"}
+        if model_variant not in allowed_model_variants:
+            raise ValueError(
+                "model_variant must be one of "
+                f"{sorted(allowed_model_variants)}, got {model_variant!r}."
+            )
+
+        if default_ner_config is None:
+            default_ner_config = model_variant not in {"vision", "audio"}
+
+        # NER: on by default for legacy/text/omni configs, but single-media
+        # configs avoid carrying unused text heads.
+        if ner_config is None and default_ner_config:
             ner_config = {}
         if isinstance(ner_config, dict):
             ner_config.pop("scorer_type", None)  # backward compat: scorer_type removed
@@ -473,6 +557,20 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.audio_in_channels = audio_in_channels
         self.audio_num_layers = audio_num_layers
         self.audio_stride = audio_stride
+        self.audio_freq_stride = audio_freq_stride
+        self.audio_time_stride = audio_time_stride
+        self.audio_input_format = audio_input_format
+        self.audio_processor_type = audio_processor_type
+        self.audio_processor_name = audio_processor_name
+        self.audio_sampling_rate = audio_sampling_rate
+        self.audio_do_resample = audio_do_resample
+        self.audio_processor_output_format = audio_processor_output_format
+        self.audio_do_normalize = audio_do_normalize
+        self.audio_n_fft = audio_n_fft
+        self.audio_hop_length = audio_hop_length
+        self.audio_win_length = audio_win_length
+        self.audio_n_mels = audio_n_mels
+        self.audio_power = audio_power
         self.omni_modalities = tuple(omni_modalities) if omni_modalities is not None else None
 
         # Projector
@@ -490,6 +588,15 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.obj_token_index = obj_token_index
         self.embed_obj_token = embed_obj_token
         self.image_size = image_size
+        self.vision_processor_type = vision_processor_type
+        self.vision_processor_name = vision_processor_name
+        self.vision_resize_size = vision_resize_size
+        self.vision_center_crop_size = vision_center_crop_size
+        self.vision_interpolation = vision_interpolation
+        self.vision_do_rescale = vision_do_rescale
+        self.vision_do_normalize = vision_do_normalize
+        self.vision_image_mean = vision_image_mean
+        self.vision_image_std = vision_image_std
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -592,9 +699,107 @@ class GLiNextConfig(BaseGLiNERConfig):
         """True when per-task parent tokens are distinct from each other."""
         return self.per_task_parents
 
+    def get_task_config(self, task_name: str):
+        """Return the task sub-config for a canonical task name."""
+        attr_name = self.TASK_CONFIG_ATTRS.get(task_name)
+        if attr_name is None:
+            return None
+        return getattr(self, attr_name, None)
+
     def to_dict(self) -> dict[str, Any]:
         output = super().to_dict()
         for key, value in output.items():
             if dataclasses.is_dataclass(value) and not isinstance(value, type):
                 output[key] = dataclasses.asdict(value)
         return output
+
+
+_TEXT_CONFIG_FIELDS = (
+    "ner_config",
+    "classification_config",
+    "joint_relex_config",
+    "open_relex_config",
+    "structuring_config",
+    "count_config",
+    "embedding_config",
+)
+_VISION_CONFIG_FIELDS = (
+    "image_classification_config",
+    "object_detection_config",
+    "segmentation_config",
+)
+_AUDIO_CONFIG_FIELDS = (
+    "audio_classification_config",
+    "audio_segmentation_config",
+)
+
+
+def _non_null_config_names(config: GLiNextConfig, names: tuple[str, ...]) -> list[str]:
+    return [name for name in names if getattr(config, name, None) is not None]
+
+
+class GLiNextTextConfig(GLiNextConfig):
+    """Text-only GLiNExT config.
+
+    This keeps the legacy text defaults, including enabling NER when no explicit
+    ``ner_config`` is provided, but rejects vision/audio task configs.
+    """
+
+    def __init__(self, *args, model_variant: str = "text", **kwargs):
+        kwargs.setdefault("default_ner_config", True)
+        super().__init__(*args, model_variant=model_variant, **kwargs)
+        disallowed = _non_null_config_names(self, _VISION_CONFIG_FIELDS + _AUDIO_CONFIG_FIELDS)
+        if disallowed:
+            raise ValueError(
+                f"{self.__class__.__name__} supports text tasks only; "
+                f"received configs: {', '.join(disallowed)}"
+            )
+
+
+class GLiNextLayoutConfig(GLiNextTextConfig):
+    """Text config with layout coordinates enabled."""
+
+    def __init__(
+        self,
+        *args,
+        model_variant: str = "layout",
+        use_layout: bool = True,
+        **kwargs,
+    ):
+        super().__init__(*args, model_variant=model_variant, use_layout=use_layout, **kwargs)
+
+
+class GLiNextVisionConfig(GLiNextConfig):
+    """Vision-only bi-encoder GLiNExT config."""
+
+    def __init__(self, *args, model_variant: str = "vision", **kwargs):
+        kwargs.setdefault("default_ner_config", False)
+        super().__init__(*args, model_variant=model_variant, **kwargs)
+        disallowed = _non_null_config_names(self, _TEXT_CONFIG_FIELDS + _AUDIO_CONFIG_FIELDS)
+        if disallowed:
+            raise ValueError(
+                f"{self.__class__.__name__} supports vision tasks only; "
+                f"received configs: {', '.join(disallowed)}"
+            )
+
+
+class GLiNextAudioConfig(GLiNextConfig):
+    """Audio-only bi-encoder GLiNExT config."""
+
+    def __init__(self, *args, model_variant: str = "audio", **kwargs):
+        kwargs.setdefault("default_ner_config", False)
+        super().__init__(*args, model_variant=model_variant, **kwargs)
+        disallowed = _non_null_config_names(self, _TEXT_CONFIG_FIELDS + _VISION_CONFIG_FIELDS)
+        if disallowed:
+            raise ValueError(
+                f"{self.__class__.__name__} supports audio tasks only; "
+                f"received configs: {', '.join(disallowed)}"
+            )
+
+
+class GLiNextOmniConfig(GLiNextConfig):
+    """Omni config that can combine text, vision, audio, and layout settings."""
+
+    def __init__(self, *args, model_variant: str = "omni", **kwargs):
+        kwargs.setdefault("default_ner_config", True)
+        super().__init__(*args, model_variant=model_variant, **kwargs)

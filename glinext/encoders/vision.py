@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoConfig, AutoModel
 
+from .base import hidden_size
+from .text import TextTransformer
+
 
 def _get_config_value(config: Any, name: str, default: Any = None) -> Any:
     return getattr(config, name, default) if config is not None else default
@@ -160,3 +163,83 @@ class VisionEncoder(nn.Module):
         if hasattr(self, "projection"):
             token_embeddings = self.projection(token_embeddings)
         return token_embeddings
+
+
+class VisionBiEncoder(nn.Module):
+    """Bi-encoder for vision GLiNExT models.
+
+    Images are encoded by ``VisionEncoder``. Label names are encoded by a text
+    transformer and mean-pooled, matching the GLiNER bi-encoder label contract.
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        from_pretrained: bool = False,
+        cache_dir: Optional[Union[str, Path]] = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.vision_encoder = VisionEncoder(
+            config,
+            from_pretrained=from_pretrained,
+            cache_dir=cache_dir,
+        )
+        label_model_name = _get_config_value(config, "labels_encoder") or _get_config_value(config, "model_name")
+        if label_model_name is None:
+            raise ValueError("VisionBiEncoder requires config.labels_encoder or config.model_name for label encoding")
+        self.labels_encoder = TextTransformer(
+            label_model_name,
+            config,
+            from_pretrained=from_pretrained,
+            labels_encoder=True,
+            cache_dir=cache_dir,
+        )
+        label_hidden_size = hidden_size(self.labels_encoder.model.config)
+        if int(_get_config_value(config, "hidden_size")) != label_hidden_size:
+            self.labels_projection = nn.Linear(label_hidden_size, int(_get_config_value(config, "hidden_size")))
+
+    @staticmethod
+    def mean_pooling(token_embeddings: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
+            input_mask_expanded.sum(1),
+            min=1e-9,
+        )
+
+    def resize_token_embeddings(
+        self,
+        new_num_tokens: int,
+        pad_to_multiple_of: Optional[int] = None,
+    ) -> nn.Embedding:
+        return self.labels_encoder.model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.labels_encoder.model.get_input_embeddings()
+
+    def encode_labels(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        label_kwargs = dict(kwargs)
+        label_kwargs.pop("packing_config", None)
+        label_kwargs.pop("pair_attention_mask", None)
+        label_tokens = self.labels_encoder(input_ids, attention_mask=attention_mask, **label_kwargs)
+        if hasattr(self, "labels_projection"):
+            label_tokens = self.labels_projection(label_tokens)
+        return self.mean_pooling(label_tokens, attention_mask)
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        labels_input_ids: Optional[torch.Tensor] = None,
+        labels_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ):
+        vision_tokens = self.vision_encoder(pixel_values, **kwargs)
+        if labels_input_ids is None or labels_attention_mask is None:
+            return vision_tokens
+        labels_embeddings = self.encode_labels(labels_input_ids, labels_attention_mask)
+        return vision_tokens, labels_embeddings
