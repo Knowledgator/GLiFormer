@@ -8,7 +8,7 @@ from .attention import SelfAttentionBlock, CrossAttentionBlock, Fuser, Layerwise
 from .rotary import RotaryEmbedding, rotate_half, apply_rotary_pos_emb
 from .groups import RotaryGroupRNN, QueryGroupRNN, QueryGroupTransformer, AnchorCrossAttentionLayer
 from .anchor_layer import (
-    AnchorLayer, ParentAnchorLayer, FixedAnchorLayer,
+    AnchorLayer, ParentAnchorLayer, FeatureAnchorLayer, FixedAnchorLayer,
     FixedRNNAnchorLayer, FixedTransformerAnchorLayer,
     RotaryAnchorLayer, QueryRNNAnchorLayer, QueryTransformerAnchorLayer,
 )
@@ -27,7 +27,7 @@ __all__ = [
     "SelfAttentionBlock", "CrossAttentionBlock", "Fuser", "LayerwiseAttention",
     "RotaryEmbedding", "rotate_half", "apply_rotary_pos_emb",
     "RotaryGroupRNN", "QueryGroupRNN", "QueryGroupTransformer", "AnchorCrossAttentionLayer",
-    "AnchorLayer", "ParentAnchorLayer", "FixedAnchorLayer",
+    "AnchorLayer", "ParentAnchorLayer", "FeatureAnchorLayer", "FixedAnchorLayer",
     "FixedRNNAnchorLayer", "FixedTransformerAnchorLayer", 
     "RotaryAnchorLayer", "QueryRNNAnchorLayer", "QueryTransformerAnchorLayer",
     "AnchorModeling", "LinearAnchorModeling", "RNNAnchorModeling", "MLPAnchorModeling", "TransformerAnchorModeling",

@@ -8,6 +8,7 @@ All layers accept context_embedding of shape (B, D) — a single context vector 
 
 Strategies:
 - ParentAnchorLayer: returns context as single anchor (NER, Classification default)
+- FeatureAnchorLayer: returns sequence feature embeddings as anchors
 - FixedAnchorLayer: learnable nn.Embedding table conditioned on context
 - FixedRNNAnchorLayer: learnable slots conditioned on context via GRU
 - FixedTransformerAnchorLayer: learnable slots conditioned on context via transformer
@@ -52,16 +53,18 @@ class AnchorLayer(nn.Module):
     def forward(
         self,
         context_embedding: torch.Tensor,
-        word_embeddings: Optional[torch.Tensor] = None,
+        feature_embeddings: Optional[torch.Tensor] = None,
         count: Optional[torch.Tensor] = None,
         threshold: float = 0.5,
+        feature_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             context_embedding: (B, D) context vector per sample
-            word_embeddings: (B, L, D) text token embeddings (for query-based layers)
+            feature_embeddings: (B, L, D) text, vision, or audio token features
             count: (B,) or scalar — number of anchors to generate per sample
             threshold: float — similarity threshold (for query-based layers)
+            feature_mask: (B, L) valid feature mask
 
         Returns:
             anchors: (B, A, D) anchor representations
@@ -90,11 +93,76 @@ class ParentAnchorLayer(AnchorLayer, anchor_mode="parent"):
         super().__init__()
         self.hidden_size = hidden_size
 
-    def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
+    def forward(
+        self,
+        context_embedding,
+        feature_embeddings=None,
+        count=None,
+        threshold=0.5,
+        feature_mask=None,
+    ):
         B = context_embedding.shape[0]
         anchor = context_embedding.unsqueeze(1)  # (B, 1, D)
         mask = torch.ones(B, 1, dtype=torch.bool, device=context_embedding.device)
         return anchor, mask
+
+
+class FeatureAnchorLayer(AnchorLayer, anchor_mode="features"):
+    """Use input sequence features directly as anchor slots.
+
+    This is useful for vision/audio tasks where each encoded patch or frame can
+    serve as an anchor candidate. If ``feature_anchor_mlp`` is enabled in the
+    task config, the features are passed through a small MLP before being used as
+    anchors; otherwise the returned anchors are exactly the input features.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        feature_mlp: bool = False,
+        feature_mlp_hidden_multiplier: int = 1,
+        dropout: float = 0.1,
+        **kwargs,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.feature_mlp = bool(feature_mlp)
+        if self.feature_mlp:
+            hidden_dim = hidden_size * max(int(feature_mlp_hidden_multiplier), 1)
+            self.projector = create_mlp(
+                input_dim=hidden_size,
+                intermediate_dims=[hidden_dim],
+                output_dim=hidden_size,
+                dropout=dropout,
+                activation="gelu",
+                add_layer_norm=True,
+            )
+
+    def forward(
+        self,
+        context_embedding,
+        feature_embeddings=None,
+        count=None,
+        threshold=0.5,
+        feature_mask=None,
+    ):
+        if feature_embeddings is None:
+            B = context_embedding.shape[0]
+            return (
+                torch.zeros(B, 0, context_embedding.shape[-1], device=context_embedding.device),
+                torch.zeros(B, 0, dtype=torch.bool, device=context_embedding.device),
+            )
+
+        anchors = self.projector(feature_embeddings) if self.feature_mlp else feature_embeddings
+        if feature_mask is None:
+            mask = torch.ones(anchors.shape[:2], dtype=torch.bool, device=anchors.device)
+        else:
+            mask = feature_mask.to(device=anchors.device).bool()
+        return anchors, mask
+
+
+# Backward-friendly singular alias.
+AnchorLayer._registry["feature"] = FeatureAnchorLayer
 
 
 class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
@@ -109,7 +177,14 @@ class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
         self.context_proj = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
+    def forward(
+        self,
+        context_embedding,
+        feature_embeddings=None,
+        count=None,
+        threshold=0.5,
+        feature_mask=None,
+    ):
         B = context_embedding.shape[0]
         device = context_embedding.device
 
@@ -142,7 +217,14 @@ class FixedRNNAnchorLayer(AnchorLayer, anchor_mode="fixed_rnn"):
             add_layer_norm=False,
         )
 
-    def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
+    def forward(
+        self,
+        context_embedding,
+        feature_embeddings=None,
+        count=None,
+        threshold=0.5,
+        feature_mask=None,
+    ):
         B = context_embedding.shape[0]
         device = context_embedding.device
 
@@ -165,7 +247,7 @@ class FixedTransformerAnchorLayer(AnchorLayer, anchor_mode="fixed_transformer"):
     """Learnable fixed slots conditioned on context via transformer cross-attention.
 
     Fixed slot embeddings serve as queries in a transformer decoder that cross-attends
-    to the context embedding (and optionally word embeddings).
+    to the context embedding (and optionally sequence feature embeddings).
     """
 
     def __init__(self, hidden_size: int, num_slots: int = 10, num_heads: int = 4,
@@ -179,7 +261,14 @@ class FixedTransformerAnchorLayer(AnchorLayer, anchor_mode="fixed_transformer"):
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-    def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
+    def forward(
+        self,
+        context_embedding,
+        feature_embeddings=None,
+        count=None,
+        threshold=0.5,
+        feature_mask=None,
+    ):
         B = context_embedding.shape[0]
         device = context_embedding.device
 
@@ -187,9 +276,9 @@ class FixedTransformerAnchorLayer(AnchorLayer, anchor_mode="fixed_transformer"):
         slots = self.anchor_table.weight.unsqueeze(0).expand(B, -1, -1)
         # Context as memory: (B, 1, D)
         memory = self.context_proj(context_embedding).unsqueeze(1)
-        # Optionally include word embeddings as additional memory
-        if word_embeddings is not None:
-            memory = torch.cat([memory, word_embeddings], dim=1)  # (B, 1+L, D)
+        # Optionally include sequence features as additional memory
+        if feature_embeddings is not None:
+            memory = torch.cat([memory, feature_embeddings], dim=1)  # (B, 1+L, D)
 
         anchors = self.transformer_decoder(slots, memory)  # (B, num_slots, D)
 
@@ -204,7 +293,14 @@ class RotaryAnchorLayer(AnchorLayer, anchor_mode="rotary"):
         super().__init__()
         self.groups_layer = RotaryGroupRNN(hidden_size=hidden_size, max_count=max_count)
 
-    def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
+    def forward(
+        self,
+        context_embedding,
+        feature_embeddings=None,
+        count=None,
+        threshold=0.5,
+        feature_mask=None,
+    ):
         B, D = context_embedding.shape
         device = context_embedding.device
 
@@ -238,15 +334,22 @@ class QueryRNNAnchorLayer(AnchorLayer, anchor_mode="query_rnn"):
         super().__init__()
         self.groups_layer = QueryGroupRNN(hidden_size=hidden_size, max_count=max_count)
 
-    def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
-        if word_embeddings is None:
+    def forward(
+        self,
+        context_embedding,
+        feature_embeddings=None,
+        count=None,
+        threshold=0.5,
+        feature_mask=None,
+    ):
+        if feature_embeddings is None:
             B = context_embedding.shape[0]
             device = context_embedding.device
             return (
                 torch.zeros(B, 0, context_embedding.shape[-1], device=device),
                 torch.zeros(B, 0, dtype=torch.bool, device=device),
             )
-        return self.groups_layer(context_embedding, word_embeddings, count_val=count, threshold=threshold)
+        return self.groups_layer(context_embedding, feature_embeddings, count_val=count, threshold=threshold)
 
 
 class QueryTransformerAnchorLayer(AnchorLayer, anchor_mode="query_transformer"):
@@ -260,12 +363,19 @@ class QueryTransformerAnchorLayer(AnchorLayer, anchor_mode="query_transformer"):
             num_layers=num_layers, dropout=dropout, max_count=max_count,
         )
 
-    def forward(self, context_embedding, word_embeddings=None, count=None, threshold=0.5):
-        if word_embeddings is None:
+    def forward(
+        self,
+        context_embedding,
+        feature_embeddings=None,
+        count=None,
+        threshold=0.5,
+        feature_mask=None,
+    ):
+        if feature_embeddings is None:
             B = context_embedding.shape[0]
             device = context_embedding.device
             return (
                 torch.zeros(B, 0, context_embedding.shape[-1], device=device),
                 torch.zeros(B, 0, dtype=torch.bool, device=device),
             )
-        return self.groups_layer(context_embedding, word_embeddings, count_val=count, threshold=threshold)
+        return self.groups_layer(context_embedding, feature_embeddings, count_val=count, threshold=threshold)

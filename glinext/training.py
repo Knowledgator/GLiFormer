@@ -16,6 +16,9 @@ _LABEL_KEYS = frozenset({
     "ner_labels", "cat_labels", "rel_labels",
     "open_rel_labels", "structuring_labels",
     "embedding_labels", "count_targets",
+    "image_classification_labels", "object_detection_class_labels",
+    "segmentation_class_labels", "audio_classification_labels",
+    "audio_segmentation_class_labels",
 })
 
 

@@ -36,12 +36,14 @@ class TaskFlatInputs:
     BN = total number of subtask groups across the batch for a specific task.
     E.g., if batch item 0 has 3 NER schemas and item 1 has 1, BN=4 for NER.
     """
-    words_embedding: torch.Tensor     # (BN, W, D) word embeddings repeated per group
-    mask: torch.Tensor                # (BN, W) word mask repeated per group
+    words_embedding: torch.Tensor     # (BN, W, D) backward-compatible text/feature embeddings
+    mask: torch.Tensor                # (BN, W) backward-compatible text/feature mask
     parent_embedding: torch.Tensor    # (BN, D) parent embedding per group
     child_embedding: torch.Tensor     # (BN, max_C, D) child embeddings per group
     child_mask: torch.Tensor          # (BN, max_C) child mask per group
     batch_origin: torch.Tensor        # (BN,) maps flat idx to original batch idx
+    feature_embedding: Optional[torch.Tensor] = None  # (BN, L, D) task input features
+    feature_mask: Optional[torch.Tensor] = None        # (BN, L) task input mask
 
 
 @dataclass
@@ -80,6 +82,8 @@ class TaskHead(ABC, nn.Module):
             num_heads=getattr(task_cfg, "anchor_num_heads", 4),
             num_layers=getattr(task_cfg, "anchor_num_layers", 2),
             dropout=dropout,
+            feature_mlp=getattr(task_cfg, "feature_anchor_mlp", False),
+            feature_mlp_hidden_multiplier=getattr(task_cfg, "feature_anchor_mlp_hidden_multiplier", 1),
         )
 
         if "anchor_modeling" in shared_layers:

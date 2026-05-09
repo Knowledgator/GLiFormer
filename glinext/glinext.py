@@ -271,6 +271,69 @@ class BaseGLiNExT(BaseGLiNER):
             input_x.append(item)
         return input_x
 
+    @staticmethod
+    def _single_or_batch(items, single: bool):
+        return items[0] if single else items
+
+    @staticmethod
+    def _label_group_count(labels) -> int:
+        if isinstance(labels, dict):
+            return len(labels)
+        return 1 if labels is not None else 0
+
+    @staticmethod
+    def _collapse_single_group_results(results: List[Any]) -> List[Any]:
+        collapsed = []
+        for result in results:
+            if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+                collapsed.append(result[0])
+            else:
+                collapsed.append(result)
+        return collapsed
+
+    @staticmethod
+    def _normalize_texts(texts: Union[str, List[str]]) -> Tuple[List[str], bool]:
+        if isinstance(texts, str):
+            return [texts], True
+        return list(texts), False
+
+    @staticmethod
+    def _normalize_media_inputs(inputs: Any, tensor_batch_rank: Optional[int] = None) -> Tuple[List[Any], bool]:
+        if isinstance(inputs, (str, Path)):
+            return [inputs], True
+        if isinstance(inputs, torch.Tensor):
+            if tensor_batch_rank is not None and inputs.dim() == tensor_batch_rank:
+                return [inputs[i] for i in range(inputs.shape[0])], False
+            return [inputs], True
+        if isinstance(inputs, (list, tuple)):
+            return list(inputs), False
+        return [inputs], True
+
+    @staticmethod
+    def _normalize_media_label_groups(
+        labels: Union[List[str], Dict[str, List[str]]],
+    ) -> List[Dict[str, Any]]:
+        if isinstance(labels, dict):
+            return [
+                {
+                    "name": name,
+                    "all_labels": list(dict.fromkeys(group_labels)),
+                    "true_labels": [],
+                }
+                for name, group_labels in labels.items()
+            ]
+        if isinstance(labels, list):
+            return [{"name": None, "all_labels": list(dict.fromkeys(labels)), "true_labels": []}]
+        raise TypeError(f"Expected labels to be a list or dict, got {type(labels)}.")
+
+    @staticmethod
+    def _media_item(value: Any, path_key: str, tensor_key: str) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, (str, Path)):
+            return {path_key: value}
+        return {tensor_key: value}
+
     def _require_task_heads(self, *task_names: str):
         missing = [
             task_name for task_name in task_names
@@ -450,7 +513,10 @@ class BaseGLiNExT(BaseGLiNER):
         num_original: int,
     ) -> Dict[str, Any]:
         result = dict(kwargs)
-        for key in ("pixel_values", "vision_attention_mask", "audio_values", "audio_attention_mask", "bbox"):
+        for key in (
+            "pixel_values", "vision_attention_mask", "vision_input_mask",
+            "audio_values", "audio_attention_mask", "audio_input_mask", "bbox",
+        ):
             value = result.get(key)
             if isinstance(value, torch.Tensor) and value.shape[0] == num_original:
                 index = torch.tensor(valid_to_orig_idx, dtype=torch.long, device=value.device)
@@ -473,6 +539,7 @@ class BaseGLiNExT(BaseGLiNER):
         threshold: float,
         flat_ner: bool,
         multi_label: bool,
+        decoder_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Tuple[Dict[str, list], list]:
         """Run model forward + decode for each batch, accumulating per-task results.
@@ -515,6 +582,7 @@ class BaseGLiNExT(BaseGLiNER):
                 flat_ner=flat_ner,
                 multi_label=multi_label,
                 texts=tokens,
+                **(decoder_kwargs or {}),
             )
 
             # Accumulate per-item classes_mapping for schema name resolution
@@ -529,6 +597,69 @@ class BaseGLiNExT(BaseGLiNER):
                 accumulated[task_name].extend(task_results)
 
         return accumulated, all_classes_mappings
+
+    @torch.no_grad()
+    def _predict_media_task(
+        self,
+        inputs: Any,
+        labels: Union[List[str], Dict[str, List[str]]],
+        task_name: str,
+        path_key: str,
+        tensor_key: str,
+        tensor_batch_rank: Optional[int],
+        threshold: float = 0.5,
+        multi_label: bool = True,
+        batch_size: int = 8,
+        decoder_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
+        self._require_task_heads(task_name)
+        self.eval()
+
+        values, single = self._normalize_media_inputs(inputs, tensor_batch_rank=tensor_batch_rank)
+        label_groups = self._normalize_media_label_groups(labels)
+
+        input_x = []
+        for value in values:
+            item = self._media_item(value, path_key=path_key, tensor_key=tensor_key)
+            item[task_name] = [dict(group) for group in label_groups]
+            input_x.append(item)
+
+        collator_cls = self.data_collator_class or resolve_glinext_collator_class(self.config)
+        collator = collator_cls(
+            self.config,
+            data_processor=self.data_processor,
+            return_tokens=False,
+            prepare_labels=False,
+        )
+
+        data_loader = DataLoader(
+            input_x,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collator,
+        )
+
+        decoded, _ = self._process_multitask_batches(
+            data_loader,
+            threshold=threshold,
+            flat_ner=True,
+            multi_label=multi_label,
+            decoder_kwargs=decoder_kwargs,
+            **kwargs,
+        )
+        results = self.decoder.map_results(
+            decoded,
+            valid_to_orig_idx=list(range(len(values))),
+            all_start_maps=[[] for _ in values],
+            all_end_maps=[[] for _ in values],
+            valid_texts=["" for _ in values],
+            num_original=len(values),
+        )
+        task_results = results.get(task_name, [[] for _ in values])
+        if len(label_groups) == 1:
+            task_results = self._collapse_single_group_results(task_results)
+        return self._single_or_batch(task_results, single)
 
     def _map_multitask_results(
         self,
@@ -559,100 +690,214 @@ class BaseGLiNExT(BaseGLiNER):
 
     def predict_entities(
         self,
-        text: str,
+        texts: Union[str, List[str]],
         entities: Union[List[str], Dict[str, List[str]]],
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
         **kwargs,
-    ) -> List[Dict]:
-        """Predict entities for a single text.
+    ) -> Union[List[Dict], List[List[Dict]]]:
+        """Predict entities for one text or a batch of texts.
 
         Returns:
-            List of entity dicts with start, end, text, label, score.
+            Entity dicts for a single input, or a per-input list for a batch.
         """
+        text_batch, single = self._normalize_texts(texts)
         results = self.inference(
-            [text], entities=entities, flat_ner=flat_ner,
+            text_batch, entities=entities, flat_ner=flat_ner,
             threshold=threshold, multi_label=multi_label, **kwargs,
         )
-        return results.get("ner", [[]])[0]
-
-    def batch_predict_entities(
-        self,
-        texts: List[str],
-        entities: Union[List[str], Dict[str, List[str]]],
-        flat_ner: bool = True,
-        threshold: float = 0.5,
-        multi_label: bool = False,
-        **kwargs,
-    ) -> List[List[Dict]]:
-        """Predict entities for multiple texts.
-
-        Returns:
-            List of lists of entity dicts.
-        """
-        results = self.inference(
-            texts, entities=entities, flat_ner=flat_ner,
-            threshold=threshold, multi_label=multi_label, **kwargs,
-        )
-        return results.get("ner", [[] for _ in texts])
+        return self._single_or_batch(results.get("ner", [[] for _ in text_batch]), single)
 
     def classify(
         self,
-        text: str,
+        texts: Union[str, List[str]],
         classes: Union[List[str], Dict[str, List[str]]],
         threshold: float = 0.5,
         **kwargs,
-    ) -> List[Dict]:
-        """Classify a single text.
+    ) -> Union[List[Dict], List[List[Dict]]]:
+        """Classify one text or a batch of texts.
 
         Returns:
-            List of predicted label dicts with class_id, score.
+            Label dicts for a single input, or a per-input list for a batch.
         """
+        text_batch, single = self._normalize_texts(texts)
         results = self.inference(
-            [text], classes=classes, threshold=threshold, **kwargs,
+            text_batch, classes=classes, threshold=threshold, **kwargs,
         )
-        return results.get("classification", [[]])[0]
+        task_results = results.get("classification", [[] for _ in text_batch])
+        if self._label_group_count(classes) == 1:
+            task_results = self._collapse_single_group_results(task_results)
+        return self._single_or_batch(task_results, single)
 
     def predict_relations(
         self,
-        text: str,
+        texts: Union[str, List[str]],
         relations: Union[List[str], Dict[str, List[str]]],
         threshold: float = 0.5,
         flat_ner: bool = True,
         **kwargs,
-    ) -> List[Dict]:
-        """Extract relations from a single text.
+    ) -> Union[List[Dict], List[List[Dict]]]:
+        """Extract relations from one text or a batch of texts.
 
         Returns:
-            List of relation triple dicts with head, tail, relation, score.
+            Relation dicts for a single input, or a per-input list for a batch.
         """
+        text_batch, single = self._normalize_texts(texts)
         results = self.inference(
-            [text], relations=relations, threshold=threshold,
+            text_batch, relations=relations, threshold=threshold,
             flat_ner=flat_ner, **kwargs,
         )
-        return results.get("open_relex", [[]])[0]
+        task_results = results.get("open_relex", [[] for _ in text_batch])
+        if self._label_group_count(relations) == 1:
+            task_results = self._collapse_single_group_results(task_results)
+        return self._single_or_batch(task_results, single)
 
     def structure(
         self,
-        text: str,
+        texts: Union[str, List[str]],
         structures: Dict[str, Union[List[str], dict]],
         threshold: float = 0.5,
         flat_ner: bool = True,
         **kwargs,
-    ) -> Dict[str, List[Dict]]:
-        """Extract structured data from a single text.
+    ) -> Union[Dict[str, List[Dict]], List[Dict[str, List[Dict]]]]:
+        """Extract structured data from one text or a batch of texts.
 
         Returns:
-            Dict mapping schema names to lists of extracted instances::
+            A schema result dict for a single input, or one dict per input::
 
                 {"person": [{"name": "John", "age": "30"}, ...]}
         """
+        text_batch, single = self._normalize_texts(texts)
         results = self.inference(
-            [text], structures=structures, threshold=threshold,
+            text_batch, structures=structures, threshold=threshold,
             flat_ner=flat_ner, **kwargs,
         )
-        return results.get("structuring", [{}])[0]
+        return self._single_or_batch(results.get("structuring", [{} for _ in text_batch]), single)
+
+    def classify_images(
+        self,
+        images: Any,
+        classes: Union[List[str], Dict[str, List[str]]],
+        threshold: float = 0.5,
+        multi_label: bool = True,
+        batch_size: int = 8,
+        **kwargs,
+    ):
+        """Classify one image or a batch of images."""
+        return self._predict_media_task(
+            images,
+            labels=classes,
+            task_name="image_classification",
+            path_key="image",
+            tensor_key="pixel_values",
+            tensor_batch_rank=4,
+            threshold=threshold,
+            multi_label=multi_label,
+            batch_size=batch_size,
+            **kwargs,
+        )
+
+    def detect_objects(
+        self,
+        images: Any,
+        classes: Union[List[str], Dict[str, List[str]]],
+        threshold: float = 0.5,
+        batch_size: int = 8,
+        **kwargs,
+    ):
+        """Detect objects in one image or a batch of images."""
+        return self._predict_media_task(
+            images,
+            labels=classes,
+            task_name="object_detection",
+            path_key="image",
+            tensor_key="pixel_values",
+            tensor_batch_rank=4,
+            threshold=threshold,
+            multi_label=False,
+            batch_size=batch_size,
+            **kwargs,
+        )
+
+    def segment_instances(
+        self,
+        images: Any,
+        classes: Union[List[str], Dict[str, List[str]]],
+        threshold: float = 0.5,
+        mask_threshold: float = 0.5,
+        return_masks: bool = False,
+        batch_size: int = 8,
+        **kwargs,
+    ):
+        """Segment object instances in one image or a batch of images."""
+        return self._predict_media_task(
+            images,
+            labels=classes,
+            task_name="segmentation",
+            path_key="image",
+            tensor_key="pixel_values",
+            tensor_batch_rank=4,
+            threshold=threshold,
+            multi_label=False,
+            batch_size=batch_size,
+            decoder_kwargs={
+                "mask_threshold": mask_threshold,
+                "return_masks": return_masks,
+            },
+            **kwargs,
+        )
+
+    def classify_audio(
+        self,
+        audio: Any,
+        classes: Union[List[str], Dict[str, List[str]]],
+        threshold: float = 0.5,
+        multi_label: bool = True,
+        batch_size: int = 8,
+        **kwargs,
+    ):
+        """Classify one audio input or a batch of audio inputs."""
+        return self._predict_media_task(
+            audio,
+            labels=classes,
+            task_name="audio_classification",
+            path_key="audio",
+            tensor_key="audio_values",
+            tensor_batch_rank=None,
+            threshold=threshold,
+            multi_label=multi_label,
+            batch_size=batch_size,
+            **kwargs,
+        )
+
+    def segment_audio(
+        self,
+        audio: Any,
+        classes: Union[List[str], Dict[str, List[str]]],
+        threshold: float = 0.5,
+        mask_threshold: float = 0.5,
+        return_masks: bool = False,
+        batch_size: int = 8,
+        **kwargs,
+    ):
+        """Segment one audio input or a batch of audio inputs."""
+        return self._predict_media_task(
+            audio,
+            labels=classes,
+            task_name="audio_segmentation",
+            path_key="audio",
+            tensor_key="audio_values",
+            tensor_batch_rank=None,
+            threshold=threshold,
+            multi_label=False,
+            batch_size=batch_size,
+            decoder_kwargs={
+                "mask_threshold": mask_threshold,
+                "return_masks": return_masks,
+            },
+            **kwargs,
+        )
 
     @torch.no_grad()
     def embed_text(
@@ -1096,6 +1341,14 @@ _GLINEXT_MODEL_TO_WRAPPER = {
     GLiNExTOmniModel: GLiNExTOmni,
 }
 
+_GLINEXT_VARIANT_TO_CONFIG_CLASS = {
+    "text": GLiNextTextConfig,
+    "layout": GLiNextLayoutConfig,
+    "vision": GLiNextVisionConfig,
+    "audio": GLiNextAudioConfig,
+    "omni": GLiNextOmniConfig,
+}
+
 
 class GLiNExT(nn.Module, PyTorchModelHubMixin):
     """Factory class that instantiates the appropriate GLiNExT wrapper.
@@ -1114,21 +1367,39 @@ class GLiNExT(nn.Module, PyTorchModelHubMixin):
         self.__dict__ = new_instance.__dict__
 
     @staticmethod
-    def _coerce_config(config: Union[str, Path, GLiNextConfig, dict]) -> GLiNextConfig:
+    def _config_class_for_variant(config_dict: Dict[str, Any]):
+        variant = config_dict.get("model_variant") or "text"
+        try:
+            return _GLINEXT_VARIANT_TO_CONFIG_CLASS[variant]
+        except KeyError as exc:
+            raise ValueError(
+                "model_variant must be one of "
+                f"{sorted(_GLINEXT_VARIANT_TO_CONFIG_CLASS)}, got {variant!r}."
+            ) from exc
+
+    @classmethod
+    def _coerce_config_dict(cls, config_dict: Dict[str, Any]) -> GLiNextConfig:
+        config_dict = dict(config_dict)
+        config_dict.pop("model_type", None)
+        config_cls = cls._config_class_for_variant(config_dict)
+        return config_cls(**config_dict)
+
+    @classmethod
+    def _coerce_config(cls, config: Union[str, Path, GLiNextConfig, dict]) -> GLiNextConfig:
         if isinstance(config, (str, Path)):
             config_path = Path(config)
             if not config_path.exists():
                 raise FileNotFoundError(f"Config file not found: {config}")
             with open(config_path) as f:
                 config_dict = json.load(f)
-            config_dict.pop("model_type", None)
-            return GLiNextConfig(**config_dict)
+            return cls._coerce_config_dict(config_dict)
         if isinstance(config, dict):
-            config_dict = config.copy()
-            config_dict.pop("model_type", None)
-            return GLiNextConfig(**config_dict)
+            return cls._coerce_config_dict(config)
         if isinstance(config, GLiNextConfig):
-            return config
+            config_cls = cls._config_class_for_variant(config.to_dict())
+            if isinstance(config, config_cls):
+                return config
+            return cls._coerce_config_dict(config.to_dict())
         raise TypeError(f"config must be a GLiNextConfig object, path to config file, or dict. Got {type(config)}")
 
     @staticmethod
@@ -1185,6 +1456,7 @@ class GLiNExT(nn.Module, PyTorchModelHubMixin):
             post_fusion_schema=post_fusion_schema,
             _attn_implementation=_attn_implementation,
         )
+        config = cls._coerce_config(config)
         glinext_class = cls._get_glinext_class(config)
         logger.info("Loading the following GLiNExT type: %s...", glinext_class)
         return glinext_class.from_pretrained(
@@ -1234,7 +1506,7 @@ class GLiNExT(nn.Module, PyTorchModelHubMixin):
         config_instance = cls._coerce_config(config)
         glinext_class = cls._get_glinext_class(config_instance)
         return glinext_class.load_from_config(
-            config=config,
+            config=config_instance,
             cache_dir=cache_dir,
             load_tokenizer=load_tokenizer,
             resize_token_embeddings=resize_token_embeddings,

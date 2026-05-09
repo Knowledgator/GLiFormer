@@ -48,6 +48,18 @@ class VisionProcessor(TaskProcessor):
         self.max_count = int(getattr(cfg, "max_count", 100))
         self.mask_size = int(getattr(cfg, "mask_size", 128))
 
+    def _task_label_groups(self, item: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        groups = item.get(self.task_name)
+        if groups is None:
+            return None
+        if isinstance(groups, dict):
+            groups = [groups]
+        elif isinstance(groups, (list, tuple)) and (
+            not groups or not isinstance(groups[0], dict)
+        ):
+            groups = [{"all_labels": list(groups)}]
+        return list(groups)
+
     @staticmethod
     def labels_from_item(item: Dict[str, Any]) -> List[str]:
         labels = item.get("labels") or item.get("classes") or item.get("all_labels")
@@ -65,23 +77,38 @@ class VisionProcessor(TaskProcessor):
     def get_classes_mapping(self, batch_list, **kwargs):
         mappings = []
         for item in batch_list:
-            labels = self.labels_from_item(item)
-            if not labels:
+            if item.get("_skip_vision_tasks"):
                 mappings.append(VisionClassMapping())
                 continue
-            mappings.append(
-                VisionClassMapping(
-                    items=[
-                        VisionItemMapping(
-                            class_to_id=BaseClassMapping(
-                                class_to_id={label: idx for idx, label in enumerate(labels)},
-                                name=item.get("name", self.task_name),
-                            ),
-                            name=item.get("name", self.task_name),
-                        )
-                    ]
+
+            task_groups = self._task_label_groups(item)
+            if task_groups is None:
+                labels = self.labels_from_item(item)
+                task_groups = [{
+                    "name": item.get("name", self.task_name),
+                    "all_labels": labels,
+                }]
+
+            item_mappings = []
+            for group in task_groups:
+                labels = group.get("all_labels") or group.get("labels") or group.get("classes")
+                labels = _unique(labels or [])
+                if not labels:
+                    continue
+                item_mappings.append(
+                    VisionItemMapping(
+                        class_to_id=BaseClassMapping(
+                            class_to_id={label: idx for idx, label in enumerate(labels)},
+                            name=group.get("name", item.get("name", self.task_name)),
+                        ),
+                        name=group.get("name", item.get("name", self.task_name)),
+                    )
                 )
-            )
+
+            if not item_mappings:
+                mappings.append(VisionClassMapping())
+                continue
+            mappings.append(VisionClassMapping(items=item_mappings))
         return mappings
 
     def contribute_prompt(self, classes_mapping: BatchClassesMapping, batch_idx, use_labels_encoder=False):

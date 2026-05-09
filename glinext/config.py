@@ -20,6 +20,8 @@ class BaseHeadConfig:
     focal_loss_prob_margin: Optional[float] = None
     anchor_mode: str = "parent"
     anchor_modeling: str = "linear"
+    feature_anchor_mlp: bool = False
+    feature_anchor_mlp_hidden_multiplier: int = 1
     anchor_refine_layers: int = 0
     anchor_refine_heads: int = 8
     represent_spans: bool = False
@@ -122,7 +124,7 @@ class OpenRelexHeadConfig(BaseHeadConfig):
     Standalone head — no NER dependency. Uses configurable anchor layers
     to extract head/tail spans directly per (anchor, rel_type) pair.
     """
-    anchor_mode: str = "fixed"          # "fixed", "rotary", "query_rnn", "query_transformer"
+    anchor_mode: str = "fixed"          # "fixed", "features", "rotary", "query_rnn", "query_transformer"
     num_fixed_slots: int = 10
     max_count: int = 20
     anchor_num_heads: int = 4
@@ -133,7 +135,7 @@ class OpenRelexHeadConfig(BaseHeadConfig):
 
 @dataclass
 class StructuringHeadConfig(BaseHeadConfig):
-    anchor_mode: str = "rnn"  # "rnn", "query_rnn", "query_transformer", "fixed"
+    anchor_mode: str = "rnn"  # "rnn", "features", "query_rnn", "query_transformer", "fixed"
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
     max_count: int = 20

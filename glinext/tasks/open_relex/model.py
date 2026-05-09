@@ -65,8 +65,8 @@ class OpenRelexHead(TaskHead):
         span_mask = batch.get("open_rel_span_mask")
         span_labels = batch.get("open_rel_span_labels")
 
-        words_embedding = flat_inputs.words_embedding       # (BN, W, D)
-        mask = flat_inputs.mask                              # (BN, W)
+        feature_embeddings = flat_inputs.words_embedding     # (BN, W, D)
+        feature_mask = flat_inputs.mask                      # (BN, W)
         rel_embedding = flat_inputs.child_embedding          # (BN, max_C, D)
         rel_embedding_mask = flat_inputs.child_mask          # (BN, max_C)
         parent_embedding = flat_inputs.parent_embedding      # (BN, D)
@@ -76,22 +76,22 @@ class OpenRelexHead(TaskHead):
 
         # 2. Generate anchors
         anchors, anchor_mask = self.anchor_layer(
-            parent_embedding, words_embedding,
-            count=open_rel_count, threshold=threshold,
+            parent_embedding, feature_embeddings,
+            count=open_rel_count, threshold=threshold, feature_mask=feature_mask,
         )
 
         if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(anchors, words_embedding, token_mask=mask)
+            anchors = self.anchor_refine(anchors, feature_embeddings, token_mask=feature_mask)
 
         # 3. Fuse anchors + rel types: (B, X, C, D)
         fused = self.anchor_modeling(anchors, rel_embedding)
         B, X, C, D = fused.shape
-        L = words_embedding.shape[1]
+        L = feature_embeddings.shape[1]
         fused_flat = fused.view(B, X * C, D)
 
         # 4. Score head and tail spans separately
-        head_logits_flat = self.head_scorer(fused_flat, words_embedding, word_mask=mask)  # (B, X*C, L, 3)
-        tail_logits_flat = self.tail_scorer(fused_flat, words_embedding, word_mask=mask)  # (B, X*C, L, 3)
+        head_logits_flat = self.head_scorer(fused_flat, feature_embeddings, word_mask=feature_mask)  # (B, X*C, L, 3)
+        tail_logits_flat = self.tail_scorer(fused_flat, feature_embeddings, word_mask=feature_mask)  # (B, X*C, L, 3)
 
         # 5. Reshape and stack: (B, X, C, L, 2, 3)
         head_logits = head_logits_flat.view(B, X, C, L, 3)
@@ -102,7 +102,7 @@ class OpenRelexHead(TaskHead):
         span_logits_out = None
         if self.represent_spans and hasattr(self, "span_rep_layer"):
             if span_idx is not None:
-                span_rep = self.span_rep_layer(words_embedding, span_idx)  # (B, S, D)
+                span_rep = self.span_rep_layer(feature_embeddings, span_idx)  # (B, S, D)
                 S = span_rep.shape[1]
                 # Separate projections for head/tail roles
                 head_span_rep = self.head_span_proj(span_rep)  # (B, S, D)
@@ -133,7 +133,7 @@ class OpenRelexHead(TaskHead):
 
             # Build masks: anchor × rel_class × word
             inst_mask = anchor_mask[:, :min_X].float()
-            word_mask_f = mask[:, :min_L].float()
+            word_mask_f = feature_mask[:, :min_L].float()
             rel_mask_f = rel_embedding_mask[:, :min_C].float()
 
             full_mask = (

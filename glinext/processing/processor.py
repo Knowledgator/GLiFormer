@@ -1071,9 +1071,11 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             "word_bboxes": batch.get("word_bboxes"),
             "pixel_values": batch.get("pixel_values"),
             "vision_attention_mask": batch.get("vision_attention_mask"),
+            "vision_input_mask": batch.get("vision_input_mask"),
             "image_sizes": batch.get("image_sizes"),
             "audio_values": batch.get("audio_values"),
             "audio_attention_mask": batch.get("audio_attention_mask"),
+            "audio_input_mask": batch.get("audio_input_mask"),
             "bbox": batch.get("bbox"),
         }
 
@@ -1395,28 +1397,204 @@ class GLiNextOmniProcessor(
 
     processor_task_names = _ALL_TASKS
 
+    @staticmethod
+    def _has_vision_payload(item: Dict[str, Any]) -> bool:
+        return item.get("image") is not None or item.get("pixel_values") is not None
+
+    @staticmethod
+    def _has_audio_payload(item: Dict[str, Any]) -> bool:
+        return any(
+            item.get(key) is not None
+            for key in ("audio", "audio_values", "mel_values", "mel_spectrogram", "audio_features")
+        )
+
+    @staticmethod
+    def _requires_vision_payload(item: Dict[str, Any]) -> bool:
+        return any(item.get(name) is not None for name in _VISION_TASKS) or bool(item.get("objects"))
+
+    @staticmethod
+    def _requires_audio_payload(item: Dict[str, Any]) -> bool:
+        return any(item.get(name) is not None for name in _AUDIO_TASKS) or bool(
+            item.get("segments") or item.get("audio_segments")
+        )
+
+    def _mark_optional_media_items(self, batch_list):
+        for item in batch_list:
+            has_vision = self._has_vision_payload(item)
+            has_audio = self._has_audio_payload(item)
+
+            if not has_vision:
+                if self._requires_vision_payload(item):
+                    raise ValueError(
+                        "Omni vision task rows require 'image' or 'pixel_values'."
+                    )
+                item["_skip_vision_tasks"] = True
+            else:
+                item.pop("_skip_vision_tasks", None)
+
+            if not has_audio:
+                if self._requires_audio_payload(item):
+                    raise ValueError(
+                        "Omni audio task rows require 'audio', 'audio_values', or audio feature tensors."
+                    )
+                item["_skip_audio_tasks"] = True
+            else:
+                item.pop("_skip_audio_tasks", None)
+
+    def _prepare_optional_vision_batch(self, batch_list):
+        if not self._has_vision_inputs():
+            return {}
+
+        image_tensors = [None for _ in batch_list]
+        image_sizes = [(0, 0) for _ in batch_list]
+        max_shape = None
+        any_payload = False
+
+        for idx, item in enumerate(batch_list):
+            if item.get("_skip_vision_tasks"):
+                continue
+            tensor, image_size = self.load_image(item, getattr(self.config, "image_size", None))
+            item["_image_size"] = image_size
+            image_tensors[idx] = tensor
+            image_sizes[idx] = image_size
+            any_payload = True
+
+            shape = tuple(tensor.shape)
+            if max_shape is None:
+                max_shape = list(shape)
+            elif len(shape) != len(max_shape):
+                raise ValueError("All image tensors in an omni batch must have the same rank.")
+            else:
+                max_shape = [max(current, int(dim)) for current, dim in zip(max_shape, shape)]
+
+        if not any_payload:
+            return {}
+
+        pixel_values = torch.zeros((len(batch_list), *max_shape), dtype=torch.float)
+        vision_input_mask = torch.zeros(len(batch_list), dtype=torch.long)
+        for idx, tensor in enumerate(image_tensors):
+            if tensor is None:
+                continue
+            slices = (idx, *[slice(0, int(dim)) for dim in tensor.shape])
+            pixel_values[slices] = tensor
+            vision_input_mask[idx] = 1
+
+        return {
+            "pixel_values": pixel_values,
+            "image_sizes": torch.tensor(image_sizes, dtype=torch.long),
+            "vision_input_mask": vision_input_mask,
+        }
+
+    def _prepare_optional_audio_batch(self, batch_list):
+        if not self._has_audio_inputs():
+            return {}
+
+        audio_tensors = [None for _ in batch_list]
+        max_audio_shape = None
+        max_audio_len = 0
+        any_payload = False
+
+        for idx, item in enumerate(batch_list):
+            if item.get("_skip_audio_tasks"):
+                continue
+            tensor, time_length = self.load_audio(item)
+            item["_audio_num_samples"] = time_length
+            audio_tensors[idx] = tensor
+            any_payload = True
+
+            shape = tuple(tensor.shape)
+            if max_audio_shape is None:
+                max_audio_shape = list(shape)
+            elif len(shape) != len(max_audio_shape):
+                raise ValueError("All audio tensors in an omni batch must have the same rank.")
+            else:
+                max_audio_shape = [max(current, int(dim)) for current, dim in zip(max_audio_shape, shape)]
+            max_audio_len = max(max_audio_len, time_length)
+
+        if not any_payload:
+            return {}
+
+        audio_values = torch.zeros((len(batch_list), *max_audio_shape), dtype=torch.float)
+        audio_attention_mask = torch.zeros(len(batch_list), max_audio_len, dtype=torch.long)
+        audio_input_mask = torch.zeros(len(batch_list), dtype=torch.long)
+        for idx, tensor in enumerate(audio_tensors):
+            if tensor is None:
+                continue
+            slices = (idx, *[slice(0, int(dim)) for dim in tensor.shape])
+            audio_values[slices] = tensor
+            audio_attention_mask[idx, :self._time_length(tensor)] = 1
+            audio_input_mask[idx] = 1
+
+        return {
+            "audio_values": audio_values,
+            "audio_attention_mask": audio_attention_mask,
+            "audio_input_mask": audio_input_mask,
+        }
+
     def collate_raw_batch(self, batch_list, **kwargs):
+        self._mark_optional_media_items(batch_list)
         layout_fields = self._prepare_layout_batch(batch_list)
         batch = GLiNextTextProcessor.collate_raw_batch(self, batch_list, **kwargs)
-        batch.update(self._prepare_vision_batch(batch_list))
-        batch.update(self._prepare_audio_batch(batch_list))
+        batch.update(self._prepare_optional_vision_batch(batch_list))
+        batch.update(self._prepare_optional_audio_batch(batch_list))
         batch.update(layout_fields)
+        batch.update({
+            "labels": [item.get("labels") for item in batch_list],
+            "classes": [item.get("classes") for item in batch_list],
+            "all_labels": [item.get("all_labels") for item in batch_list],
+            "true_labels": [item.get("true_labels") for item in batch_list],
+            "name": [item.get("name") for item in batch_list],
+            "segments": [item.get("segments") for item in batch_list],
+            "audio_segments": [item.get("audio_segments") for item in batch_list],
+            "duration": [item.get("duration") for item in batch_list],
+            "audio_duration": [item.get("audio_duration") for item in batch_list],
+            "sample_rate": [item.get("sample_rate") for item in batch_list],
+        })
         return batch
+
+    def _build_label_batch_list(self, batch):
+        batch_list = GLiNextTextProcessor._build_label_batch_list(self, batch)
+        for i, item in enumerate(batch_list):
+            for field in (
+                "labels", "classes", "all_labels", "true_labels", "name",
+                "segments", "audio_segments", "duration", "audio_duration",
+                "sample_rate",
+            ):
+                values = batch.get(field)
+                if values is not None and i < len(values) and values[i] is not None:
+                    item[field] = values[i]
+        return batch_list
 
     def tokenize_and_prepare_labels(self, batch, prepare_labels=True, *args, **kwargs):
         tokenized_input = GLiNextTextProcessor.tokenize_and_prepare_labels(
             self, batch, prepare_labels, *args, **kwargs,
         )
+        if prepare_labels:
+            classes_mapping = batch["classes_mapping"]
+            max_seq_len = batch["seq_length"].max().item()
+            batch_list = self._build_label_batch_list(batch)
+            tokenized_input.update(
+                self.create_task_labels(
+                    batch_list,
+                    classes_mapping,
+                    (*_VISION_TASKS, *_AUDIO_TASKS),
+                    max_seq_len=max_seq_len,
+                )
+            )
         if batch.get("pixel_values") is not None:
             tokenized_input["pixel_values"] = batch["pixel_values"]
         if batch.get("vision_attention_mask") is not None:
             tokenized_input["vision_attention_mask"] = batch["vision_attention_mask"]
+        if batch.get("vision_input_mask") is not None:
+            tokenized_input["vision_input_mask"] = batch["vision_input_mask"]
         if batch.get("image_sizes") is not None:
             tokenized_input["image_sizes"] = batch["image_sizes"]
         if batch.get("audio_values") is not None:
             tokenized_input["audio_values"] = batch["audio_values"]
         if batch.get("audio_attention_mask") is not None:
             tokenized_input["audio_attention_mask"] = batch["audio_attention_mask"]
+        if batch.get("audio_input_mask") is not None:
+            tokenized_input["audio_input_mask"] = batch["audio_input_mask"]
         return tokenized_input
 
 

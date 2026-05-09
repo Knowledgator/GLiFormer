@@ -1,7 +1,7 @@
 """Base head for anchor-based BIO span extraction.
 
 Shared by NER and Structuring — both score (anchor × child) pairs against
-word embeddings to produce per-token BIO logits.
+sequence features to produce per-token BIO logits.
 
 Structuring is a generalization of NER where the anchor dimension A can be
 greater than one; flattening (A, C) yields the same scoring pipeline as NER.
@@ -19,7 +19,7 @@ class AnchoredSpanExtractionHead(TaskHead):
 
     Produces raw scores of shape ``(BN, A, L, C, 3)`` from
     ``anchor_modeling(anchor_layer(parent), child)`` fused against word
-    embeddings via :class:`AnchoredSpanScorer`. Subclasses reshape, mask and
+    features via :class:`AnchoredSpanScorer`. Subclasses reshape, mask and
     decode the output per task.
     """
 
@@ -50,22 +50,22 @@ class AnchoredSpanExtractionHead(TaskHead):
             fused_flat:   (BN, A*C, D) fused reps (for span-level reuse)
             dims:         (B, A, C, L)
         """
-        words_embedding = flat_inputs.words_embedding
-        word_mask = flat_inputs.mask
+        feature_embeddings = flat_inputs.words_embedding
+        feature_mask = flat_inputs.mask
         child_embedding = flat_inputs.child_embedding
         parent_embedding = flat_inputs.parent_embedding
 
         anchors, anchor_mask = self.anchor_layer(
-            parent_embedding, words_embedding, **self._anchor_kwargs(batch),
+            parent_embedding, feature_embeddings, feature_mask=feature_mask, **self._anchor_kwargs(batch),
         )
         if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(anchors, words_embedding, token_mask=word_mask)
+            anchors = self.anchor_refine(anchors, feature_embeddings, token_mask=feature_mask)
 
         fused = self.anchor_modeling(anchors, child_embedding)   # (BN, A, C, D)
         B, A, C, D = fused.shape
-        L = words_embedding.shape[1]
+        L = feature_embeddings.shape[1]
         fused_flat = fused.reshape(B, A * C, D)
-        scores_flat = self.scorer(fused_flat, words_embedding, word_mask=word_mask)
+        scores_flat = self.scorer(fused_flat, feature_embeddings, word_mask=feature_mask)
         # (BN, A*C, L, 3) → (BN, A, C, L, 3) → (BN, A, L, C, 3)
         scores = scores_flat.reshape(B, A, C, L, 3).permute(0, 1, 3, 2, 4)
         return scores, anchors, anchor_mask, fused_flat, (B, A, C, L)
@@ -122,9 +122,9 @@ class AnchoredSpanExtractionHead(TaskHead):
         span_idx = span_idx * span_mask.unsqueeze(-1).long()
         return span_idx, span_mask
 
-    def _span_logits_from_fused(self, words_embedding, fused_flat, B, A, C, span_idx):
+    def _span_logits_from_fused(self, feature_embeddings, fused_flat, B, A, C, span_idx):
         """Default span-level scoring: span_rep · fused — shape (BN, A, S, C)."""
-        span_rep = self.span_rep_layer(words_embedding, span_idx)             # (B, S, D)
+        span_rep = self.span_rep_layer(feature_embeddings, span_idx)          # (B, S, D)
         span_logits_flat = torch.einsum("BSD,BND->BSN", span_rep, fused_flat)  # (B, S, A*C)
         S = span_rep.shape[1]
         return span_logits_flat.reshape(B, S, A, C).permute(0, 2, 1, 3)

@@ -4,15 +4,24 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
 from torch import nn
 
 from gliner.modeling.loss_functions import focal_loss_with_logits
 
 from .. import TaskHead, TaskHeadOutput
+from ..matcher import HungarianMatcher
 from ...layers import Pooling
 from ...layers.mlp import create_mlp
 from ..classification.scorer import ClassificationScorer
+
+
+def _flat_features(flat_inputs):
+    features = getattr(flat_inputs, "feature_embedding", None)
+    mask = getattr(flat_inputs, "feature_mask", None)
+    return (
+        features if features is not None else flat_inputs.words_embedding,
+        mask if mask is not None else flat_inputs.mask,
+    )
 
 
 def _xyxy_from_raw(raw: torch.Tensor) -> torch.Tensor:
@@ -54,11 +63,20 @@ class ImageClassificationHead(TaskHead):
     def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
         labels = batch.get("image_classification_labels")
         base_loss_fn = batch.get("base_loss_fn")
-        image_rep = self.pooling(flat_inputs.words_embedding, flat_inputs.mask)
-        anchors, _ = self.anchor_layer(flat_inputs.parent_embedding, flat_inputs.words_embedding)
+        image_features, image_mask = _flat_features(flat_inputs)
+        image_rep = self.pooling(image_features, image_mask)
+        anchors, anchor_mask = self.anchor_layer(
+            flat_inputs.parent_embedding,
+            image_features,
+            feature_mask=image_mask,
+        )
         if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(anchors, flat_inputs.words_embedding, token_mask=flat_inputs.mask)
+            anchors = self.anchor_refine(anchors, image_features, token_mask=image_mask)
         fused = self.anchor_modeling(anchors, flat_inputs.child_embedding).squeeze(1)
+        if fused.dim() == 4:
+            anchor_weights = anchor_mask.float()
+            fused = (fused * anchor_weights[:, :, None, None]).sum(dim=1)
+            fused = fused / anchor_weights.sum(dim=1).clamp(min=1)[:, None, None]
         logits = self.scorer(image_rep, fused)
 
         loss = None
@@ -87,6 +105,10 @@ class ObjectDetectionHead(TaskHead):
         self.loss_coef = cfg.loss_coef
         if shared_layers is None:
             shared_layers = {}
+        self.matcher = HungarianMatcher(
+            cost_class=getattr(cfg, "matcher_class_cost", 1.0),
+            cost_geometry=getattr(cfg, "matcher_bbox_cost", 5.0),
+        )
         self._init_anchor_pipeline(cfg, config, hidden_size, dropout, shared_layers)
         self.class_head = nn.Linear(hidden_size, 1)
         self.bbox_head = create_mlp(
@@ -106,14 +128,16 @@ class ObjectDetectionHead(TaskHead):
                    shared_layers=shared_layers)
 
     def _compute_detection(self, flat_inputs, count=None, threshold=0.5):
+        image_features, image_mask = _flat_features(flat_inputs)
         anchors, anchor_mask = self.anchor_layer(
             flat_inputs.parent_embedding,
-            flat_inputs.words_embedding,
+            image_features,
             count=count,
             threshold=threshold,
+            feature_mask=image_mask,
         )
         if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(anchors, flat_inputs.words_embedding, token_mask=flat_inputs.mask)
+            anchors = self.anchor_refine(anchors, image_features, token_mask=image_mask)
 
         fused = self.anchor_modeling(anchors, flat_inputs.child_embedding)
         class_logits = self.class_head(fused).squeeze(-1)
@@ -121,28 +145,8 @@ class ObjectDetectionHead(TaskHead):
         objectness_logits = self.objectness_head(anchors).squeeze(-1)
         return class_logits, bbox_preds, objectness_logits, anchors, anchor_mask
 
-    def _match_single(self, class_logits, bbox_preds, gold_classes, gold_boxes, valid_objects, child_mask):
-        valid_idx = torch.nonzero(valid_objects > 0, as_tuple=False).squeeze(-1)
-        if valid_idx.numel() == 0 or class_logits.shape[0] == 0:
-            return []
-
-        gold_classes = gold_classes[valid_idx].long()
-        gold_boxes = gold_boxes[valid_idx]
-        probs = class_logits.sigmoid()
-        class_cost = []
-        for cls in gold_classes:
-            if 0 <= int(cls.item()) < probs.shape[1]:
-                class_cost.append(-probs[:, int(cls.item())])
-            else:
-                class_cost.append(torch.zeros(probs.shape[0], device=probs.device))
-        class_cost = torch.stack(class_cost, dim=1)
-        bbox_cost = torch.cdist(bbox_preds, gold_boxes, p=1)
-        cost = (
-            float(getattr(self.det_cfg, "matcher_class_cost", 1.0)) * class_cost
-            + float(getattr(self.det_cfg, "matcher_bbox_cost", 5.0)) * bbox_cost
-        )
-        rows, cols = linear_sum_assignment(cost.detach().cpu().numpy())
-        return [(int(r), int(valid_idx[int(c)].item())) for r, c in zip(rows, cols)]
+    def _match_single(self, class_logits, bbox_preds, gold_classes, gold_boxes, valid_objects):
+        return self.matcher(class_logits, bbox_preds, gold_classes, gold_boxes, valid_objects)
 
     def _detection_loss(
         self,
@@ -169,7 +173,6 @@ class ObjectDetectionHead(TaskHead):
                 class_labels[b],
                 bbox_labels[b],
                 object_mask[b],
-                child_mask[b],
             )
             matches_by_batch[b] = matches
             for anchor_idx, obj_idx in matches:
@@ -250,6 +253,10 @@ class SegmentationHead(ObjectDetectionHead):
         self.loss_coef = cfg.loss_coef
         if shared_layers is None:
             shared_layers = {}
+        self.matcher = HungarianMatcher(
+            cost_class=getattr(cfg, "matcher_class_cost", 1.0),
+            cost_geometry=getattr(cfg, "matcher_bbox_cost", 5.0),
+        )
         self._init_anchor_pipeline(cfg, config, hidden_size, dropout, shared_layers)
         self.class_head = nn.Linear(hidden_size, 1)
         self.bbox_head = create_mlp(
@@ -302,7 +309,8 @@ class SegmentationHead(ObjectDetectionHead):
             count=batch.get("segmentation_count"),
             threshold=batch.get("threshold", 0.5),
         )
-        prototypes = self._prototype_masks(flat_inputs.words_embedding)
+        image_features, _ = _flat_features(flat_inputs)
+        prototypes = self._prototype_masks(image_features)
         coefficients = self.coeff_head(anchors)
         mask_logits = torch.einsum("bphw,bap->bahw", prototypes, coefficients)
 

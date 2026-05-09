@@ -74,6 +74,15 @@ def _cache_forward_modality(module: nn.Module, name: str, tokens, mask) -> None:
         cache[name] = (tokens, mask)
 
 
+def _apply_modality_input_mask(mask: torch.Tensor, input_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    if input_mask is None:
+        return mask
+    input_mask = input_mask.to(device=mask.device, dtype=mask.dtype)
+    if input_mask.dim() == 1:
+        input_mask = input_mask[:, None]
+    return mask * input_mask
+
+
 class BaseGLiNextModel(BaseModel):
     """Unified multi-task model composing optional task heads.
 
@@ -329,6 +338,7 @@ class BaseGLiNextModel(BaseModel):
             vision_mask = vision_attention_mask.to(device=vision_tokens.device)
         else:
             vision_mask = torch.ones(vision_tokens.shape[:2], dtype=torch.long, device=vision_tokens.device)
+        vision_mask = _apply_modality_input_mask(vision_mask, kwargs.get("vision_input_mask"))
         return vision_tokens, vision_mask
 
     def _encode_audio_tokens(
@@ -354,6 +364,7 @@ class BaseGLiNextModel(BaseModel):
             audio_mask = audio_attention_mask.to(device=audio_tokens.device)
         else:
             audio_mask = torch.ones(audio_tokens.shape[:2], dtype=torch.long, device=audio_tokens.device)
+        audio_mask = _apply_modality_input_mask(audio_mask, kwargs.get("audio_input_mask"))
         return audio_tokens, audio_mask
 
     def _build_flat_rel_prompts(
@@ -523,6 +534,8 @@ class BaseGLiNextModel(BaseModel):
             child_embedding=flat_children,
             child_mask=flat_child_mask,
             batch_origin=batch_origin,
+            feature_embedding=flat_words,
+            feature_mask=flat_word_mask,
         )
 
     def get_representations(
@@ -642,6 +655,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             "audio_values",
             "vision_attention_mask",
             "audio_attention_mask",
+            "vision_input_mask",
+            "audio_input_mask",
         }
         direct_media_keys = {
             "pixel_values",
@@ -664,6 +679,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                     "vision_attention_mask": vision_attention_mask,
                     "audio_values": audio_values,
                     "audio_attention_mask": audio_attention_mask,
+                    "vision_input_mask": kwargs.get("vision_input_mask"),
+                    "audio_input_mask": kwargs.get("audio_input_mask"),
                 }
             )
 
@@ -998,19 +1015,14 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 label_group_sizes = label_group_sizes_map.get(
                     "ner" if task_name == "joint_relex" else task_name
                 )
-                flat_words = (
-                    audio_embedding
-                    if task_name in ("audio_classification", "audio_segmentation") and audio_embedding is not None
-                    else vision_embedding
-                    if task_name in ("image_classification", "object_detection", "segmentation") and vision_embedding is not None
-                    else words_embedding
-                )
-                flat_mask = (
-                    audio_mask
-                    if task_name in ("audio_classification", "audio_segmentation") and audio_mask is not None
-                    else vision_mask
-                    if task_name in ("image_classification", "object_detection", "segmentation") and vision_mask is not None
-                    else mask
+                flat_words, flat_mask = self._features_for_task(
+                    task_name=task_name,
+                    words_embedding=words_embedding,
+                    word_mask=mask,
+                    vision_embedding=vision_embedding,
+                    vision_mask=vision_mask,
+                    audio_embedding=audio_embedding,
+                    audio_mask=audio_mask,
                 )
                 flat_inputs = self._build_flat_inputs(
                     task_parent_e,
@@ -1040,6 +1052,35 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 )
 
         return flat_inputs_map, joint_rel_flat_prompts, joint_rel_flat_mask
+
+    @staticmethod
+    def _features_for_task(
+        *,
+        task_name: str,
+        words_embedding: torch.Tensor,
+        word_mask: torch.Tensor,
+        vision_embedding: Optional[torch.Tensor],
+        vision_mask: Optional[torch.Tensor],
+        audio_embedding: Optional[torch.Tensor],
+        audio_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if task_name in ("image_classification", "object_detection", "segmentation"):
+            if vision_embedding is None or vision_mask is None:
+                raise ValueError(
+                    f"{task_name} requires vision embeddings. Provide pixel_values "
+                    "for rows with active vision task groups."
+                )
+            return vision_embedding, vision_mask
+
+        if task_name in ("audio_classification", "audio_segmentation"):
+            if audio_embedding is None or audio_mask is None:
+                raise ValueError(
+                    f"{task_name} requires audio embeddings. Provide audio_values, "
+                    "audio, or audio feature tensors for rows with active audio task groups."
+                )
+            return audio_embedding, audio_mask
+
+        return words_embedding, word_mask
 
     def _build_count_flat_inputs(
         self,
@@ -1098,6 +1139,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             child_embedding=torch.zeros(count_size, 0, embed_dim, device=words_embedding.device),
             child_mask=torch.zeros(count_size, 0, device=words_embedding.device),
             batch_origin=batch_origin,
+            feature_embedding=words_embedding[batch_origin],
+            feature_mask=mask[batch_origin],
         )
 
     def _encode_embedding_pair_inputs(
@@ -2265,7 +2308,7 @@ class GLiNExTOmniModel(_GLiNExTJointForwardModel):
         allowed = {
             "packing_config", "pair_attention_mask", "pixel_values",
             "vision_attention_mask", "audio_values", "audio_attention_mask",
-            "bbox",
+            "vision_input_mask", "audio_input_mask", "bbox",
         }
         cls._reject_unsupported_input_names(kwargs)
         return {key: kwargs[key] for key in allowed if key in kwargs}
