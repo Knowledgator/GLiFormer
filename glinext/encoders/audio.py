@@ -244,6 +244,8 @@ class AudioBiEncoder(nn.Module):
     text transformer and mean-pooled into label embeddings.
     """
 
+    resizes_labels_encoder_only = True
+
     def __init__(
         self,
         config: Any,
@@ -273,10 +275,11 @@ class AudioBiEncoder(nn.Module):
 
     @staticmethod
     def mean_pooling(token_embeddings: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size())
+        input_mask_expanded = input_mask_expanded.to(dtype=token_embeddings.dtype)
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
             input_mask_expanded.sum(1),
-            min=1e-9,
+            min=1,
         )
 
     def resize_token_embeddings(
@@ -284,7 +287,7 @@ class AudioBiEncoder(nn.Module):
         new_num_tokens: int,
         pad_to_multiple_of: Optional[int] = None,
     ) -> nn.Embedding:
-        return self.labels_encoder.model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+        return self.get_input_embeddings()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.labels_encoder.model.get_input_embeddings()

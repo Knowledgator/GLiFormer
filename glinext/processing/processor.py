@@ -350,7 +350,12 @@ class VisionProcessingMixin:
 
     def _init_vision_processor(self):
         self.vision_input_processor = getattr(self.config, "vision_processor", None)
+        self._vision_processor_initialized = self.vision_input_processor is not None
+        if self._vision_processor_initialized or not self._has_vision_inputs():
+            return
+        self._build_vision_processor()
 
+    def _build_vision_processor(self):
         processor_name = getattr(self.config, "vision_processor_name", None)
         processor_mode = str(getattr(self.config, "vision_processor_type", "custom") or "custom").lower()
         if self.vision_input_processor is None and processor_mode == "auto":
@@ -360,6 +365,11 @@ class VisionProcessingMixin:
             self.vision_input_processor = AutoProcessor.from_pretrained(source)
         elif self.vision_input_processor is None:
             self.vision_input_processor = TorchVisionImageProcessor.from_config(self.config)
+        self._vision_processor_initialized = True
+
+    def _ensure_vision_processor(self):
+        if not getattr(self, "_vision_processor_initialized", False):
+            self._build_vision_processor()
 
     def _has_vision_inputs(self) -> bool:
         return any(name in self.task_processors for name in _VISION_TASKS)
@@ -372,6 +382,7 @@ class VisionProcessingMixin:
         return image, (image.height, image.width)
 
     def _apply_vision_processor(self, image: Image.Image, orig_size: Tuple[int, int]) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        self._ensure_vision_processor()
         processor = getattr(self, "vision_input_processor", None)
         if callable(processor):
             try:
@@ -585,72 +596,128 @@ class LayoutProcessingMixin:
             raise ValueError(f"layout bbox must contain 4 coordinates, got {bbox!r}")
         return [int(v) for v in values.tolist()]
 
-    def _extract_layout_words_and_bboxes(self, item: Dict[str, Any]) -> Tuple[Optional[List[str]], Optional[List[List[int]]]]:
+    @staticmethod
+    def _normalize_page_id_value(page_id) -> int:
+        return int(torch.as_tensor(page_id, dtype=torch.long).view(-1)[0].item())
+
+    def _default_word_page_ids(self, item: Dict[str, Any], length: int) -> Optional[List[int]]:
+        page_ids = (
+            item.get("word_page_ids")
+            or item.get("token_page_ids")
+            or item.get("page_ids")
+        )
+        if page_ids is not None:
+            values = [self._normalize_page_id_value(value) for value in page_ids]
+            if len(values) != length:
+                raise ValueError(
+                    f"Layout page_ids must match words length, got {len(values)} and {length}."
+                )
+            return values
+        if item.get("page") is not None:
+            return [self._normalize_page_id_value(item["page"]) for _ in range(length)]
+        return None
+
+    def _extract_layout_words_bboxes_and_pages(
+        self,
+        item: Dict[str, Any],
+    ) -> Tuple[Optional[List[str]], Optional[List[List[int]]], Optional[List[int]]]:
         layout = item.get("layout")
         if isinstance(layout, list):
             words = []
             bboxes = []
+            page_ids = []
+            has_page_ids = False
             for entry in layout:
                 if isinstance(entry, dict):
                     word = entry.get("word", entry.get("text", entry.get("token")))
                     bbox = entry.get("bbox", entry.get("box"))
+                    page_id = entry.get("page_id", entry.get("page", entry.get("page_number")))
                 elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
                     word, bbox = entry[0], entry[1]
+                    page_id = entry[2] if len(entry) >= 3 else None
                 else:
                     continue
                 if word is None or bbox is None:
                     continue
                 words.append(str(word))
                 bboxes.append(self._normalize_bbox_value(bbox))
-            return words or None, bboxes or None
+                if page_id is not None:
+                    has_page_ids = True
+                page_ids.append(self._normalize_page_id_value(page_id if page_id is not None else item.get("page", 0)))
+            if not words:
+                return None, None, None
+            return words, bboxes, page_ids if has_page_ids or item.get("page") is not None else None
 
-        words = item.get("words") or item.get("tokenized_text")
+        words = item.get("tokenized_text")
         bboxes = item.get("bboxes") or item.get("word_bboxes")
         if bboxes is None:
             raw_bbox = item.get("bbox")
             if isinstance(raw_bbox, (list, tuple)) and raw_bbox and not isinstance(raw_bbox[0], (int, float)):
                 bboxes = raw_bbox
         if words is not None and bboxes is not None:
-            return list(map(str, words)), [self._normalize_bbox_value(b) for b in bboxes]
-        return None, None
+            words = list(map(str, words))
+            return (
+                words,
+                [self._normalize_bbox_value(b) for b in bboxes],
+                self._default_word_page_ids(item, len(words)),
+            )
+        return None, None, None
 
     def _prepare_layout_batch(self, batch_list):
         word_bboxes = []
+        word_page_ids = []
         has_layout = False
+        has_page_ids = False
         for item in batch_list:
-            words, bboxes = self._extract_layout_words_and_bboxes(item)
+            words, bboxes, page_ids = self._extract_layout_words_bboxes_and_pages(item)
             if words is None or bboxes is None:
                 word_bboxes.append(None)
+                word_page_ids.append(None)
                 continue
             if len(words) != len(bboxes):
                 raise ValueError(
                     f"Layout words and bboxes must have the same length, got {len(words)} and {len(bboxes)}."
                 )
+            if page_ids is not None and len(words) != len(page_ids):
+                raise ValueError(
+                    f"Layout words and page_ids must have the same length, got {len(words)} and {len(page_ids)}."
+                )
             item.setdefault("tokenized_text", words)
             item.setdefault("text", " ".join(words))
             word_bboxes.append(bboxes)
+            word_page_ids.append(page_ids)
             has_layout = True
-        return {"word_bboxes": word_bboxes} if has_layout else {}
+            has_page_ids = has_page_ids or page_ids is not None
+        fields = {"word_bboxes": word_bboxes} if has_layout else {}
+        if has_page_ids:
+            fields["word_page_ids"] = word_page_ids
+        return fields
 
     def _augment_label_item(self, item, batch, batch_idx):
         super()._augment_label_item(item, batch, batch_idx)
         if batch.get("word_bboxes") is not None:
             item["word_bboxes"] = batch["word_bboxes"][batch_idx]
+        if batch.get("word_page_ids") is not None:
+            item["word_page_ids"] = batch["word_page_ids"][batch_idx]
 
     def tokenize_inputs(self, texts, classes_mapping, **kwargs):
         tokenized_inputs = super().tokenize_inputs(texts, classes_mapping, **kwargs)
         word_bboxes = kwargs.get("word_bboxes")
+        word_page_ids = kwargs.get("word_page_ids")
         prompt_lengths = kwargs.get("prompt_lengths")
-        if word_bboxes is None:
+        if word_bboxes is None and word_page_ids is None:
             return tokenized_inputs
 
         input_ids = tokenized_inputs["input_ids"]
-        bbox = torch.zeros((*input_ids.shape, 4), dtype=torch.long)
+        bbox = torch.zeros((*input_ids.shape, 4), dtype=torch.long) if word_bboxes is not None else None
+        page_token_ids = torch.zeros(input_ids.shape, dtype=torch.long) if word_page_ids is not None else None
         if prompt_lengths is None:
             _, prompt_lengths = self.prepare_inputs(texts, classes_mapping)
 
-        for batch_idx, boxes in enumerate(word_bboxes):
-            if not boxes:
+        for batch_idx in range(input_ids.shape[0]):
+            boxes = word_bboxes[batch_idx] if word_bboxes is not None else None
+            page_ids = word_page_ids[batch_idx] if word_page_ids is not None else None
+            if not boxes and not page_ids:
                 continue
             try:
                 word_ids = tokenized_inputs.word_ids(batch_index=batch_idx)
@@ -661,9 +728,14 @@ class LayoutProcessingMixin:
                 if word_id is None or word_id < prompt_len:
                     continue
                 source_idx = int(word_id) - prompt_len
-                if 0 <= source_idx < len(boxes):
+                if bbox is not None and boxes is not None and 0 <= source_idx < len(boxes):
                     bbox[batch_idx, token_idx] = torch.tensor(boxes[source_idx], dtype=torch.long)
-        tokenized_inputs["bbox"] = bbox
+                if page_token_ids is not None and page_ids is not None and 0 <= source_idx < len(page_ids):
+                    page_token_ids[batch_idx, token_idx] = int(page_ids[source_idx])
+        if bbox is not None:
+            tokenized_inputs["bbox"] = bbox
+        if page_token_ids is not None:
+            tokenized_inputs["page_token_ids"] = page_token_ids
         return tokenized_inputs
 
 
@@ -1069,10 +1141,13 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             "objects": batch.get("objects", [[] for _ in range(batch_size)]),
             "image": batch.get("image", [None for _ in range(batch_size)]),
             "word_bboxes": batch.get("word_bboxes"),
+            "word_page_ids": batch.get("word_page_ids"),
             "pixel_values": batch.get("pixel_values"),
             "vision_attention_mask": batch.get("vision_attention_mask"),
             "vision_input_mask": batch.get("vision_input_mask"),
             "image_sizes": batch.get("image_sizes"),
+            "image_batch_idx": batch.get("image_batch_idx"),
+            "image_page_ids": batch.get("image_page_ids"),
             "audio_values": batch.get("audio_values"),
             "audio_attention_mask": batch.get("audio_attention_mask"),
             "audio_input_mask": batch.get("audio_input_mask"),
@@ -1151,6 +1226,8 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
         tokenize_kwargs = {}
         if batch.get("word_bboxes") is not None:
             tokenize_kwargs["word_bboxes"] = batch["word_bboxes"]
+        if batch.get("word_page_ids") is not None:
+            tokenize_kwargs["word_page_ids"] = batch["word_page_ids"]
         tokenized_input = self.tokenize_inputs(batch["tokens"], classes_mapping, **tokenize_kwargs)
         tokenized_input["classes_mapping"] = classes_mapping
 
@@ -1355,10 +1432,98 @@ class GLiNextLayoutProcessor(LayoutProcessingMixin, VisionProcessingMixin, GLiNe
 
     processor_task_names = _TEXT_TASKS
 
+    @staticmethod
+    def _has_layout_image_payload(item: Dict[str, Any]) -> bool:
+        return (
+            item.get("image") is not None
+            or item.get("images") is not None
+            or item.get("pixel_values") is not None
+        )
+
+    @staticmethod
+    def _as_list_payload(value):
+        if value is None:
+            return []
+        if isinstance(value, torch.Tensor):
+            if value.dim() == 4:
+                return [value[i] for i in range(value.shape[0])]
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    def _layout_image_payloads(self, item: Dict[str, Any]):
+        pixels = self._as_list_payload(item.get("pixel_values"))
+        images = self._as_list_payload(item.get("images"))
+        if not images:
+            images = self._as_list_payload(item.get("image"))
+        if pixels:
+            payloads = [{"pixel_values": value} for value in pixels]
+        else:
+            payloads = [{"image": value} for value in images]
+
+        raw_page_ids = item.get("image_page_ids")
+        if raw_page_ids is None:
+            raw_page_ids = item.get("pages")
+        if raw_page_ids is None and len(payloads) == 1:
+            raw_page_ids = [item.get("page", 0)]
+        elif raw_page_ids is None:
+            raw_page_ids = list(range(len(payloads)))
+        page_ids = [self._normalize_page_id_value(value) for value in self._as_list_payload(raw_page_ids)]
+        if len(page_ids) == 1 and len(payloads) > 1:
+            page_ids = page_ids * len(payloads)
+        if len(page_ids) != len(payloads):
+            raise ValueError(
+                f"image_page_ids/pages must contain one entry per image, got {len(page_ids)} and {len(payloads)}."
+            )
+        return list(zip(payloads, page_ids))
+
+    def _prepare_layout_vision_batch(self, batch_list):
+        if not any(self._has_layout_image_payload(item) for item in batch_list):
+            return {}
+
+        image_tensors = []
+        image_sizes = []
+        image_batch_idx = []
+        image_page_ids = []
+        max_shape = None
+        for batch_idx, item in enumerate(batch_list):
+            if not self._has_layout_image_payload(item):
+                raise ValueError(
+                    "Layout batches with page images require every item to contain "
+                    "'image', 'images', or 'pixel_values'."
+                )
+            for payload, page_id in self._layout_image_payloads(item):
+                tensor, image_size = self.load_image(payload, getattr(self.config, "image_size", None))
+                item["_image_size"] = image_size
+                image_tensors.append(tensor)
+                image_sizes.append(image_size)
+                image_batch_idx.append(batch_idx)
+                image_page_ids.append(page_id)
+                shape = tuple(tensor.shape)
+                if max_shape is None:
+                    max_shape = list(shape)
+                elif len(shape) != len(max_shape):
+                    raise ValueError("All layout image tensors in a batch must have the same rank.")
+                else:
+                    max_shape = [max(current, int(dim)) for current, dim in zip(max_shape, shape)]
+
+        pixel_values = torch.zeros((len(image_tensors), *max_shape), dtype=torch.float)
+        for idx, tensor in enumerate(image_tensors):
+            slices = (idx, *[slice(0, int(dim)) for dim in tensor.shape])
+            pixel_values[slices] = tensor
+
+        return {
+            "pixel_values": pixel_values,
+            "image_sizes": torch.tensor(image_sizes, dtype=torch.long),
+            "image_batch_idx": torch.tensor(image_batch_idx, dtype=torch.long),
+            "image_page_ids": torch.tensor(image_page_ids, dtype=torch.long),
+        }
+
     def collate_raw_batch(self, batch_list, **kwargs):
         layout_fields = self._prepare_layout_batch(batch_list)
         batch = GLiNextTextProcessor.collate_raw_batch(self, batch_list, **kwargs)
-        batch.update(self._prepare_vision_batch(batch_list))
+        batch.update(self._prepare_layout_vision_batch(batch_list))
         batch.update(layout_fields)
         return batch
 
@@ -1384,6 +1549,10 @@ class GLiNextLayoutProcessor(LayoutProcessingMixin, VisionProcessingMixin, GLiNe
             tokenized_input["vision_attention_mask"] = batch["vision_attention_mask"]
         if batch.get("image_sizes") is not None:
             tokenized_input["image_sizes"] = batch["image_sizes"]
+        if batch.get("image_batch_idx") is not None:
+            tokenized_input["image_batch_idx"] = batch["image_batch_idx"]
+        if batch.get("image_page_ids") is not None:
+            tokenized_input["image_page_ids"] = batch["image_page_ids"]
         return tokenized_input
 
 

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import inspect
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
@@ -22,6 +23,9 @@ from .config import (
     GLiNextOmniConfig,
     GLiNextTextConfig,
     GLiNextVisionConfig,
+    GLINEXT_MODEL_TYPE_TO_VARIANT,
+    GLINEXT_VARIANT_TO_CONFIG_CLASS,
+    resolve_glinext_config_class,
 )
 from .model import (
     GLiNExTAudioModel,
@@ -33,6 +37,7 @@ from .model import (
     resolve_glinext_model_class,
 )
 from .processing.processor import GLiNextProcessor, resolve_glinext_processor_class
+from .processing.pdf import GLiNextPDFProcessor
 from .processing.decoder import GLiNExTDecoder
 from .processing.collator import (
     GLiNExTAudioDataCollator,
@@ -125,6 +130,59 @@ class BaseGLiNExT(BaseGLiNER):
             prepare_labels=True,
             **kwargs,
         )
+
+    @staticmethod
+    def _supported_base_loader_kwargs(loader, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep dispatcher kwargs compatible with the installed GLiNER version."""
+        signature = inspect.signature(loader)
+        parameters = signature.parameters
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if accepts_kwargs:
+            # Older GLiNER releases accept **model_kwargs and forward unknown
+            # loader options into the model constructor. Keep arbitrary caller
+            # model kwargs, but only pass GLiNExT dispatcher options when the
+            # installed base loader declares support for them.
+            dispatcher_only = {"quantize", "dtype"}
+            return {
+                key: value
+                for key, value in kwargs.items()
+                if key not in dispatcher_only or key in parameters
+            }
+        return {
+            key: value
+            for key, value in kwargs.items()
+            if key in parameters
+        }
+
+    @classmethod
+    def _load_config(cls, config_file: Path, **config_overrides) -> GLiNextConfig:
+        """Load GLiNExT config, dispatching factory loads by saved model_type."""
+        with open(config_file) as f:
+            config_dict = json.load(f)
+
+        for key, value in config_overrides.items():
+            if value is not None:
+                config_dict[key] = value
+
+        specific_config_classes = (
+            GLiNextTextConfig,
+            GLiNextLayoutConfig,
+            GLiNextVisionConfig,
+            GLiNextAudioConfig,
+            GLiNextOmniConfig,
+        )
+        if cls.config_class in specific_config_classes:
+            config_cls = cls.config_class
+        else:
+            config_cls = resolve_glinext_config_class(config_dict)
+
+        model_type = config_dict.pop("model_type", None)
+        if model_type in GLINEXT_MODEL_TYPE_TO_VARIANT:
+            config_dict["model_variant"] = GLINEXT_MODEL_TYPE_TO_VARIANT[model_type]
+        return config_cls(**config_dict)
 
     def _get_special_tokens(self):
         """Return special tokens to add to the tokenizer.
@@ -235,10 +293,14 @@ class BaseGLiNExT(BaseGLiNER):
         tokenizer = self.data_processor.transformer_tokenizer
         if len(tokenizer) != self.config.vocab_size:
             new_num_tokens = len(tokenizer)
-            model_embeds = self.model.token_rep_layer.resize_token_embeddings(new_num_tokens, None)
-            self.config.vocab_size = model_embeds.num_embeddings
-            if hasattr(self.config, "encoder_config") and self.config.encoder_config is not None:
-                self.config.encoder_config.vocab_size = model_embeds.num_embeddings
+            token_rep_layer = self.model.token_rep_layer
+            if getattr(token_rep_layer, "resizes_labels_encoder_only", False):
+                self.config.vocab_size = new_num_tokens
+            else:
+                model_embeds = token_rep_layer.resize_token_embeddings(new_num_tokens, None)
+                self.config.vocab_size = model_embeds.num_embeddings
+                if hasattr(self.config, "encoder_config") and self.config.encoder_config is not None:
+                    self.config.encoder_config.vocab_size = model_embeds.num_embeddings
 
     def _build_inference_input(
         self,
@@ -259,6 +321,33 @@ class BaseGLiNExT(BaseGLiNER):
         task_processors = self.data_processor.task_processors.values()
         for tokens in all_tokens:
             item: Dict[str, Any] = {"tokenized_text": tokens}
+            for processor in task_processors:
+                processor.contribute_inference_input(
+                    item,
+                    entities=entities,
+                    classes=classes,
+                    relations=relations,
+                    joint_relations=joint_relations,
+                    structures=structures,
+                )
+            input_x.append(item)
+        return input_x
+
+    def _build_pdf_inference_input(
+        self,
+        pdf_items: List[Dict[str, Any]],
+        entities=None,
+        classes=None,
+        relations=None,
+        joint_relations=None,
+        structures=None,
+    ) -> List[Dict[str, Any]]:
+        input_x = []
+        task_processors = self.data_processor.task_processors.values()
+        for pdf_item in pdf_items:
+            item = dict(pdf_item)
+            item["tokenized_text"] = list(pdf_item.get("tokenized_text") or [])
+            item.setdefault("text", " ".join(item["tokenized_text"]))
             for processor in task_processors:
                 processor.contribute_inference_input(
                     item,
@@ -296,6 +385,54 @@ class BaseGLiNExT(BaseGLiNER):
         if isinstance(texts, str):
             return [texts], True
         return list(texts), False
+
+    def prepare_inputs(self, texts: List[str]):
+        """Tokenize texts and keep word-token to character-offset mappings."""
+        all_tokens = []
+        all_start_token_idx_to_text_idx = []
+        all_end_token_idx_to_text_idx = []
+
+        for text in texts:
+            tokens = []
+            start_token_idx_to_text_idx = []
+            end_token_idx_to_text_idx = []
+            for token, start, end in self.data_processor.words_splitter(text):
+                tokens.append(token)
+                start_token_idx_to_text_idx.append(start)
+                end_token_idx_to_text_idx.append(end)
+            all_tokens.append(tokens)
+            all_start_token_idx_to_text_idx.append(start_token_idx_to_text_idx)
+            all_end_token_idx_to_text_idx.append(end_token_idx_to_text_idx)
+
+        return all_tokens, all_start_token_idx_to_text_idx, all_end_token_idx_to_text_idx
+
+    @staticmethod
+    def _pdf_tokens_to_text_and_maps(tokens: List[str]) -> Tuple[str, List[int], List[int]]:
+        text_parts = []
+        start_map = []
+        end_map = []
+        offset = 0
+        for idx, token in enumerate(tokens):
+            token = str(token)
+            if idx > 0:
+                text_parts.append(" ")
+                offset += 1
+            start_map.append(offset)
+            text_parts.append(token)
+            offset += len(token)
+            end_map.append(offset)
+        return "".join(text_parts), start_map, end_map
+
+    @staticmethod
+    def _filter_valid_texts(texts: List[str]) -> Tuple[List[str], List[int]]:
+        """Drop empty text inputs while preserving their original indices."""
+        valid_texts = []
+        valid_to_orig_idx = []
+        for idx, text in enumerate(texts):
+            if isinstance(text, str) and text.strip():
+                valid_texts.append(text)
+                valid_to_orig_idx.append(idx)
+        return valid_texts, valid_to_orig_idx
 
     @staticmethod
     def _normalize_media_inputs(inputs: Any, tensor_batch_rank: Optional[int] = None) -> Tuple[List[Any], bool]:
@@ -495,6 +632,155 @@ class BaseGLiNExT(BaseGLiNER):
             structuring_dedup=structuring_dedup,
         )
 
+    @torch.no_grad()
+    def parse_pdf(
+        self,
+        pdf_path: Union[str, Path],
+        words: Optional[List[str]] = None,
+        bbox: Optional[List[List[int]]] = None,
+        pixel_values: Optional[Any] = None,
+        pages: Union[List[int], Tuple[int, ...], None] = None,
+        password: Optional[str] = None,
+        add_image_token: bool = True,
+        return_pixel_values: Optional[bool] = None,
+        return_word_bboxes: bool = True,
+        return_page_ids: bool = False,
+        split_pages: bool = True,
+        extract_tables: bool = False,
+        table_settings: Optional[Dict[str, Any]] = None,
+        entities: Optional[Union[List[str], Dict[str, List[str]]]] = None,
+        classes: Optional[Union[List[str], Dict[str, List[str]]]] = None,
+        relations: Optional[Union[List[str], Dict[str, List[str]]]] = None,
+        joint_relations: Optional[Dict[str, dict]] = None,
+        structures: Optional[Dict[str, Union[List[str], dict]]] = None,
+        flat_ner: bool = True,
+        threshold: float = 0.5,
+        multi_label: bool = False,
+        batch_size: int = 8,
+        manual_structuring_count: Optional[int] = None,
+        structuring_dedup: bool = True,
+        return_pages: bool = False,
+        **kwargs,
+    ) -> Dict[str, List]:
+        """Run GLiNExT layout/text inference over PDF pages.
+
+        ``words``/``bbox`` may be supplied to skip PDF text extraction. The
+        processor emits ``tokenized_text`` plus optional word ``bboxes`` and
+        optional page screenshots as ``pixel_values``. Set ``extract_tables``
+        to replace detected table regions with markdown-like table tokens.
+        """
+        self.eval()
+        self._validate_requested_inference_heads(
+            entities=entities,
+            classes=classes,
+            relations=relations,
+            joint_relations=joint_relations,
+            structures=structures,
+        )
+
+        pdf_processor = GLiNextPDFProcessor()
+        pdf_items = pdf_processor(
+            pdf_path,
+            words=words,
+            bbox=bbox,
+            pixel_values=pixel_values,
+            pages=pages,
+            password=password,
+            add_image_token=add_image_token,
+            return_pixel_values=return_pixel_values,
+            return_word_bboxes=return_word_bboxes,
+            return_page_ids=return_page_ids,
+            split_pages=split_pages,
+            extract_tables=extract_tables,
+            table_settings=table_settings,
+        )
+        num_pages = len(pdf_items)
+        if num_pages == 0:
+            results = self.data_processor.empty_inference_results(
+                0,
+                entities=entities,
+                classes=classes,
+                relations=relations,
+                joint_relations=joint_relations,
+                structures=structures,
+            )
+            if return_pages:
+                results["pages"] = []
+            return results
+
+        valid_items = []
+        valid_to_orig_idx = []
+        all_start_maps = []
+        all_end_maps = []
+        valid_texts = []
+        for idx, item in enumerate(pdf_items):
+            tokens = list(item.get("tokenized_text") or [])
+            if not tokens:
+                continue
+            text, start_map, end_map = self._pdf_tokens_to_text_and_maps(tokens)
+            item["text"] = text
+            valid_items.append(item)
+            valid_to_orig_idx.append(idx)
+            all_start_maps.append(start_map)
+            all_end_maps.append(end_map)
+            valid_texts.append(text)
+
+        if not valid_items:
+            results = self.data_processor.empty_inference_results(
+                num_pages,
+                entities=entities,
+                classes=classes,
+                relations=relations,
+                joint_relations=joint_relations,
+                structures=structures,
+            )
+            if return_pages:
+                results["pages"] = [item.get("pages", item.get("page", idx)) for idx, item in enumerate(pdf_items)]
+            return results
+
+        input_x = self._build_pdf_inference_input(
+            valid_items, entities, classes, relations, joint_relations, structures,
+        )
+
+        collator_cls = self.data_collator_class or resolve_glinext_collator_class(self.config)
+        collator = collator_cls(
+            self.config,
+            data_processor=self.data_processor,
+            return_tokens=True,
+            prepare_labels=False,
+        )
+        data_loader = DataLoader(
+            input_x,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collator,
+        )
+
+        if manual_structuring_count is not None:
+            kwargs["manual_structuring_count"] = manual_structuring_count
+
+        all_decoded, all_classes_mappings = self._process_multitask_batches(
+            data_loader,
+            threshold,
+            flat_ner,
+            multi_label,
+            **kwargs,
+        )
+        results = self._map_multitask_results(
+            all_decoded,
+            valid_to_orig_idx,
+            all_start_maps,
+            all_end_maps,
+            valid_texts,
+            num_pages,
+            all_classes_mappings,
+            structures=structures,
+            structuring_dedup=structuring_dedup,
+        )
+        if return_pages:
+            results["pages"] = [item.get("pages", item.get("page", idx)) for idx, item in enumerate(pdf_items)]
+        return results
+
     @staticmethod
     def _infer_batch_size(batch: Dict[str, Any], model_batch: Dict[str, Any]) -> int:
         tokens = batch.get("tokens")
@@ -516,6 +802,7 @@ class BaseGLiNExT(BaseGLiNER):
         for key in (
             "pixel_values", "vision_attention_mask", "vision_input_mask",
             "audio_values", "audio_attention_mask", "audio_input_mask", "bbox",
+            "page_token_ids",
         ):
             value = result.get(key)
             if isinstance(value, torch.Tensor) and value.shape[0] == num_original:
@@ -549,6 +836,7 @@ class BaseGLiNExT(BaseGLiNER):
             classes_mappings for schema name resolution).
         """
         device = self.device
+        model_dtype = self._model_floating_dtype()
         accumulated: Dict[str, list] = {}
         all_classes_mappings: list = []
         total_items = len(data_loader.dataset) if hasattr(data_loader, "dataset") else 0
@@ -559,7 +847,10 @@ class BaseGLiNExT(BaseGLiNER):
             model_batch = {}
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    model_batch[k] = v.to(device)
+                    v = v.to(device)
+                    if v.is_floating_point() and model_dtype is not None:
+                        v = v.to(dtype=model_dtype)
+                    model_batch[k] = v
                 else:
                     # classes_mapping, tokens, etc. — pass through
                     model_batch[k] = v
@@ -597,6 +888,12 @@ class BaseGLiNExT(BaseGLiNER):
                 accumulated[task_name].extend(task_results)
 
         return accumulated, all_classes_mappings
+
+    def _model_floating_dtype(self) -> Optional[torch.dtype]:
+        for parameter in self.model.parameters():
+            if parameter.is_floating_point():
+                return parameter.dtype
+        return None
 
     @torch.no_grad()
     def _predict_media_task(
@@ -1341,15 +1638,6 @@ _GLINEXT_MODEL_TO_WRAPPER = {
     GLiNExTOmniModel: GLiNExTOmni,
 }
 
-_GLINEXT_VARIANT_TO_CONFIG_CLASS = {
-    "text": GLiNextTextConfig,
-    "layout": GLiNextLayoutConfig,
-    "vision": GLiNextVisionConfig,
-    "audio": GLiNextAudioConfig,
-    "omni": GLiNextOmniConfig,
-}
-
-
 class GLiNExT(nn.Module, PyTorchModelHubMixin):
     """Factory class that instantiates the appropriate GLiNExT wrapper.
 
@@ -1370,18 +1658,20 @@ class GLiNExT(nn.Module, PyTorchModelHubMixin):
     def _config_class_for_variant(config_dict: Dict[str, Any]):
         variant = config_dict.get("model_variant") or "text"
         try:
-            return _GLINEXT_VARIANT_TO_CONFIG_CLASS[variant]
+            return GLINEXT_VARIANT_TO_CONFIG_CLASS[variant]
         except KeyError as exc:
             raise ValueError(
                 "model_variant must be one of "
-                f"{sorted(_GLINEXT_VARIANT_TO_CONFIG_CLASS)}, got {variant!r}."
+                f"{sorted(GLINEXT_VARIANT_TO_CONFIG_CLASS)}, got {variant!r}."
             ) from exc
 
     @classmethod
     def _coerce_config_dict(cls, config_dict: Dict[str, Any]) -> GLiNextConfig:
         config_dict = dict(config_dict)
-        config_dict.pop("model_type", None)
-        config_cls = cls._config_class_for_variant(config_dict)
+        config_cls = resolve_glinext_config_class(config_dict)
+        model_type = config_dict.pop("model_type", None)
+        if model_type in GLINEXT_MODEL_TYPE_TO_VARIANT:
+            config_dict["model_variant"] = GLINEXT_MODEL_TYPE_TO_VARIANT[model_type]
         return config_cls(**config_dict)
 
     @classmethod
@@ -1459,32 +1749,36 @@ class GLiNExT(nn.Module, PyTorchModelHubMixin):
         config = cls._coerce_config(config)
         glinext_class = cls._get_glinext_class(config)
         logger.info("Loading the following GLiNExT type: %s...", glinext_class)
-        return glinext_class.from_pretrained(
-            model_id=model_id,
-            model_dir=model_dir,
-            revision=revision,
-            cache_dir=cache_dir,
-            force_download=force_download,
-            proxies=proxies,
-            resume_download=resume_download,
-            local_files_only=local_files_only,
-            token=token,
-            map_location=map_location,
-            strict=strict,
-            load_tokenizer=load_tokenizer,
-            resize_token_embeddings=resize_token_embeddings,
-            compile_torch_model=compile_torch_model,
-            quantize=quantize,
-            dtype=dtype,
-            load_onnx_model=load_onnx_model,
-            onnx_model_file=onnx_model_file,
-            session_options=session_options,
-            max_length=max_length,
-            max_width=max_width,
-            post_fusion_schema=post_fusion_schema,
-            _attn_implementation=_attn_implementation,
-            **model_kwargs,
+        loader_kwargs = BaseGLiNExT._supported_base_loader_kwargs(
+            glinext_class.from_pretrained,
+            {
+                "model_id": model_id,
+                "model_dir": model_dir,
+                "revision": revision,
+                "cache_dir": cache_dir,
+                "force_download": force_download,
+                "proxies": proxies,
+                "resume_download": resume_download,
+                "local_files_only": local_files_only,
+                "token": token,
+                "map_location": map_location,
+                "strict": strict,
+                "load_tokenizer": load_tokenizer,
+                "resize_token_embeddings": resize_token_embeddings,
+                "compile_torch_model": compile_torch_model,
+                "quantize": quantize,
+                "dtype": dtype,
+                "load_onnx_model": load_onnx_model,
+                "onnx_model_file": onnx_model_file,
+                "session_options": session_options,
+                "max_length": max_length,
+                "max_width": max_width,
+                "post_fusion_schema": post_fusion_schema,
+                "_attn_implementation": _attn_implementation,
+                **model_kwargs,
+            },
         )
+        return glinext_class.from_pretrained(**loader_kwargs)
 
     @classmethod
     def load_from_config(
@@ -1505,21 +1799,25 @@ class GLiNExT(nn.Module, PyTorchModelHubMixin):
     ):
         config_instance = cls._coerce_config(config)
         glinext_class = cls._get_glinext_class(config_instance)
-        return glinext_class.load_from_config(
-            config=config_instance,
-            cache_dir=cache_dir,
-            load_tokenizer=load_tokenizer,
-            resize_token_embeddings=resize_token_embeddings,
-            backbone_from_pretrained=backbone_from_pretrained,
-            compile_torch_model=compile_torch_model,
-            quantize=quantize,
-            map_location=map_location,
-            max_length=max_length,
-            max_width=max_width,
-            post_fusion_schema=post_fusion_schema,
-            _attn_implementation=_attn_implementation,
-            **model_kwargs,
+        loader_kwargs = BaseGLiNExT._supported_base_loader_kwargs(
+            glinext_class.load_from_config,
+            {
+                "config": config_instance,
+                "cache_dir": cache_dir,
+                "load_tokenizer": load_tokenizer,
+                "resize_token_embeddings": resize_token_embeddings,
+                "backbone_from_pretrained": backbone_from_pretrained,
+                "compile_torch_model": compile_torch_model,
+                "quantize": quantize,
+                "map_location": map_location,
+                "max_length": max_length,
+                "max_width": max_width,
+                "post_fusion_schema": post_fusion_schema,
+                "_attn_implementation": _attn_implementation,
+                **model_kwargs,
+            },
         )
+        return glinext_class.load_from_config(**loader_kwargs)
 
     @classmethod
     def from_config(cls, *args, **kwargs):

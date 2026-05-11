@@ -462,7 +462,7 @@ class BaseGLiNextModel(BaseModel):
         # Track per-item child offset for prompt-based splitting
         item_child_offset: dict = {}
 
-        for flat_idx, batch_idx, group_idx, _ in flat_iter():
+        for flat_idx, batch_idx, group_idx, _ in flat_iter:
             batch_origins.append(batch_idx)
 
             # Parent position within the parent tensor
@@ -1616,6 +1616,11 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             "packing_config",
             "pair_attention_mask",
             "bbox",
+            "page_token_ids",
+            "pixel_values",
+            "vision_attention_mask",
+            "image_batch_idx",
+            "image_page_ids",
         }
         representation_kwargs = {
             key: kwargs[key]
@@ -2153,14 +2158,33 @@ class GLiNExTLayoutModel(_GLiNExTJointForwardModel):
             "output_hidden_states",
             "return_dict",
             "bbox",
+            "page_token_ids",
             "pixel_values",
+            "vision_attention_mask",
+            "image_batch_idx",
+            "image_page_ids",
         }
         return {key: kwargs[key] for key in allowed if key in kwargs}
+
+    def _append_layout_extra_tokens(
+        self,
+        token_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        words_embedding: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        extra_mask = getattr(self.token_rep_layer, "_last_layout_extra_mask", None)
+        if extra_mask is None or token_embeds.shape[1] <= input_ids.shape[1]:
+            return words_embedding, mask
+        extra_tokens = token_embeds[:, input_ids.shape[1]:]
+        extra_mask = extra_mask[:, :extra_tokens.shape[1]].to(device=mask.device, dtype=mask.dtype)
+        if extra_tokens.shape[1] == 0:
+            return words_embedding, mask
+        return torch.cat([words_embedding, extra_tokens], dim=1), torch.cat([mask, extra_mask], dim=1)
 
     @staticmethod
     def _reject_unsupported_media_inputs(kwargs: dict) -> None:
         media_keys = (
-            "vision_attention_mask",
             "audio_values",
             "input_values",
             "audio_attention_mask",
@@ -2202,6 +2226,7 @@ class GLiNExTLayoutModel(_GLiNExTJointForwardModel):
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
             if hasattr(self, "cross_fuser"):
                 labels_embeds, words_embedding = self.cross_fuser(labels_embeds, words_embedding, labels_mask, mask)
+            words_embedding, mask = self._append_layout_extra_tokens(token_embeds, input_ids, words_embedding, mask)
             if hasattr(self, "rnn"):
                 words_embedding = self.rnn(words_embedding, mask)
             return token_embeds, labels_embeds, labels_mask, words_embedding, mask
@@ -2217,6 +2242,7 @@ class GLiNExTLayoutModel(_GLiNExTJointForwardModel):
                 text_lengths, words_mask, self.config.embed_ent_token,
             )
         )
+        words_embedding, mask = self._append_layout_extra_tokens(token_embeds, input_ids, words_embedding, mask)
         if hasattr(self, "rnn"):
             words_embedding = self.rnn(words_embedding, mask)
         return token_embeds, prompts_embedding, prompts_embedding_mask, words_embedding, mask

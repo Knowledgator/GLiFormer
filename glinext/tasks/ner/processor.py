@@ -137,11 +137,16 @@ class NERProcessor(SpanProcessor):
     def resolve_spans(self, item):
         if item.get('_glinext_extraction_spans_resolved'):
             return
-        if not item.get('extraction') or not item.get('text'):
+        if not item.get('extraction'):
             return
         text = item.get('text', '')
-        tokens_with_spans, tokens = self._tokenize_text(item)
-        if tokens_with_spans is None:
+        has_tokenized_text = bool(item.get('tokenized_text'))
+        if has_tokenized_text:
+            tokens = list(item.get('tokenized_text') or [])
+            tokens_with_spans = self._align_tokens_to_text(tokens, text) if text else None
+        else:
+            tokens_with_spans, tokens = self._tokenize_text(item)
+        if not tokens:
             return
 
         for ext_example in item.get('extraction', []):
@@ -155,7 +160,13 @@ class NERProcessor(SpanProcessor):
             resolved = []
             old_to_new = {}
             for orig_idx, ent in enumerate(ner):
-                single = self._resolve_labeled_span(text, tokens_with_spans, ent)
+                single = self._resolve_ner_span(
+                    text,
+                    tokens_with_spans,
+                    ent,
+                    tokenized_offsets=has_tokenized_text,
+                    num_tokens=len(tokens),
+                )
                 if single:
                     old_to_new[orig_idx] = len(resolved)
                     resolved.append(single[0])
@@ -180,6 +191,51 @@ class NERProcessor(SpanProcessor):
 
         self._sort_extraction_data(item)
         item['_glinext_extraction_spans_resolved'] = True
+
+    @classmethod
+    def _resolve_ner_span(
+        cls,
+        text,
+        tokens_with_spans,
+        value,
+        tokenized_offsets: bool,
+        num_tokens: int,
+    ):
+        if not tokenized_offsets:
+            if tokens_with_spans is None:
+                return []
+            return cls._resolve_labeled_span(text, tokens_with_spans, value)
+
+        label = cls._entity_label(value)
+        if isinstance(value, dict):
+            if "start" in value and "end" in value and label is not None:
+                return cls._token_span(value.get("start"), value.get("end"), label, num_tokens)
+            mention_text = value.get("text")
+        elif isinstance(value, (list, tuple)):
+            if len(value) >= 4 and isinstance(value[0], str) and isinstance(value[1], int) and isinstance(value[2], int):
+                label = value[-1]
+                return cls._token_span(value[1], value[2], label, num_tokens)
+            if len(value) >= 3 and isinstance(value[0], int) and isinstance(value[1], int):
+                label = value[-1]
+                return cls._token_span(value[0], value[1], label, num_tokens)
+            mention_text = value[0] if value else None
+        else:
+            mention_text = value
+
+        if mention_text is None or label is None or tokens_with_spans is None:
+            return []
+        return cls._resolve_labeled_span(text, tokens_with_spans, mention_text, label=label)
+
+    @staticmethod
+    def _token_span(start, end, label, num_tokens: int):
+        try:
+            start = int(start)
+            end = int(end)
+        except (TypeError, ValueError):
+            return []
+        if label is None or start < 0 or end < start or start >= num_tokens or end >= num_tokens:
+            return []
+        return [[start, end, label]]
 
     @staticmethod
     def _sort_extraction_data(item):

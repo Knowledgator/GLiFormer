@@ -88,7 +88,7 @@ class Transformer(nn.Module):
 
         if encoder_config is None:
             encoder_config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
-            if config.vocab_size != -1:
+            if config.vocab_size != -1 and not labels_encoder:
                 encoder_config.vocab_size = config.vocab_size
         encoder_config = _coerce_backbone_config(encoder_config, backbone)
 
@@ -287,6 +287,7 @@ class Transformer(nn.Module):
         token_type_ids = model_kwargs.pop("token_type_ids", None)
         position_ids = model_kwargs.pop("position_ids", None)
         bbox = model_kwargs.pop("bbox", None)
+        page_token_ids = model_kwargs.pop("page_token_ids", None)
         output_attentions = model_kwargs.pop("output_attentions")
         produce_hidden = model_kwargs.pop("output_hidden_states")
         return_dict = model_kwargs.pop("return_dict")
@@ -310,6 +311,8 @@ class Transformer(nn.Module):
         }
         if bbox is not None:
             embedding_kwargs["bbox"] = bbox
+        if page_token_ids is not None:
+            embedding_kwargs["page_token_ids"] = page_token_ids
         embedding_output = self.model.embeddings(**embedding_kwargs)
 
         encoder_kwargs = {

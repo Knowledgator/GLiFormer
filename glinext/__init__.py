@@ -1,3 +1,16 @@
+try:
+    import wcwidth
+
+    if not hasattr(wcwidth, "wcswidth"):
+        wcwidth.wcswidth = lambda text: sum(  # type: ignore[attr-defined]
+            max(getattr(wcwidth, "wcwidth", lambda _: 1)(char), 0)
+            for char in str(text)
+        )
+    if not hasattr(wcwidth, "wcwidth"):
+        wcwidth.wcwidth = lambda char: 1  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 from .config import (
     GLiNextConfig,
     GLiNextAudioConfig,
@@ -36,6 +49,7 @@ from .model import (
     resolve_glinext_model_class,
 )
 from .processing.processor import GLiNextProcessor
+from .processing.pdf import GLiNextPDFProcessor, PDFTableProcessor
 from .processing.decoder import GLiNExTDecoder
 from .processing.collator import (
     BaseGLiNExTDataCollator,

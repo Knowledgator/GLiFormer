@@ -32,7 +32,7 @@ class MeanPooling(Pooling, pooling_type="mean"):
         super().__init__()
 
     def forward(self, token_embeds, attention_mask):
-        mask_f = attention_mask.unsqueeze(-1).float()
+        mask_f = attention_mask.unsqueeze(-1).to(dtype=token_embeds.dtype)
         return (token_embeds * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
 
 

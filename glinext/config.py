@@ -196,6 +196,7 @@ class EmbeddingHeadConfig:
 
 class GLiNextConfig(BaseGLiNERConfig):
     model_type = "glinext"
+    expected_model_variant = None
     TASK_CONFIG_ATTRS = {
         "ner": "ner_config",
         "classification": "classification_config",
@@ -240,6 +241,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         model_variant: str = "text",
         multimodal_fusion: str = "uni-encoder",
         use_layout: bool = False,
+        layout_image_tokens: bool = True,
+        max_page_embeddings: int = 1024,
         # Optional multimodal encoders
         vision_model_name: Optional[str] = None,
         vision_encoder_type: Optional[str] = None,
@@ -385,6 +388,12 @@ class GLiNextConfig(BaseGLiNERConfig):
             raise ValueError(
                 "model_variant must be one of "
                 f"{sorted(allowed_model_variants)}, got {model_variant!r}."
+            )
+        expected_model_variant = getattr(self, "expected_model_variant", None)
+        if expected_model_variant is not None and model_variant != expected_model_variant:
+            raise ValueError(
+                f"{self.__class__.__name__} requires model_variant={expected_model_variant!r}, "
+                f"got {model_variant!r}."
             )
 
         if default_ner_config is None:
@@ -536,6 +545,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.model_variant = model_variant
         self.multimodal_fusion = multimodal_fusion
         self.use_layout = use_layout
+        self.layout_image_tokens = layout_image_tokens
+        self.max_page_embeddings = max_page_embeddings
 
         # Multimodal encoder config
         if isinstance(vision_encoder_config, dict):
@@ -713,6 +724,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         for key, value in output.items():
             if dataclasses.is_dataclass(value) and not isinstance(value, type):
                 output[key] = dataclasses.asdict(value)
+        output["model_type"] = self.model_type
         return output
 
 
@@ -735,6 +747,196 @@ _AUDIO_CONFIG_FIELDS = (
     "audio_segmentation_config",
 )
 
+_BASE_SERIALIZED_FIELDS = frozenset(
+    {
+        # Base GLiNER/encoder fields.
+        "model_type",
+        "model_name",
+        "name",
+        "max_width",
+        "hidden_size",
+        "dropout",
+        "fine_tune",
+        "subtoken_pooling",
+        "span_mode",
+        "post_fusion_schema",
+        "num_post_fusion_layers",
+        "vocab_size",
+        "max_neg_type_ratio",
+        "max_types",
+        "max_len",
+        "words_splitter_type",
+        "num_rnn_layers",
+        "fuse_layers",
+        "embed_ent_token",
+        "class_token_index",
+        "encoder_config",
+        "ent_token",
+        "sep_token",
+        "_attn_implementation",
+        "token_loss_coef",
+        "span_loss_coef",
+        "represent_spans",
+        "neg_spans_ratio",
+        # Shared GLiNExT fields.
+        "shared_anchor_modeling",
+        "shared_anchor_refine_layers",
+        "shared_anchor_refine_heads",
+        "labels_encoder",
+        "labels_encoder_config",
+        "backbone_type",
+        "model_variant",
+        "multimodal_fusion",
+        "use_layout",
+        "seq_token",
+        "cat_token",
+        "rel_token",
+        "parent_token",
+        "child_token",
+        "obj_token",
+        "per_task_parents",
+        "ner_parent_token",
+        "cat_parent_token",
+        "open_rel_parent_token",
+        "struct_parent_token",
+        "parent_token_index",
+        "embed_parent_token",
+        "projector_hidden_act",
+        # Token ids commonly supplied by PretrainedConfig.
+        "pad_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "transformers_version",
+    }
+)
+
+_TEXT_SERIALIZED_FIELDS = frozenset(
+    {
+        "ner_config",
+        "classification_config",
+        "joint_relex_config",
+        "relations_config",
+        "open_relex_config",
+        "structuring_config",
+        "count_config",
+        "embedding_config",
+        "relations_layer",
+        "classifier_layer",
+        "groups_layer",
+        "count_layer",
+        "rel_mode",
+        "pair_rep_type",
+        "triples_layer",
+        "embed_rel_token",
+        "rel_token_index",
+        "cat_token_index",
+        "embed_cat_token",
+        "ner_loss_coef",
+        "cat_loss_coef",
+        "rel_loss_coef",
+        "adjacency_loss_coef",
+        "count_loss_coef",
+        "groups_loss_coef",
+        "embedding_loss_coef",
+        "structuring_loss_coef",
+        "count_mode",
+        "max_count",
+        "anchor_num_heads",
+        "anchor_num_layers",
+        "child_token_index",
+        "embed_child_token",
+    }
+)
+
+_VISION_SERIALIZED_FIELDS = frozenset(
+    {
+        "image_classification_config",
+        "object_detection_config",
+        "segmentation_config",
+        "vision_model_name",
+        "vision_encoder_type",
+        "vision_encoder_config",
+        "vision_in_channels",
+        "vision_patch_size",
+        "vision_num_layers",
+        "vision_stride",
+        "obj_token_index",
+        "embed_obj_token",
+        "image_size",
+        "vision_processor_type",
+        "vision_processor_name",
+        "vision_resize_size",
+        "vision_center_crop_size",
+        "vision_interpolation",
+        "vision_do_rescale",
+        "vision_do_normalize",
+        "vision_image_mean",
+        "vision_image_std",
+        "image_classification_loss_coef",
+        "object_detection_loss_coef",
+        "segmentation_loss_coef",
+    }
+)
+
+_AUDIO_SERIALIZED_FIELDS = frozenset(
+    {
+        "audio_classification_config",
+        "audio_segmentation_config",
+        "audio_model_name",
+        "audio_encoder_type",
+        "audio_encoder_config",
+        "audio_in_channels",
+        "audio_num_layers",
+        "audio_stride",
+        "audio_freq_stride",
+        "audio_time_stride",
+        "audio_input_format",
+        "audio_processor_type",
+        "audio_processor_name",
+        "audio_sampling_rate",
+        "audio_do_resample",
+        "audio_processor_output_format",
+        "audio_do_normalize",
+        "audio_n_fft",
+        "audio_hop_length",
+        "audio_win_length",
+        "audio_n_mels",
+        "audio_power",
+        "obj_token_index",
+        "embed_obj_token",
+        "audio_classification_loss_coef",
+        "audio_segmentation_loss_coef",
+    }
+)
+
+_LAYOUT_SERIALIZED_FIELDS = _TEXT_SERIALIZED_FIELDS | frozenset(
+    {
+        "image_size",
+        "vision_processor_type",
+        "vision_processor_name",
+        "vision_resize_size",
+        "vision_center_crop_size",
+        "vision_interpolation",
+        "vision_do_rescale",
+        "vision_do_normalize",
+        "vision_image_mean",
+        "vision_image_std",
+    }
+)
+
+_OMNI_SERIALIZED_FIELDS = (
+    _TEXT_SERIALIZED_FIELDS
+    | _VISION_SERIALIZED_FIELDS
+    | _AUDIO_SERIALIZED_FIELDS
+    | frozenset({"omni_modalities"})
+)
+
+
+def _serialize_only(config: GLiNextConfig, field_names: frozenset[str]) -> dict[str, Any]:
+    output = GLiNextConfig.to_dict(config)
+    allowed = _BASE_SERIALIZED_FIELDS | field_names
+    return {key: value for key, value in output.items() if key in allowed}
+
 
 def _non_null_config_names(config: GLiNextConfig, names: tuple[str, ...]) -> list[str]:
     return [name for name in names if getattr(config, name, None) is not None]
@@ -747,6 +949,9 @@ class GLiNextTextConfig(GLiNextConfig):
     ``ner_config`` is provided, but rejects vision/audio task configs.
     """
 
+    model_type = "glinext-text"
+    expected_model_variant = "text"
+
     def __init__(self, *args, model_variant: str = "text", **kwargs):
         kwargs.setdefault("default_ner_config", True)
         super().__init__(*args, model_variant=model_variant, **kwargs)
@@ -757,9 +962,15 @@ class GLiNextTextConfig(GLiNextConfig):
                 f"received configs: {', '.join(disallowed)}"
             )
 
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize_only(self, _TEXT_SERIALIZED_FIELDS)
+
 
 class GLiNextLayoutConfig(GLiNextTextConfig):
     """Text config with layout coordinates enabled."""
+
+    model_type = "glinext-layout"
+    expected_model_variant = "layout"
 
     def __init__(
         self,
@@ -770,9 +981,15 @@ class GLiNextLayoutConfig(GLiNextTextConfig):
     ):
         super().__init__(*args, model_variant=model_variant, use_layout=use_layout, **kwargs)
 
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize_only(self, _LAYOUT_SERIALIZED_FIELDS)
+
 
 class GLiNextVisionConfig(GLiNextConfig):
     """Vision-only bi-encoder GLiNExT config."""
+
+    model_type = "glinext-vision"
+    expected_model_variant = "vision"
 
     def __init__(self, *args, model_variant: str = "vision", **kwargs):
         kwargs.setdefault("default_ner_config", False)
@@ -784,9 +1001,15 @@ class GLiNextVisionConfig(GLiNextConfig):
                 f"received configs: {', '.join(disallowed)}"
             )
 
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize_only(self, _VISION_SERIALIZED_FIELDS)
+
 
 class GLiNextAudioConfig(GLiNextConfig):
     """Audio-only bi-encoder GLiNExT config."""
+
+    model_type = "glinext-audio"
+    expected_model_variant = "audio"
 
     def __init__(self, *args, model_variant: str = "audio", **kwargs):
         kwargs.setdefault("default_ner_config", False)
@@ -798,10 +1021,64 @@ class GLiNextAudioConfig(GLiNextConfig):
                 f"received configs: {', '.join(disallowed)}"
             )
 
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize_only(self, _AUDIO_SERIALIZED_FIELDS)
+
 
 class GLiNextOmniConfig(GLiNextConfig):
     """Omni config that can combine text, vision, audio, and layout settings."""
 
+    model_type = "glinext-omni"
+    expected_model_variant = "omni"
+
     def __init__(self, *args, model_variant: str = "omni", **kwargs):
         kwargs.setdefault("default_ner_config", True)
         super().__init__(*args, model_variant=model_variant, **kwargs)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize_only(self, _OMNI_SERIALIZED_FIELDS)
+
+
+GLINEXT_MODEL_TYPE_TO_CONFIG_CLASS = {
+    GLiNextTextConfig.model_type: GLiNextTextConfig,
+    GLiNextLayoutConfig.model_type: GLiNextLayoutConfig,
+    GLiNextVisionConfig.model_type: GLiNextVisionConfig,
+    GLiNextAudioConfig.model_type: GLiNextAudioConfig,
+    GLiNextOmniConfig.model_type: GLiNextOmniConfig,
+}
+
+GLINEXT_MODEL_TYPE_TO_VARIANT = {
+    GLiNextTextConfig.model_type: "text",
+    GLiNextLayoutConfig.model_type: "layout",
+    GLiNextVisionConfig.model_type: "vision",
+    GLiNextAudioConfig.model_type: "audio",
+    GLiNextOmniConfig.model_type: "omni",
+}
+
+GLINEXT_VARIANT_TO_CONFIG_CLASS = {
+    "text": GLiNextTextConfig,
+    "layout": GLiNextLayoutConfig,
+    "vision": GLiNextVisionConfig,
+    "audio": GLiNextAudioConfig,
+    "omni": GLiNextOmniConfig,
+}
+
+
+def resolve_glinext_config_class(config_dict: dict[str, Any]):
+    model_type = config_dict.get("model_type")
+    if model_type in GLINEXT_MODEL_TYPE_TO_CONFIG_CLASS:
+        return GLINEXT_MODEL_TYPE_TO_CONFIG_CLASS[model_type]
+    if model_type not in {None, GLiNextConfig.model_type}:
+        raise ValueError(
+            "model_type must be one of "
+            f"{sorted(GLINEXT_MODEL_TYPE_TO_CONFIG_CLASS)}, got {model_type!r}."
+        )
+
+    variant = config_dict.get("model_variant") or "text"
+    try:
+        return GLINEXT_VARIANT_TO_CONFIG_CLASS[variant]
+    except KeyError as exc:
+        raise ValueError(
+            "model_variant must be one of "
+            f"{sorted(GLINEXT_VARIANT_TO_CONFIG_CLASS)}, got {variant!r}."
+        ) from exc

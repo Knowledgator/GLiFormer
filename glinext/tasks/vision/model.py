@@ -33,6 +33,24 @@ def _xyxy_from_raw(raw: torch.Tensor) -> torch.Tensor:
     return torch.stack([x1, y1, x2, y2], dim=-1)
 
 
+def _matched_mask_loss(mask_logits: torch.Tensor, mask_labels: torch.Tensor, matches) -> torch.Tensor:
+    matched_pred = []
+    matched_target = []
+    for b, pairs in (matches or {}).items():
+        for anchor_idx, obj_idx in pairs:
+            matched_pred.append(mask_logits[b, anchor_idx])
+            matched_target.append(mask_labels[b, obj_idx])
+    if not matched_pred:
+        return mask_logits.new_tensor(0.0)
+
+    loss = F.binary_cross_entropy_with_logits(
+        torch.stack(matched_pred),
+        torch.stack(matched_target).to(mask_logits.device),
+        reduction="none",
+    )
+    return loss.flatten(1).mean(dim=1).sum()
+
+
 class ImageClassificationHead(TaskHead):
     name = "image_classification"
     dependencies = []
@@ -323,18 +341,7 @@ class SegmentationHead(ObjectDetectionHead):
             )
             mask_loss = class_logits.new_tensor(0.0)
             if mask_labels is not None:
-                matched_pred = []
-                matched_target = []
-                for b, pairs in (matches or {}).items():
-                    for anchor_idx, obj_idx in pairs:
-                        matched_pred.append(mask_logits[b, anchor_idx])
-                        matched_target.append(mask_labels[b, obj_idx])
-                if matched_pred:
-                    mask_loss = F.binary_cross_entropy_with_logits(
-                        torch.stack(matched_pred),
-                        torch.stack(matched_target).to(mask_logits.device),
-                        reduction="sum",
-                    )
+                mask_loss = _matched_mask_loss(mask_logits, mask_labels, matches)
             loss = det_loss + float(getattr(self.det_cfg, "mask_loss_coef", 1.0)) * mask_loss
 
         return TaskHeadOutput(

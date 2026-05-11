@@ -76,6 +76,7 @@ class LayoutDebertaConfig(HFDebertaV2Config):
     def __init__(
         self,
         max_2d_position_embeddings: int = 1024,
+        max_page_embeddings: int = 1024,
         coordinate_size: int = 128,
         shape_size: int = 64,
         layout_embedding_type: str = "absolute",
@@ -88,6 +89,7 @@ class LayoutDebertaConfig(HFDebertaV2Config):
         layout_embedding_type = kwargs.pop("spatial_embedding_type", layout_embedding_type)
         super().__init__(**kwargs)
         self.max_2d_position_embeddings = max_2d_position_embeddings
+        self.max_page_embeddings = max_page_embeddings
         self.coordinate_size = coordinate_size
         self.shape_size = shape_size
         self.layout_embedding_type = layout_embedding_type
@@ -120,6 +122,12 @@ class LayoutDebertaEmbeddings(nn.Module):
         else:
             self.token_type_embeddings = None
 
+        max_page_embeddings = int(getattr(config, "max_page_embeddings", 0) or 0)
+        if max_page_embeddings > 0:
+            self.page_embeddings = nn.Embedding(max_page_embeddings, self.embedding_size)
+        else:
+            self.page_embeddings = None
+
         if self.embedding_size != config.hidden_size:
             self.embed_proj = nn.Linear(self.embedding_size, config.hidden_size, bias=False)
         else:
@@ -146,6 +154,7 @@ class LayoutDebertaEmbeddings(nn.Module):
         token_type_ids=None,
         position_ids=None,
         bbox=None,
+        page_token_ids=None,
         mask=None,
         inputs_embeds=None,
     ):
@@ -167,6 +176,16 @@ class LayoutDebertaEmbeddings(nn.Module):
             embeddings = embeddings + self.position_embeddings(position_ids.long())
         if self.token_type_embeddings is not None:
             embeddings = embeddings + self.token_type_embeddings(token_type_ids)
+        if self.page_embeddings is not None:
+            if page_token_ids is None:
+                page_token_ids = torch.zeros(input_shape, dtype=torch.long, device=embeddings.device)
+            if page_token_ids.shape != input_shape:
+                raise ValueError(
+                    f"page_token_ids must have shape {tuple(input_shape)}, got {tuple(page_token_ids.shape)}"
+                )
+            page_token_ids = page_token_ids.to(device=embeddings.device, dtype=torch.long)
+            page_token_ids = torch.clamp(page_token_ids, 0, self.page_embeddings.num_embeddings - 1)
+            embeddings = embeddings + self.page_embeddings(page_token_ids)
         if self.spatial_embeddings is not None and bbox is not None:
             embeddings = embeddings + self.spatial_embeddings(bbox)
 
@@ -455,6 +474,7 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         bbox: Optional[torch.Tensor] = None,
+        page_token_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -485,12 +505,17 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
         if bbox is not None and bbox.shape[:2] != input_shape:
             raise ValueError(f"bbox must have shape (batch, seq_len, 4), got {tuple(bbox.shape)} for input {tuple(input_shape)}")
+        if page_token_ids is not None and page_token_ids.shape != input_shape:
+            raise ValueError(
+                f"page_token_ids must have shape {tuple(input_shape)}, got {tuple(page_token_ids.shape)}"
+            )
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             bbox=bbox,
+            page_token_ids=page_token_ids,
             mask=attention_mask,
             inputs_embeds=inputs_embeds,
         )

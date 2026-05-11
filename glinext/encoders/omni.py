@@ -92,6 +92,25 @@ class LayoutEncoder(TextEncoder):
             return int(attention_mask.shape[1])
         return None
 
+    def __init__(
+        self,
+        config: Any,
+        from_pretrained: bool = False,
+        cache_dir: Optional[Union[str, Path]] = None,
+    ) -> None:
+        super().__init__(config, from_pretrained=from_pretrained, cache_dir=cache_dir)
+        self.layout_image_tokens = bool(_get_config_value(config, "layout_image_tokens", True))
+        self._last_layout_extra_mask: Optional[torch.Tensor] = None
+        if self.layout_image_tokens:
+            self.vision_encoder = VisionEncoder(
+                config,
+                from_pretrained=from_pretrained,
+                cache_dir=cache_dir,
+            )
+            output_hidden_size = int(_get_config_value(config, "hidden_size", self.model_hidden_size))
+            if output_hidden_size != self.model_hidden_size:
+                self.layout_vision_projection = nn.Linear(output_hidden_size, self.model_hidden_size)
+
     @staticmethod
     def _resize_bbox(
         bbox: torch.Tensor,
@@ -105,6 +124,180 @@ class LayoutEncoder(TextEncoder):
         if bbox.shape[1] < text_length:
             bbox = torch.nn.functional.pad(bbox, (0, 0, 0, text_length - bbox.shape[1]))
         return bbox
+
+    @staticmethod
+    def _resize_page_token_ids(
+        page_token_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        text_length = LayoutEncoder._text_length(input_ids, attention_mask)
+        if text_length is None or page_token_ids.shape[1] == text_length:
+            return page_token_ids
+        page_token_ids = page_token_ids[:, :text_length]
+        if page_token_ids.shape[1] < text_length:
+            page_token_ids = torch.nn.functional.pad(page_token_ids, (0, text_length - page_token_ids.shape[1]))
+        return page_token_ids
+
+    def _supports_page_token_ids(self) -> bool:
+        embeddings = getattr(getattr(self.bert_layer, "model", None), "embeddings", None)
+        return hasattr(embeddings, "page_embeddings")
+
+    def _text_input_embeddings(
+        self,
+        input_ids: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if inputs_embeds is not None:
+            return inputs_embeds
+        if input_ids is None:
+            raise ValueError("input_ids or inputs_embeds are required")
+        return self.get_input_embeddings()(input_ids)
+
+    @staticmethod
+    def _image_batch_index(
+        pixel_values: torch.Tensor,
+        image_batch_idx: Optional[torch.Tensor],
+        batch_size: int,
+    ) -> torch.Tensor:
+        if image_batch_idx is None:
+            if pixel_values.shape[0] == batch_size:
+                return torch.arange(batch_size, device=pixel_values.device, dtype=torch.long)
+            raise ValueError(
+                "image_batch_idx is required when pixel_values contains a flattened "
+                "set of page images whose count differs from the text batch size."
+            )
+        image_batch_idx = image_batch_idx.to(device=pixel_values.device, dtype=torch.long).view(-1)
+        if image_batch_idx.numel() != pixel_values.shape[0]:
+            raise ValueError(
+                f"image_batch_idx must contain one entry per image, got {image_batch_idx.numel()} "
+                f"for {pixel_values.shape[0]} images."
+            )
+        return image_batch_idx
+
+    @staticmethod
+    def _image_page_ids(
+        image_page_ids: Optional[torch.Tensor],
+        image_count: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if image_page_ids is None:
+            return torch.zeros(image_count, dtype=torch.long, device=device)
+        image_page_ids = image_page_ids.to(device=device, dtype=torch.long).view(-1)
+        if image_page_ids.numel() != image_count:
+            raise ValueError(
+                f"image_page_ids must contain one entry per image, got {image_page_ids.numel()} "
+                f"for {image_count} images."
+            )
+        return image_page_ids
+
+    def _encode_vision_pages(
+        self,
+        pixel_values: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if pixel_values is None or not hasattr(self, "vision_encoder"):
+            return None
+        image_embeddings = self.vision_encoder(pixel_values)
+        if hasattr(self, "layout_vision_projection"):
+            image_embeddings = self.layout_vision_projection(image_embeddings)
+        return image_embeddings
+
+    def _combine_text_and_image_inputs(
+        self,
+        text_inputs: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        bbox: Optional[torch.Tensor],
+        page_token_ids: Optional[torch.Tensor],
+        pixel_values: Optional[torch.Tensor],
+        vision_attention_mask: Optional[torch.Tensor],
+        image_batch_idx: Optional[torch.Tensor],
+        image_page_ids: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        self._last_layout_extra_mask = None
+        image_embeddings = self._encode_vision_pages(pixel_values)
+        if image_embeddings is None:
+            if attention_mask is None:
+                attention_mask = torch.ones(text_inputs.shape[:2], dtype=torch.long, device=text_inputs.device)
+            return text_inputs, attention_mask.to(device=text_inputs.device), bbox, page_token_ids
+
+        batch_size, text_len = text_inputs.shape[:2]
+        image_embeddings = image_embeddings.to(device=text_inputs.device, dtype=text_inputs.dtype)
+        image_batch_idx = self._image_batch_index(pixel_values, image_batch_idx, batch_size).to(device=text_inputs.device)
+        image_page_ids = self._image_page_ids(image_page_ids, image_embeddings.shape[0], text_inputs.device)
+        if attention_mask is None:
+            attention_mask = torch.ones(batch_size, text_len, dtype=torch.long, device=text_inputs.device)
+        else:
+            attention_mask = attention_mask.to(device=text_inputs.device)
+
+        if vision_attention_mask is not None and vision_attention_mask.shape[-1] == image_embeddings.shape[1]:
+            image_masks = vision_attention_mask.to(device=text_inputs.device, dtype=attention_mask.dtype)
+        else:
+            image_masks = torch.ones(
+                image_embeddings.shape[:2],
+                dtype=attention_mask.dtype,
+                device=text_inputs.device,
+            )
+
+        grouped_embeddings: list[torch.Tensor] = []
+        grouped_masks: list[torch.Tensor] = []
+        grouped_bboxes: list[Optional[torch.Tensor]] = []
+        grouped_pages: list[Optional[torch.Tensor]] = []
+        max_len = 0
+        for batch_idx in range(batch_size):
+            selected = torch.where(image_batch_idx == batch_idx)[0]
+            image_part = image_embeddings[selected].reshape(-1, image_embeddings.shape[-1])
+            image_mask = image_masks[selected].reshape(-1)
+            parts = [text_inputs[batch_idx], image_part]
+            masks = [attention_mask[batch_idx], image_mask]
+            combined = torch.cat(parts, dim=0)
+            combined_mask = torch.cat(masks, dim=0)
+            grouped_embeddings.append(combined)
+            grouped_masks.append(combined_mask)
+            max_len = max(max_len, int(combined.shape[0]))
+
+            if bbox is not None:
+                image_bbox = torch.zeros(
+                    image_part.shape[0],
+                    4,
+                    dtype=bbox.dtype,
+                    device=text_inputs.device,
+                )
+                grouped_bboxes.append(torch.cat([bbox[batch_idx].to(device=text_inputs.device), image_bbox], dim=0))
+            if page_token_ids is not None:
+                image_pages = image_page_ids[selected].repeat_interleave(image_embeddings.shape[1])
+                grouped_pages.append(torch.cat([page_token_ids[batch_idx].to(device=text_inputs.device), image_pages], dim=0))
+
+        combined_inputs = torch.zeros(
+            batch_size,
+            max_len,
+            text_inputs.shape[-1],
+            dtype=text_inputs.dtype,
+            device=text_inputs.device,
+        )
+        combined_mask = torch.zeros(
+            batch_size,
+            max_len,
+            dtype=attention_mask.dtype,
+            device=text_inputs.device,
+        )
+        combined_bbox = None
+        if grouped_bboxes:
+            combined_bbox = torch.zeros(batch_size, max_len, 4, dtype=bbox.dtype, device=text_inputs.device)
+        combined_pages = None
+        if grouped_pages:
+            combined_pages = torch.zeros(batch_size, max_len, dtype=torch.long, device=text_inputs.device)
+
+        for batch_idx, (embeds, mask) in enumerate(zip(grouped_embeddings, grouped_masks)):
+            length = int(embeds.shape[0])
+            combined_inputs[batch_idx, :length] = embeds
+            combined_mask[batch_idx, :length] = mask
+            if combined_bbox is not None:
+                combined_bbox[batch_idx, :length] = grouped_bboxes[batch_idx]
+            if combined_pages is not None:
+                combined_pages[batch_idx, :length] = grouped_pages[batch_idx]
+
+        self._last_layout_extra_mask = combined_mask[:, text_len:]
+        return combined_inputs, combined_mask, combined_bbox, combined_pages
 
     @staticmethod
     def _truncate_to_text_tokens(
@@ -122,14 +315,24 @@ class LayoutEncoder(TextEncoder):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         bbox: Optional[torch.Tensor] = None,
+        page_token_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
+        vision_attention_mask: Optional[torch.Tensor] = None,
+        image_batch_idx: Optional[torch.Tensor] = None,
+        image_page_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         bbox = LayoutEncoder._pop_bbox(kwargs, bbox)
         model_kwargs = dict(kwargs)
-        if attention_mask is not None:
-            model_kwargs["attention_mask"] = attention_mask
+        page_token_ids = model_kwargs.pop("page_token_ids", page_token_ids)
+        vision_attention_mask = model_kwargs.pop("vision_attention_mask", vision_attention_mask)
+        image_batch_idx = model_kwargs.pop("image_batch_idx", image_batch_idx)
+        image_page_ids = model_kwargs.pop("image_page_ids", image_page_ids)
+        text_inputs_embeds = None
+        combined_image_tokens = False
+        original_input_ids = input_ids
+        original_attention_mask = attention_mask
         if bbox is not None:
             if not isinstance(bbox, torch.Tensor):
                 bbox = torch.as_tensor(bbox)
@@ -139,8 +342,52 @@ class LayoutEncoder(TextEncoder):
                 bbox = bbox.to(device=attention_mask.device)
             bbox = LayoutEncoder._resize_bbox(bbox, input_ids, attention_mask)
             model_kwargs["bbox"] = bbox
-        if pixel_values is not None:
+
+        if page_token_ids is not None:
+            if not isinstance(page_token_ids, torch.Tensor):
+                page_token_ids = torch.as_tensor(page_token_ids)
+            if input_ids is not None:
+                page_token_ids = page_token_ids.to(device=input_ids.device)
+            elif attention_mask is not None:
+                page_token_ids = page_token_ids.to(device=attention_mask.device)
+            page_token_ids = LayoutEncoder._resize_page_token_ids(page_token_ids, input_ids, attention_mask)
+            if self._supports_page_token_ids():
+                model_kwargs["page_token_ids"] = page_token_ids
+        elif pixel_values is not None and hasattr(self, "vision_encoder") and self._supports_page_token_ids():
+            ref = input_ids if input_ids is not None else attention_mask
+            if ref is not None:
+                page_token_ids = torch.zeros(ref.shape[:2], dtype=torch.long, device=ref.device)
+
+        if pixel_values is not None and hasattr(self, "vision_encoder"):
+            text_inputs_embeds = self._text_input_embeddings(input_ids, inputs_embeds)
+            combined = self._combine_text_and_image_inputs(
+                text_inputs_embeds,
+                attention_mask,
+                bbox,
+                page_token_ids if self._supports_page_token_ids() else None,
+                pixel_values,
+                vision_attention_mask,
+                image_batch_idx,
+                image_page_ids,
+            )
+            inputs_embeds, attention_mask, bbox, page_token_ids = combined
+            input_ids = None
+            combined_image_tokens = True
+            model_kwargs["attention_mask"] = attention_mask
+            if bbox is not None:
+                model_kwargs["bbox"] = bbox
+            else:
+                model_kwargs.pop("bbox", None)
+            if page_token_ids is not None and self._supports_page_token_ids():
+                model_kwargs["page_token_ids"] = page_token_ids
+            elif "page_token_ids" in model_kwargs:
+                model_kwargs.pop("page_token_ids", None)
+        elif attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask
+
+        if pixel_values is not None and not hasattr(self, "vision_encoder"):
             model_kwargs["pixel_values"] = pixel_values
+
         if inputs_embeds is not None:
             model_kwargs["inputs_embeds"] = inputs_embeds
 
@@ -148,7 +395,12 @@ class LayoutEncoder(TextEncoder):
             input_ids=input_ids,
             **model_kwargs,
         )
-        token_embeddings = LayoutEncoder._truncate_to_text_tokens(token_embeddings, input_ids, attention_mask)
+        if not combined_image_tokens:
+            token_embeddings = LayoutEncoder._truncate_to_text_tokens(
+                token_embeddings,
+                original_input_ids,
+                original_attention_mask,
+            )
         if hasattr(self, "projection"):
             token_embeddings = self.projection(token_embeddings)
         return token_embeddings
@@ -158,6 +410,7 @@ class LayoutEncoder(TextEncoder):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         bbox: Optional[torch.Tensor] = None,
+        page_token_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
@@ -165,6 +418,7 @@ class LayoutEncoder(TextEncoder):
             input_ids=input_ids,
             attention_mask=attention_mask,
             bbox=bbox,
+            page_token_ids=page_token_ids,
             pixel_values=pixel_values,
             **kwargs,
         )
@@ -191,6 +445,25 @@ class LayoutEncoder(TextEncoder):
 class LayoutBiEncoder(TextBiEncoder):
     """Layout encoder with optional text-label bi-encoder support."""
 
+    def __init__(
+        self,
+        config: Any,
+        from_pretrained: bool = False,
+        cache_dir: Optional[Union[str, Path]] = None,
+    ) -> None:
+        super().__init__(config, from_pretrained=from_pretrained, cache_dir=cache_dir)
+        self.layout_image_tokens = bool(_get_config_value(config, "layout_image_tokens", True))
+        self._last_layout_extra_mask: Optional[torch.Tensor] = None
+        if self.layout_image_tokens:
+            self.vision_encoder = VisionEncoder(
+                config,
+                from_pretrained=from_pretrained,
+                cache_dir=cache_dir,
+            )
+            output_hidden_size = int(_get_config_value(config, "hidden_size", self.model_hidden_size))
+            if output_hidden_size != self.model_hidden_size:
+                self.layout_vision_projection = nn.Linear(output_hidden_size, self.model_hidden_size)
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -198,6 +471,7 @@ class LayoutBiEncoder(TextBiEncoder):
         labels_input_ids: Optional[torch.Tensor] = None,
         labels_attention_mask: Optional[torch.Tensor] = None,
         bbox: Optional[torch.Tensor] = None,
+        page_token_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -206,6 +480,7 @@ class LayoutBiEncoder(TextBiEncoder):
             input_ids=input_ids,
             attention_mask=attention_mask,
             bbox=bbox,
+            page_token_ids=page_token_ids,
             pixel_values=pixel_values,
             **kwargs,
         )
