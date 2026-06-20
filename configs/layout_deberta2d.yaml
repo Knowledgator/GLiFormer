@@ -1,5 +1,9 @@
 model:
-  model_name: microsoft/deberta-v3-small
+  model_variant: layout
+  use_layout: true
+  backbone_type: deberta_2d
+  model_name: microsoft/deberta-v3-base
+  labels_encoder: null
   name: "glinext"
   max_width: 12
   hidden_size: 768
@@ -12,7 +16,6 @@ model:
   max_neg_type_ratio: 1
 
   ner_config:
-    scorer_type: "gliner"
     loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null
@@ -20,12 +23,12 @@ model:
     represent_spans: false
 
   structuring_config:
-    anchor_mode: "rnn"
+    anchor_mode: "fixed"
     anchor_modeling: "linear"
     anchor_num_heads: 4
     anchor_num_layers: 2
     max_count: 20
-    num_fixed_slots: 10
+    num_fixed_slots: 20
     loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null
@@ -43,21 +46,24 @@ model:
   embedding_config: null
 
 data:
-  root_dir: logs/ner_structuring
-  train_data: "data/ner_structuring_train.json"
+  root_dir: logs/layout_deberta2d
+  train_data: "data/layoutlmv3_invoice_train.json"
   val_data: "none"
 
 training:
-  prev_path: null                 # path to a GLiNExT checkpoint to init from (null = from scratch)
-  num_steps: 20000
-  train_batch_size: 4
-  gradient_accumulation_steps: 1
+  prev_path: null
+  num_steps: 30000
+  train_batch_size: 2
+  gradient_accumulation_steps: 2
   eval_every: 1000
   warmup_ratio: 0.05
   scheduler_type: "cosine"
   focal_loss_alpha: 0.75
   focal_loss_gamma: 0
+  focal_loss_prob_margin: 0
   loss_reduction: "sum"
+  negatives: 1.0
+  masking: "none"
   lr_encoder: 1e-5
   lr_others: 3e-5
   weight_decay_encoder: 0.01
@@ -65,4 +71,6 @@ training:
   max_grad_norm: 10.0
   save_total_limit: 3
   train_head_only: false
+  freeze_components: null
   bf16: true
+  compile_model: false

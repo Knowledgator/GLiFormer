@@ -175,6 +175,7 @@ class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
         super().__init__()
         self.num_slots = num_slots
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
+        nn.init.orthogonal_(self.anchor_table.weight)
         self.context_proj = nn.Linear(hidden_size, hidden_size)
 
     def forward(
@@ -207,6 +208,7 @@ class FixedRNNAnchorLayer(AnchorLayer, anchor_mode="fixed_rnn"):
         super().__init__()
         self.num_slots = num_slots
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
+        nn.init.orthogonal_(self.anchor_table.weight)
         self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size, batch_first=True)
         self.projector = create_mlp(
             input_dim=hidden_size * 2,
@@ -255,6 +257,7 @@ class FixedTransformerAnchorLayer(AnchorLayer, anchor_mode="fixed_transformer"):
         super().__init__()
         self.num_slots = num_slots
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
+        nn.init.orthogonal_(self.anchor_table.weight)
         self.context_proj = nn.Linear(hidden_size, hidden_size)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_size, nhead=num_heads, dropout=dropout, batch_first=True,

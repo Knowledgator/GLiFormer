@@ -1,0 +1,85 @@
+model:
+  model_variant: audio
+  model_name: microsoft/deberta-v3-small
+  labels_encoder: null
+  name: "glinext"
+  hidden_size: 768
+  dropout: 0.3
+  max_types: 100
+  max_len: 512
+
+  audio_encoder_type: conv
+  audio_in_channels: 1
+  audio_num_layers: 3
+  audio_stride: 4
+  audio_processor_type: custom
+  audio_processor_output_format: raw
+  audio_sampling_rate: 16000
+  audio_do_resample: true
+  audio_do_normalize: true
+
+  audio_classification_config:
+    pooling_type: "mean"
+    scorer_type: "dot"
+    loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+
+  audio_segmentation_config:
+    anchor_mode: "fixed"
+    anchor_modeling: "linear"
+    num_fixed_slots: 100
+    max_count: 100
+    anchor_num_heads: 4
+    anchor_num_layers: 2
+    num_prototypes: 32
+    mask_size: 256
+    segment_loss_coef: 5.0
+    class_loss_coef: 1.0
+    objectness_loss_coef: 1.0
+    mask_loss_coef: 1.0
+    matcher_class_cost: 1.0
+    matcher_segment_cost: 5.0
+    loss_coef: 1.0
+
+  ner_config: null
+  classification_config: null
+  joint_relex_config: null
+  open_relex_config: null
+  structuring_config: null
+  count_config: null
+  embedding_config: null
+  image_classification_config: null
+  object_detection_config: null
+  segmentation_config: null
+
+data:
+  root_dir: logs/audio_only
+  train_data: "data/esc50_train.json"
+  val_data: "none"
+
+training:
+  prev_path: null
+  num_steps: 30000
+  train_batch_size: 4
+  gradient_accumulation_steps: 1
+  eval_every: 1000
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"
+  focal_loss_alpha: 0.75
+  focal_loss_gamma: 0
+  focal_loss_prob_margin: 0
+  loss_reduction: "sum"
+  negatives: 1.0
+  masking: "none"
+  lr_encoder: 1e-5
+  lr_others: 3e-5
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+  save_total_limit: 3
+  train_head_only: false
+  freeze_components: null
+  bf16: true
+  compile_model: false

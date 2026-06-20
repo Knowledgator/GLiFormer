@@ -1,5 +1,5 @@
 model:
-  model_name: microsoft/deberta-v3-small
+  model_name: microsoft/deberta-v3-base
   name: "glinext"
   max_width: 12
   hidden_size: 768
@@ -14,32 +14,49 @@ model:
   ner_config: null
 
   structuring_config:
-    anchor_mode: "fixed_lstm"
-    anchor_modeling: "lstm"
+    anchor_mode: "fixed_rnn"
+    anchor_modeling: "mlp"
     anchor_num_heads: 4
     anchor_num_layers: 2
     max_count: 10
     num_fixed_slots: 10
     loss_coef: 1.0
-    focal_loss_alpha: null
-    focal_loss_gamma: null
+    focal_loss_alpha: 0.75
+    focal_loss_gamma: 2.0
     focal_loss_prob_margin: null
     represent_spans: false
     use_anchor_matching: true
+    # Normalise BIO loss by the valid-mask volume so gradient magnitude
+    # is decoupled from anchor count and sequence length.
+    bio_loss_reduction: "mean"
+    # GLiNER-style negative sampling on BIO losses. "anchor" only drops
+    # negatives for unmatched fixed slots — directly attacks the
+    # pure-negative anchor imbalance.
+    negatives: 1.0
+    masking: null
+    # Per-anchor "is this slot used?" head. Filters empty anchors at
+    # inference and adds explicit objectness supervision during training.
+    anchor_objectness: false
+    anchor_objectness_loss_coef: 0.5
+    anchor_objectness_threshold: 0.5
+    # Diagnostic: log positive vs negative loss split every N steps.
+    log_loss_stats: true
+    log_loss_stats_every: 50
 
   classification_config: null
   joint_relex_config: null
   open_relex_config: null
   count_config: null
+
   embedding_config: null
 
 data:
   root_dir: logs/structuring
-  train_data: "data/extraction_multi.json"
+  train_data: "data/structuring_synthetic.cleaned.jsonl"
   val_data: "none"
 
 training:
-  prev_path: null                 # path to a GLiNExT checkpoint to init from (null = from scratch)
+  prev_path: null                # path to a GLiNExT checkpoint to init from (null = from scratch)
   num_steps: 200000
   train_batch_size: 1
   gradient_accumulation_steps: 4
@@ -47,7 +64,7 @@ training:
   warmup_ratio: 0.05
   scheduler_type: "cosine"
   focal_loss_alpha: 0.75
-  focal_loss_gamma: 0
+  focal_loss_gamma: 2
   loss_reduction: "sum"
   lr_encoder: 3e-5
   lr_others: 5e-5

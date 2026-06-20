@@ -7,6 +7,7 @@ images, audio, and layout boxes become canonical model inputs.
 
 import wave
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 import torch
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 from gliner.data_processing import BaseProcessor
-from transformers import AutoProcessor
+from transformers import AutoImageProcessor, AutoProcessor
 
 from .mappings import (
     CatClassMapping,
@@ -362,7 +363,10 @@ class VisionProcessingMixin:
             source = processor_name or getattr(self.config, "vision_model_name", None)
             if source is None:
                 raise ValueError("vision_processor_type='auto' requires vision_processor_name or vision_model_name.")
-            self.vision_input_processor = AutoProcessor.from_pretrained(source)
+            try:
+                self.vision_input_processor = AutoProcessor.from_pretrained(source)
+            except ValueError:
+                self.vision_input_processor = AutoImageProcessor.from_pretrained(source)
         elif self.vision_input_processor is None:
             self.vision_input_processor = TorchVisionImageProcessor.from_config(self.config)
         self._vision_processor_initialized = True
@@ -392,7 +396,7 @@ class VisionProcessingMixin:
         else:
             output = processor
 
-        if isinstance(output, dict):
+        if isinstance(output, Mapping) or hasattr(output, "get"):
             pixel_values = output.get("pixel_values")
             image_sizes = output.get("image_sizes")
             if image_sizes is None:
@@ -405,8 +409,6 @@ class VisionProcessingMixin:
             tensor = tensor.squeeze(0)
         if tensor.dim() == 3 and tensor.shape[0] not in (1, 3):
             tensor = tensor.permute(2, 0, 1)
-        if tensor.numel() and tensor.max() > 1:
-            tensor = tensor / 255.0
         if image_sizes is not None:
             image_size = torch.as_tensor(image_sizes).view(-1).tolist()
             if len(image_size) >= 2:
@@ -600,6 +602,50 @@ class LayoutProcessingMixin:
     def _normalize_page_id_value(page_id) -> int:
         return int(torch.as_tensor(page_id, dtype=torch.long).view(-1)[0].item())
 
+    @classmethod
+    def _page_offsets_to_page_ids(cls, page_offsets, length: int) -> Optional[List[int]]:
+        if page_offsets is None:
+            return None
+        entries = []
+        for idx, entry in enumerate(page_offsets):
+            if isinstance(entry, dict):
+                offset = entry.get("offset", entry.get("start", entry.get("token_start")))
+                page_id = entry.get("page_id", entry.get("page", idx))
+            elif isinstance(entry, (list, tuple)):
+                if len(entry) == 1:
+                    offset = entry[0]
+                    page_id = idx
+                elif len(entry) >= 2:
+                    page_id, offset = entry[0], entry[1]
+                else:
+                    continue
+            else:
+                offset = entry
+                page_id = idx
+            if offset is None:
+                raise ValueError(f"Layout page_offsets entry is missing an offset: {entry!r}")
+            offset = int(offset)
+            if offset < 0 or offset > length:
+                raise ValueError(
+                    f"Layout page offset {offset} is outside tokenized_text length {length}."
+                )
+            entries.append((offset, cls._normalize_page_id_value(page_id)))
+        if not entries:
+            return None
+
+        entries = sorted(entries, key=lambda item: item[0])
+        if entries[0][0] != 0:
+            entries.insert(0, (0, 0))
+
+        page_ids = [0 for _ in range(length)]
+        for idx, (start, page_id) in enumerate(entries):
+            end = entries[idx + 1][0] if idx + 1 < len(entries) else length
+            if end < start:
+                raise ValueError(f"Layout page_offsets must be sorted by token offset, got {page_offsets!r}.")
+            for token_idx in range(start, end):
+                page_ids[token_idx] = page_id
+        return page_ids
+
     def _default_word_page_ids(self, item: Dict[str, Any], length: int) -> Optional[List[int]]:
         page_ids = (
             item.get("word_page_ids")
@@ -613,6 +659,9 @@ class LayoutProcessingMixin:
                     f"Layout page_ids must match words length, got {len(values)} and {length}."
                 )
             return values
+        page_offsets = item.get("page_offsets")
+        if page_offsets is not None:
+            return self._page_offsets_to_page_ids(page_offsets, length)
         if item.get("page") is not None:
             return [self._normalize_page_id_value(item["page"]) for _ in range(length)]
         return None
@@ -694,7 +743,10 @@ class LayoutProcessingMixin:
         return fields
 
     def _augment_label_item(self, item, batch, batch_idx):
-        super()._augment_label_item(item, batch, batch_idx)
+        if batch.get("image_batch_idx") is not None:
+            super(VisionProcessingMixin, self)._augment_label_item(item, batch, batch_idx)
+        else:
+            super()._augment_label_item(item, batch, batch_idx)
         if batch.get("word_bboxes") is not None:
             item["word_bboxes"] = batch["word_bboxes"][batch_idx]
         if batch.get("word_page_ids") is not None:
@@ -1138,6 +1190,11 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             "embedding": batch.get("embedding", [[] for _ in range(batch_size)]),
             "structuring": batch.get("structuring", [{} for _ in range(batch_size)]),
             "open_relex": batch.get("open_relex", [[] for _ in range(batch_size)]),
+            "image_classification": batch.get("image_classification", [None for _ in range(batch_size)]),
+            "object_detection": batch.get("object_detection", [None for _ in range(batch_size)]),
+            "segmentation": batch.get("segmentation", [None for _ in range(batch_size)]),
+            "audio_classification": batch.get("audio_classification", [None for _ in range(batch_size)]),
+            "audio_segmentation": batch.get("audio_segmentation", [None for _ in range(batch_size)]),
             "objects": batch.get("objects", [[] for _ in range(batch_size)]),
             "image": batch.get("image", [None for _ in range(batch_size)]),
             "word_bboxes": batch.get("word_bboxes"),
@@ -1181,15 +1238,22 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
         batch_list = []
         for i in range(len(batch["tokens"])):
             item = {
-                "classification": batch["classification"][i],
-                "extraction": batch["extraction"][i],
-                "embedding": batch["embedding"][i],
-                "objects": batch.get("objects", [[]])[i],
-            }
+            "classification": batch["classification"][i],
+            "extraction": batch["extraction"][i],
+            "embedding": batch["embedding"][i],
+            "objects": batch.get("objects", [[]])[i],
+        }
             if "structuring" in batch and i < len(batch["structuring"]):
                 item["structuring"] = batch["structuring"][i]
             if "open_relex" in batch and i < len(batch["open_relex"]):
                 item["open_relex"] = batch["open_relex"][i]
+            for field in (
+                "image_classification", "object_detection", "segmentation",
+                "audio_classification", "audio_segmentation",
+            ):
+                values = batch.get(field)
+                if values is not None and i < len(values) and values[i] is not None:
+                    item[field] = values[i]
             self._augment_label_item(item, batch, i)
             batch_list.append(item)
         return batch_list
@@ -1214,6 +1278,11 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
             "embedding": [item.get("embedding", []) for item in batch_list],
             "structuring": [item.get("structuring", {}) for item in batch_list],
             "open_relex": [item.get("open_relex", []) for item in batch_list],
+            "image_classification": [item.get("image_classification") for item in batch_list],
+            "object_detection": [item.get("object_detection") for item in batch_list],
+            "segmentation": [item.get("segmentation") for item in batch_list],
+            "audio_classification": [item.get("audio_classification") for item in batch_list],
+            "audio_segmentation": [item.get("audio_segmentation") for item in batch_list],
             "objects": [item.get("objects", []) for item in batch_list],
             "image": [item.get("image") for item in batch_list],
             "span_idx": [item.get("span_idx") for item in preprocessed],
@@ -1328,6 +1397,9 @@ class GLiNextVisionProcessor(VisionProcessingMixin, BaseGLiNextProcessor):
             "all_labels": [item.get("all_labels") for item in batch_list],
             "true_labels": [item.get("true_labels") for item in batch_list],
             "name": [item.get("name") for item in batch_list],
+            "image_classification": [item.get("image_classification") for item in batch_list],
+            "object_detection": [item.get("object_detection") for item in batch_list],
+            "segmentation": [item.get("segmentation") for item in batch_list],
         }
         batch.update(self._prepare_vision_batch(batch_list))
         return batch
@@ -1340,6 +1412,10 @@ class GLiNextVisionProcessor(VisionProcessingMixin, BaseGLiNextProcessor):
                 "objects": batch["objects"][i],
             }
             for field in ("labels", "classes", "all_labels", "true_labels", "name", "image"):
+                values = batch.get(field)
+                if values is not None and i < len(values) and values[i] is not None:
+                    item[field] = values[i]
+            for field in ("image_classification", "object_detection", "segmentation"):
                 values = batch.get(field)
                 if values is not None and i < len(values) and values[i] is not None:
                     item[field] = values[i]
@@ -1388,6 +1464,8 @@ class GLiNextAudioProcessor(AudioProcessingMixin, BaseGLiNextProcessor):
             "duration": [item.get("duration") for item in batch_list],
             "audio_duration": [item.get("audio_duration") for item in batch_list],
             "sample_rate": [item.get("sample_rate") for item in batch_list],
+            "audio_classification": [item.get("audio_classification") for item in batch_list],
+            "audio_segmentation": [item.get("audio_segmentation") for item in batch_list],
         }
         batch.update(audio_fields)
         return batch
@@ -1400,6 +1478,7 @@ class GLiNextAudioProcessor(AudioProcessingMixin, BaseGLiNextProcessor):
             for field in (
                 "segments", "audio_segments", "labels", "classes", "all_labels",
                 "true_labels", "name", "duration", "audio_duration", "sample_rate",
+                "audio_classification", "audio_segmentation",
             ):
                 values = batch.get(field)
                 if values is not None and i < len(values) and values[i] is not None:
@@ -1479,20 +1558,12 @@ class GLiNextLayoutProcessor(LayoutProcessingMixin, VisionProcessingMixin, GLiNe
         return list(zip(payloads, page_ids))
 
     def _prepare_layout_vision_batch(self, batch_list):
-        if not any(self._has_layout_image_payload(item) for item in batch_list):
-            return {}
-
         image_tensors = []
         image_sizes = []
         image_batch_idx = []
         image_page_ids = []
         max_shape = None
         for batch_idx, item in enumerate(batch_list):
-            if not self._has_layout_image_payload(item):
-                raise ValueError(
-                    "Layout batches with page images require every item to contain "
-                    "'image', 'images', or 'pixel_values'."
-                )
             for payload, page_id in self._layout_image_payloads(item):
                 tensor, image_size = self.load_image(payload, getattr(self.config, "image_size", None))
                 item["_image_size"] = image_size
@@ -1507,6 +1578,8 @@ class GLiNextLayoutProcessor(LayoutProcessingMixin, VisionProcessingMixin, GLiNe
                     raise ValueError("All layout image tensors in a batch must have the same rank.")
                 else:
                     max_shape = [max(current, int(dim)) for current, dim in zip(max_shape, shape)]
+        if not image_tensors:
+            return {}
 
         pixel_values = torch.zeros((len(image_tensors), *max_shape), dtype=torch.float)
         for idx, tensor in enumerate(image_tensors):
@@ -1718,6 +1791,11 @@ class GLiNextOmniProcessor(
             "duration": [item.get("duration") for item in batch_list],
             "audio_duration": [item.get("audio_duration") for item in batch_list],
             "sample_rate": [item.get("sample_rate") for item in batch_list],
+            "image_classification": [item.get("image_classification") for item in batch_list],
+            "object_detection": [item.get("object_detection") for item in batch_list],
+            "segmentation": [item.get("segmentation") for item in batch_list],
+            "audio_classification": [item.get("audio_classification") for item in batch_list],
+            "audio_segmentation": [item.get("audio_segmentation") for item in batch_list],
         })
         return batch
 
@@ -1728,6 +1806,8 @@ class GLiNextOmniProcessor(
                 "labels", "classes", "all_labels", "true_labels", "name",
                 "segments", "audio_segments", "duration", "audio_duration",
                 "sample_rate",
+                "image_classification", "object_detection", "segmentation",
+                "audio_classification", "audio_segmentation",
             ):
                 values = batch.get(field)
                 if values is not None and i < len(values) and values[i] is not None:

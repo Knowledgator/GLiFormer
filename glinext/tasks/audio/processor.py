@@ -50,6 +50,25 @@ class AudioProcessor(TaskProcessor):
             groups = [{"all_labels": list(groups)}]
         return list(groups)
 
+    def _fallback_label_group(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        labels = self.labels_from_item(item)
+        group: Dict[str, Any] = {
+            "name": item.get("name", self.task_name),
+            "all_labels": labels,
+        }
+        if "true_labels" in item:
+            group["true_labels"] = item.get("true_labels")
+        segments = self._segments(item)
+        if segments:
+            group["segments"] = segments
+        return group
+
+    def _label_groups_for_item(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        groups = self._task_label_groups(item)
+        if groups is not None:
+            return groups
+        return [self._fallback_label_group(item)]
+
     @staticmethod
     def labels_from_item(item: Dict[str, Any]) -> List[str]:
         labels = item.get("labels") or item.get("classes") or item.get("all_labels")
@@ -71,17 +90,18 @@ class AudioProcessor(TaskProcessor):
                 mappings.append(VisionClassMapping())
                 continue
 
-            task_groups = self._task_label_groups(item)
-            if task_groups is None:
-                labels = self.labels_from_item(item)
-                task_groups = [{
-                    "name": item.get("name", self.task_name),
-                    "all_labels": labels,
-                }]
+            task_groups = self._label_groups_for_item(item)
 
             item_mappings = []
             for group in task_groups:
-                labels = group.get("all_labels") or group.get("labels") or group.get("classes")
+                labels = (
+                    group.get("all_labels")
+                    or group.get("labels")
+                    or group.get("classes")
+                    or group.get("true_labels")
+                    or _unique(seg.get("label") for seg in group.get("segments", []))
+                    or _unique(seg.get("label") for seg in group.get("audio_segments", []))
+                )
                 labels = _unique(labels or [])
                 if not labels:
                     continue
@@ -137,7 +157,13 @@ class AudioProcessor(TaskProcessor):
         labels = torch.zeros(total, max_classes, dtype=torch.float)
         for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
             label_to_id = mapping.class_to_id.class_to_id
-            for label in self.true_labels_from_item(batch_list[batch_idx]):
+            groups = self._label_groups_for_item(batch_list[batch_idx])
+            group = groups[group_idx] if group_idx < len(groups) else {}
+            true_labels = group.get("true_labels")
+            if true_labels is None and self._task_label_groups(batch_list[batch_idx]) is None:
+                true_labels = self.true_labels_from_item(batch_list[batch_idx])
+            true_labels = _unique(true_labels or [])
+            for label in true_labels:
                 if label in label_to_id:
                     labels[flat_idx, label_to_id[label]] = 1.0
         return {"audio_classification_labels": labels}
@@ -186,9 +212,18 @@ class AudioProcessor(TaskProcessor):
         if total == 0:
             return None
 
+        group_segments = []
+        for _, batch_idx, group_idx, _ in self._mapping_iter(classes_mapping):
+            groups = self._label_groups_for_item(batch_list[batch_idx])
+            group = groups[group_idx] if group_idx < len(groups) else {}
+            segments = group.get("segments") or group.get("audio_segments")
+            if segments is None and self._task_label_groups(batch_list[batch_idx]) is None:
+                segments = self._segments(batch_list[batch_idx])
+            group_segments.append(list(segments or []))
+
         max_segments = min(
             self.max_count,
-            max((len(self._segments(item)) for item in batch_list), default=0),
+            max((len(segments) for segments in group_segments), default=0),
         )
         max_segments = max(max_segments, 1)
         class_labels = torch.full((total, max_segments), -1, dtype=torch.long)
@@ -198,7 +233,7 @@ class AudioProcessor(TaskProcessor):
 
         for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
             label_to_id = mapping.class_to_id.class_to_id
-            for seg_idx, segment in enumerate(self._segments(batch_list[batch_idx])[:max_segments]):
+            for seg_idx, segment in enumerate(group_segments[flat_idx][:max_segments]):
                 label = segment.get("label")
                 if label not in label_to_id:
                     continue

@@ -1,0 +1,120 @@
+model:
+  model_variant: omni
+  multimodal_fusion: uni-encoder
+  omni_modalities: ["text", "vision", "audio"]
+  model_name: microsoft/deberta-v3-small
+  labels_encoder: null
+  name: "glinext"
+  max_width: 12
+  hidden_size: 512
+  dropout: 0.3
+  fine_tune: true
+  subtoken_pooling: first
+  span_mode: markerV0
+  max_types: 100
+  max_len: 256
+  max_neg_type_ratio: 1
+
+  vision_encoder_type: patch
+  vision_in_channels: 3
+  vision_patch_size: 16
+  image_size: 224
+  vision_processor_type: custom
+  vision_resize_size: 224
+  vision_center_crop_size: null
+  vision_interpolation: bilinear
+  vision_do_rescale: true
+  vision_do_normalize: true
+
+  audio_encoder_type: conv
+  audio_in_channels: 1
+  audio_num_layers: 3
+  audio_stride: 4
+  audio_processor_type: custom
+  audio_processor_output_format: raw
+  audio_sampling_rate: 16000
+  audio_do_resample: true
+  audio_do_normalize: true
+
+  ner_config:
+    loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+    represent_spans: false
+
+  classification_config:
+    pooling_type: "mean"
+    scorer_type: "dot"
+    loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+
+  structuring_config:
+    anchor_mode: "fixed"
+    anchor_modeling: "linear"
+    anchor_num_heads: 4
+    anchor_num_layers: 2
+    max_count: 20
+    num_fixed_slots: 20
+    loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+    represent_spans: false
+    use_anchor_matching: true
+
+  image_classification_config:
+    pooling_type: "mean"
+    scorer_type: "dot"
+    loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+
+  audio_classification_config:
+    pooling_type: "mean"
+    scorer_type: "dot"
+    loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+
+  object_detection_config: null
+  segmentation_config: null
+  audio_segmentation_config: null
+  joint_relex_config: null
+  open_relex_config: null
+  count_config: null
+  embedding_config: null
+
+data:
+  root_dir: logs/omni
+  train_data: "data/omni_train.json"
+  val_data: "none"
+
+training:
+  prev_path: null
+  num_steps: 50000
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  eval_every: 1000
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"
+  focal_loss_alpha: 0.75
+  focal_loss_gamma: 0
+  focal_loss_prob_margin: 0
+  loss_reduction: "sum"
+  negatives: 1.0
+  masking: "none"
+  lr_encoder: 1e-5
+  lr_others: 3e-5
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+  save_total_limit: 3
+  train_head_only: false
+  freeze_components: null
+  bf16: true
+  compile_model: false

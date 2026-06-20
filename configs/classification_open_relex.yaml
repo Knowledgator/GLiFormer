@@ -30,13 +30,13 @@ model:
   open_relex_config:
     # Anchor acquisition strategy:
     #   "fixed"             — learnable embedding table with num_fixed_slots anchor slots
-    #   "rotary" / "lstm"   — rotary position-conditioned anchors via RotaryGroupLSTM
-    #   "query_lstm"        — similarity-based token selection + GRU (uses word embeddings)
+    #   "rotary" / "rnn"    — rotary position-conditioned anchors via RotaryGroupRNN
+    #   "query_rnn"         — similarity-based token selection + GRU (uses word embeddings)
     #   "query_transformer" — similarity-based token selection + Transformer (uses word embeddings)
     anchor_mode: "fixed"
     # Anchor-child fusion strategy:
     #   "linear" — linear projection of concatenated anchor + child (default)
-    #   "lstm"   — GRU-based recurrent processing (GLiNER2-style)
+    #   "rnn"    — GRU-based recurrent processing (GLiNER2-style)
     #   "mlp"    — multi-layer perceptron fusion
     anchor_modeling: "linear"
     # Number of learnable anchor slots (only used when anchor_mode="fixed")

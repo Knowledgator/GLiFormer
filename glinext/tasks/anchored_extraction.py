@@ -38,6 +38,14 @@ class AnchoredSpanExtractionHead(TaskHead):
         """Extra kwargs forwarded to ``self.anchor_layer``. Default: threshold only."""
         return {"threshold": batch.get("threshold", 0.5)}
 
+    @staticmethod
+    def _fit_feature_mask(feature_mask, target_length: int):
+        if feature_mask is None or feature_mask.shape[1] == target_length:
+            return feature_mask
+        if feature_mask.shape[1] < target_length:
+            return torch.nn.functional.pad(feature_mask, (0, target_length - feature_mask.shape[1]))
+        return feature_mask[:, :target_length]
+
     # ── Shared pipeline ──────────────────────────────────────────────
 
     def _compute_bio_scores(self, flat_inputs, batch):
@@ -52,6 +60,8 @@ class AnchoredSpanExtractionHead(TaskHead):
         """
         feature_embeddings = flat_inputs.words_embedding
         feature_mask = flat_inputs.mask
+        feature_mask = self._fit_feature_mask(feature_mask, feature_embeddings.shape[1])
+        flat_inputs.mask = feature_mask
         child_embedding = flat_inputs.child_embedding
         parent_embedding = flat_inputs.parent_embedding
 

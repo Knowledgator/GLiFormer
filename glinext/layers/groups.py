@@ -10,6 +10,10 @@ class _AnchorCrossAttentionBlock(nn.Module):
 
     def __init__(self, hidden_size: int, num_heads: int, dropout: float):
         super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.norm0 = nn.LayerNorm(hidden_size)
         self.cross_attn = nn.MultiheadAttention(
             hidden_size, num_heads, dropout=dropout, batch_first=True,
         )
@@ -23,10 +27,16 @@ class _AnchorCrossAttentionBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_size)
 
-    def forward(self, anchor_rep, token_emb, token_mask=None):
-        key_padding_mask = ~token_mask if token_mask is not None else None
+    def forward(self, anchor_rep, token_emb, token_mask=None, query_pos_emb=None):
+        # Add slot positional embedding to Q and K only (not V) so each slot
+        # maintains a unique identity through self-attention (DETR convention).
+        q = anchor_rep if query_pos_emb is None else anchor_rep + query_pos_emb
+        sa_out, _ = self.self_attn(q, q, anchor_rep)
+        anchor_rep = self.norm0(anchor_rep + sa_out)
+        key_padding_mask = ~token_mask.bool() if token_mask is not None else None
+        q_cross = anchor_rep if query_pos_emb is None else anchor_rep + query_pos_emb
         attn_out, _ = self.cross_attn(
-            anchor_rep, token_emb, token_emb, key_padding_mask=key_padding_mask,
+            q_cross, token_emb, token_emb, key_padding_mask=key_padding_mask,
         )
         x = self.norm1(anchor_rep + attn_out)
         x = self.norm2(x + self.ffn(x))
@@ -51,18 +61,22 @@ class AnchorCrossAttentionLayer(nn.Module):
         anchor_rep: torch.Tensor,
         token_emb: torch.Tensor,
         token_mask: torch.Tensor | None = None,
+        query_pos_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             anchor_rep: (B, A, D) anchor embeddings to refine
             token_emb: (B, L, D) token embeddings from encoder
             token_mask: (B, L) optional mask for valid token positions
+            query_pos_emb: (B, A, D) or (1, A, D) slot positional embeddings
+                added to Q (and K) in self- and cross-attention at every layer.
+                Prevents anchor collapse when anchors start with similar values.
 
         Returns:
             refined: (B, A, D) refined anchor embeddings
         """
         for layer in self.layers:
-            anchor_rep = layer(anchor_rep, token_emb, token_mask)
+            anchor_rep = layer(anchor_rep, token_emb, token_mask, query_pos_emb)
         return anchor_rep
 
 class RotaryGroupRNN(nn.Module):

@@ -1,0 +1,95 @@
+model:
+  model_variant: vision
+  model_name: microsoft/deberta-v3-small
+  labels_encoder: null
+  name: "glinext"
+  hidden_size: 768
+  dropout: 0.3
+  max_types: 100
+  max_len: 512
+  media_parent_embedding_source: mean
+
+  vision_model_name: google/vit-base-patch16-224
+  vision_encoder_type: auto
+  vision_in_channels: 3
+  vision_patch_size: 16
+  image_size: 224
+  vision_processor_type: custom
+  vision_processor_name: null
+  vision_resize_size: 224
+  vision_center_crop_size: null
+  vision_interpolation: bilinear
+  vision_do_rescale: true
+  vision_do_normalize: true
+
+  image_classification_config:
+    pooling_type: "mean"
+    scorer_type: "dot"
+    loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+
+  object_detection_config:
+    anchor_mode: "fixed"
+    anchor_modeling: "linear"
+    anchor_refine_layers: 4
+    anchor_refine_heads: 8
+    num_fixed_slots: 100
+    max_count: 100
+    anchor_num_heads: 4
+    anchor_num_layers: 2
+    class_conditioned_bbox: false
+    bbox_prior_grid: true
+    bbox_prior_margin: 0.1
+    drop_cls_token_for_dense: true
+    dense_coord_features: true
+    bbox_loss_coef: 10.0
+    class_loss_coef: 1.0
+    objectness_loss_coef: 2.0
+    objectness_positive_weight: 5.0
+    matcher_class_cost: 1.0
+    matcher_bbox_cost: 5.0
+    loss_coef: 1.0
+
+  segmentation_config: null
+
+  ner_config: null
+  classification_config: null
+  joint_relex_config: null
+  open_relex_config: null
+  structuring_config: null
+  count_config: null
+  embedding_config: null
+  audio_classification_config: null
+  audio_segmentation_config: null
+
+data:
+  root_dir: logs/vision_only
+  train_data: "data/lvis_validation.json"
+  val_data: "none"
+
+training:
+  prev_path: null
+  num_steps: 300000
+  train_batch_size: 4
+  gradient_accumulation_steps: 1
+  eval_every: 1000
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"
+  focal_loss_alpha: 0.75
+  focal_loss_gamma: 2
+  focal_loss_prob_margin: 0
+  loss_reduction: "sum"
+  negatives: 1.0
+  masking: "none"
+  lr_encoder: 1e-5
+  lr_others: 3e-5
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+  save_total_limit: 3
+  train_head_only: false
+  freeze_components: null
+  bf16: true
+  compile_model: false

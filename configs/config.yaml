@@ -24,7 +24,7 @@ model:
     focal_loss_gamma: null        # null = use training.focal_loss_gamma
     focal_loss_prob_margin: null  # null = use training.focal_loss_prob_margin
     anchor_mode: "parent"         # "parent", "fixed" (only used when scorer_type="anchored")
-    anchor_modeling: "linear"     # "linear", "lstm", "mlp" (only used when scorer_type="anchored")
+    anchor_modeling: "linear"     # "linear", "rnn", "mlp" (only used when scorer_type="anchored")
     anchor_refine_layers: 0       # cross-attention layers for anchor refinement (0 = disabled)
     anchor_refine_heads: 8
     represent_spans: false
@@ -57,8 +57,8 @@ model:
 
   open_relex_config: null
   # open_relex_config:
-  #   anchor_mode: "fixed"        # "fixed", "rotary", "query_lstm", "query_transformer"
-  #   anchor_modeling: "linear"   # "linear", "lstm", "mlp"
+  #   anchor_mode: "fixed"        # "fixed", "rotary", "query_rnn", "query_transformer"
+  #   anchor_modeling: "linear"   # "linear", "rnn", "mlp"
   #   num_fixed_slots: 10
   #   max_count: 20
   #   anchor_num_heads: 4
@@ -77,8 +77,8 @@ model:
 
   structuring_config: null
   # structuring_config:
-  #   anchor_mode: "lstm"         # "lstm", "query_lstm", "query_transformer", "fixed"
-  #   anchor_modeling: "linear"   # "linear", "lstm", "mlp"
+  #   anchor_mode: "rnn"          # "rnn", "query_rnn", "query_transformer", "fixed"
+  #   anchor_modeling: "linear"   # "linear", "rnn", "mlp"
   #   anchor_num_heads: 4
   #   anchor_num_layers: 2
   #   max_count: 20

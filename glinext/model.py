@@ -248,7 +248,7 @@ class BaseGLiNextModel(BaseModel):
         open_rel_labels_input_ids: Optional[torch.Tensor] = None,
         open_rel_labels_attention_mask: Optional[torch.Tensor] = None,
     ):
-        """Batch all task label inputs into a single BiEncoder pass, then split results."""
+        """Batch text-task label inputs into one BiEncoder pass, then split results."""
         if not _has_labels_encoder(self.token_rep_layer):
             return None, None, None, None
 
@@ -301,19 +301,61 @@ class BaseGLiNextModel(BaseModel):
         # Single encoder pass
         all_embeds = self.token_rep_layer.encode_labels(batched_ids, batched_masks)
 
-        # Split back and expand to batch size
+        # Split back as flat label embeddings. _build_flat_inputs packs them
+        # into (flattened_groups, max_classes, dim) using labels_group_size.
         results = []
         offset = 0
         for size in sizes:
             if size > 0:
                 embeds = all_embeds[offset:offset + size]
-                embeds = embeds.unsqueeze(0).expand(batch_size, -1, -1)
                 results.append(embeds)
                 offset += size
             else:
                 results.append(None)
 
         return results[0], results[1], results[2], results[3]
+
+    def _encode_media_labels_batched(self, kwargs: dict) -> Dict[str, torch.Tensor]:
+        """Encode media-task label inputs as flat per-label embeddings."""
+        if not _has_labels_encoder(self.token_rep_layer):
+            return {}
+
+        task_names = [
+            task_name
+            for task_name in self._media_task_names
+            if task_name in self.heads
+            and kwargs.get(f"{task_name}_labels_input_ids") is not None
+            and kwargs.get(f"{task_name}_labels_attention_mask") is not None
+        ]
+        if not task_names:
+            return {}
+
+        ids_by_task = [kwargs[f"{task_name}_labels_input_ids"] for task_name in task_names]
+        masks_by_task = [kwargs[f"{task_name}_labels_attention_mask"] for task_name in task_names]
+        max_len = max(ids.shape[1] for ids in ids_by_task)
+        padded_ids = []
+        padded_masks = []
+        sizes = []
+        for ids, mask in zip(ids_by_task, masks_by_task):
+            sizes.append(ids.shape[0])
+            if ids.shape[1] < max_len:
+                pad_size = max_len - ids.shape[1]
+                ids = torch.nn.functional.pad(ids, (0, pad_size), value=0)
+                mask = torch.nn.functional.pad(mask, (0, pad_size), value=0)
+            padded_ids.append(ids)
+            padded_masks.append(mask)
+
+        all_embeds = self.token_rep_layer.encode_labels(
+            torch.cat(padded_ids, dim=0),
+            torch.cat(padded_masks, dim=0),
+        )
+
+        media_label_embeds = {}
+        offset = 0
+        for task_name, size in zip(task_names, sizes):
+            media_label_embeds[task_name] = all_embeds[offset:offset + size]
+            offset += size
+        return media_label_embeds
 
     def _encode_vision_tokens(
         self,
@@ -413,7 +455,13 @@ class BaseGLiNextModel(BaseModel):
         flat_mask = torch.zeros(BN, max_C, device=device, dtype=mask_dtype)
         for idx, (bi, cs, ce) in enumerate(slices):
             n = ce - cs
-            if n > 0 and ce <= rel_prompts.shape[1]:
+            if n <= 0:
+                continue
+            if rel_prompts.dim() == 2:
+                if ce <= rel_prompts.shape[0]:
+                    flat[idx, :n] = rel_prompts[cs:ce]
+                    flat_mask[idx, :n] = 1
+            elif ce <= rel_prompts.shape[1]:
                 flat[idx, :n] = rel_prompts[bi, cs:ce]
                 if rel_prompts_mask is not None:
                     flat_mask[idx, :n] = rel_prompts_mask[bi, cs:ce]
@@ -510,7 +558,13 @@ class BaseGLiNextModel(BaseModel):
                 c_start = 0 if g == 0 else int(cumsum[g - 1].item())
                 c_end = int(cumsum[g].item())
                 n = c_end - c_start
-                if n > 0 and c_end <= child_embeds.shape[1]:
+                if n <= 0:
+                    continue
+                if child_embeds.dim() == 2:
+                    if c_end <= child_embeds.shape[0]:
+                        flat_children[g, :n] = child_embeds[c_start:c_end]
+                        flat_child_mask[g, :n] = 1.0
+                elif c_end <= child_embeds.shape[1]:
                     flat_children[g, :n] = child_embeds[batch_origins[g], c_start:c_end]
                     flat_child_mask[g, :n] = 1.0
         else:
@@ -764,6 +818,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         rel_label_embeds: Optional[torch.Tensor],
         child_label_embeds: Optional[torch.Tensor],
         open_rel_label_embeds: Optional[torch.Tensor],
+        media_label_embeds: Optional[Dict[str, torch.Tensor]],
         vision_embedding: Optional[torch.Tensor],
         vision_mask: Optional[torch.Tensor],
         audio_embedding: Optional[torch.Tensor],
@@ -924,6 +979,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 self.config.embed_obj_token,
             )
 
+        media_label_embeds = media_label_embeds or {}
         media_child_prompts: Dict[str, Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = {}
         if obj_child_embeds is not None and classes_mapping is not None:
             offsets = [0 for _ in range(batch_size)]
@@ -987,11 +1043,26 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 "classification": (cat_child_embeds, cat_child_mask),
                 "structuring": (struct_child_embeds, struct_child_mask),
                 "open_relex": (open_rel_child_embeds, open_rel_child_mask),
-                "image_classification": media_child_prompts.get("image_classification", (obj_child_embeds, obj_child_mask)),
-                "audio_classification": media_child_prompts.get("audio_classification", (obj_child_embeds, obj_child_mask)),
-                "object_detection": media_child_prompts.get("object_detection", (obj_child_embeds, obj_child_mask)),
-                "segmentation": media_child_prompts.get("segmentation", (obj_child_embeds, obj_child_mask)),
-                "audio_segmentation": media_child_prompts.get("audio_segmentation", (obj_child_embeds, obj_child_mask)),
+                "image_classification": (
+                    media_label_embeds.get("image_classification"),
+                    None,
+                ) if "image_classification" in media_label_embeds else media_child_prompts.get("image_classification", (obj_child_embeds, obj_child_mask)),
+                "audio_classification": (
+                    media_label_embeds.get("audio_classification"),
+                    None,
+                ) if "audio_classification" in media_label_embeds else media_child_prompts.get("audio_classification", (obj_child_embeds, obj_child_mask)),
+                "object_detection": (
+                    media_label_embeds.get("object_detection"),
+                    None,
+                ) if "object_detection" in media_label_embeds else media_child_prompts.get("object_detection", (obj_child_embeds, obj_child_mask)),
+                "segmentation": (
+                    media_label_embeds.get("segmentation"),
+                    None,
+                ) if "segmentation" in media_label_embeds else media_child_prompts.get("segmentation", (obj_child_embeds, obj_child_mask)),
+                "audio_segmentation": (
+                    media_label_embeds.get("audio_segmentation"),
+                    None,
+                ) if "audio_segmentation" in media_label_embeds else media_child_prompts.get("audio_segmentation", (obj_child_embeds, obj_child_mask)),
             }
 
             task_names = (
@@ -1465,6 +1536,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 open_rel_labels_input_ids, open_rel_labels_attention_mask,
             )
         )
+        media_label_embeds = self._encode_media_labels_batched(kwargs)
 
         # ── 1c-e. Build TaskFlatInputs per task ─────────────────────────
         flat_inputs_map, joint_rel_flat_prompts, joint_rel_flat_mask = (
@@ -1483,6 +1555,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 rel_label_embeds=rel_label_embeds,
                 child_label_embeds=child_label_embeds,
                 open_rel_label_embeds=open_rel_label_embeds,
+                media_label_embeds=media_label_embeds,
                 vision_embedding=vision_embedding,
                 vision_mask=vision_mask,
                 audio_embedding=audio_embedding,
@@ -1681,6 +1754,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 rel_label_embeds=rel_label_embeds,
                 child_label_embeds=child_label_embeds,
                 open_rel_label_embeds=open_rel_label_embeds,
+                media_label_embeds=None,
                 vision_embedding=None,
                 vision_mask=None,
                 audio_embedding=None,
@@ -1811,6 +1885,8 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
         classes_mapping,
         task_name: str,
         batch_size: int,
+        media_tokens: torch.Tensor,
+        media_mask: torch.Tensor,
         device,
         dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1818,12 +1894,53 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
         max_groups = max(max(counts, default=0), 1)
         parent = torch.zeros(batch_size, max_groups, self.config.hidden_size, device=device, dtype=dtype)
         parent_mask = torch.zeros(batch_size, max_groups, device=device, dtype=torch.long)
-        task_parent = self.media_parent_embeddings[task_name].to(device=device, dtype=dtype)
+        task_parent = self._media_parent_embedding_for_task(
+            task_name,
+            media_tokens,
+            media_mask,
+            device=device,
+            dtype=dtype,
+        )
         for batch_idx, count in enumerate(counts):
             if count > 0:
-                parent[batch_idx, :count] = task_parent
+                parent[batch_idx, :count] = task_parent[batch_idx]
                 parent_mask[batch_idx, :count] = 1
         return parent, parent_mask
+
+    def _media_parent_embedding_for_task(
+        self,
+        task_name: str,
+        media_tokens: torch.Tensor,
+        media_mask: torch.Tensor,
+        *,
+        device,
+        dtype,
+    ) -> torch.Tensor:
+        source = getattr(self.config, "media_parent_embedding_source", "fixed")
+        if source == "fixed":
+            task_parent = self.media_parent_embeddings[task_name].to(device=device, dtype=dtype)
+            return task_parent.unsqueeze(0).expand(media_tokens.shape[0], -1)
+
+        tokens = media_tokens.to(device=device, dtype=dtype)
+        if media_mask is None or media_mask.shape[-1] != tokens.shape[1]:
+            mask = torch.ones(tokens.shape[:2], dtype=tokens.dtype, device=device)
+        else:
+            mask = media_mask.to(device=device, dtype=tokens.dtype)
+
+        if source == "first":
+            valid = mask > 0
+            first_idx = valid.float().argmax(dim=1)
+            batch_idx = torch.arange(tokens.shape[0], device=device)
+            parent = tokens[batch_idx, first_idx]
+            return parent * valid.any(dim=1).to(dtype=dtype).unsqueeze(-1)
+
+        weights = mask.unsqueeze(-1)
+        pooled = (tokens * weights).sum(dim=1)
+        if source == "mean":
+            pooled = pooled / weights.sum(dim=1).clamp(min=1.0)
+        elif source != "sum":
+            raise ValueError(f"Unknown media_parent_embedding_source: {source!r}")
+        return pooled
 
     def _encode_task_labels(
         self,
@@ -1838,9 +1955,8 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
         if input_ids is None or attention_mask is None or group_sizes is None:
             return None, None, None
         labels_embeds = self.token_rep_layer.encode_labels(input_ids, attention_mask)
-        labels_embeds = labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
         labels_mask = torch.ones(
-            labels_embeds.shape[:-1],
+            labels_embeds.shape[:1],
             dtype=attention_dtype,
             device=labels_embeds.device,
         )
@@ -1870,6 +1986,8 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
                 classes_mapping,
                 task_name,
                 batch_size,
+                media_tokens,
+                media_mask,
                 media_tokens.device,
                 media_tokens.dtype,
             )

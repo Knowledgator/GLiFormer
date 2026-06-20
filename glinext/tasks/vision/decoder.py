@@ -65,26 +65,30 @@ class ObjectDetectionDecoder(TaskDecoder):
         if logits is None or boxes is None or origin is None:
             return []
 
-        class_probs = torch.sigmoid(logits)
-        obj_probs = torch.sigmoid(objectness) if objectness is not None else torch.ones_like(class_probs[..., 0])
+        obj_probs = torch.sigmoid(objectness) if objectness is not None else torch.ones_like(logits[..., 0])
         id_to_class_maps = _id_maps(classes_mapping, self.mapping_name)
         flat_results = []
-        for b in range(class_probs.shape[0]):
+        for b in range(logits.shape[0]):
             id_to_class = id_to_class_maps[b] if b < len(id_to_class_maps) else {}
-            num_classes = len(id_to_class) if id_to_class else class_probs.shape[-1]
+            num_classes = len(id_to_class) if id_to_class else logits.shape[-1]
+            class_probs = torch.softmax(logits[b, :, :num_classes], dim=-1)
             predictions = []
-            for a in range(class_probs.shape[1]):
+            for a in range(class_probs.shape[0]):
                 if anchor_mask is not None and not bool(anchor_mask[b, a].item()):
                     continue
-                scores = class_probs[b, a, :num_classes] * obj_probs[b, a]
-                best_idx = int(scores.argmax().item())
-                score = float(scores[best_idx].item())
+                obj_prob = float(obj_probs[b, a].item())
+                if obj_prob <= threshold:
+                    continue
+                best_idx = int(class_probs[a].argmax().item())
+                score = float(class_probs[a, best_idx].item())
                 if score <= threshold:
                     continue
+                box = boxes[b, a, best_idx] if boxes.dim() == 4 else boxes[b, a]
                 predictions.append({
                     "label": id_to_class.get(best_idx, str(best_idx)),
                     "score": score,
-                    "bbox": boxes[b, a].detach().cpu().tolist(),
+                    "objectness": obj_prob,
+                    "bbox": box.detach().cpu().tolist(),
                     "anchor": a,
                 })
             flat_results.append(predictions)

@@ -34,15 +34,17 @@ class NERHead(AnchoredSpanExtractionHead):
     @staticmethod
     def _fit_length(tensor, mask, target_length):
         """Pad or trim ``tensor`` and ``mask`` to ``target_length`` along dim=1."""
-        current = tensor.shape[1]
-        if current == target_length:
-            return tensor, mask
-        if current < target_length:
-            pad_size = target_length - current
+        tensor_length = tensor.shape[1]
+        if tensor_length < target_length:
+            pad_size = target_length - tensor_length
             tensor = torch.nn.functional.pad(tensor, [0] * (2 * (tensor.dim() - 2)) + [0, pad_size])
-            mask = torch.nn.functional.pad(mask, [0, pad_size])
-        else:
+        elif tensor_length > target_length:
             tensor = tensor[:, :target_length]
+
+        mask_length = mask.shape[1]
+        if mask_length < target_length:
+            mask = torch.nn.functional.pad(mask, [0, target_length - mask_length])
+        elif mask_length > target_length:
             mask = mask[:, :target_length]
         return tensor, mask
 

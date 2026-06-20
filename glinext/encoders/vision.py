@@ -20,6 +20,9 @@ def _hidden_size(model_config: Any, default: int) -> int:
         value = getattr(model_config, name, None)
         if value is not None:
             return int(value)
+    hidden_sizes = getattr(model_config, "hidden_sizes", None)
+    if hidden_sizes:
+        return int(hidden_sizes[-1])
     return int(default)
 
 
@@ -150,12 +153,17 @@ class VisionEncoder(nn.Module):
     @staticmethod
     def _extract_sequence(output: Any) -> torch.Tensor:
         if isinstance(output, torch.Tensor):
-            return output
-        if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
-            return output.last_hidden_state
-        if isinstance(output, (tuple, list)) and output:
-            return output[0]
-        raise ValueError("Vision backbone did not return token embeddings")
+            token_embeddings = output
+        elif hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+            token_embeddings = output.last_hidden_state
+        elif isinstance(output, (tuple, list)) and output:
+            token_embeddings = output[0]
+        else:
+            raise ValueError("Vision backbone did not return token embeddings")
+
+        if token_embeddings.dim() == 4:
+            token_embeddings = token_embeddings.flatten(2).transpose(1, 2)
+        return token_embeddings
 
     def forward(self, pixel_values: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         output = self.model(pixel_values=pixel_values, **kwargs)

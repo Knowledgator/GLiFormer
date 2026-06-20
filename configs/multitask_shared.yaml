@@ -14,7 +14,7 @@ model:
   # ── Shared layers across extraction heads ──
   # A single AnchorModeling instance shared by NER (anchored), Open Relex,
   # Structuring, and Joint Relex — per-task anchor_modeling settings are ignored.
-  shared_anchor_modeling: "lstm"
+  shared_anchor_modeling: "rnn"
   shared_anchor_refine_layers: 2
   shared_anchor_refine_heads: 8
 
@@ -47,7 +47,7 @@ model:
     focal_loss_prob_margin: null
 
   structuring_config:
-    anchor_mode: "lstm"
+    anchor_mode: "rnn"
     anchor_modeling: "linear"
     anchor_num_heads: 4
     anchor_num_layers: 2
@@ -61,11 +61,11 @@ model:
     neg_spans_ratio: 1.0
     span_loss_coef: 0.5
     use_anchor_matching: true
+    anchor_objectness: true
+    anchor_objectness_loss_coef: 0.5
+    anchor_objectness_threshold: 0.5
 
-  count_config:
-    mode: "classification"
-    max_count: 30
-    loss_coef: 0.5
+  count_config: null
 
   embedding_config:
     pooling_type: "mean"

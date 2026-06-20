@@ -67,11 +67,19 @@ class ObjectDetectionHeadConfig(BaseHeadConfig):
     max_count: int = 100
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
+    anchor_refine_layers: int = 2
+    scorer_type: str = "dot"
     obj_token_index: int = -1
     embed_obj_token: bool = True
     bbox_loss_coef: float = 5.0
     class_loss_coef: float = 1.0
     objectness_loss_coef: float = 1.0
+    objectness_positive_weight: float = 5.0
+    class_conditioned_bbox: bool = True
+    bbox_prior_grid: bool = False
+    bbox_prior_margin: float = 0.1
+    drop_cls_token_for_dense: bool = True
+    dense_coord_features: bool = True
     matcher_class_cost: float = 1.0
     matcher_bbox_cost: float = 5.0
 
@@ -240,6 +248,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         backbone_type: str = "auto",
         model_variant: str = "text",
         multimodal_fusion: str = "uni-encoder",
+        media_parent_embedding_source: str = "fixed",
         use_layout: bool = False,
         layout_image_tokens: bool = True,
         max_page_embeddings: int = 1024,
@@ -388,6 +397,17 @@ class GLiNextConfig(BaseGLiNERConfig):
             raise ValueError(
                 "model_variant must be one of "
                 f"{sorted(allowed_model_variants)}, got {model_variant!r}."
+            )
+        media_parent_embedding_source = str(media_parent_embedding_source).lower().replace("-", "_")
+        media_parent_embedding_source = {
+            "avg": "mean",
+            "average": "mean",
+        }.get(media_parent_embedding_source, media_parent_embedding_source)
+        allowed_media_parent_sources = {"fixed", "first", "mean", "sum"}
+        if media_parent_embedding_source not in allowed_media_parent_sources:
+            raise ValueError(
+                "media_parent_embedding_source must be one of "
+                f"{sorted(allowed_media_parent_sources)}, got {media_parent_embedding_source!r}."
             )
         expected_model_variant = getattr(self, "expected_model_variant", None)
         if expected_model_variant is not None and model_variant != expected_model_variant:
@@ -544,6 +564,7 @@ class GLiNextConfig(BaseGLiNERConfig):
 
         self.model_variant = model_variant
         self.multimodal_fusion = multimodal_fusion
+        self.media_parent_embedding_source = media_parent_embedding_source
         self.use_layout = use_layout
         self.layout_image_tokens = layout_image_tokens
         self.max_page_embeddings = max_page_embeddings
@@ -787,6 +808,7 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "backbone_type",
         "model_variant",
         "multimodal_fusion",
+        "media_parent_embedding_source",
         "use_layout",
         "seq_token",
         "cat_token",
