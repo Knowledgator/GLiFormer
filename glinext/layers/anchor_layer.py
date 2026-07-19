@@ -177,6 +177,14 @@ class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
         nn.init.orthogonal_(self.anchor_table.weight)
         self.context_proj = nn.Linear(hidden_size, hidden_size)
+        # The slots start as orthogonal directions, but the projected context is a
+        # single vector added to every slot. If it dominates (its learned norm is
+        # typically several times the unit-norm table rows), it rotates all slots
+        # toward one direction → they become near-collinear → downstream
+        # self-attention averages them into a single identical query, so every
+        # anchor predicts the same class/box. Gate the context low so the distinct
+        # per-slot identity survives; training can grow the gate if it helps.
+        self.context_gate = nn.Parameter(torch.tensor(0.1))
 
     def forward(
         self,
@@ -191,7 +199,7 @@ class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
 
         anchors = self.anchor_table.weight.unsqueeze(0).expand(B, -1, -1)  # (B, num_slots, D)
         context = self.context_proj(context_embedding).unsqueeze(1)  # (B, 1, D)
-        anchors = anchors + context
+        anchors = anchors + self.context_gate * context
 
         mask = _count_mask(B, self.num_slots, count, device)
         return anchors, mask

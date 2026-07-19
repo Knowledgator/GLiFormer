@@ -7,6 +7,21 @@ from scipy.optimize import linear_sum_assignment
 from torch import nn
 
 
+def _pairwise_giou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Pairwise GIoU between ``(N, 4)`` and ``(M, 4)`` xyxy boxes -> ``(N, M)``."""
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    inter = (rb - lt).clamp(min=0).prod(dim=-1)
+    union = area1[:, None] + area2[None, :] - inter + 1e-6
+    iou = inter / union
+    elt = torch.minimum(boxes1[:, None, :2], boxes2[None, :, :2])
+    erb = torch.maximum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    enclosing = (erb - elt).clamp(min=0).prod(dim=-1) + 1e-6
+    return iou - (enclosing - union) / enclosing
+
+
 class HungarianMatcher(nn.Module):
     """Match anchor-slot predictions to labeled targets with Hungarian assignment.
 
@@ -16,11 +31,12 @@ class HungarianMatcher(nn.Module):
     target indices from the padded target tensor.
     """
 
-    def __init__(self, cost_class: float = 1.0, cost_geometry: float = 1.0):
+    def __init__(self, cost_class: float = 1.0, cost_geometry: float = 1.0, cost_giou: float = 0.0):
         super().__init__()
         self.cost_class = float(cost_class)
         self.cost_geometry = float(cost_geometry)
-        if self.cost_class == 0.0 and self.cost_geometry == 0.0:
+        self.cost_giou = float(cost_giou)
+        if self.cost_class == 0.0 and self.cost_geometry == 0.0 and self.cost_giou == 0.0:
             raise ValueError("at least one Hungarian matching cost must be non-zero")
 
     @torch.no_grad()
@@ -43,14 +59,17 @@ class HungarianMatcher(nn.Module):
         if valid_idx.numel() == 0 or pred_idx.numel() == 0:
             return []
 
-        class_logits = class_logits[pred_idx]
-        geometry_preds = geometry_preds[pred_idx]
+        # Matching is non-differentiable and ends in a NumPy linear-assignment,
+        # so resolve to float32: bf16 has no cdist kernel and no NumPy dtype.
+        class_logits = class_logits[pred_idx].float()
+        geometry_preds = geometry_preds[pred_idx].float()
         target_classes = target_classes[valid_idx].long()
-        target_geometry = target_geometry[valid_idx]
+        target_geometry = target_geometry[valid_idx].float()
 
-        # Use softmax to compute class probabilities, consistent with cross_entropy
-        # training. For single-class groups, softmax collapses to 1.0, making the
-        # class cost neutral — in that case geometry cost drives matching.
+        # Detection heads train matched queries with softmax cross-entropy, and
+        # inference uses the same softmax distribution. Matching must use that
+        # distribution as well; sigmoid ignores competition between labels and
+        # can assign a query whose target logit is high but not its winning class.
         probs = class_logits.softmax(dim=-1)
         class_cost = probs.new_zeros((probs.shape[0], target_classes.numel()))
         valid_classes = (target_classes >= 0) & (target_classes < probs.shape[1])
@@ -67,9 +86,20 @@ class HungarianMatcher(nn.Module):
                 geometry_cost[:, valid_geometry_classes] = (
                     pred_geometry - target_geometry[valid_geometry_classes].unsqueeze(0)
                 ).abs().sum(dim=-1)
+            giou_cost = geometry_cost.new_zeros(geometry_cost.shape)
         else:
             geometry_cost = torch.cdist(geometry_preds, target_geometry, p=1)
-        cost = self.cost_class * class_cost + self.cost_geometry * geometry_cost
+            if self.cost_giou != 0.0 and geometry_preds.shape[-1] == 4:
+                # Negative GIoU as a cost: better-overlapping pairs are cheaper.
+                # Pairs the boxes that L1 alone leaves ambiguous for small objects.
+                giou_cost = -_pairwise_giou(geometry_preds, target_geometry)
+            else:
+                giou_cost = geometry_cost.new_zeros(geometry_cost.shape)
+        cost = (
+            self.cost_class * class_cost
+            + self.cost_geometry * geometry_cost
+            + self.cost_giou * giou_cost
+        )
         rows, cols = linear_sum_assignment(cost.detach().cpu().numpy())
         return [
             (int(pred_idx[int(row)].item()), int(valid_idx[int(col)].item()))

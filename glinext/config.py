@@ -68,13 +68,35 @@ class ObjectDetectionHeadConfig(BaseHeadConfig):
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
     anchor_refine_layers: int = 2
+    # Std of the per-slot positional embeddings that break anchor permutation
+    # symmetry in the refine layers. Must be strong (~1.0, norm ~sqrt(D)); a weak
+    # value lets the refine self-attention collapse all slots to one query.
+    slot_pos_emb_std: float = 1.0
+    # DAB/Conditional-DETR reference points: each slot owns a learnable
+    # (cx, cy, w, h) reference that both steers its cross-attention (via a shared
+    # sinusoidal positional query) and biases its box regression as an offset.
+    # Supersedes slot_pos_emb + bbox_prior_grid when enabled, and is what lets the
+    # boxes localize instead of collapsing to the dataset-mean box.
+    reference_points: bool = True
+    pos_emb_scale: float = 1.0
+    default_box_size: float = 0.1
     scorer_type: str = "dot"
     obj_token_index: int = -1
     embed_obj_token: bool = True
     bbox_loss_coef: float = 5.0
+    iou_loss_coef: float = 2.0
     class_loss_coef: float = 1.0
     objectness_loss_coef: float = 1.0
-    objectness_positive_weight: float = 5.0
+    objectness_positive_weight: float = 1.0
+    # Resolution-aware target cleanup. ``min_bbox_side_pixels`` is measured at
+    # the configured model input resolution after normalizing the source box.
+    # Defaults preserve existing datasets; detection configs can opt in.
+    min_bbox_side_pixels: float = 0.0
+    bbox_dedup_iou_threshold: Optional[float] = None
+    # "first" preserves legacy source ordering. "largest" prioritizes spatially
+    # resolvable targets, while "class_balanced_largest" round-robins classes
+    # and takes the largest remaining target from each class.
+    object_selection_strategy: str = "first"
     class_conditioned_bbox: bool = True
     bbox_prior_grid: bool = False
     bbox_prior_margin: float = 0.1
@@ -82,6 +104,7 @@ class ObjectDetectionHeadConfig(BaseHeadConfig):
     dense_coord_features: bool = True
     matcher_class_cost: float = 1.0
     matcher_bbox_cost: float = 5.0
+    matcher_giou_cost: float = 2.0
 
 
 @dataclass

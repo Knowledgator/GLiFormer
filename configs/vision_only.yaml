@@ -9,18 +9,22 @@ model:
   max_len: 512
   media_parent_embedding_source: mean
 
-  vision_model_name: google/vit-base-patch16-224
+  vision_model_name: google/vit-base-patch16-384
   vision_encoder_type: auto
   vision_in_channels: 3
   vision_patch_size: 16
-  image_size: 224
+  image_size: 384
   vision_processor_type: custom
   vision_processor_name: null
-  vision_resize_size: 224
+  vision_resize_size: 384
   vision_center_crop_size: null
   vision_interpolation: bilinear
   vision_do_rescale: true
   vision_do_normalize: true
+  # google/vit-base-patch16-384 uses the standard ViT [-1, 1]
+  # normalization, rather than torchvision's ImageNet mean/std defaults.
+  vision_image_mean: [0.5, 0.5, 0.5]
+  vision_image_std: [0.5, 0.5, 0.5]
 
   image_classification_config:
     pooling_type: "mean"
@@ -35,21 +39,55 @@ model:
     anchor_modeling: "linear"
     anchor_refine_layers: 4
     anchor_refine_heads: 8
-    num_fixed_slots: 100
-    max_count: 100
+    # After resolution-aware filtering, 30 slots retain about 97.7% of usable
+    # Web-COCO boxes and avoid diluting objectness with needless background
+    # queries.
+    num_fixed_slots: 30
+    max_count: 30
+    # Web-COCO originates from segmentation polygons. Ignore contour fragments
+    # smaller than one 16px ViT patch, collapse near-identical same-class boxes,
+    # and prevent source-file label ordering from monopolizing the query budget.
+    min_bbox_side_pixels: 16.0
+    bbox_dedup_iou_threshold: 0.95
+    object_selection_strategy: "class_balanced_largest"
     anchor_num_heads: 4
     anchor_num_layers: 2
-    class_conditioned_bbox: false
-    bbox_prior_grid: true
-    bbox_prior_margin: 0.1
-    drop_cls_token_for_dense: true
+    # DAB/Conditional-DETR reference points. Each slot owns a learnable
+    # (cx, cy, w, h) reference that (a) supplies a sinusoidal positional query
+    # steering its cross-attention to its own image region and (b) biases its box
+    # regression as an offset. This is what stops the boxes collapsing to the
+    # dataset-mean box: without it the slots have no spatial conditioning and the
+    # loss-minimizing constant output is a single centered medium box.
+    # Supersedes slot_pos_emb_std and bbox_prior_grid when enabled.
+    reference_points: true
+    pos_emb_scale: 1.0          # magnitude of the sinusoidal position query (~norm sqrt(D))
+    default_box_size: 0.1       # initial box side; LVIS objects are small (median ~0.06)
+    slot_pos_emb_std: 1.0       # legacy fallback, ignored when reference_points: true
+    bbox_prior_grid: false      # ignored when reference_points: true
+    bbox_prior_margin: 0.1      # also seeds the reference-point grid layout
+    # When reference_points is on, patch tokens get the same sinusoidal 2D PE as
+    # the slot queries (not the learnable coord projection) so cross-attention is
+    # spatially peaked. The CLS token is still dropped so the grid is square.
     dense_coord_features: true
-    bbox_loss_coef: 10.0
+    drop_cls_token_for_dense: true
+    bbox_loss_coef: 5.0
+    iou_loss_coef: 2.0
     class_loss_coef: 1.0
-    objectness_loss_coef: 2.0
-    objectness_positive_weight: 5.0
+    objectness_loss_coef: 1.0
+    # Do not up-weight positives here. Combined with focal alpha=0.75, the old
+    # value of 5 made an almost-constant foreground probability optimal.
+    objectness_positive_weight: 1.0
     matcher_class_cost: 1.0
     matcher_bbox_cost: 5.0
+    # GIoU term in the Hungarian assignment cost (DETR-style class:1 / L1:5 / giou:2).
+    # L1 alone under-separates small LVIS boxes, whose absolute coordinate
+    # differences are tiny; GIoU disambiguates which slot owns each object.
+    matcher_giou_cost: 2.0
+    # The query set is small enough that plain BCE provides a better-calibrated
+    # objectness signal than the previous doubly weighted focal objective.
+    focal_loss_alpha: -1.0
+    focal_loss_gamma: 0
+    focal_loss_prob_margin: 0
     loss_coef: 1.0
 
   segmentation_config: null
@@ -65,17 +103,18 @@ model:
   audio_segmentation_config: null
 
 data:
-  root_dir: logs/vision_only
-  train_data: "data/lvis_validation.json"
-  val_data: "none"
+  # Preserve both earlier detector runs while retraining with cleaned targets.
+  root_dir: logs/vision_only_v3
+  train_data: "data/web_coco_train.json"
+  val_data: "data/web_coco_val.json"
 
 training:
   prev_path: null
-  num_steps: 300000
+  num_steps: 50000
   train_batch_size: 4
   gradient_accumulation_steps: 1
   eval_every: 1000
-  warmup_ratio: 0.05
+  warmup_ratio: 0.01
   scheduler_type: "cosine"
   focal_loss_alpha: 0.75
   focal_loss_gamma: 2
@@ -84,10 +123,10 @@ training:
   negatives: 1.0
   masking: "none"
   lr_encoder: 1e-5
-  lr_others: 3e-5
+  lr_others: 1e-4
   weight_decay_encoder: 0.01
-  weight_decay_other: 0.01
-  max_grad_norm: 10.0
+  weight_decay_other: 0.0
+  max_grad_norm: 1.0
   save_total_limit: 3
   train_head_only: false
   freeze_components: null

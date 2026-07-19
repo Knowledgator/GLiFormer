@@ -63,13 +63,10 @@ class ClassificationHead(TaskHead):
         anchor_rep, anchor_mask = self.anchor_layer(context, feature_embeddings, feature_mask=feature_mask)
         if hasattr(self, "anchor_refine"):
             anchor_rep = self.anchor_refine(anchor_rep, feature_embeddings, token_mask=feature_mask)
-        fused = self.anchor_modeling(anchor_rep, cat_embedding)  # (B, 1, C, D)
-        if fused.shape[1] == 1:
-            fused = fused.squeeze(1)
-        else:
-            anchor_weights = anchor_mask.float()
-            fused = (fused * anchor_weights[:, :, None, None]).sum(dim=1)
-            fused = fused / anchor_weights.sum(dim=1).clamp(min=1)[:, None, None]
+        fused = self._reduce_fused_anchors(
+            self.anchor_modeling(anchor_rep, cat_embedding),
+            anchor_mask,
+        )
         scores = self.scorer(text_rep, fused)
 
         loss = None

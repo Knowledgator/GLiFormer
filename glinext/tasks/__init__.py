@@ -116,6 +116,16 @@ class TaskHead(ABC, nn.Module):
                 dropout=dropout,
             )
 
+    def _reduce_fused_anchors(self, fused: torch.Tensor, anchor_mask: torch.Tensor) -> torch.Tensor:
+        if fused.dim() != 4:
+            return fused
+        if fused.shape[1] == 1:
+            return fused.squeeze(1)
+
+        anchor_weights = anchor_mask.float()
+        fused = (fused * anchor_weights[:, :, None, None]).sum(dim=1)
+        return fused / anchor_weights.sum(dim=1).clamp(min=1)[:, None, None]
+
     @abstractmethod
     def forward(
         self,

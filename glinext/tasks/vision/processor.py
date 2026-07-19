@@ -47,6 +47,26 @@ class VisionProcessor(TaskProcessor):
         cfg = getattr(config, f"{task_name}_config", None)
         self.max_count = int(getattr(cfg, "max_count", 100))
         self.mask_size = int(getattr(cfg, "mask_size", 128))
+        self.min_bbox_side_pixels = float(getattr(cfg, "min_bbox_side_pixels", 0.0))
+        self.bbox_dedup_iou_threshold = getattr(cfg, "bbox_dedup_iou_threshold", None)
+        if self.bbox_dedup_iou_threshold is not None:
+            self.bbox_dedup_iou_threshold = float(self.bbox_dedup_iou_threshold)
+        self.object_selection_strategy = str(
+            getattr(cfg, "object_selection_strategy", "first")
+        ).lower()
+        if self.min_bbox_side_pixels < 0:
+            raise ValueError("min_bbox_side_pixels must be non-negative")
+        if (
+            self.bbox_dedup_iou_threshold is not None
+            and not 0.0 < self.bbox_dedup_iou_threshold <= 1.0
+        ):
+            raise ValueError("bbox_dedup_iou_threshold must be in (0, 1]")
+        allowed_selection = {"first", "largest", "class_balanced_largest"}
+        if self.object_selection_strategy not in allowed_selection:
+            raise ValueError(
+                "object_selection_strategy must be one of "
+                f"{sorted(allowed_selection)}, got {self.object_selection_strategy!r}"
+            )
 
     def _task_label_groups(self, item: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         groups = item.get(self.task_name)
@@ -60,69 +80,26 @@ class VisionProcessor(TaskProcessor):
             groups = [{"all_labels": list(groups)}]
         return list(groups)
 
-    def _fallback_label_group(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        labels = self.labels_from_item(item)
-        group: Dict[str, Any] = {
-            "name": item.get("name", self.task_name),
-            "all_labels": labels,
-        }
-        if "true_labels" in item:
-            group["true_labels"] = item.get("true_labels")
-        if "objects" in item:
-            group["objects"] = item.get("objects")
-        return group
-
     @staticmethod
-    def _label_universe_for_group(item: Dict[str, Any], group: Dict[str, Any]) -> List[str]:
-        labels = (
-            group.get("all_labels") or item.get("all_labels")
-        )
-        return _unique(labels or [])
+    def _groups_for_task(item: Dict[str, Any], task_name: str) -> Optional[List[Dict[str, Any]]]:
+        groups = item.get(task_name)
+        if groups is None:
+            return None
+        if isinstance(groups, dict):
+            return [groups]
+        if isinstance(groups, (list, tuple)) and groups and isinstance(groups[0], dict):
+            return list(groups)
+        return None
 
-    def _classification_groups_from_objects(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
-        sources = []
-        for task_name in ("object_detection", "segmentation"):
-            groups = item.get(task_name)
-            if groups is None:
-                continue
-            if isinstance(groups, dict):
-                groups = [groups]
-            for group in groups:
-                if isinstance(group, dict) and group.get("objects"):
-                    sources.append(group)
-
-        if not sources and item.get("objects"):
-            sources.append({
-                "name": item.get("name", self.task_name),
-                "objects": item.get("objects", []),
-            })
-
-        class_groups = []
-        for group in sources:
-            true_labels = _unique(obj.get("label") for obj in group.get("objects", []))
-            all_labels = self._label_universe_for_group(item, group) or true_labels
-            if not all_labels and not true_labels:
-                continue
-            class_groups.append({
-                "name": group.get("name", item.get("name", self.task_name)),
-                "all_labels": _unique([*all_labels, *true_labels]),
-                "true_labels": true_labels,
-            })
-        return class_groups
-
-    def _label_groups_for_item(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _group_for_mapping(self, item: Dict[str, Any], group_idx: int) -> Dict[str, Any]:
         groups = self._task_label_groups(item)
-        if groups is not None:
-            return groups
-        if self.task_name == "image_classification":
-            groups = self._classification_groups_from_objects(item)
-            if groups:
-                return groups
-        return [self._fallback_label_group(item)]
+        if groups is not None and group_idx < len(groups):
+            return groups[group_idx]
+        return item
 
     @staticmethod
     def labels_from_item(item: Dict[str, Any]) -> List[str]:
-        labels = item.get("all_labels")
+        labels = item.get("labels") or item.get("classes") or item.get("all_labels")
         if labels is not None:
             return _unique(labels)
         return _unique(obj.get("label") for obj in item.get("objects", []))
@@ -141,17 +118,32 @@ class VisionProcessor(TaskProcessor):
                 mappings.append(VisionClassMapping())
                 continue
 
-            task_groups = self._label_groups_for_item(item)
+            task_groups = self._task_label_groups(item)
+            if task_groups is None:
+                labels = self.labels_from_item(item)
+                if not labels and self.task_name == "image_classification":
+                    detection_groups = self._groups_for_task(item, "object_detection") or []
+                    task_groups = []
+                    for group in detection_groups:
+                        group_labels = group.get("all_labels") or group.get("labels") or group.get("classes")
+                        group_labels = _unique(group_labels or [])
+                        if group_labels:
+                            task_groups.append({
+                                "name": group.get("name", item.get("name", self.task_name)),
+                                "all_labels": group_labels,
+                                "true_labels": self.true_labels_from_item(group),
+                            })
+                    if not task_groups:
+                        task_groups = None
+                if task_groups is None:
+                    task_groups = [{
+                        "name": item.get("name", self.task_name),
+                        "all_labels": labels,
+                    }]
 
             item_mappings = []
             for group in task_groups:
-                labels = (
-                    group.get("all_labels")
-                    or group.get("labels")
-                    or group.get("classes")
-                    or group.get("true_labels")
-                    or _unique(obj.get("label") for obj in group.get("objects", []))
-                )
+                labels = group.get("all_labels") or group.get("labels") or group.get("classes")
                 labels = _unique(labels or [])
                 if not labels:
                     continue
@@ -209,13 +201,14 @@ class VisionProcessor(TaskProcessor):
         labels = torch.zeros(total, max_classes, dtype=torch.float)
         for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
             label_to_id = mapping.class_to_id.class_to_id
-            groups = self._label_groups_for_item(batch_list[batch_idx])
-            group = groups[group_idx] if group_idx < len(groups) else {}
-            true_labels = group.get("true_labels")
-            if true_labels is None and self._task_label_groups(batch_list[batch_idx]) is None:
-                true_labels = self.true_labels_from_item(batch_list[batch_idx])
-            true_labels = _unique(true_labels or [])
-            for label in true_labels:
+            item = batch_list[batch_idx]
+            groups = self._task_label_groups(item)
+            if groups is not None and group_idx < len(groups):
+                group = groups[group_idx]
+            else:
+                detection_groups = self._groups_for_task(item, "object_detection") or []
+                group = detection_groups[group_idx] if group_idx < len(detection_groups) else item
+            for label in self.true_labels_from_item(group):
                 if label in label_to_id:
                     labels[flat_idx, label_to_id[label]] = 1.0
         return {"image_classification_labels": labels}
@@ -234,6 +227,103 @@ class VisionProcessor(TaskProcessor):
         x2 = torch.maximum(box[0], box[2]).clamp(0, 1)
         y2 = torch.maximum(box[1], box[3]).clamp(0, 1)
         return torch.stack([x1, y1, x2, y2])
+
+    @staticmethod
+    def _bbox_area(bbox: torch.Tensor) -> float:
+        width = (bbox[2] - bbox[0]).clamp(min=0)
+        height = (bbox[3] - bbox[1]).clamp(min=0)
+        return float((width * height).item())
+
+    @staticmethod
+    def _bbox_iou(first: torch.Tensor, second: torch.Tensor) -> float:
+        left = torch.maximum(first[0], second[0])
+        top = torch.maximum(first[1], second[1])
+        right = torch.minimum(first[2], second[2])
+        bottom = torch.minimum(first[3], second[3])
+        intersection = (right - left).clamp(min=0) * (bottom - top).clamp(min=0)
+        first_area = (first[2] - first[0]).clamp(min=0) * (first[3] - first[1]).clamp(min=0)
+        second_area = (second[2] - second[0]).clamp(min=0) * (second[3] - second[1]).clamp(min=0)
+        union = first_area + second_area - intersection
+        return float((intersection / union.clamp(min=1e-12)).item())
+
+    def _prepare_detection_objects(self, objects, image_size, label_to_id):
+        """Normalize, clean, and deterministically select detection targets.
+
+        Web-COCO is converted from segmentation polygons, so its raw object list
+        contains many sub-patch contour fragments and near-identical boxes. A
+        dense detector should not spend query slots on targets that the visual
+        token grid cannot resolve. Selection happens after cleanup so crowded
+        images do not systematically discard labels appearing late in the file.
+        """
+        candidates = []
+        for source_index, obj in enumerate(objects or []):
+            if not isinstance(obj, dict):
+                continue
+            label = obj.get("label")
+            bbox = obj.get("bbox")
+            if label not in label_to_id or bbox is None:
+                continue
+            norm_bbox = self._normalize_bbox(bbox, image_size)
+            width = float((norm_bbox[2] - norm_bbox[0]).clamp(min=0).item())
+            height = float((norm_bbox[3] - norm_bbox[1]).clamp(min=0).item())
+            if width <= 0.0 or height <= 0.0:
+                continue
+            if min(width, height) * self.image_size < self.min_bbox_side_pixels:
+                continue
+            candidates.append({
+                "object": obj,
+                "label": label,
+                "bbox": norm_bbox,
+                "area": width * height,
+                "source_index": source_index,
+            })
+
+        if self.bbox_dedup_iou_threshold is not None:
+            deduplicated = []
+            # Consider the largest boxes first so a noisy inner contour cannot
+            # displace the more complete same-class object box.
+            for candidate in sorted(
+                candidates,
+                key=lambda item: (-item["area"], item["source_index"]),
+            ):
+                duplicate = any(
+                    kept["label"] == candidate["label"]
+                    and self._bbox_iou(kept["bbox"], candidate["bbox"])
+                    >= self.bbox_dedup_iou_threshold
+                    for kept in deduplicated
+                )
+                if not duplicate:
+                    deduplicated.append(candidate)
+            candidates = deduplicated
+
+        if self.object_selection_strategy == "largest":
+            candidates.sort(key=lambda item: (-item["area"], item["source_index"]))
+        elif self.object_selection_strategy == "class_balanced_largest":
+            buckets = {label: [] for label in label_to_id}
+            for candidate in candidates:
+                buckets[candidate["label"]].append(candidate)
+            for bucket in buckets.values():
+                bucket.sort(key=lambda item: (-item["area"], item["source_index"]))
+
+            balanced = []
+            round_index = 0
+            while len(balanced) < self.max_count:
+                added = False
+                for label in label_to_id:
+                    bucket = buckets[label]
+                    if round_index < len(bucket):
+                        balanced.append(bucket[round_index])
+                        added = True
+                        if len(balanced) == self.max_count:
+                            break
+                if not added:
+                    break
+                round_index += 1
+            candidates = balanced
+        else:
+            candidates.sort(key=lambda item: item["source_index"])
+
+        return candidates[:self.max_count]
 
     def _object_mask(self, obj, bbox, image_size):
         mask = obj.get("mask")
@@ -263,18 +353,18 @@ class VisionProcessor(TaskProcessor):
         if total == 0:
             return None
 
-        group_objects = []
-        for _, batch_idx, group_idx, _ in self._mapping_iter(classes_mapping):
-            groups = self._label_groups_for_item(batch_list[batch_idx])
-            group = groups[group_idx] if group_idx < len(groups) else {}
-            objects = group.get("objects")
-            if objects is None and self._task_label_groups(batch_list[batch_idx]) is None:
-                objects = batch_list[batch_idx].get("objects", [])
-            group_objects.append(list(objects or []))
-
-        max_objects = min(
-            self.max_count,
-            max((len(objects) for objects in group_objects), default=0),
+        image_sizes = [item.get("_image_size") for item in batch_list]
+        grouped_objects = []
+        for _, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
+            group = self._group_for_mapping(batch_list[batch_idx], group_idx)
+            grouped_objects.append(self._prepare_detection_objects(
+                group.get("objects", []),
+                image_sizes[batch_idx],
+                mapping.class_to_id.class_to_id,
+            ))
+        max_objects = max(
+            (len(objects) for objects in grouped_objects),
+            default=0,
         )
         max_objects = max(max_objects, 1)
         class_labels = torch.full((total, max_objects), -1, dtype=torch.long)
@@ -282,19 +372,13 @@ class VisionProcessor(TaskProcessor):
         object_mask = torch.zeros(total, max_objects, dtype=torch.float)
         mask_labels = torch.zeros(total, max_objects, self.mask_size, self.mask_size, dtype=torch.float)
 
-        image_sizes = [item.get("_image_size") for item in batch_list]
         for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
             label_to_id = mapping.class_to_id.class_to_id
-            objects = group_objects[flat_idx][:max_objects]
             image_size = image_sizes[batch_idx]
-            for obj_idx, obj in enumerate(objects):
-                label = obj.get("label")
-                if label not in label_to_id:
-                    continue
-                bbox = obj.get("bbox")
-                if bbox is None:
-                    continue
-                norm_bbox = self._normalize_bbox(bbox, image_size)
+            for obj_idx, candidate in enumerate(grouped_objects[flat_idx]):
+                obj = candidate["object"]
+                label = candidate["label"]
+                norm_bbox = candidate["bbox"]
                 class_labels[flat_idx, obj_idx] = label_to_id[label]
                 bbox_labels[flat_idx, obj_idx] = norm_bbox
                 object_mask[flat_idx, obj_idx] = 1.0

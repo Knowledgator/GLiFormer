@@ -25,7 +25,7 @@ class ImageClassificationDecoder(TaskDecoder):
         origin = getattr(model_output, "image_classification_batch_origin", None)
         if logits is None or origin is None:
             return []
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(logits.float())
         id_to_class_maps = _id_maps(classes_mapping, "image_classification_mapping")
         flat_results = []
         for b in range(probs.shape[0]):
@@ -65,30 +65,37 @@ class ObjectDetectionDecoder(TaskDecoder):
         if logits is None or boxes is None or origin is None:
             return []
 
-        obj_probs = torch.sigmoid(objectness) if objectness is not None else torch.ones_like(logits[..., 0])
+        # Softmax over classes to match the cross-entropy training objective:
+        # the head scores each anchor against the candidate labels and is trained
+        # with softmax CE, so the per-class confidence is the softmax, not sigmoid.
+        # Padded label columns are masked to -1e4 by the head, so they contribute
+        # ~0 probability here.
+        class_probs = torch.softmax(logits.float(), dim=-1)
+        obj_probs = torch.sigmoid(objectness.float()) if objectness is not None else torch.ones_like(class_probs[..., 0])
         id_to_class_maps = _id_maps(classes_mapping, self.mapping_name)
         flat_results = []
-        for b in range(logits.shape[0]):
+        for b in range(class_probs.shape[0]):
             id_to_class = id_to_class_maps[b] if b < len(id_to_class_maps) else {}
-            num_classes = len(id_to_class) if id_to_class else logits.shape[-1]
-            class_probs = torch.softmax(logits[b, :, :num_classes], dim=-1)
+            num_classes = len(id_to_class) if id_to_class else class_probs.shape[-1]
             predictions = []
-            for a in range(class_probs.shape[0]):
+            for a in range(class_probs.shape[1]):
                 if anchor_mask is not None and not bool(anchor_mask[b, a].item()):
                     continue
-                obj_prob = float(obj_probs[b, a].item())
-                if obj_prob <= threshold:
-                    continue
-                best_idx = int(class_probs[a].argmax().item())
-                score = float(class_probs[a, best_idx].item())
+                scores = class_probs[b, a, :num_classes] * obj_probs[b, a]
+                best_idx = int(scores.argmax().item())
+                score = float(scores[best_idx].item())
                 if score <= threshold:
                     continue
-                box = boxes[b, a, best_idx] if boxes.dim() == 4 else boxes[b, a]
+                class_score = float(class_probs[b, a, best_idx].item())
+                objectness_score = float(obj_probs[b, a].item())
                 predictions.append({
                     "label": id_to_class.get(best_idx, str(best_idx)),
                     "score": score,
-                    "objectness": obj_prob,
-                    "bbox": box.detach().cpu().tolist(),
+                    "class_score": class_score,
+                    "objectness_score": objectness_score,
+                    # Training keeps edge-crossing corners differentiable. Clip
+                    # only the public inference result to normalized image space.
+                    "bbox": boxes[b, a].detach().float().clamp(0.0, 1.0).cpu().tolist(),
                     "anchor": a,
                 })
             flat_results.append(predictions)

@@ -94,11 +94,10 @@ class AudioClassificationHead(TaskHead):
         )
         if hasattr(self, "anchor_refine"):
             anchors = self.anchor_refine(anchors, audio_features, token_mask=audio_mask)
-        fused = self.anchor_modeling(anchors, flat_inputs.child_embedding).squeeze(1)
-        if fused.dim() == 4:
-            anchor_weights = anchor_mask.float()
-            fused = (fused * anchor_weights[:, :, None, None]).sum(dim=1)
-            fused = fused / anchor_weights.sum(dim=1).clamp(min=1)[:, None, None]
+        fused = self._reduce_fused_anchors(
+            self.anchor_modeling(anchors, flat_inputs.child_embedding),
+            anchor_mask,
+        )
         logits = self.scorer(audio_rep, fused)
 
         loss = None
