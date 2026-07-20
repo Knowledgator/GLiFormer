@@ -1,6 +1,7 @@
 import dataclasses
+import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from transformers.models.auto import CONFIG_MAPPING
 
@@ -11,24 +12,73 @@ from .backbones import get_backbone, normalize_backbone_type
 
 
 @dataclass
-class BaseHeadConfig:
-    """Base config for all task heads that use the anchor paradigm."""
+class TaskHeadConfig:
+    """Loss controls shared by every configurable task head."""
+
     loss_coef: float = 1.0
     # None means inherit the global focal loss value supplied by training args.
     focal_loss_alpha: Optional[float] = None
     focal_loss_gamma: Optional[float] = None
     focal_loss_prob_margin: Optional[float] = None
+
+    def __post_init__(self):
+        if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
+            raise ValueError("loss_coef must be finite and non-negative")
+        for name in (
+            "focal_loss_alpha",
+            "focal_loss_gamma",
+            "focal_loss_prob_margin",
+        ):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite when configured")
+        if self.focal_loss_alpha is not None and self.focal_loss_alpha > 1:
+            raise ValueError("positive focal_loss_alpha must be at most 1")
+
+
+@dataclass
+class AnchorHeadConfig(TaskHeadConfig):
+    """Configuration for heads that acquire and model semantic anchors."""
+
     anchor_mode: str = "parent"
     anchor_modeling: str = "linear"
     feature_anchor_mlp: bool = False
     feature_anchor_mlp_hidden_multiplier: int = 1
     anchor_refine_layers: int = 0
     anchor_refine_heads: int = 8
+    # Post-norm preserves historical checkpoints. Set-prediction decoders can
+    # opt into pre-norm plus LayerScale so a common attention response cannot
+    # erase the distinct learned query residual at the first layer.
+    anchor_refine_norm: str = "post_norm"
+    anchor_refine_layer_scale_init: Optional[float] = None
+    anchor_context_gate_init: float = 0.1
+    anchor_context_gate_trainable: bool = True
+    parent_token_index: int = -1
+    embed_parent_token: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.anchor_refine_norm not in {"post_norm", "pre_norm"}:
+            raise ValueError(
+                "anchor_refine_norm must be 'post_norm' or 'pre_norm'"
+            )
+        if self.anchor_refine_layer_scale_init is not None:
+            layer_scale = float(self.anchor_refine_layer_scale_init)
+            if not math.isfinite(layer_scale) or layer_scale < 0:
+                raise ValueError(
+                    "anchor_refine_layer_scale_init must be finite and non-negative"
+                )
+        if not math.isfinite(float(self.anchor_context_gate_init)):
+            raise ValueError("anchor_context_gate_init must be finite")
+
+
+@dataclass
+class BaseHeadConfig(AnchorHeadConfig):
+    """Span-capable anchor head config retained as the text-head base."""
+
     represent_spans: bool = False
     neg_spans_ratio: float = 1.0
     span_loss_coef: float = 1.0
-    parent_token_index: int = -1
-    embed_parent_token: bool = True
 
 
 @dataclass
@@ -37,7 +87,7 @@ class NERHeadConfig(BaseHeadConfig):
 
 
 @dataclass
-class ClassificationHeadConfig(BaseHeadConfig):
+class ClassificationHeadConfig(AnchorHeadConfig):
     cat_token_index: int = -1
     embed_cat_token: bool = True
     pooling_type: str = "mean"  # "mean", "cls", "max"
@@ -45,66 +95,353 @@ class ClassificationHeadConfig(BaseHeadConfig):
 
 
 @dataclass
-class ImageClassificationHeadConfig(BaseHeadConfig):
-    obj_token_index: int = -1
-    embed_obj_token: bool = True
+class MediaClassificationHeadConfig(AnchorHeadConfig):
+    """Shared configuration for pooled vision and audio classification."""
+
     pooling_type: str = "mean"
     scorer_type: str = "dot"
 
 
-@dataclass
-class AudioClassificationHeadConfig(BaseHeadConfig):
-    obj_token_index: int = -1
-    embed_obj_token: bool = True
-    pooling_type: str = "mean"
-    scorer_type: str = "dot"
+# Public modality-specific names remain aliases for source/checkpoint
+# compatibility; there is only one implementation and one field hierarchy.
+ImageClassificationHeadConfig = MediaClassificationHeadConfig
+AudioClassificationHeadConfig = MediaClassificationHeadConfig
 
 
 @dataclass
-class ObjectDetectionHeadConfig(BaseHeadConfig):
+class SetPredictionHeadConfig(AnchorHeadConfig):
+    """Shared configuration for slot-based media set-prediction heads."""
+
     anchor_mode: str = "fixed"
     num_fixed_slots: int = 100
     max_count: int = 100
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
-    anchor_refine_layers: int = 2
-    # Std of the per-slot positional embeddings that break anchor permutation
-    # symmetry in the refine layers. Must be strong (~1.0, norm ~sqrt(D)); a weak
-    # value lets the refine self-attention collapse all slots to one query.
-    slot_pos_emb_std: float = 1.0
-    # DAB/Conditional-DETR reference points: each slot owns a learnable
-    # (cx, cy, w, h) reference that both steers its cross-attention (via a shared
-    # sinusoidal positional query) and biases its box regression as an offset.
-    # Supersedes slot_pos_emb + bbox_prior_grid when enabled, and is what lets the
-    # boxes localize instead of collapsing to the dataset-mean box.
-    reference_points: bool = True
-    pos_emb_scale: float = 1.0
-    default_box_size: float = 0.1
-    scorer_type: str = "dot"
-    obj_token_index: int = -1
-    embed_obj_token: bool = True
-    bbox_loss_coef: float = 5.0
-    iou_loss_coef: float = 2.0
+    # Independent sigmoid classes need absolute logits with a stable scale;
+    # unlike softmax, a shared large offset does not cancel at inference.
+    scorer_type: str = "scaled-dot"
     class_loss_coef: float = 1.0
     objectness_loss_coef: float = 1.0
     objectness_positive_weight: float = 1.0
-    # Resolution-aware target cleanup. ``min_bbox_side_pixels`` is measured at
-    # the configured model input resolution after normalizing the source box.
-    # Defaults preserve existing datasets; detection configs can opt in.
-    min_bbox_side_pixels: float = 0.0
-    bbox_dedup_iou_threshold: Optional[float] = None
-    # "first" preserves legacy source ordering. "largest" prioritizes spatially
-    # resolvable targets, while "class_balanced_largest" round-robins classes
-    # and takes the largest remaining target from each class.
-    object_selection_strategy: str = "first"
-    class_conditioned_bbox: bool = True
-    bbox_prior_grid: bool = False
-    bbox_prior_margin: float = 0.1
-    drop_cls_token_for_dense: bool = True
-    dense_coord_features: bool = True
+    objectness_negative_weight: float = 1.0
+    # Objectness has a very different positive/negative population from
+    # matched-slot classification, so it needs an independently configurable
+    # focal policy. ``None`` inherits the task/global value.
+    objectness_focal_loss_alpha: Optional[float] = 0.25
+    objectness_focal_loss_gamma: Optional[float] = None
+    objectness_focal_loss_prob_margin: Optional[float] = None
+    # Set-prediction geometry is decoded from the refined representation. Keep
+    # memory positions in that value stream by default; keys-only positions
+    # tell attention where to look but discard that location before decoding.
+    memory_position_in_values: bool = True
+    multi_label: bool = True
+    class_probability: str = "sigmoid"
     matcher_class_cost: float = 1.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.num_fixed_slots <= 0:
+            raise ValueError("num_fixed_slots must be positive")
+        if self.max_count <= 0:
+            raise ValueError("max_count must be positive")
+        if self.anchor_num_heads <= 0 or self.anchor_num_layers <= 0:
+            raise ValueError("anchor_num_heads and anchor_num_layers must be positive")
+        if self.class_probability not in {"sigmoid", "softmax"}:
+            raise ValueError("class_probability must be 'sigmoid' or 'softmax'")
+        if self.multi_label and self.class_probability != "sigmoid":
+            raise ValueError("multi-label set prediction requires class_probability='sigmoid'")
+        if self.objectness_positive_weight < 0 or self.objectness_negative_weight < 0:
+            raise ValueError("objectness positive/negative weights must be non-negative")
+        for name in (
+            "objectness_focal_loss_alpha",
+            "objectness_focal_loss_gamma",
+            "objectness_focal_loss_prob_margin",
+        ):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite when configured")
+        if (
+            self.objectness_focal_loss_alpha is not None
+            and self.objectness_focal_loss_alpha > 1
+        ):
+            raise ValueError(
+                "positive objectness_focal_loss_alpha must be at most 1"
+            )
+        for name in (
+            "class_loss_coef",
+            "objectness_loss_coef",
+            "matcher_class_cost",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+
+@dataclass
+class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
+    PREDICTION_ARCHITECTURE_FIELDS: ClassVar[tuple[str, ...]] = (
+        "anchor_mode",
+        "anchor_modeling",
+        "feature_anchor_mlp",
+        "feature_anchor_mlp_hidden_multiplier",
+        "anchor_refine_layers",
+        "anchor_refine_heads",
+        "anchor_refine_norm",
+        "anchor_refine_layer_scale_init",
+        "anchor_context_gate_init",
+        "anchor_context_gate_trainable",
+        "parent_token_index",
+        "embed_parent_token",
+        "num_fixed_slots",
+        "max_count",
+        "anchor_num_heads",
+        "anchor_num_layers",
+        "scorer_type",
+        "memory_position_embedding_type",
+        "query_position_embedding_type",
+        "memory_position_embedding_kwargs",
+        "query_position_embedding_kwargs",
+        "memory_position_in_values",
+        "iterative_box_refinement",
+        "bbox_refinement_detach",
+        "bbox_head_zero_init",
+        "spatial_attention_bias_type",
+        "spatial_attention_sigma",
+        "spatial_attention_bias_weight",
+        "reference_box_mode",
+        "reference_box_initialization",
+        "reference_box_initial_size",
+        "reference_box_grid_margin",
+    )
+
+    anchor_refine_layers: int = 2
+    # Explicit, independently configurable spatial-position strategies.
+    # memory: image-patch key positions; query: object-slot positions.
+    memory_position_embedding_type: str = "sine2d"
+    query_position_embedding_type: str = "sine2d"
+    memory_position_embedding_kwargs: Optional[dict[str, Any]] = None
+    query_position_embedding_kwargs: Optional[dict[str, Any]] = None
+    reference_box_mode: str = "learned"
+    # Grid preserves historical checkpoints. Random learned references avoid
+    # exposing a deterministic spatial codebook to new set-prediction runs.
+    reference_box_initialization: str = "grid"
+    reference_box_initial_size: float = 0.1
+    reference_box_grid_margin: float = 0.1
+    # Modern DAB-style decoding options. Defaults retain historical one-shot
+    # checkpoint behavior; the scratch vision configuration enables them.
+    iterative_box_refinement: bool = False
+    bbox_refinement_detach: bool = True
+    bbox_head_zero_init: bool = False
+    auxiliary_detection_loss_coef: float = 0.0
+    spatial_attention_bias_type: str = "none"
+    spatial_attention_sigma: float = 0.2
+    spatial_attention_bias_weight: float = 1.0
+    bbox_loss_coef: float = 5.0
+    bbox_l1_format: str = "cxcywh"
+    iou_loss_coef: float = 2.0
     matcher_bbox_cost: float = 5.0
     matcher_giou_cost: float = 2.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        from .layers.position import PositionEmbedding, covering_grid_2d
+
+        self.memory_position_embedding_kwargs = dict(
+            self.memory_position_embedding_kwargs or {}
+        )
+        self.query_position_embedding_kwargs = dict(
+            self.query_position_embedding_kwargs or {}
+        )
+        if not 0.0 < self.reference_box_initial_size < 1.0:
+            raise ValueError("reference_box_initial_size must be between 0 and 1")
+        if not 0.0 <= self.reference_box_grid_margin < 0.5:
+            raise ValueError("reference_box_grid_margin must be in [0, 0.5)")
+        memory_strategy = PositionEmbedding.strategy_class(
+            self.memory_position_embedding_type
+        )
+        query_strategy = PositionEmbedding.strategy_class(
+            self.query_position_embedding_type
+        )
+        if memory_strategy.coordinate_dimensions not in {None, 2}:
+            raise ValueError("Detection memory positions must be two-dimensional")
+        if query_strategy.coordinate_dimensions not in {None, 2, 4}:
+            raise ValueError(
+                "Detection query positions must encode 2D centers or 2D boxes"
+            )
+        if query_strategy.requires_num_embeddings:
+            self.query_position_embedding_kwargs.setdefault(
+                "num_embeddings",
+                self.num_fixed_slots,
+            )
+        if query_strategy.requires_grid_size:
+            self.query_position_embedding_kwargs.setdefault(
+                "grid_size",
+                covering_grid_2d(self.num_fixed_slots),
+            )
+        if memory_strategy.requires_grid_size and "grid_size" not in (
+            self.memory_position_embedding_kwargs
+        ):
+            raise ValueError(
+                "memory learned-grid positions require an explicit base grid_size"
+            )
+        PositionEmbedding.validate_kwargs(
+            self.memory_position_embedding_type,
+            self.memory_position_embedding_kwargs,
+        )
+        PositionEmbedding.validate_kwargs(
+            self.query_position_embedding_type,
+            self.query_position_embedding_kwargs,
+        )
+        if memory_strategy.requires_num_embeddings:
+            raise ValueError(
+                "memory_position_embedding_type must support variable-size image grids"
+            )
+        if self.reference_box_mode not in {"none", "learned"}:
+            raise ValueError("reference_box_mode must be 'none' or 'learned'")
+        if self.reference_box_initialization not in {"grid", "random"}:
+            raise ValueError(
+                "reference_box_initialization must be 'grid' or 'random'"
+            )
+        if self.iterative_box_refinement and self.reference_box_mode != "learned":
+            raise ValueError(
+                "iterative_box_refinement requires reference_box_mode='learned'"
+            )
+        if self.iterative_box_refinement and self.anchor_refine_layers <= 0:
+            raise ValueError(
+                "iterative_box_refinement requires anchor_refine_layers > 0"
+            )
+        if self.reference_box_mode == "learned" and self.anchor_mode not in {
+            "fixed",
+            "fixed_rnn",
+            "fixed_transformer",
+        }:
+            raise ValueError(
+                "reference_box_mode='learned' requires a fixed anchor mode"
+            )
+        if query_strategy.requires_coordinates and self.reference_box_mode == "none":
+            raise ValueError(
+                "Coordinate-based query positions require reference_box_mode='learned'"
+            )
+        if query_strategy.requires_num_embeddings and self.anchor_mode not in {
+            "fixed",
+            "fixed_rnn",
+            "fixed_transformer",
+        }:
+            raise ValueError(
+                "Learned index query positions require a fixed anchor mode"
+            )
+        coefficients = (
+            self.bbox_loss_coef,
+            self.iou_loss_coef,
+            self.matcher_bbox_cost,
+            self.matcher_giou_cost,
+            self.auxiliary_detection_loss_coef,
+        )
+        if any(coefficient < 0 for coefficient in coefficients):
+            raise ValueError("detection loss and matcher coefficients must be non-negative")
+        if not any(
+            coefficient > 0
+            for coefficient in (
+                self.matcher_class_cost,
+                self.matcher_bbox_cost,
+                self.matcher_giou_cost,
+            )
+        ):
+            raise ValueError("at least one matcher cost must be positive")
+        if self.bbox_l1_format not in {"cxcywh", "xyxy"}:
+            raise ValueError("bbox_l1_format must be 'cxcywh' or 'xyxy'")
+        if self.spatial_attention_bias_type not in {"none", "gaussian"}:
+            raise ValueError(
+                "spatial_attention_bias_type must be 'none' or 'gaussian'"
+            )
+        if (
+            self.spatial_attention_bias_type != "none"
+            and self.anchor_refine_layers <= 0
+        ):
+            raise ValueError(
+                "spatial attention bias requires anchor_refine_layers > 0"
+            )
+        if (
+            self.spatial_attention_bias_type != "none"
+            and self.reference_box_mode != "learned"
+        ):
+            raise ValueError(
+                "spatial attention bias requires reference_box_mode='learned'"
+            )
+        if not math.isfinite(float(self.spatial_attention_sigma)) or (
+            self.spatial_attention_sigma <= 0
+        ):
+            raise ValueError("spatial_attention_sigma must be finite and positive")
+        if not math.isfinite(float(self.spatial_attention_bias_weight)) or (
+            self.spatial_attention_bias_weight < 0
+        ):
+            raise ValueError(
+                "spatial_attention_bias_weight must be finite and non-negative"
+            )
+        if self.auxiliary_detection_loss_coef > 0 and (
+            not self.iterative_box_refinement or self.anchor_refine_layers < 2
+        ):
+            raise ValueError(
+                "auxiliary_detection_loss_coef requires iterative refinement "
+                "with at least two decoder layers"
+            )
+
+    def prediction_architecture_signature(self) -> tuple[tuple[str, Any], ...]:
+        """Return only fields that construct or parameterize prediction modules."""
+
+        mode = "rotary" if self.anchor_mode == "rnn" else self.anchor_mode
+        fields = [
+            "anchor_modeling",
+            "parent_token_index",
+            "embed_parent_token",
+            "scorer_type",
+            "anchor_refine_layers",
+            "anchor_context_gate_init",
+            "anchor_context_gate_trainable",
+            "reference_box_mode",
+            "iterative_box_refinement",
+            "bbox_refinement_detach",
+            "bbox_head_zero_init",
+            "spatial_attention_bias_type",
+            "spatial_attention_sigma",
+            "spatial_attention_bias_weight",
+        ]
+        if mode == "features":
+            fields.extend(
+                (
+                    "feature_anchor_mlp",
+                    "feature_anchor_mlp_hidden_multiplier",
+                )
+            )
+        if mode in {"fixed", "fixed_rnn", "fixed_transformer"}:
+            fields.append("num_fixed_slots")
+        if mode in {"rotary", "query_rnn", "query_transformer"}:
+            fields.append("max_count")
+        if mode in {"fixed_transformer", "query_transformer"}:
+            fields.extend(("anchor_num_heads", "anchor_num_layers"))
+        if self.anchor_refine_layers > 0:
+            fields.extend(
+                (
+                    "anchor_refine_heads",
+                    "anchor_refine_norm",
+                    "anchor_refine_layer_scale_init",
+                    "memory_position_embedding_type",
+                    "query_position_embedding_type",
+                    "memory_position_embedding_kwargs",
+                    "query_position_embedding_kwargs",
+                    "memory_position_in_values",
+                )
+            )
+        if self.reference_box_mode == "learned":
+            fields.extend(
+                (
+                    "reference_box_initial_size",
+                    "reference_box_grid_margin",
+                    "reference_box_initialization",
+                )
+            )
+        return (("anchor_mode", mode),) + tuple(
+            (name, getattr(self, name)) for name in fields
+        )
 
 
 @dataclass
@@ -112,25 +449,99 @@ class SegmentationHeadConfig(ObjectDetectionHeadConfig):
     num_prototypes: int = 32
     mask_size: int = 128
     mask_loss_coef: float = 1.0
+    reuse_detection_head: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.num_prototypes <= 0:
+            raise ValueError("num_prototypes must be positive")
+        if self.mask_size <= 0:
+            raise ValueError("mask_size must be positive")
+        if self.mask_loss_coef < 0:
+            raise ValueError("mask_loss_coef must be non-negative")
 
 
 @dataclass
-class AudioSegmentationHeadConfig(BaseHeadConfig):
-    anchor_mode: str = "fixed"
-    num_fixed_slots: int = 100
-    max_count: int = 100
-    anchor_num_heads: int = 4
-    anchor_num_layers: int = 2
-    obj_token_index: int = -1
-    embed_obj_token: bool = True
+class AudioSegmentationHeadConfig(SetPredictionHeadConfig):
+    anchor_refine_layers: int = 2
+    memory_position_embedding_type: str = "sine1d"
+    query_position_embedding_type: str = "sine1d"
+    memory_position_embedding_kwargs: Optional[dict[str, Any]] = None
+    query_position_embedding_kwargs: Optional[dict[str, Any]] = None
     segment_loss_coef: float = 5.0
-    class_loss_coef: float = 1.0
-    objectness_loss_coef: float = 1.0
-    matcher_class_cost: float = 1.0
     matcher_segment_cost: float = 5.0
     num_prototypes: int = 32
     mask_size: int = 256
     mask_loss_coef: float = 1.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        from .layers.position import PositionEmbedding
+
+        self.memory_position_embedding_kwargs = dict(
+            self.memory_position_embedding_kwargs or {}
+        )
+        self.query_position_embedding_kwargs = dict(
+            self.query_position_embedding_kwargs or {}
+        )
+        memory_strategy = PositionEmbedding.strategy_class(
+            self.memory_position_embedding_type
+        )
+        query_strategy = PositionEmbedding.strategy_class(
+            self.query_position_embedding_type
+        )
+        for role, strategy in (
+            ("memory", memory_strategy),
+            ("query", query_strategy),
+        ):
+            if strategy.coordinate_dimensions not in {None, 1}:
+                raise ValueError(
+                    f"Audio segmentation {role} positions must be one-dimensional"
+                )
+            if strategy.requires_grid_size:
+                raise ValueError(
+                    f"Audio segmentation {role} positions cannot use a 2D grid"
+                )
+        if memory_strategy.requires_num_embeddings:
+            raise ValueError(
+                "Audio memory positions must support variable sequence lengths"
+            )
+        if query_strategy.requires_num_embeddings:
+            self.query_position_embedding_kwargs.setdefault(
+                "num_embeddings",
+                self.num_fixed_slots,
+            )
+            if self.anchor_mode not in {
+                "fixed",
+                "fixed_rnn",
+                "fixed_transformer",
+            }:
+                raise ValueError(
+                    "Learned index query positions require a fixed anchor mode"
+                )
+        PositionEmbedding.validate_kwargs(
+            self.memory_position_embedding_type,
+            self.memory_position_embedding_kwargs,
+        )
+        PositionEmbedding.validate_kwargs(
+            self.query_position_embedding_type,
+            self.query_position_embedding_kwargs,
+        )
+        if self.num_prototypes <= 0:
+            raise ValueError("num_prototypes must be positive")
+        if self.mask_size <= 0:
+            raise ValueError("mask_size must be positive")
+        coefficients = (
+            self.segment_loss_coef,
+            self.matcher_segment_cost,
+            self.mask_loss_coef,
+        )
+        if any(coefficient < 0 for coefficient in coefficients):
+            raise ValueError(
+                "audio segmentation loss and matcher coefficients must be non-negative"
+            )
+        if self.matcher_class_cost == 0 and self.matcher_segment_cost == 0:
+            raise ValueError("at least one audio segmentation matcher cost must be positive")
 
 
 @dataclass
@@ -243,6 +654,151 @@ class GLiNextConfig(BaseGLiNERConfig):
         "embedding": "embedding_config",
     }
 
+    @staticmethod
+    def _migrate_non_span_config(config: dict) -> None:
+        """Drop fields serialized by the former overly broad head base class."""
+
+        for obsolete in (
+            "represent_spans",
+            "neg_spans_ratio",
+            "span_loss_coef",
+            "obj_token_index",
+            "embed_obj_token",
+        ):
+            config.pop(obsolete, None)
+
+    @staticmethod
+    def _migrate_detection_config(
+        config: dict,
+        *,
+        segmentation: bool = False,
+    ) -> None:
+        """Translate legacy detector switches and discard obsolete target policy."""
+        GLiNextConfig._migrate_non_span_config(config)
+        has_explicit_memory_value_policy = "memory_position_in_values" in config
+        modern_position_schema = any(
+            name in config
+            for name in (
+                "memory_position_embedding_type",
+                "query_position_embedding_type",
+                "memory_position_embedding_kwargs",
+                "query_position_embedding_kwargs",
+            )
+        )
+        legacy_detection_schema = any(
+            name in config
+            for name in (
+                "reference_points",
+                "dense_coord_features",
+                "bbox_prior_grid",
+                "slot_pos_emb_std",
+                "pos_emb_scale",
+            )
+        )
+        if segmentation and legacy_detection_schema:
+            # Older segmentation checkpoints own an independently trained
+            # detector branch. Do not silently replace it with detection-head
+            # weights merely because sharing became the modern default.
+            config.setdefault("reuse_detection_head", False)
+        if legacy_detection_schema:
+            # Preserve pre-hierarchy detector inference: old checkpoints scored
+            # raw label embeddings with mutually exclusive softmax classes. Old
+            # files commonly serialized ``anchor_modeling: linear`` even though
+            # that setting had no live consumer, so it must be replaced rather
+            # than treated as an explicit modern choice.
+            config["anchor_modeling"] = "identity"
+            config.setdefault("scorer_type", "dot")
+            config["multi_label"] = False
+            config["class_probability"] = "softmax"
+        if not has_explicit_memory_value_policy:
+            if legacy_detection_schema:
+                # The original detector added dense coordinates before using
+                # image tokens as attention values.
+                config["memory_position_in_values"] = True
+            elif modern_position_schema:
+                # The first registry-backed implementation used positions in
+                # keys only. Preserve those checkpoint equations on load.
+                config["memory_position_in_values"] = False
+        legacy_reference = config.pop("reference_points", None)
+        legacy_dense = config.pop("dense_coord_features", None)
+        legacy_prior = config.pop("bbox_prior_grid", None)
+
+        aliases = {
+            "pos_emb_scale": "position_embedding_scale",
+            "slot_pos_emb_std": "position_embedding_init_std",
+            "default_box_size": "reference_box_initial_size",
+            "bbox_prior_margin": "reference_box_grid_margin",
+        }
+        for old_name, new_name in aliases.items():
+            value = config.pop(old_name, None)
+            if value is not None:
+                config.setdefault(new_name, value)
+
+        # Older detector configs shared one set of constructor options between
+        # memory and query positions.  Keep them loadable while moving to two
+        # independent dictionaries that can configure arbitrary registry types.
+        shared_position_kwargs = {}
+        for config_name, strategy_name in (
+            ("position_embedding_scale", "scale"),
+            ("position_embedding_temperature", "temperature"),
+            ("position_embedding_init_std", "init_std"),
+        ):
+            value = config.pop(config_name, None)
+            if value is not None:
+                shared_position_kwargs[strategy_name] = value
+        for kwargs_name in (
+            "memory_position_embedding_kwargs",
+            "query_position_embedding_kwargs",
+        ):
+            strategy_kwargs = dict(config.get(kwargs_name) or {})
+            position_type_name = (
+                "memory_position_embedding_type"
+                if kwargs_name.startswith("memory")
+                else "query_position_embedding_type"
+            )
+            default_position_type = "sine2d"
+            from .layers.position import PositionEmbedding
+
+            strategy = PositionEmbedding.strategy_class(
+                config.get(position_type_name, default_position_type)
+            )
+            for name, value in shared_position_kwargs.items():
+                if name in strategy.config_fields:
+                    strategy_kwargs.setdefault(name, value)
+            if strategy_kwargs:
+                config[kwargs_name] = strategy_kwargs
+
+        if legacy_reference is not None:
+            config.setdefault(
+                "reference_box_mode",
+                "learned" if legacy_reference or legacy_prior else "none",
+            )
+            config.setdefault(
+                "query_position_embedding_type",
+                "sine2d" if legacy_reference else "learned",
+            )
+        elif legacy_prior:
+            config.setdefault("reference_box_mode", "learned")
+
+        if legacy_dense is not None:
+            if legacy_reference:
+                memory_type = "sine2d"
+            elif legacy_dense:
+                memory_type = "linear2d"
+            else:
+                memory_type = "none"
+            config.setdefault("memory_position_embedding_type", memory_type)
+
+        for obsolete in (
+            "min_bbox_side_pixels",
+            "bbox_dedup_iou_threshold",
+            "object_selection_strategy",
+            "class_conditioned_bbox",
+            "drop_cls_token_for_dense",
+            "matcher_class_probability",
+        ):
+            config.pop(obsolete, None)
+
     def __init__(
         self,
         # Per-task sub-configs (None = disabled, dict or dataclass = enabled)
@@ -281,8 +837,12 @@ class GLiNextConfig(BaseGLiNERConfig):
         vision_encoder_config: Optional[dict] = None,
         vision_in_channels: int = 3,
         vision_patch_size: int = 16,
-        vision_num_layers: int = 3,
-        vision_stride: int = 2,
+        vision_position_embedding_type: Optional[str] = None,
+        vision_position_embedding_kwargs: Optional[dict[str, Any]] = None,
+        vision_position_embeddings: Optional[bool] = None,
+        vision_feature_stride: Optional[Any] = None,
+        vision_feature_spatial_shape: Optional[Any] = None,
+        vision_feature_prefix_tokens: Optional[int] = None,
         audio_model_name: Optional[str] = None,
         audio_encoder_type: Optional[str] = None,
         audio_encoder_config: Optional[dict] = None,
@@ -381,6 +941,10 @@ class GLiNextConfig(BaseGLiNERConfig):
             "audio_feature_type",
             "audio_log_mel",
         }
+        # Accepted and discarded only so older checkpoints remain loadable. These
+        # fields never controlled a vision module and are no longer serialized.
+        kwargs.pop("vision_num_layers", None)
+        kwargs.pop("vision_stride", None)
         deprecated_present = sorted(deprecated_processor_fields.intersection(kwargs))
         if deprecated_present:
             raise ValueError(
@@ -447,6 +1011,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         if ner_config is None and default_ner_config:
             ner_config = {}
         if isinstance(ner_config, dict):
+            ner_config = dict(ner_config)
             ner_config.pop("scorer_type", None)  # backward compat: scorer_type removed
             ner_config.setdefault("loss_coef", ner_loss_coef)
             ner_config.setdefault("represent_spans", represent_spans)
@@ -464,36 +1029,74 @@ class GLiNextConfig(BaseGLiNERConfig):
                 "loss_coef": cat_loss_coef,
             }
         if isinstance(classification_config, dict):
+            classification_config = dict(classification_config)
             classification_config.pop("layer_type", None)  # backward compat: layer_type removed
+            self._migrate_non_span_config(classification_config)
             self.classification_config = ClassificationHeadConfig(**classification_config)
         else:
             self.classification_config = classification_config
 
         if isinstance(image_classification_config, dict):
+            image_classification_config = dict(image_classification_config)
+            self._migrate_non_span_config(image_classification_config)
             image_classification_config.setdefault("loss_coef", image_classification_loss_coef)
             self.image_classification_config = ImageClassificationHeadConfig(**image_classification_config)
         else:
             self.image_classification_config = image_classification_config
 
         if isinstance(audio_classification_config, dict):
+            audio_classification_config = dict(audio_classification_config)
+            self._migrate_non_span_config(audio_classification_config)
             audio_classification_config.setdefault("loss_coef", audio_classification_loss_coef)
             self.audio_classification_config = AudioClassificationHeadConfig(**audio_classification_config)
         else:
             self.audio_classification_config = audio_classification_config
 
         if isinstance(object_detection_config, dict):
+            object_detection_config = dict(object_detection_config)
+            self._migrate_detection_config(object_detection_config)
             object_detection_config.setdefault("loss_coef", object_detection_loss_coef)
             self.object_detection_config = ObjectDetectionHeadConfig(**object_detection_config)
         else:
             self.object_detection_config = object_detection_config
 
-        if isinstance(segmentation_config, dict):
+        if segmentation_config is not None:
+            if dataclasses.is_dataclass(segmentation_config) and not isinstance(
+                segmentation_config,
+                type,
+            ):
+                segmentation_config = dataclasses.asdict(segmentation_config)
+            elif isinstance(segmentation_config, dict):
+                segmentation_config = dict(segmentation_config)
+            else:
+                raise TypeError(
+                    "segmentation_config must be a dict, a dataclass instance, or None"
+                )
+            self._migrate_detection_config(
+                segmentation_config,
+                segmentation=True,
+            )
+            if (
+                segmentation_config.get("reuse_detection_head", True)
+                and self.object_detection_config is not None
+            ):
+                # Reuse is an explicit architecture policy, not a side effect
+                # of whether configuration arrived as a dict or dataclass.
+                # Set reuse_detection_head=False to own a separate detector.
+                # Loss, matching, focal, and mask policy remain independent.
+                for name in ObjectDetectionHeadConfig.PREDICTION_ARCHITECTURE_FIELDS:
+                    segmentation_config[name] = getattr(
+                        self.object_detection_config,
+                        name,
+                    )
             segmentation_config.setdefault("loss_coef", segmentation_loss_coef)
             self.segmentation_config = SegmentationHeadConfig(**segmentation_config)
         else:
-            self.segmentation_config = segmentation_config
+            self.segmentation_config = None
 
         if isinstance(audio_segmentation_config, dict):
+            audio_segmentation_config = dict(audio_segmentation_config)
+            self._migrate_non_span_config(audio_segmentation_config)
             audio_segmentation_config.setdefault("loss_coef", audio_segmentation_loss_coef)
             self.audio_segmentation_config = AudioSegmentationHeadConfig(**audio_segmentation_config)
         else:
@@ -562,6 +1165,7 @@ class GLiNextConfig(BaseGLiNERConfig):
 
         # Labels encoder config
         if isinstance(labels_encoder_config, dict):
+            labels_encoder_config = dict(labels_encoder_config)
             labels_encoder_config["model_type"] = labels_encoder_config.get("model_type", "deberta-v2")
             labels_encoder_config = CONFIG_MAPPING[labels_encoder_config["model_type"]](**labels_encoder_config)
         self.labels_encoder = labels_encoder
@@ -576,6 +1180,20 @@ class GLiNextConfig(BaseGLiNERConfig):
             or self.object_detection_config is not None
             or self.segmentation_config is not None
         )
+        dense_vision_tasks_enabled = (
+            self.object_detection_config is not None
+            or self.segmentation_config is not None
+        )
+        if dense_vision_tasks_enabled and vision_center_crop_size is not None:
+            raise ValueError(
+                "Detection and segmentation do not support center-cropped image "
+                "processing without annotation transform metadata"
+            )
+        if dense_vision_tasks_enabled and vision_processor_type == "auto":
+            raise ValueError(
+                "Detection and segmentation require vision_processor_type='custom' "
+                "until external processor geometry metadata is available"
+            )
         if vision_tasks_enabled and vision_model_name is None and vision_encoder_type is None:
             vision_encoder_type = "patch"
         audio_tasks_enabled = (
@@ -594,10 +1212,12 @@ class GLiNextConfig(BaseGLiNERConfig):
 
         # Multimodal encoder config
         if isinstance(vision_encoder_config, dict):
+            vision_encoder_config = dict(vision_encoder_config)
             if "model_type" not in vision_encoder_config:
                 raise ValueError("vision_encoder_config requires a model_type")
             vision_encoder_config = CONFIG_MAPPING[vision_encoder_config["model_type"]](**vision_encoder_config)
         if isinstance(audio_encoder_config, dict):
+            audio_encoder_config = dict(audio_encoder_config)
             if "model_type" not in audio_encoder_config:
                 raise ValueError("audio_encoder_config requires a model_type")
             audio_encoder_config = CONFIG_MAPPING[audio_encoder_config["model_type"]](**audio_encoder_config)
@@ -606,8 +1226,86 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.vision_encoder_config = vision_encoder_config
         self.vision_in_channels = vision_in_channels
         self.vision_patch_size = vision_patch_size
-        self.vision_num_layers = vision_num_layers
-        self.vision_stride = vision_stride
+        local_vision_encoder = (
+            vision_encoder_type in {"patch", "path", "cnn"}
+            or (vision_encoder_type is None and vision_model_name is None)
+        )
+        if vision_position_embedding_type is None:
+            vision_position_embedding_type = (
+                "learned_grid2d"
+                if local_vision_encoder and vision_position_embeddings is not False
+                else "none"
+            )
+        elif (
+            not local_vision_encoder
+            and str(vision_position_embedding_type).lower().replace("-", "_")
+            != "none"
+        ):
+            raise ValueError(
+                "vision_position_embedding_type configures only the local patch "
+                "encoder; AutoModel backbones own their positional embeddings"
+            )
+        elif (
+            vision_position_embeddings is not None
+            and bool(vision_position_embeddings)
+            != (str(vision_position_embedding_type).lower() != "none")
+        ):
+            raise ValueError(
+                "vision_position_embeddings conflicts with "
+                "vision_position_embedding_type"
+            )
+        from .layers.position import PositionEmbedding
+
+        vision_position_embedding_type = (
+            str(vision_position_embedding_type).lower().replace("-", "_")
+        )
+        vision_position_strategy = PositionEmbedding.strategy_class(
+            vision_position_embedding_type
+        )
+        vision_position_embedding_kwargs = dict(
+            vision_position_embedding_kwargs or {}
+        )
+        if vision_position_strategy.requires_num_embeddings:
+            image_hw = (
+                tuple(image_size)
+                if isinstance(image_size, (list, tuple))
+                else (image_size, image_size)
+            )
+            patch_hw = (
+                tuple(vision_patch_size)
+                if isinstance(vision_patch_size, (list, tuple))
+                else (vision_patch_size, vision_patch_size)
+            )
+            vision_position_embedding_kwargs.setdefault(
+                "num_embeddings",
+                (int(image_hw[0]) // int(patch_hw[0]))
+                * (int(image_hw[1]) // int(patch_hw[1])),
+            )
+        PositionEmbedding.validate_kwargs(
+            vision_position_embedding_type,
+            vision_position_embedding_kwargs,
+        )
+        self.vision_position_embedding_type = vision_position_embedding_type
+        self.vision_position_embedding_kwargs = vision_position_embedding_kwargs
+        if vision_feature_stride is not None and vision_feature_spatial_shape is not None:
+            raise ValueError(
+                "Configure only one of vision_feature_stride and "
+                "vision_feature_spatial_shape"
+            )
+        for name, value in (
+            ("vision_feature_stride", vision_feature_stride),
+            ("vision_feature_spatial_shape", vision_feature_spatial_shape),
+        ):
+            if value is None:
+                continue
+            values = value if isinstance(value, (list, tuple)) else (value, value)
+            if len(values) != 2 or any(int(item) <= 0 for item in values):
+                raise ValueError(f"{name} must be a positive int or pair")
+        if vision_feature_prefix_tokens is not None and vision_feature_prefix_tokens < 0:
+            raise ValueError("vision_feature_prefix_tokens must be non-negative")
+        self.vision_feature_stride = vision_feature_stride
+        self.vision_feature_spatial_shape = vision_feature_spatial_shape
+        self.vision_feature_prefix_tokens = vision_feature_prefix_tokens
         self.audio_model_name = audio_model_name
         self.audio_encoder_type = audio_encoder_type
         self.audio_encoder_config = audio_encoder_config
@@ -689,22 +1387,6 @@ class GLiNextConfig(BaseGLiNERConfig):
 
         self.cat_token_index = self.classification_config.cat_token_index if self.classification_config else cat_token_index
         self.embed_cat_token = self.classification_config.embed_cat_token if self.classification_config else embed_cat_token
-        if self.image_classification_config:
-            self.image_classification_config.obj_token_index = obj_token_index
-            self.image_classification_config.embed_obj_token = embed_obj_token
-        if self.audio_classification_config:
-            self.audio_classification_config.obj_token_index = obj_token_index
-            self.audio_classification_config.embed_obj_token = embed_obj_token
-        if self.object_detection_config:
-            self.object_detection_config.obj_token_index = obj_token_index
-            self.object_detection_config.embed_obj_token = embed_obj_token
-        if self.segmentation_config:
-            self.segmentation_config.obj_token_index = obj_token_index
-            self.segmentation_config.embed_obj_token = embed_obj_token
-        if self.audio_segmentation_config:
-            self.audio_segmentation_config.obj_token_index = obj_token_index
-            self.audio_segmentation_config.embed_obj_token = embed_obj_token
-
         self.represent_spans = self.ner_config.represent_spans if self.ner_config else represent_spans
         self.neg_spans_ratio = self.ner_config.neg_spans_ratio if self.ner_config else neg_spans_ratio
         self.span_loss_coef = self.ner_config.span_loss_coef if self.ner_config else span_loss_coef
@@ -903,8 +1585,11 @@ _VISION_SERIALIZED_FIELDS = frozenset(
         "vision_encoder_config",
         "vision_in_channels",
         "vision_patch_size",
-        "vision_num_layers",
-        "vision_stride",
+        "vision_position_embedding_type",
+        "vision_position_embedding_kwargs",
+        "vision_feature_stride",
+        "vision_feature_spatial_shape",
+        "vision_feature_prefix_tokens",
         "obj_token_index",
         "embed_obj_token",
         "image_size",
@@ -966,6 +1651,8 @@ _LAYOUT_SERIALIZED_FIELDS = _TEXT_SERIALIZED_FIELDS | frozenset(
         "vision_do_normalize",
         "vision_image_mean",
         "vision_image_std",
+        "layout_image_tokens",
+        "max_page_embeddings",
     }
 )
 
@@ -973,13 +1660,34 @@ _OMNI_SERIALIZED_FIELDS = (
     _TEXT_SERIALIZED_FIELDS
     | _VISION_SERIALIZED_FIELDS
     | _AUDIO_SERIALIZED_FIELDS
-    | frozenset({"omni_modalities"})
+    | frozenset(
+        {
+            "omni_modalities",
+            "layout_image_tokens",
+            "max_page_embeddings",
+        }
+    )
 )
 
 
-def _serialize_only(config: GLiNextConfig, field_names: frozenset[str]) -> dict[str, Any]:
+_MEDIA_UNUSED_SERIALIZED_FIELDS = frozenset(
+    {
+        "represent_spans",
+        "neg_spans_ratio",
+        "span_loss_coef",
+        "token_loss_coef",
+    }
+)
+
+
+def _serialize_only(
+    config: GLiNextConfig,
+    field_names: frozenset[str],
+    *,
+    excluded: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     output = GLiNextConfig.to_dict(config)
-    allowed = _BASE_SERIALIZED_FIELDS | field_names
+    allowed = (_BASE_SERIALIZED_FIELDS | field_names) - excluded
     return {key: value for key, value in output.items() if key in allowed}
 
 
@@ -1047,7 +1755,11 @@ class GLiNextVisionConfig(GLiNextConfig):
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return _serialize_only(self, _VISION_SERIALIZED_FIELDS)
+        return _serialize_only(
+            self,
+            _VISION_SERIALIZED_FIELDS,
+            excluded=_MEDIA_UNUSED_SERIALIZED_FIELDS,
+        )
 
 
 class GLiNextAudioConfig(GLiNextConfig):
@@ -1067,7 +1779,11 @@ class GLiNextAudioConfig(GLiNextConfig):
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return _serialize_only(self, _AUDIO_SERIALIZED_FIELDS)
+        return _serialize_only(
+            self,
+            _AUDIO_SERIALIZED_FIELDS,
+            excluded=_MEDIA_UNUSED_SERIALIZED_FIELDS,
+        )
 
 
 class GLiNextOmniConfig(GLiNextConfig):

@@ -1,12 +1,9 @@
 """Classification task head — anchor paradigm."""
 
-import torch
-from torch import nn
 
-from gliner.modeling.loss_functions import focal_loss_with_logits
-
-from .. import TaskHead, TaskHeadOutput
 from ...layers import Pooling
+from .. import TaskHead, TaskHeadOutput
+from ..losses import binary_focal_or_bce
 from .scorer import ClassificationScorer
 
 
@@ -62,7 +59,12 @@ class ClassificationHead(TaskHead):
         # Anchor paradigm: anchor_layer → anchor_modeling → dot product
         anchor_rep, anchor_mask = self.anchor_layer(context, feature_embeddings, feature_mask=feature_mask)
         if hasattr(self, "anchor_refine"):
-            anchor_rep = self.anchor_refine(anchor_rep, feature_embeddings, token_mask=feature_mask)
+            anchor_rep = self.anchor_refine(
+                anchor_rep,
+                feature_embeddings,
+                token_mask=feature_mask,
+                query_mask=anchor_mask,
+            )
         fused = self._reduce_fused_anchors(
             self.anchor_modeling(anchor_rep, cat_embedding),
             anchor_mask,
@@ -71,7 +73,7 @@ class ClassificationHead(TaskHead):
 
         loss = None
         if cat_labels is not None:
-            loss_fn = base_loss_fn or focal_loss_with_logits
+            loss_fn = base_loss_fn or binary_focal_or_bce
             all_losses = loss_fn(scores, cat_labels)
             valid_mask = cat_embedding_mask
             all_losses = all_losses * valid_mask

@@ -1,32 +1,22 @@
 """GLiNExT: unified multi-task model — thin orchestrator over modular task heads."""
 
 from dataclasses import fields
-from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from torch import nn
-
 from gliner.modeling.base import BaseModel
 from gliner.modeling.layers import CrossFuser, LstmSeq2SeqEncoder
 from gliner.modeling.utils import (
-    extract_word_embeddings,
     extract_prompt_features,
     extract_prompt_features_and_word_embeddings,
+    extract_word_embeddings,
 )
+from torch import nn
 
 from .config import GLiNextConfig
-from .outputs import (
-    GLiNExTAudioOutput,
-    GLiNExTLayoutOutput,
-    GLiNExTOmniOutput,
-    GLiNExTOutput,
-    GLiNExTTextOutput,
-    GLiNExTVisionOutput,
-)
-from .tasks import SharedRepresentations, TASK_REGISTRY, TaskFlatInputs, TaskHeadOutput
-from .layers import AnchorModeling, AnchorCrossAttentionLayer
-from .encoders.audio import AudioBiEncoder
+from .encoders.audio import AudioBiEncoder, audio_token_mask
+from .encoders.media import apply_input_mask
 from .encoders.omni import (
     LayoutBiEncoder,
     LayoutEncoder,
@@ -35,7 +25,18 @@ from .encoders.omni import (
     TriOmniEncoder,
 )
 from .encoders.text import TextBiEncoder, TextEncoder
-from .encoders.vision import VisionBiEncoder
+from .encoders.vision import VisionBiEncoder, vision_encoder_kwargs, vision_token_mask
+from .layers import AnchorCrossAttentionLayer, AnchorModeling
+from .outputs import (
+    GLiNExTAudioOutput,
+    GLiNExTLayoutOutput,
+    GLiNExTOmniOutput,
+    GLiNExTOutput,
+    GLiNExTTextOutput,
+    GLiNExTVisionOutput,
+)
+from .tasks import TASK_REGISTRY, SharedRepresentations, TaskFlatInputs, TaskHeadOutput
+from .tasks.losses import binary_focal_or_bce
 
 
 def _normalize_model_variant(value: Optional[str]) -> str:
@@ -44,6 +45,12 @@ def _normalize_model_variant(value: Optional[str]) -> str:
 
 _VARIANT_MODALITIES = {
     "omni": ("text", "vision", "audio"),
+}
+
+_SET_PREDICTION_COUNT_KEYS = {
+    "object_detection": "object_detection_count",
+    "segmentation": "segmentation_count",
+    "audio_segmentation": "audio_segmentation_count",
 }
 
 
@@ -68,19 +75,20 @@ def _filtered_output(output_cls, **kwargs):
     return output_cls(**{key: value for key, value in kwargs.items() if key in allowed})
 
 
-def _cache_forward_modality(module: nn.Module, name: str, tokens, mask) -> None:
+def _cache_forward_modality(
+    module: nn.Module,
+    name: str,
+    tokens,
+    mask,
+    spatial_shape=None,
+    prefix_tokens=None,
+) -> None:
     cache = getattr(module, "_forward_modality_cache", None)
     if cache is not None and tokens is not None:
-        cache[name] = (tokens, mask)
-
-
-def _apply_modality_input_mask(mask: torch.Tensor, input_mask: Optional[torch.Tensor]) -> torch.Tensor:
-    if input_mask is None:
-        return mask
-    input_mask = input_mask.to(device=mask.device, dtype=mask.dtype)
-    if input_mask.dim() == 1:
-        input_mask = input_mask[:, None]
-    return mask * input_mask
+        if spatial_shape is None and prefix_tokens is None:
+            cache[name] = (tokens, mask)
+        else:
+            cache[name] = (tokens, mask, spatial_shape, prefix_tokens)
 
 
 class BaseGLiNextModel(BaseModel):
@@ -135,12 +143,18 @@ class BaseGLiNextModel(BaseModel):
         enabled_task_names = getattr(self, "enabled_task_names", None)
         enabled_task_names = set(enabled_task_names) if enabled_task_names is not None else None
         for HeadClass in TASK_REGISTRY.head_classes():
-            head = HeadClass.from_config(
-                config,
-                from_pretrained=from_pretrained,
-                cache_dir=cache_dir,
-                shared_layers=shared_layers,
-            )
+            head_kwargs = {
+                "from_pretrained": from_pretrained,
+                "cache_dir": cache_dir,
+                "shared_layers": shared_layers,
+            }
+            if HeadClass.__name__ == "SegmentationHead":
+                head_kwargs["detection_head"] = (
+                    self.heads["object_detection"]
+                    if "object_detection" in self.heads
+                    else None
+                )
+            head = HeadClass.from_config(config, **head_kwargs)
             if head is not None:
                 if enabled_task_names is not None and head.name not in enabled_task_names:
                     continue
@@ -183,21 +197,14 @@ class BaseGLiNextModel(BaseModel):
         count_cfg = self.config.count_config
         if count_cfg and count_cfg.mode == "classification":
             predicted = count_logits.argmax(dim=-1)
-            print(f"[DEBUG count_head] mode=classification logits.shape={tuple(count_logits.shape)} "
-                  f"top3_argmax_per_row={count_logits.topk(min(3, count_logits.shape[-1]), dim=-1).indices.tolist()} "
-                  f"top3_probs_per_row={count_logits.softmax(dim=-1).topk(min(3, count_logits.shape[-1]), dim=-1).values.tolist()}")
         else:
             predicted = count_logits.squeeze(-1).round().long()
-            print(f"[DEBUG count_head] mode=regression raw={count_logits.squeeze(-1).tolist()}")
 
         predicted = predicted.clamp(min=0)
-        print(f"[DEBUG count_head] all_predicted={predicted.tolist()} (struct_bn={struct_bn})")
         if predicted.shape[0] < struct_bn:
             return None
 
-        struct_predicted = predicted[-struct_bn:]
-        print(f"[DEBUG count_head] structuring_count={struct_predicted.tolist()}")
-        return struct_predicted
+        return predicted[-struct_bn:]
 
     @staticmethod
     def _runtime_loss_value(runtime_kwargs: dict, focal_name: str, short_name: str):
@@ -223,18 +230,93 @@ class BaseGLiNextModel(BaseModel):
         return resolved
 
     def _make_task_loss_fn(self, task_name: str, runtime_kwargs: dict):
-        focal_kwargs = self._resolve_task_focal_loss_kwargs(task_name, runtime_kwargs)
-        if not focal_kwargs:
-            return self._loss
+        loss_defaults = self._resolve_task_focal_loss_kwargs(
+            task_name,
+            runtime_kwargs,
+        )
+        # Focal is the project-wide binary-loss default.  BCE is an explicit
+        # opt-out made by setting both alpha and gamma to non-positive values.
+        loss_defaults.setdefault("alpha", 0.25)
+        loss_defaults.setdefault("gamma", 2.0)
+        for name in ("label_smoothing", "negatives", "masking"):
+            value = runtime_kwargs.get(name)
+            if value is not None:
+                loss_defaults[name] = value
 
         def task_loss_fn(logits, labels, **call_kwargs):
-            merged_kwargs = dict(focal_kwargs)
+            merged_kwargs = dict(loss_defaults)
             merged_kwargs.update(
                 {key: value for key, value in call_kwargs.items() if value is not None}
             )
-            return self._loss(logits, labels, **merged_kwargs)
+            # Task heads own their reductions and structural masks. Keep this
+            # shared primitive elementwise even when the trainer is configured
+            # with a global reduction for legacy text heads.
+            merged_kwargs["reduction"] = "none"
+            losses = binary_focal_or_bce(logits, labels, **merged_kwargs)
+
+            negatives = float(merged_kwargs.get("negatives", 1.0))
+            masking = merged_kwargs.get("masking", "none")
+            if negatives >= 1.0 or masking in {None, False, "none"}:
+                return losses
+            if masking == "global":
+                keep = torch.where(
+                    labels == 0,
+                    torch.rand_like(logits) < negatives,
+                    torch.ones_like(logits, dtype=torch.bool),
+                )
+                return losses * keep
+            if masking in {"label", "span"}:
+                dimension = 1 if masking == "label" else 2
+                negative_groups = labels.sum(dim=dimension, keepdim=True) == 0
+                negative_groups = negative_groups.expand_as(labels)
+                keep = torch.where(
+                    negative_groups,
+                    torch.rand_like(logits) < negatives,
+                    torch.ones_like(logits, dtype=torch.bool),
+                )
+                return losses * keep
+            return losses
 
         return task_loss_fn
+
+    @staticmethod
+    def _flatten_set_prediction_count(
+        count,
+        flat_inputs: TaskFlatInputs,
+        task_name: str,
+    ) -> Optional[torch.Tensor]:
+        """Map public per-item query counts to flattened task-label groups."""
+
+        if count is None:
+            return None
+        batch_origin = flat_inputs.batch_origin.long()
+        count = torch.as_tensor(count, device=batch_origin.device)
+        if count.ndim == 0:
+            count = count.expand(
+                int(batch_origin.max().item()) + 1 if batch_origin.numel() else 0
+            )
+        elif count.ndim == 2 and count.shape[1] == 1:
+            count = count[:, 0]
+        elif count.ndim != 1:
+            raise ValueError(
+                f"{task_name}_count must be a scalar or one value per input item"
+            )
+        if count.is_floating_point():
+            if not torch.equal(count, count.round()):
+                raise ValueError(f"{task_name}_count values must be integers")
+            count = count.round()
+        count = count.long()
+        if (count < 0).any():
+            raise ValueError(f"{task_name}_count values must be non-negative")
+        if not batch_origin.numel():
+            return count.new_empty(0)
+        required_items = int(batch_origin.max().item()) + 1
+        if count.numel() < required_items:
+            raise ValueError(
+                f"{task_name}_count has {count.numel()} values, but flattened "
+                f"groups reference {required_items} input items"
+            )
+        return count.index_select(0, batch_origin)
 
     def _encode_all_labels_batched(
         self,
@@ -357,31 +439,69 @@ class BaseGLiNextModel(BaseModel):
             offset += size
         return media_label_embeds
 
-    def _encode_vision_tokens(
-        self,
-        pixel_values: Optional[torch.Tensor],
-        vision_attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        cache = getattr(self, "_forward_modality_cache", None)
-        if cache is not None and "vision" in cache:
-            return cache["vision"]
-        if pixel_values is None:
-            return None, None
+    def _vision_feature_encoder(self):
         encoder = getattr(self, "vision_encoder", None)
         if encoder is None:
             feature_encoders = getattr(self.token_rep_layer, "feature_encoders", None)
             if feature_encoders is not None and "vision" in feature_encoders:
                 encoder = feature_encoders["vision"]
+        return encoder
+
+    def _encode_vision_features(
+        self,
+        pixel_values: Optional[torch.Tensor],
+        vision_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        encoder = self._vision_feature_encoder()
+        cache = getattr(self, "_forward_modality_cache", None)
+        if cache is not None and "vision" in cache:
+            cached = cache["vision"]
+            vision_tokens, vision_mask = cached[:2]
+            if len(cached) >= 4:
+                spatial_shape, prefix_tokens = cached[2:4]
+            else:
+                spatial_shape = prefix_tokens = None
+            if (
+                spatial_shape is None
+                and encoder is not None
+                and pixel_values is not None
+                and hasattr(encoder, "_infer_spatial_metadata")
+            ):
+                spatial_shape, prefix_tokens = encoder._infer_spatial_metadata(
+                    pixel_values,
+                    vision_tokens,
+                    explicit_shape=None,
+                )
+            return vision_tokens, vision_mask, spatial_shape, prefix_tokens
+        if pixel_values is None:
+            return None, None, None, None
         if encoder is None:
-            return None, None
-        vision_tokens = encoder(pixel_values)
-        if vision_attention_mask is not None and vision_attention_mask.shape[-1] == vision_tokens.shape[1]:
-            vision_mask = vision_attention_mask.to(device=vision_tokens.device)
+            return None, None, None, None
+        if hasattr(encoder, "forward_features"):
+            vision_features = encoder.forward_features(
+                pixel_values,
+                **vision_encoder_kwargs(kwargs),
+            )
+            vision_tokens = vision_features.token_embeddings
+            spatial_shape = vision_features.spatial_shape
+            prefix_tokens = vision_features.prefix_tokens
         else:
-            vision_mask = torch.ones(vision_tokens.shape[:2], dtype=torch.long, device=vision_tokens.device)
-        vision_mask = _apply_modality_input_mask(vision_mask, kwargs.get("vision_input_mask"))
-        return vision_tokens, vision_mask
+            vision_tokens = encoder(pixel_values)
+            spatial_shape = prefix_tokens = None
+        vision_mask = vision_token_mask(
+            vision_tokens,
+            vision_attention_mask,
+            prefix_tokens,
+            spatial_shape,
+        )
+        vision_mask = apply_input_mask(vision_mask, kwargs.get("vision_input_mask"))
+        return vision_tokens, vision_mask, spatial_shape, prefix_tokens
 
     def _encode_audio_tokens(
         self,
@@ -402,11 +522,12 @@ class BaseGLiNextModel(BaseModel):
         if encoder is None:
             return None, None
         audio_tokens = encoder(audio_values, attention_mask=audio_attention_mask)
-        if audio_attention_mask is not None and audio_attention_mask.shape[-1] == audio_tokens.shape[1]:
-            audio_mask = audio_attention_mask.to(device=audio_tokens.device)
-        else:
-            audio_mask = torch.ones(audio_tokens.shape[:2], dtype=torch.long, device=audio_tokens.device)
-        audio_mask = _apply_modality_input_mask(audio_mask, kwargs.get("audio_input_mask"))
+        audio_mask = audio_token_mask(
+            encoder,
+            audio_tokens,
+            audio_attention_mask,
+        )
+        audio_mask = apply_input_mask(audio_mask, kwargs.get("audio_input_mask"))
         return audio_tokens, audio_mask
 
     def _build_flat_rel_prompts(
@@ -710,6 +831,9 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             "vision_attention_mask",
             "audio_attention_mask",
             "vision_input_mask",
+            "vision_encoder_kwargs",
+            "interpolate_pos_encoding",
+            "pixel_mask",
             "audio_input_mask",
         }
         direct_media_keys = {
@@ -751,7 +875,12 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         )
 
         if include_media:
-            vision_embedding, vision_mask = self._encode_vision_tokens(
+            (
+                vision_embedding,
+                vision_mask,
+                vision_spatial_shape,
+                vision_prefix_tokens,
+            ) = self._encode_vision_features(
                 pixel_values,
                 vision_attention_mask=vision_attention_mask,
                 **kwargs,
@@ -763,6 +892,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             )
         else:
             vision_embedding, vision_mask = None, None
+            vision_spatial_shape, vision_prefix_tokens = None, None
             audio_embedding, audio_mask = None, None
 
         return {
@@ -773,6 +903,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             "mask": mask,
             "vision_embedding": vision_embedding,
             "vision_mask": vision_mask,
+            "vision_spatial_shape": vision_spatial_shape,
+            "vision_prefix_tokens": vision_prefix_tokens,
             "audio_embedding": audio_embedding,
             "audio_mask": audio_mask,
         }
@@ -825,6 +957,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         audio_mask: Optional[torch.Tensor],
         include_media: bool,
         kwargs: dict,
+        vision_spatial_shape: Optional[torch.Tensor] = None,
+        vision_prefix_tokens: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, TaskFlatInputs], Optional[torch.Tensor], Optional[torch.Tensor]]:
         parent_embeds = None
         parent_mask_t = None
@@ -1108,6 +1242,15 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                     per_task_parents=use_per_task,
                 )
                 if flat_inputs is not None:
+                    if task_name in {"object_detection", "segmentation"}:
+                        if vision_spatial_shape is not None:
+                            flat_inputs.feature_spatial_shape = vision_spatial_shape[
+                                flat_inputs.batch_origin
+                            ]
+                        if vision_prefix_tokens is not None:
+                            flat_inputs.feature_prefix_tokens = vision_prefix_tokens[
+                                flat_inputs.batch_origin
+                            ]
                     flat_inputs_map[task_name] = flat_inputs
 
             if "count" in self.heads:
@@ -1263,8 +1406,6 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                         (struct_bn,), int(manual_structuring_count), dtype=torch.long,
                     )
                     extra_kwargs["structuring_count"] = forced
-                    print(f"[DEBUG model.forward] manual_structuring_count={int(manual_structuring_count)} "
-                          f"applied to {struct_bn} groups (overrides count head)")
                 else:
                     predicted_structuring_count = self._predict_structuring_counts_from_count_head(
                         head_outputs.get("count", TaskHeadOutput()).logits,
@@ -1284,6 +1425,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
 
             call_kwargs = dict(batch_kwargs)
             call_kwargs.update(extra_kwargs)
+            count_key = _SET_PREDICTION_COUNT_KEYS.get(name)
+            if count_key is not None and name in flat_inputs_map:
+                call_kwargs[count_key] = self._flatten_set_prediction_count(
+                    call_kwargs.get(count_key),
+                    flat_inputs_map[name],
+                    name,
+                )
             output = head(shared, dependency_outputs=dep_outputs, **call_kwargs)
             head_outputs[name] = output
 
@@ -1383,6 +1531,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             segmentation_objectness_logits=seg_out.extra.get("objectness_logits"),
             segmentation_anchor_mask=seg_out.extra.get("anchor_mask"),
             segmentation_mask_logits=seg_out.extra.get("mask_logits"),
+            segmentation_mask_validity=seg_out.extra.get("mask_validity"),
             segmentation_prototypes=seg_out.extra.get("prototypes"),
             segmentation_coefficients=seg_out.extra.get("coefficients"),
             audio_segmentation_logits=audio_seg_out.logits,
@@ -1422,14 +1571,17 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         object_detection_class_labels: Optional[torch.Tensor] = None,
         object_detection_bbox_labels: Optional[torch.Tensor] = None,
         object_detection_object_mask: Optional[torch.Tensor] = None,
+        object_detection_count: Optional[torch.Tensor] = None,
         segmentation_class_labels: Optional[torch.Tensor] = None,
         segmentation_bbox_labels: Optional[torch.Tensor] = None,
         segmentation_object_mask: Optional[torch.Tensor] = None,
         segmentation_mask_labels: Optional[torch.Tensor] = None,
+        segmentation_count: Optional[torch.Tensor] = None,
         audio_segmentation_class_labels: Optional[torch.Tensor] = None,
         audio_segmentation_segment_labels: Optional[torch.Tensor] = None,
         audio_segmentation_object_mask: Optional[torch.Tensor] = None,
         audio_segmentation_mask_labels: Optional[torch.Tensor] = None,
+        audio_segmentation_count: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         vision_attention_mask: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
@@ -1562,6 +1714,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 audio_mask=audio_mask,
                 include_media=include_media,
                 kwargs=kwargs,
+                vision_spatial_shape=representations["vision_spatial_shape"],
+                vision_prefix_tokens=representations["vision_prefix_tokens"],
             )
         )
 
@@ -1581,14 +1735,17 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             object_detection_class_labels=object_detection_class_labels,
             object_detection_bbox_labels=object_detection_bbox_labels,
             object_detection_object_mask=object_detection_object_mask,
+            object_detection_count=object_detection_count,
             segmentation_class_labels=segmentation_class_labels,
             segmentation_bbox_labels=segmentation_bbox_labels,
             segmentation_object_mask=segmentation_object_mask,
             segmentation_mask_labels=segmentation_mask_labels,
+            segmentation_count=segmentation_count,
             audio_segmentation_class_labels=audio_segmentation_class_labels,
             audio_segmentation_segment_labels=audio_segmentation_segment_labels,
             audio_segmentation_object_mask=audio_segmentation_object_mask,
             audio_segmentation_mask_labels=audio_segmentation_mask_labels,
+            audio_segmentation_count=audio_segmentation_count,
             rel_pair_mask=rel_pair_mask,
             rel_span_idx=rel_span_idx, rel_span_mask=rel_span_mask,
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
@@ -1871,12 +2028,6 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
         for param in self.media_parent_embeddings.values():
             nn.init.normal_(param, std=0.02)
 
-    @staticmethod
-    def _mask_for_tokens(tokens: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        if mask is not None and mask.shape[-1] == tokens.shape[1]:
-            return mask.to(device=tokens.device)
-        return torch.ones(tokens.shape[:2], dtype=torch.long, device=tokens.device)
-
     def _encode_media_tokens(self, media_values: torch.Tensor, media_mask: Optional[torch.Tensor], **kwargs):
         raise NotImplementedError
 
@@ -1968,6 +2119,8 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
         media_tokens: torch.Tensor,
         media_mask: torch.Tensor,
         kwargs: dict,
+        media_spatial_shape: Optional[torch.Tensor] = None,
+        media_prefix_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, TaskFlatInputs]:
         flat_inputs_map: Dict[str, TaskFlatInputs] = {}
         batch_size = media_tokens.shape[0]
@@ -2004,6 +2157,14 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
                 per_task_parents=True,
             )
             if flat_inputs is not None:
+                if media_spatial_shape is not None:
+                    flat_inputs.feature_spatial_shape = media_spatial_shape[
+                        flat_inputs.batch_origin
+                    ]
+                if media_prefix_tokens is not None:
+                    flat_inputs.feature_prefix_tokens = media_prefix_tokens[
+                        flat_inputs.batch_origin
+                    ]
                 flat_inputs_map[task_name] = flat_inputs
         return flat_inputs_map
 
@@ -2024,7 +2185,23 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
             call_kwargs = dict(batch_kwargs)
             call_kwargs["flat_inputs"] = flat_inputs_map[name]
             call_kwargs["base_loss_fn"] = self._make_task_loss_fn(name, runtime_kwargs)
-            output = head(shared, dependency_outputs={}, **call_kwargs)
+            count_key = _SET_PREDICTION_COUNT_KEYS.get(name)
+            if count_key is not None:
+                call_kwargs[count_key] = self._flatten_set_prediction_count(
+                    call_kwargs.get(count_key),
+                    flat_inputs_map[name],
+                    name,
+                )
+            dep_outputs = {
+                dependency: head_outputs[dependency]
+                for dependency in head.dependencies
+                if dependency in head_outputs
+            }
+            output = head(
+                shared,
+                dependency_outputs=dep_outputs,
+                **call_kwargs,
+            )
             head_outputs[name] = output
             if output.loss is not None:
                 total_loss = total_loss + head.loss_coef * output.loss
@@ -2049,7 +2226,10 @@ class GLiNExTVisionModel(_MediaOnlyBiEncoderModel):
     bi_encoder_cls = VisionBiEncoder
 
     def _encode_media_tokens(self, media_values: torch.Tensor, media_mask: Optional[torch.Tensor], **kwargs):
-        return self.token_rep_layer.vision_encoder(media_values)
+        return self.token_rep_layer.vision_encoder(
+            media_values,
+            **vision_encoder_kwargs(kwargs),
+        )
 
     def forward(
         self,
@@ -2060,10 +2240,12 @@ class GLiNExTVisionModel(_MediaOnlyBiEncoderModel):
         object_detection_class_labels: Optional[torch.Tensor] = None,
         object_detection_bbox_labels: Optional[torch.Tensor] = None,
         object_detection_object_mask: Optional[torch.Tensor] = None,
+        object_detection_count: Optional[torch.Tensor] = None,
         segmentation_class_labels: Optional[torch.Tensor] = None,
         segmentation_bbox_labels: Optional[torch.Tensor] = None,
         segmentation_object_mask: Optional[torch.Tensor] = None,
         segmentation_mask_labels: Optional[torch.Tensor] = None,
+        segmentation_count: Optional[torch.Tensor] = None,
         threshold: float = 0.5,
         **kwargs,
     ) -> GLiNExTVisionOutput:
@@ -2073,9 +2255,25 @@ class GLiNExTVisionModel(_MediaOnlyBiEncoderModel):
         if classes_mapping is None:
             raise ValueError("GLiNExTVisionModel requires classes_mapping to build vision task inputs")
 
-        vision_tokens = self._encode_media_tokens(pixel_values, vision_attention_mask, **kwargs)
-        vision_mask = self._mask_for_tokens(vision_tokens, vision_attention_mask)
-        flat_inputs_map = self._build_media_flat_inputs(classes_mapping, vision_tokens, vision_mask, kwargs)
+        vision_features = self.token_rep_layer.vision_encoder.forward_features(
+            pixel_values,
+            **vision_encoder_kwargs(kwargs),
+        )
+        vision_tokens = vision_features.token_embeddings
+        vision_mask = vision_token_mask(
+            vision_tokens,
+            vision_attention_mask,
+            vision_features.prefix_tokens,
+            vision_features.spatial_shape,
+        )
+        flat_inputs_map = self._build_media_flat_inputs(
+            classes_mapping,
+            vision_tokens,
+            vision_mask,
+            kwargs,
+            media_spatial_shape=vision_features.spatial_shape,
+            media_prefix_tokens=vision_features.prefix_tokens,
+        )
 
         shared = SharedRepresentations(
             token_embeds=vision_tokens,
@@ -2096,10 +2294,12 @@ class GLiNExTVisionModel(_MediaOnlyBiEncoderModel):
             object_detection_class_labels=object_detection_class_labels,
             object_detection_bbox_labels=object_detection_bbox_labels,
             object_detection_object_mask=object_detection_object_mask,
+            object_detection_count=object_detection_count,
             segmentation_class_labels=segmentation_class_labels,
             segmentation_bbox_labels=segmentation_bbox_labels,
             segmentation_object_mask=segmentation_object_mask,
             segmentation_mask_labels=segmentation_mask_labels,
+            segmentation_count=segmentation_count,
             threshold=threshold,
         )
         final_loss, head_outputs = self._forward_media_heads(
@@ -2129,6 +2329,7 @@ class GLiNExTVisionModel(_MediaOnlyBiEncoderModel):
             segmentation_objectness_logits=seg_out.extra.get("objectness_logits"),
             segmentation_anchor_mask=seg_out.extra.get("anchor_mask"),
             segmentation_mask_logits=seg_out.extra.get("mask_logits"),
+            segmentation_mask_validity=seg_out.extra.get("mask_validity"),
             segmentation_prototypes=seg_out.extra.get("prototypes"),
             segmentation_coefficients=seg_out.extra.get("coefficients"),
             vision_embedding=vision_tokens,
@@ -2163,6 +2364,7 @@ class GLiNExTAudioModel(_MediaOnlyBiEncoderModel):
         audio_segmentation_segment_labels: Optional[torch.Tensor] = None,
         audio_segmentation_object_mask: Optional[torch.Tensor] = None,
         audio_segmentation_mask_labels: Optional[torch.Tensor] = None,
+        audio_segmentation_count: Optional[torch.Tensor] = None,
         threshold: float = 0.5,
         **kwargs,
     ) -> GLiNExTAudioOutput:
@@ -2173,7 +2375,11 @@ class GLiNExTAudioModel(_MediaOnlyBiEncoderModel):
             raise ValueError("GLiNExTAudioModel requires classes_mapping to build audio task inputs")
 
         audio_tokens = self._encode_media_tokens(audio_values, audio_attention_mask, **kwargs)
-        audio_mask = self._mask_for_tokens(audio_tokens, audio_attention_mask)
+        audio_mask = audio_token_mask(
+            self.token_rep_layer.audio_encoder,
+            audio_tokens,
+            audio_attention_mask,
+        )
         flat_inputs_map = self._build_media_flat_inputs(classes_mapping, audio_tokens, audio_mask, kwargs)
 
         shared = SharedRepresentations(
@@ -2196,6 +2402,7 @@ class GLiNExTAudioModel(_MediaOnlyBiEncoderModel):
             audio_segmentation_segment_labels=audio_segmentation_segment_labels,
             audio_segmentation_object_mask=audio_segmentation_object_mask,
             audio_segmentation_mask_labels=audio_segmentation_mask_labels,
+            audio_segmentation_count=audio_segmentation_count,
             threshold=threshold,
         )
         final_loss, head_outputs = self._forward_media_heads(
@@ -2453,6 +2660,7 @@ class GLiNExTOmniModel(_GLiNExTJointForwardModel):
             "packing_config", "pair_attention_mask", "pixel_values",
             "vision_attention_mask", "audio_values", "audio_attention_mask",
             "vision_input_mask", "audio_input_mask", "bbox",
+            "vision_encoder_kwargs", "interpolate_pos_encoding", "pixel_mask",
         }
         cls._reject_unsupported_input_names(kwargs)
         return {key: kwargs[key] for key in allowed if key in kwargs}
@@ -2479,7 +2687,14 @@ class GLiNExTOmniModel(_GLiNExTJointForwardModel):
             )
             token_embeds = output.text_embeddings
             if getattr(output, "vision_embeddings", None) is not None:
-                _cache_forward_modality(self, "vision", output.vision_embeddings, output.vision_attention_mask)
+                _cache_forward_modality(
+                    self,
+                    "vision",
+                    output.vision_embeddings,
+                    output.vision_attention_mask,
+                    output.vision_spatial_shape,
+                    output.vision_prefix_tokens,
+                )
             if getattr(output, "audio_embeddings", None) is not None:
                 _cache_forward_modality(self, "audio", output.audio_embeddings, output.audio_attention_mask)
             labels_embeds = output.labels_embeddings
@@ -2505,7 +2720,14 @@ class GLiNExTOmniModel(_GLiNExTJointForwardModel):
         )
         token_embeds = output.text_embeddings
         if getattr(output, "vision_embeddings", None) is not None:
-            _cache_forward_modality(self, "vision", output.vision_embeddings, output.vision_attention_mask)
+            _cache_forward_modality(
+                self,
+                "vision",
+                output.vision_embeddings,
+                output.vision_attention_mask,
+                output.vision_spatial_shape,
+                output.vision_prefix_tokens,
+            )
         if getattr(output, "audio_embeddings", None) is not None:
             _cache_forward_modality(self, "audio", output.audio_embeddings, output.audio_attention_mask)
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = (

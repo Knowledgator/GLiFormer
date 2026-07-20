@@ -46,4 +46,11 @@ class CountProcessor(TaskProcessor):
             count_batch_idx[offset] = batch_idx
             offset += 1
 
-        return {"count_targets": count_targets, "count_val": count_targets.clone()}
+        return {
+            "count_targets": count_targets,
+            "count_val": count_targets.clone(),
+            # Backward-compatible name used by older structuring pipelines.
+            # Keep a separate clone so consumers may safely mutate either
+            # compatibility view without changing the training target.
+            "gold_count_val": count_targets.clone(),
+        }

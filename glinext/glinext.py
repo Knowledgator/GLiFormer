@@ -3,7 +3,6 @@
 import json
 import logging
 import inspect
-import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
@@ -91,6 +90,25 @@ class BaseGLiNExT(BaseGLiNER):
     data_processor_class = GLiNextProcessor
     data_collator_class = GLiNExTDataCollator
     decoder_class = GLiNExTDecoder
+
+    @classmethod
+    def create_training_args(cls, *args, **kwargs):
+        """Preserve explicit zero values for non-encoder optimizer settings.
+
+        The installed GLiNER factory selects its fallbacks with boolean ``or``,
+        which treats a deliberate ``0.0`` learning rate or weight decay as if it
+        were omitted. Keep the upstream construction and defaults, then restore
+        only explicitly supplied, non-``None`` values.
+        """
+
+        base_factory = super().create_training_args
+        supplied = inspect.signature(base_factory).bind_partial(*args, **kwargs)
+        training_args = base_factory(*args, **kwargs)
+        for name in ("others_lr", "others_weight_decay"):
+            value = supplied.arguments.get(name)
+            if value is not None:
+                setattr(training_args, name, value)
+        return training_args
 
     # ── Setup overrides ───────────────────────────────────────────────
 
@@ -277,13 +295,6 @@ class BaseGLiNExT(BaseGLiNER):
                 or self.config.audio_segmentation_config is not None):
             obj_idx = _idx(self.config.obj_token)
             self.config.obj_token_index = obj_idx
-            for cfg_name in (
-                "image_classification_config", "object_detection_config", "segmentation_config",
-                "audio_classification_config", "audio_segmentation_config",
-            ):
-                cfg = getattr(self.config, cfg_name, None)
-                if cfg is not None:
-                    cfg.obj_token_index = obj_idx
 
     def resize_embeddings(self, set_class_token_index=True):
         """Resize token embeddings to match tokenizer vocabulary."""
@@ -825,7 +836,7 @@ class BaseGLiNExT(BaseGLiNER):
         data_loader: DataLoader,
         threshold: float,
         flat_ner: bool,
-        multi_label: bool,
+        multi_label: Optional[bool],
         decoder_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Tuple[Dict[str, list], list]:
@@ -905,7 +916,7 @@ class BaseGLiNExT(BaseGLiNER):
         tensor_key: str,
         tensor_batch_rank: Optional[int],
         threshold: float = 0.5,
-        multi_label: bool = True,
+        multi_label: Optional[bool] = True,
         batch_size: int = 8,
         decoder_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
@@ -1100,6 +1111,7 @@ class BaseGLiNExT(BaseGLiNER):
         images: Any,
         classes: Union[List[str], Dict[str, List[str]]],
         threshold: float = 0.5,
+        multi_label: Optional[bool] = None,
         batch_size: int = 8,
         **kwargs,
     ):
@@ -1112,7 +1124,7 @@ class BaseGLiNExT(BaseGLiNER):
             tensor_key="pixel_values",
             tensor_batch_rank=4,
             threshold=threshold,
-            multi_label=False,
+            multi_label=multi_label,
             batch_size=batch_size,
             **kwargs,
         )
@@ -1124,6 +1136,7 @@ class BaseGLiNExT(BaseGLiNER):
         threshold: float = 0.5,
         mask_threshold: float = 0.5,
         return_masks: bool = False,
+        multi_label: Optional[bool] = None,
         batch_size: int = 8,
         **kwargs,
     ):
@@ -1136,7 +1149,7 @@ class BaseGLiNExT(BaseGLiNER):
             tensor_key="pixel_values",
             tensor_batch_rank=4,
             threshold=threshold,
-            multi_label=False,
+            multi_label=multi_label,
             batch_size=batch_size,
             decoder_kwargs={
                 "mask_threshold": mask_threshold,
@@ -1175,6 +1188,7 @@ class BaseGLiNExT(BaseGLiNER):
         threshold: float = 0.5,
         mask_threshold: float = 0.5,
         return_masks: bool = False,
+        multi_label: Optional[bool] = None,
         batch_size: int = 8,
         **kwargs,
     ):
@@ -1187,7 +1201,7 @@ class BaseGLiNExT(BaseGLiNER):
             tensor_key="audio_values",
             tensor_batch_rank=None,
             threshold=threshold,
-            multi_label=False,
+            multi_label=multi_label,
             batch_size=batch_size,
             decoder_kwargs={
                 "mask_threshold": mask_threshold,
@@ -1653,6 +1667,16 @@ class GLiNExT(nn.Module, PyTorchModelHubMixin):
         new_instance = glinext_class(config, **kwargs)
         self.__class__ = type(new_instance)
         self.__dict__ = new_instance.__dict__
+
+    def train_head_only_parameters(self) -> Dict[str, int]:
+        """Freeze shared parameters and train only task-head-owned parameters.
+
+        Construction normally turns this factory into a concrete GLiNExT
+        wrapper. Keeping the method on the public factory as well preserves the
+        API for callers that invoke helpers through :class:`GLiNExT` directly.
+        """
+
+        return BaseGLiNExT.train_head_only_parameters(self)
 
     @staticmethod
     def _config_class_for_variant(config_dict: Dict[str, Any]):

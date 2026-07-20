@@ -5,9 +5,10 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from .audio import AudioEncoder
+from .audio import AudioEncoder, audio_token_mask
+from .media import apply_input_mask, get_config_value as _get_config_value
 from .text import TextBiEncoder, TextEncoder
-from .vision import VisionEncoder
+from .vision import VisionEncoder, vision_encoder_kwargs, vision_token_mask
 
 
 @dataclass
@@ -21,13 +22,11 @@ class OmniEncoderOutput:
     text_attention_mask: Optional[torch.Tensor] = None
     vision_embeddings: Optional[torch.Tensor] = None
     vision_attention_mask: Optional[torch.Tensor] = None
+    vision_spatial_shape: Optional[torch.Tensor] = None
+    vision_prefix_tokens: Optional[torch.Tensor] = None
     audio_embeddings: Optional[torch.Tensor] = None
     audio_attention_mask: Optional[torch.Tensor] = None
     labels_embeddings: Optional[torch.Tensor] = None
-
-
-def _get_config_value(config: Any, name: str, default: Any = None) -> Any:
-    return getattr(config, name, default) if config is not None else default
 
 
 def _ones_mask(embeddings: torch.Tensor) -> torch.Tensor:
@@ -44,15 +43,6 @@ def _resize_mask(mask: Optional[torch.Tensor], embeddings: torch.Tensor) -> torc
     if mask.shape[-1] == embeddings.shape[1]:
         return mask.to(device=embeddings.device)
     return _ones_mask(embeddings)
-
-
-def _apply_input_mask(mask: torch.Tensor, input_mask: Optional[torch.Tensor]) -> torch.Tensor:
-    if input_mask is None:
-        return mask
-    input_mask = input_mask.to(device=mask.device, dtype=mask.dtype)
-    if input_mask.dim() == 1:
-        input_mask = input_mask[:, None]
-    return mask * input_mask
 
 
 _TRANSFORMER_KWARGS = {
@@ -600,14 +590,33 @@ class OmniEncoder(nn.Module):
         vision_attention_mask: Optional[torch.Tensor],
         vision_input_mask: Optional[torch.Tensor],
         kwargs: Dict[str, Any],
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         if "vision" not in self.feature_encoders or pixel_values is None:
-            return None, None
-        embeddings = self.feature_encoders["vision"](pixel_values)
-        mask = _resize_mask(vision_attention_mask, embeddings)
-        mask = _apply_input_mask(mask, vision_input_mask)
+            return None, None, None, None
+        features = self.feature_encoders["vision"].forward_features(
+            pixel_values,
+            **vision_encoder_kwargs(kwargs),
+        )
+        embeddings = features.token_embeddings
+        mask = vision_token_mask(
+            embeddings,
+            vision_attention_mask,
+            features.prefix_tokens,
+            features.spatial_shape,
+        )
+        mask = apply_input_mask(mask, vision_input_mask)
         embeddings = self._project_inputs("vision", embeddings)
-        return self._add_modality_embedding("vision", embeddings), mask
+        return (
+            self._add_modality_embedding("vision", embeddings),
+            mask,
+            features.spatial_shape,
+            features.prefix_tokens,
+        )
 
     def _audio_inputs(
         self,
@@ -622,8 +631,12 @@ class OmniEncoder(nn.Module):
             audio_values,
             attention_mask=audio_attention_mask,
         )
-        mask = _resize_mask(audio_attention_mask, embeddings)
-        mask = _apply_input_mask(mask, audio_input_mask)
+        mask = audio_token_mask(
+            self.feature_encoders["audio"],
+            embeddings,
+            audio_attention_mask,
+        )
+        mask = apply_input_mask(mask, audio_input_mask)
         embeddings = self._project_inputs("audio", embeddings)
         return self._add_modality_embedding("audio", embeddings), mask
 
@@ -712,7 +725,12 @@ class OmniEncoder(nn.Module):
         **kwargs: Any,
     ) -> OmniEncoderOutput:
         text_inputs, text_mask = self._text_inputs(input_ids, inputs_embeds, attention_mask)
-        vision_inputs, vision_mask = self._vision_inputs(
+        (
+            vision_inputs,
+            vision_mask,
+            vision_spatial_shape,
+            vision_prefix_tokens,
+        ) = self._vision_inputs(
             pixel_values, vision_attention_mask, vision_input_mask, kwargs,
         )
         audio_inputs, audio_mask = self._audio_inputs(
@@ -759,6 +777,8 @@ class OmniEncoder(nn.Module):
             text_attention_mask=text_mask,
             vision_embeddings=chunks["vision"],
             vision_attention_mask=vision_mask,
+            vision_spatial_shape=vision_spatial_shape,
+            vision_prefix_tokens=vision_prefix_tokens,
             audio_embeddings=chunks["audio"],
             audio_attention_mask=audio_mask,
         )

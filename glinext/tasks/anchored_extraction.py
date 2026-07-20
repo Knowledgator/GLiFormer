@@ -10,7 +10,7 @@ greater than one; flattening (A, C) yields the same scoring pipeline as NER.
 import torch
 from gliner.modeling.utils import extract_spans_from_tokens
 
-from . import TaskHead, TaskHeadOutput
+from . import TaskHead
 from ..layers import AnchoredSpanScorer
 
 
@@ -69,7 +69,12 @@ class AnchoredSpanExtractionHead(TaskHead):
             parent_embedding, feature_embeddings, feature_mask=feature_mask, **self._anchor_kwargs(batch),
         )
         if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(anchors, feature_embeddings, token_mask=feature_mask)
+            anchors = self.anchor_refine(
+                anchors,
+                feature_embeddings,
+                token_mask=feature_mask,
+                query_mask=anchor_mask,
+            )
 
         fused = self.anchor_modeling(anchors, child_embedding)   # (BN, A, C, D)
         B, A, C, D = fused.shape

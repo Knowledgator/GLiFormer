@@ -189,7 +189,12 @@ class SpanProcessor(TaskProcessor):
     def _resolve_entity_spans(cls, text, tokens_with_spans, ner):
         """Resolve a list of entity mentions to token indices.
 
-        Handles text mentions, dict values, and character-offset spans.
+        Handles text mentions, dict values, and character-offset spans.  The
+        legacy ``[token_start, token_end, label]`` form is already resolved and
+        is therefore passed through unchanged.  Character-offset inputs used
+        by task processors are normalized through ``_resolve_labeled_span``;
+        keeping the pass-through here preserves the public helper's original
+        contract without making the offset interpretation ambiguous.
 
         Returns:
             List of [start_token, end_token, label].
@@ -198,9 +203,14 @@ class SpanProcessor(TaskProcessor):
             return []
         resolved = []
         for ent in ner:
-            if isinstance(ent, dict) or (
-                isinstance(ent, (list, tuple)) and ent and isinstance(ent[0], int)
-            ) or (
+            if (
+                isinstance(ent, (list, tuple))
+                and len(ent) == 3
+                and isinstance(ent[0], int)
+                and isinstance(ent[1], int)
+            ):
+                resolved.append(list(ent))
+            elif isinstance(ent, dict) or (
                 isinstance(ent, (list, tuple)) and len(ent) >= 4 and isinstance(ent[0], str)
                 and isinstance(ent[1], int) and isinstance(ent[2], int)
             ):
@@ -246,6 +256,17 @@ class SpanProcessor(TaskProcessor):
         if provided:
             tokens = list(provided)
             tokens_with_spans = self._align_tokens_to_text(tokens, text)
+            # ``tokenized_text`` historically also acted as a write-once
+            # cache.  A stale/cache-only value may not describe ``text`` at
+            # all; in that case retain it on the item but use the configured
+            # splitter for this call, matching the original helper contract.
+            cache_is_aligned = all(
+                (not token and start == end) or end > start
+                for (token, start, end) in tokens_with_spans
+            )
+            if not cache_is_aligned:
+                tokens_with_spans = list(self.words_splitter(text))
+                tokens = [tok for tok, _, _ in tokens_with_spans]
         else:
             tokens_with_spans = list(self.words_splitter(text))
             tokens = [tok for tok, _, _ in tokens_with_spans]

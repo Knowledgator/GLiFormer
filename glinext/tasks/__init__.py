@@ -1,7 +1,7 @@
 """Task head abstractions for GLiNExT modular architecture."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,6 +44,8 @@ class TaskFlatInputs:
     batch_origin: torch.Tensor        # (BN,) maps flat idx to original batch idx
     feature_embedding: Optional[torch.Tensor] = None  # (BN, L, D) task input features
     feature_mask: Optional[torch.Tensor] = None        # (BN, L) task input mask
+    feature_spatial_shape: Optional[torch.Tensor] = None  # (BN, 2) dense height/width
+    feature_prefix_tokens: Optional[torch.Tensor] = None  # (BN,) non-spatial token count
 
 
 @dataclass
@@ -66,10 +68,11 @@ class TaskHead(ABC, nn.Module):
     loss_coef: float = 1.0
 
     def _init_anchor_pipeline(self, task_cfg, config, hidden_size, dropout, shared_layers):
-        """Initialize the shared anchor pipeline: anchor layer, modeling, refinement, span rep.
+        """Initialize anchor acquisition, modeling, and optional refinement.
 
-        Sets: self.anchor_layer, self.anchor_modeling, self.represent_spans,
-              self.span_loss_coef, and optionally self.anchor_refine, self.span_rep_layer.
+        Span representations are added only for configs in the span-capable
+        text hierarchy; media and classification heads do not receive dead span
+        attributes.
         """
         anchor_mode = getattr(task_cfg, "anchor_mode", "parent")
         if anchor_mode == "rnn":
@@ -84,6 +87,16 @@ class TaskHead(ABC, nn.Module):
             dropout=dropout,
             feature_mlp=getattr(task_cfg, "feature_anchor_mlp", False),
             feature_mlp_hidden_multiplier=getattr(task_cfg, "feature_anchor_mlp_hidden_multiplier", 1),
+            context_gate_init=getattr(
+                task_cfg,
+                "anchor_context_gate_init",
+                0.1,
+            ),
+            context_gate_trainable=getattr(
+                task_cfg,
+                "anchor_context_gate_trainable",
+                True,
+            ),
         )
 
         if "anchor_modeling" in shared_layers:
@@ -103,11 +116,21 @@ class TaskHead(ABC, nn.Module):
                 self.anchor_refine = AnchorCrossAttentionLayer(
                     hidden_size, num_heads=refine_heads,
                     num_layers=refine_layers, dropout=dropout,
+                    norm_first=(
+                        getattr(task_cfg, "anchor_refine_norm", "post_norm")
+                        == "pre_norm"
+                    ),
+                    layer_scale_init=getattr(
+                        task_cfg,
+                        "anchor_refine_layer_scale_init",
+                        None,
+                    ),
                 )
 
-        self.represent_spans = getattr(task_cfg, "represent_spans", False)
-        self.span_loss_coef = getattr(task_cfg, "span_loss_coef", 1.0)
-        if self.represent_spans:
+        if hasattr(task_cfg, "represent_spans"):
+            self.represent_spans = bool(task_cfg.represent_spans)
+            self.span_loss_coef = float(task_cfg.span_loss_coef)
+        if getattr(self, "represent_spans", False):
             from gliner.modeling.span_rep import SpanRepLayer
             self.span_rep_layer = SpanRepLayer(
                 span_mode="token_level",

@@ -13,10 +13,26 @@ from .anchor_layer import (
     RotaryAnchorLayer, QueryRNNAnchorLayer, QueryTransformerAnchorLayer,
 )
 from .anchor_modeling import (
-    AnchorModeling, LinearAnchorModeling, RNNAnchorModeling, MLPAnchorModeling,
+    AnchorModeling, IdentityAnchorModeling, LinearAnchorModeling,
+    RNNAnchorModeling, MLPAnchorModeling,
     TransformerAnchorModeling,
 )
 from .pooling import Pooling, MeanPooling, CLSPooling, MaxPooling, WeightedPooling
+from .position import (
+    LearnedGrid2DPositionEmbedding,
+    PositionEmbedding,
+    NoPositionEmbedding,
+    Sine1DPositionEmbedding,
+    Linear1DPositionEmbedding,
+    MLP1DPositionEmbedding,
+    Sine2DPositionEmbedding,
+    Linear2DPositionEmbedding,
+    MLP2DPositionEmbedding,
+    LearnedIndexPositionEmbedding,
+    covering_grid_2d,
+    normalized_grid_1d,
+    normalized_grid_2d,
+)
 
 __all__ = [
     "create_mlp", "FeaturesProjector",
@@ -30,6 +46,13 @@ __all__ = [
     "AnchorLayer", "ParentAnchorLayer", "FeatureAnchorLayer", "FixedAnchorLayer",
     "FixedRNNAnchorLayer", "FixedTransformerAnchorLayer", 
     "RotaryAnchorLayer", "QueryRNNAnchorLayer", "QueryTransformerAnchorLayer",
-    "AnchorModeling", "LinearAnchorModeling", "RNNAnchorModeling", "MLPAnchorModeling", "TransformerAnchorModeling",
+    "AnchorModeling", "IdentityAnchorModeling", "LinearAnchorModeling",
+    "RNNAnchorModeling", "MLPAnchorModeling", "TransformerAnchorModeling",
     "Pooling", "MeanPooling", "CLSPooling", "MaxPooling", "WeightedPooling",
+    "PositionEmbedding", "NoPositionEmbedding", "Sine2DPositionEmbedding",
+    "Sine1DPositionEmbedding", "Linear1DPositionEmbedding",
+    "MLP1DPositionEmbedding",
+    "Linear2DPositionEmbedding", "MLP2DPositionEmbedding",
+    "LearnedIndexPositionEmbedding", "LearnedGrid2DPositionEmbedding",
+    "covering_grid_2d", "normalized_grid_1d", "normalized_grid_2d",
 ]

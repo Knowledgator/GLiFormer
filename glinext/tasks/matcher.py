@@ -1,25 +1,14 @@
 """Shared matching utilities for set-prediction task heads."""
 
-from typing import List, Optional, Tuple
+from collections.abc import Callable
 
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
+from .box_ops import pairwise_generalized_box_iou
 
-def _pairwise_giou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
-    """Pairwise GIoU between ``(N, 4)`` and ``(M, 4)`` xyxy boxes -> ``(N, M)``."""
-    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
-    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
-    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
-    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
-    inter = (rb - lt).clamp(min=0).prod(dim=-1)
-    union = area1[:, None] + area2[None, :] - inter + 1e-6
-    iou = inter / union
-    elt = torch.minimum(boxes1[:, None, :2], boxes2[None, :, :2])
-    erb = torch.maximum(boxes1[:, None, 2:], boxes2[None, :, 2:])
-    enclosing = (erb - elt).clamp(min=0).prod(dim=-1) + 1e-6
-    return iou - (enclosing - union) / enclosing
+ClassProbability = str | Callable[[torch.Tensor], torch.Tensor]
 
 
 class HungarianMatcher(nn.Module):
@@ -31,13 +20,48 @@ class HungarianMatcher(nn.Module):
     target indices from the padded target tensor.
     """
 
-    def __init__(self, cost_class: float = 1.0, cost_geometry: float = 1.0, cost_giou: float = 0.0):
+    def __init__(
+        self,
+        cost_class: float = 1.0,
+        cost_geometry: float = 1.0,
+        cost_giou: float = 0.0,
+        class_probability: ClassProbability = "sigmoid",
+    ):
         super().__init__()
         self.cost_class = float(cost_class)
         self.cost_geometry = float(cost_geometry)
         self.cost_giou = float(cost_giou)
+        if isinstance(class_probability, str):
+            class_probability = class_probability.lower()
+            if class_probability not in {"sigmoid", "softmax"}:
+                raise ValueError(
+                    "class_probability must be 'sigmoid', 'softmax', or a callable, "
+                    f"got {class_probability!r}"
+                )
+        elif not callable(class_probability):
+            raise TypeError(
+                "class_probability must be 'sigmoid', 'softmax', or a callable, "
+                f"got {type(class_probability).__name__}"
+            )
+        self.class_probability = class_probability
         if self.cost_class == 0.0 and self.cost_geometry == 0.0 and self.cost_giou == 0.0:
             raise ValueError("at least one Hungarian matching cost must be non-zero")
+
+    def _class_probabilities(self, class_logits: torch.Tensor) -> torch.Tensor:
+        if self.class_probability == "sigmoid":
+            probabilities = class_logits.sigmoid()
+        elif self.class_probability == "softmax":
+            probabilities = class_logits.softmax(dim=-1)
+        else:
+            probabilities = self.class_probability(class_logits)
+        if not isinstance(probabilities, torch.Tensor):
+            raise TypeError("class probability callback must return a torch.Tensor")
+        if probabilities.shape != class_logits.shape:
+            raise ValueError(
+                "class probability callback must preserve the logits shape, "
+                f"got {tuple(probabilities.shape)} for logits {tuple(class_logits.shape)}"
+            )
+        return probabilities
 
     @torch.no_grad()
     def forward(
@@ -47,8 +71,10 @@ class HungarianMatcher(nn.Module):
         target_classes: torch.Tensor,
         target_geometry: torch.Tensor,
         target_mask: torch.Tensor,
-        prediction_mask: Optional[torch.Tensor] = None,
-    ) -> List[Tuple[int, int]]:
+        prediction_mask: torch.Tensor | None = None,
+        giou_geometry_preds: torch.Tensor | None = None,
+        target_giou_geometry: torch.Tensor | None = None,
+    ) -> list[tuple[int, int]]:
         """Return ``(prediction_index, target_index)`` matches for one sample."""
 
         valid_idx = torch.nonzero(target_mask > 0, as_tuple=False).squeeze(-1)
@@ -65,36 +91,48 @@ class HungarianMatcher(nn.Module):
         geometry_preds = geometry_preds[pred_idx].float()
         target_classes = target_classes[valid_idx].long()
         target_geometry = target_geometry[valid_idx].float()
+        if giou_geometry_preds is not None:
+            giou_geometry_preds = giou_geometry_preds[pred_idx].float()
+        if target_giou_geometry is not None:
+            target_giou_geometry = target_giou_geometry[valid_idx].float()
 
-        # Detection heads train matched queries with softmax cross-entropy, and
-        # inference uses the same softmax distribution. Matching must use that
-        # distribution as well; sigmoid ignores competition between labels and
-        # can assign a query whose target logit is high but not its winning class.
-        probs = class_logits.softmax(dim=-1)
+        # Independent sigmoid probabilities are the default for multi-label and
+        # open-vocabulary tasks. Mutually exclusive heads can explicitly request
+        # softmax, while specialized heads may supply a probability callback.
+        probs = self._class_probabilities(class_logits)
         class_cost = probs.new_zeros((probs.shape[0], target_classes.numel()))
         valid_classes = (target_classes >= 0) & (target_classes < probs.shape[1])
         if valid_classes.any():
             class_cost[:, valid_classes] = -probs[:, target_classes[valid_classes]]
 
-        if geometry_preds.dim() == 3:
-            num_classes = geometry_preds.shape[1]
-            geometry_cost = geometry_preds.new_zeros((geometry_preds.shape[0], target_classes.numel()))
-            valid_geometry_classes = (target_classes >= 0) & (target_classes < num_classes)
-            if valid_geometry_classes.any():
-                target_cls = target_classes[valid_geometry_classes]
-                pred_geometry = geometry_preds[:, target_cls, :]
-                geometry_cost[:, valid_geometry_classes] = (
-                    pred_geometry - target_geometry[valid_geometry_classes].unsqueeze(0)
-                ).abs().sum(dim=-1)
-            giou_cost = geometry_cost.new_zeros(geometry_cost.shape)
+        if geometry_preds.dim() != 2 or target_geometry.dim() != 2:
+            raise ValueError(
+                "set-prediction geometry must have shape (items, dimensions)"
+            )
+        if geometry_preds.shape[-1] != target_geometry.shape[-1]:
+            raise ValueError(
+                "prediction and target geometry dimensions must match"
+            )
+        geometry_cost = torch.cdist(geometry_preds, target_geometry, p=1)
+        if self.cost_giou != 0.0 and geometry_preds.shape[-1] == 4:
+            # Negative GIoU as a cost: better-overlapping pairs are cheaper.
+            # Pairs the boxes that L1 alone leaves ambiguous for small objects.
+            giou_predictions = (
+                giou_geometry_preds
+                if giou_geometry_preds is not None
+                else geometry_preds
+            )
+            giou_targets = (
+                target_giou_geometry
+                if target_giou_geometry is not None
+                else target_geometry
+            )
+            giou_cost = -pairwise_generalized_box_iou(
+                giou_predictions,
+                giou_targets,
+            )
         else:
-            geometry_cost = torch.cdist(geometry_preds, target_geometry, p=1)
-            if self.cost_giou != 0.0 and geometry_preds.shape[-1] == 4:
-                # Negative GIoU as a cost: better-overlapping pairs are cheaper.
-                # Pairs the boxes that L1 alone leaves ambiguous for small objects.
-                giou_cost = -_pairwise_giou(geometry_preds, target_geometry)
-            else:
-                giou_cost = geometry_cost.new_zeros(geometry_cost.shape)
+            giou_cost = geometry_cost.new_zeros(geometry_cost.shape)
         cost = (
             self.cost_class * class_cost
             + self.cost_geometry * geometry_cost
@@ -103,5 +141,5 @@ class HungarianMatcher(nn.Module):
         rows, cols = linear_sum_assignment(cost.detach().cpu().numpy())
         return [
             (int(pred_idx[int(row)].item()), int(valid_idx[int(col)].item()))
-            for row, col in zip(rows, cols)
+            for row, col in zip(rows, cols, strict=True)
         ]

@@ -85,27 +85,32 @@ class EmbeddingProcessor(TaskProcessor):
                     yield entry[0], entry[1], entry[2]
 
     def create_labels(self, batch_list, classes_mapping, **kwargs):
-        texts_a = []
-        texts_b = []
+        embedding_texts = []
+        pair_indices = []
         scores = []
 
         for item in batch_list:
-            for text_a, text_b, score in self._iter_root_pairs(item):
-                texts_a.append(self._normalize_text(text_a))
-                texts_b.append(self._normalize_text(text_b))
+            item_pairs = list(self._iter_root_pairs(item))
+            for text_a, text_b, score in item_pairs:
+                pair_indices.append([len(embedding_texts), len(embedding_texts) + 1])
+                embedding_texts.extend([
+                    self._normalize_text(text_a),
+                    self._normalize_text(text_b),
+                ])
                 scores.append(float(score))
+
+            # Legacy pair indices counted one encoder row for a batch item
+            # without embedding pairs.  Preserve that offset in the separate
+            # embedding text batch so the indices remain both compatible and
+            # valid for the newer independently encoded representation.
+            if not item_pairs:
+                embedding_texts.append(self._normalize_text(item.get("text", "")))
 
         if not scores:
             return None
 
-        n = len(scores)
-        pair_idx = torch.stack([
-            torch.arange(n),
-            torch.arange(n, 2 * n),
-        ], dim=1)
-
         return {
-            'embedding_texts': texts_a + texts_b,
-            'embedding_pair_idx': pair_idx,
+            'embedding_texts': embedding_texts,
+            'embedding_pair_idx': torch.tensor(pair_indices, dtype=torch.long),
             'embedding_labels': torch.tensor(scores, dtype=torch.float),
         }

@@ -2,13 +2,14 @@
 
 import random
 import warnings
-from typing import Dict, List, Optional
 
 import torch
 
 from ..span_processor import SpanProcessor
 from ...processing.mappings import (
-    BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping, BatchClassesMapping,
+    BaseClassMapping,
+    ExtractionClassMapping,
+    ExtractionItemMapping,
 )
 
 
@@ -54,11 +55,11 @@ class NERProcessor(SpanProcessor):
                 if 'all_labels' in example:
                     ner_labels = list(example['all_labels'])
                 else:
-                    ner_labels = list({
-                        self._entity_label(ent)
+                    ner_labels = list(dict.fromkeys(
+                        label
                         for ent in example.get('ner', [])
-                        if self._entity_label(ent) is not None
-                    })
+                        if (label := self._entity_label(ent)) is not None
+                    ))
                 ner_class_to_id = self._build_class_to_id(ner_labels, ner_negatives, sample_neg, shuffle_labels)
                 name = example.get('name', None)
                 description = example.get('description', None)
@@ -71,7 +72,9 @@ class NERProcessor(SpanProcessor):
                     rel_labels = list(example['all_rel_labels'])
                 else:
                     # Relations are (head_id, rel_type, tail_id); rel_type lives at index 1.
-                    rel_labels = list({rel[1] for rel in example.get('relations', [])})
+                    rel_labels = list(dict.fromkeys(
+                        rel[1] for rel in example.get('relations', [])
+                    ))
                 if rel_labels:
                     rel_class_to_id = self._build_class_to_id(rel_labels, rel_negatives, sample_neg, shuffle_labels)
                     rel_mapping = BaseClassMapping(
@@ -153,6 +156,19 @@ class NERProcessor(SpanProcessor):
             ner = ext_example.get('ner', [])
             if not ner:
                 continue
+            # Compact integer triplets are ambiguous when ``text`` is
+            # present: current datasets use character offsets, while older
+            # datasets used inclusive token indices.  Preserve the legacy
+            # interpretation only when every entity is a valid token span and
+            # at least one span cannot be a character-boundary span.  Fully
+            # character-aligned compact offsets continue down the current
+            # character-resolution path.
+            legacy_token_offsets = (
+                not has_tokenized_text
+                and self._uses_legacy_token_offsets(
+                    ner, tokens_with_spans, num_tokens=len(tokens)
+                )
+            )
             # Resolve per-entity so we can track which originals survived.
             # Relation head_id/tail_id reference positions in the input ner
             # list — if resolution drops an entity, the remaining indices
@@ -164,7 +180,7 @@ class NERProcessor(SpanProcessor):
                     text,
                     tokens_with_spans,
                     ent,
-                    tokenized_offsets=has_tokenized_text,
+                    tokenized_offsets=has_tokenized_text or legacy_token_offsets,
                     num_tokens=len(tokens),
                 )
                 if single:
@@ -191,6 +207,41 @@ class NERProcessor(SpanProcessor):
 
         self._sort_extraction_data(item)
         item['_glinext_extraction_spans_resolved'] = True
+
+    @staticmethod
+    def _uses_legacy_token_offsets(ner, tokens_with_spans, num_tokens: int) -> bool:
+        """Detect the old compact token-index representation conservatively.
+
+        Numeric list spans that align cleanly to character boundaries retain
+        the documented character-offset semantics.  If all spans fit inside
+        the token sequence but any one does not align to text boundaries, the
+        group can only be interpreted consistently as legacy token indices.
+        Dict annotations remain unambiguous character-offset inputs.
+        """
+        if not tokens_with_spans or num_tokens <= 0:
+            return False
+
+        spans = []
+        for value in ner:
+            if not (
+                isinstance(value, (list, tuple))
+                and len(value) >= 3
+                and isinstance(value[0], int)
+                and isinstance(value[1], int)
+            ):
+                return False
+            start, end = value[0], value[1]
+            if start < 0 or end < start or start >= num_tokens or end >= num_tokens:
+                return False
+            spans.append((start, end))
+
+        char_starts = {start for _, start, _ in tokens_with_spans}
+        char_ends = {end for _, _, end in tokens_with_spans}
+        return any(
+            start not in char_starts
+            or (end not in char_ends and end + 1 not in char_ends)
+            for start, end in spans
+        )
 
     @classmethod
     def _resolve_ner_span(

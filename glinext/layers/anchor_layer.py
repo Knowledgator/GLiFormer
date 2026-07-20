@@ -168,10 +168,20 @@ AnchorLayer._registry["feature"] = FeatureAnchorLayer
 class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
     """Learnable fixed-size embedding table conditioned on context.
 
-    Each anchor slot is a learnable embedding shifted by a projected context vector.
+    Each anchor slot is a learnable embedding shifted by a gated projected
+    context vector.  The configurable gate lets set-prediction heads disable
+    that shared context component without changing the fixed-slot state-dict
+    layout used by existing checkpoints.
     """
 
-    def __init__(self, hidden_size: int, num_slots: int = 10, **kwargs):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_slots: int = 10,
+        context_gate_init: float = 0.1,
+        context_gate_trainable: bool = True,
+        **kwargs,
+    ):
         super().__init__()
         self.num_slots = num_slots
         self.anchor_table = nn.Embedding(num_slots, hidden_size)
@@ -184,7 +194,10 @@ class FixedAnchorLayer(AnchorLayer, anchor_mode="fixed"):
         # self-attention averages them into a single identical query, so every
         # anchor predicts the same class/box. Gate the context low so the distinct
         # per-slot identity survives; training can grow the gate if it helps.
-        self.context_gate = nn.Parameter(torch.tensor(0.1))
+        self.context_gate = nn.Parameter(
+            torch.tensor(float(context_gate_init)),
+            requires_grad=bool(context_gate_trainable),
+        )
 
     def forward(
         self,
@@ -287,11 +300,29 @@ class FixedTransformerAnchorLayer(AnchorLayer, anchor_mode="fixed_transformer"):
         slots = self.anchor_table.weight.unsqueeze(0).expand(B, -1, -1)
         # Context as memory: (B, 1, D)
         memory = self.context_proj(context_embedding).unsqueeze(1)
+        memory_key_padding_mask = None
         # Optionally include sequence features as additional memory
         if feature_embeddings is not None:
             memory = torch.cat([memory, feature_embeddings], dim=1)  # (B, 1+L, D)
+            if feature_mask is not None:
+                if feature_mask.shape != feature_embeddings.shape[:2]:
+                    raise ValueError(
+                        "feature_mask must match the first two feature dimensions, "
+                        f"got {tuple(feature_mask.shape)} for "
+                        f"{tuple(feature_embeddings.shape)}"
+                    )
+                context_valid = torch.ones(B, 1, dtype=torch.bool, device=device)
+                memory_valid = torch.cat(
+                    [context_valid, feature_mask.to(device=device).bool()],
+                    dim=1,
+                )
+                memory_key_padding_mask = ~memory_valid
 
-        anchors = self.transformer_decoder(slots, memory)  # (B, num_slots, D)
+        anchors = self.transformer_decoder(
+            slots,
+            memory,
+            memory_key_padding_mask=memory_key_padding_mask,
+        )  # (B, num_slots, D)
 
         mask = _count_mask(B, self.num_slots, count, device)
         return anchors, mask
@@ -360,7 +391,13 @@ class QueryRNNAnchorLayer(AnchorLayer, anchor_mode="query_rnn"):
                 torch.zeros(B, 0, context_embedding.shape[-1], device=device),
                 torch.zeros(B, 0, dtype=torch.bool, device=device),
             )
-        return self.groups_layer(context_embedding, feature_embeddings, count_val=count, threshold=threshold)
+        return self.groups_layer(
+            context_embedding,
+            feature_embeddings,
+            count_val=count,
+            threshold=threshold,
+            token_mask=feature_mask,
+        )
 
 
 class QueryTransformerAnchorLayer(AnchorLayer, anchor_mode="query_transformer"):
@@ -389,4 +426,10 @@ class QueryTransformerAnchorLayer(AnchorLayer, anchor_mode="query_transformer"):
                 torch.zeros(B, 0, context_embedding.shape[-1], device=device),
                 torch.zeros(B, 0, dtype=torch.bool, device=device),
             )
-        return self.groups_layer(context_embedding, feature_embeddings, count_val=count, threshold=threshold)
+        return self.groups_layer(
+            context_embedding,
+            feature_embeddings,
+            count_val=count,
+            threshold=threshold,
+            token_mask=feature_mask,
+        )

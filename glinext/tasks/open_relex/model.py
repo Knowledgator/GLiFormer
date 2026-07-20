@@ -81,7 +81,12 @@ class OpenRelexHead(TaskHead):
         )
 
         if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(anchors, feature_embeddings, token_mask=feature_mask)
+            anchors = self.anchor_refine(
+                anchors,
+                feature_embeddings,
+                token_mask=feature_mask,
+                query_mask=anchor_mask,
+            )
 
         # 3. Fuse anchors + rel types: (B, X, C, D)
         fused = self.anchor_modeling(anchors, rel_embedding)

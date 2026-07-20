@@ -1,5 +1,7 @@
 """Classification scorers — registry-based factory for text × label scoring."""
 
+import math
+
 import torch
 from torch import nn
 
@@ -43,6 +45,14 @@ class DotScorer(ClassificationScorer, scorer_type="dot"):
 
     def forward(self, text_rep, label_rep):
         return torch.einsum("bd,bcd->bc", text_rep, label_rep)
+
+
+class ScaledDotScorer(DotScorer, scorer_type="scaled-dot"):
+    """Dot product scaled by the square root of the representation width."""
+
+    def forward(self, text_rep, label_rep):
+        logits = super().forward(text_rep, label_rep)
+        return logits / math.sqrt(text_rep.shape[-1])
 
 
 class WeightedDotScorer(ClassificationScorer, scorer_type="weighted-dot"):

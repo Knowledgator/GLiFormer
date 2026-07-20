@@ -56,6 +56,22 @@ class AnchorModeling(nn.Module):
         raise NotImplementedError
 
 
+class IdentityAnchorModeling(AnchorModeling, modeling_type="identity"):
+    """Compatibility strategy that leaves child/label representations unchanged."""
+
+    def __init__(self, hidden_size: int, **kwargs):
+        super().__init__()
+
+    def forward(self, anchor_rep, child_rep):
+        batch_size, anchor_count, _ = anchor_rep.shape
+        return child_rep.unsqueeze(1).expand(
+            batch_size,
+            anchor_count,
+            child_rep.shape[1],
+            child_rep.shape[2],
+        )
+
+
 class LinearAnchorModeling(AnchorModeling, modeling_type="linear"):
     """Linear projection of anchor + child concatenation."""
 
@@ -179,4 +195,3 @@ class TransformerAnchorModeling(AnchorModeling, modeling_type="transformer"):
 
         # Reshape back to (B, A, C, D)
         return fused.reshape(B, C, A, D).permute(0, 2, 1, 3)
-

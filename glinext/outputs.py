@@ -81,6 +81,7 @@ class GLiNExTVisionOutput(GLiNExTBaseOutput):
     segmentation_objectness_logits: Optional[torch.FloatTensor] = None
     segmentation_anchor_mask: Optional[torch.Tensor] = None
     segmentation_mask_logits: Optional[torch.FloatTensor] = None
+    segmentation_mask_validity: Optional[torch.Tensor] = None
     segmentation_prototypes: Optional[torch.FloatTensor] = None
     segmentation_coefficients: Optional[torch.FloatTensor] = None
 

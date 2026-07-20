@@ -5,37 +5,37 @@ Task processors own prompts and labels; modality mixins own how raw text,
 images, audio, and layout boxes become canonical model inputs.
 """
 
-import wave
+import math
 import warnings
+import wave
 from collections.abc import Mapping
 from pathlib import Path
-import torch
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
-
+import torch
 from gliner.data_processing import BaseProcessor
+from PIL import Image
 from transformers import AutoImageProcessor, AutoProcessor
 
+from ..tasks.audio.processor import AudioProcessor
+from ..tasks.classification.processor import ClassificationProcessor
+from ..tasks.count.processor import CountProcessor
+from ..tasks.embedding.processor import EmbeddingProcessor
+from ..tasks.joint_relex.processor import JointRelexProcessor
+from ..tasks.ner.processor import NERProcessor
+from ..tasks.open_relex.processor import OpenRelexProcessor
+from ..tasks.structuring.processor import StructuringProcessor
+from ..tasks.vision.processor import VisionProcessor
+from ..utils import pair_2d
 from .mappings import (
+    BatchClassesMapping,
     CatClassMapping,
     ExtractionClassMapping,
-    StructuringClassMapping,
     OpenRelexClassMapping,
+    StructuringClassMapping,
     VisionClassMapping,
-    BatchClassesMapping,
 )
-from ..tasks.ner.processor import NERProcessor
-from ..tasks.classification.processor import ClassificationProcessor
-from ..tasks.joint_relex.processor import JointRelexProcessor
-from ..tasks.open_relex.processor import OpenRelexProcessor
-from ..tasks.count.processor import CountProcessor
-from ..tasks.structuring.processor import StructuringProcessor
-from ..tasks.embedding.processor import EmbeddingProcessor
-from ..tasks.vision.processor import VisionProcessor
-from ..tasks.audio.processor import AudioProcessor
-
 
 _VISION_TASKS = ("image_classification", "object_detection", "segmentation")
 _AUDIO_TASKS = ("audio_classification", "audio_segmentation")
@@ -63,14 +63,6 @@ def _as_tensor_image(value: Any) -> Tuple[torch.Tensor, Tuple[int, int]]:
     if tensor.numel() and tensor.max() > 1:
         tensor = tensor / 255.0
     return tensor.contiguous(), (h, w)
-
-
-def _pair(value: Any) -> Tuple[int, int]:
-    if isinstance(value, (list, tuple)):
-        if len(value) != 2:
-            raise ValueError(f"Expected an int or pair, got {value!r}")
-        return int(value[0]), int(value[1])
-    return int(value), int(value)
 
 
 class TorchVisionImageProcessor:
@@ -105,9 +97,9 @@ class TorchVisionImageProcessor:
                 "Install torchvision or set vision_processor_type='auto'."
             ) from exc
 
-        self.image_size = _pair(image_size)
-        self.resize_size = _pair(resize_size if resize_size is not None else image_size)
-        self.center_crop_size = _pair(center_crop_size) if center_crop_size is not None else None
+        self.image_size = pair_2d(image_size)
+        self.resize_size = pair_2d(resize_size if resize_size is not None else image_size)
+        self.center_crop_size = pair_2d(center_crop_size) if center_crop_size is not None else None
         self.do_rescale = bool(do_rescale)
         self.do_normalize = bool(do_normalize)
         self.image_mean = image_mean if image_mean is not None else [0.485, 0.456, 0.406]
@@ -314,6 +306,37 @@ class TorchAudioProcessor:
 class TextProcessingMixin:
     """Text tokenization and word-level preprocessing."""
 
+    @staticmethod
+    def _as_tokenized_mapping(tokenized_inputs):
+        """Return a mutable mapping for tokenizer outputs.
+
+        Hugging Face tokenizers normally return ``BatchEncoding``, but small
+        tokenizer adapters may expose only the mapping protocol methods used
+        by the processor.  Normalize those adapters before task labels and
+        modality tensors are attached so collators never depend on an
+        object's concrete ``items()`` implementation.
+        """
+        if isinstance(tokenized_inputs, Mapping):
+            return tokenized_inputs
+
+        try:
+            normalized = dict(tokenized_inputs)
+        except (TypeError, ValueError):
+            normalized = {}
+
+        # Some lightweight adapters implement subscription and containment
+        # without implementing iteration.  These are the canonical tokenizer
+        # fields that can be recovered from such an adapter.
+        for key in ("input_ids", "attention_mask", "token_type_ids"):
+            if key in normalized:
+                continue
+            try:
+                if key in tokenized_inputs:
+                    normalized[key] = tokenized_inputs[key]
+            except (KeyError, TypeError):
+                continue
+        return normalized
+
     def _preprocess_batch_text(self, batch_list, classes_mapping):
         if "ner" in self.task_processors:
             return [
@@ -327,14 +350,15 @@ class TextProcessingMixin:
     def tokenize_inputs(self, texts, classes_mapping, **kwargs):
         input_texts, prompt_lengths = self.prepare_inputs(texts, classes_mapping, **kwargs)
 
-        tokenized_inputs = self.transformer_tokenizer(
+        tokenizer_output = self.transformer_tokenizer(
             input_texts,
             is_split_into_words=True,
             return_tensors="pt",
             truncation=True,
             padding="longest",
         )
-        words_masks = self.prepare_word_mask(texts, tokenized_inputs, prompt_lengths)
+        words_masks = self.prepare_word_mask(texts, tokenizer_output, prompt_lengths)
+        tokenized_inputs = self._as_tokenized_mapping(tokenizer_output)
         tokenized_inputs["words_mask"] = torch.tensor(words_masks)
 
         label_enc = self.prepare_all_label_encoder_inputs(classes_mapping)
@@ -431,6 +455,13 @@ class VisionProcessingMixin:
             item["_image_size"] = image_size
             image_tensors.append(tensor)
             image_sizes.append(image_size)
+        shapes = {tuple(tensor.shape) for tensor in image_tensors}
+        if len(shapes) > 1:
+            raise ValueError(
+                "Vision batches require one processed tensor shape. Configure "
+                "vision resizing instead of padding differently sized images, "
+                "which would misalign normalized detection coordinates."
+            )
         return {
             "pixel_values": torch.stack(image_tensors),
             "image_sizes": torch.tensor(image_sizes, dtype=torch.long),
@@ -448,6 +479,7 @@ class AudioProcessingMixin:
     """Audio loading, feature handling, and batch padding."""
 
     feature_encoder_types = {"mel", "spectrogram", "conv2d", "mel_conv", "spectrogram_conv", "conv_2d"}
+    duration_metadata_key = "_audio_duration_seconds"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -484,6 +516,83 @@ class AudioProcessingMixin:
         if input_format == "time_first":
             return int(tensor.shape[-2])
         return int(tensor.shape[-1])
+
+    @staticmethod
+    def _positive_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
+
+    def _metadata_value(self, item: Dict[str, Any], *keys: str) -> Optional[float]:
+        for key in keys:
+            value = self._positive_float(item.get(key))
+            if value is not None:
+                return value
+        return None
+
+    def _preserve_audio_duration(
+        self,
+        item: Dict[str, Any],
+        *,
+        time_length: Optional[int] = None,
+        is_feature: bool = False,
+        source_num_samples: Optional[int] = None,
+        source_sample_rate: Optional[int] = None,
+    ) -> Optional[float]:
+        """Store duration before audio processing changes the time axis."""
+        duration = self._metadata_value(
+            item,
+            "audio_duration",
+            "duration",
+            self.duration_metadata_key,
+        )
+        sample_rate = self._positive_float(source_sample_rate) or self._metadata_value(
+            item,
+            "sample_rate",
+            "sampling_rate",
+            "audio_sample_rate",
+        ) or self._positive_float(getattr(self.config, "audio_sampling_rate", None))
+
+        if duration is None:
+            num_samples = self._positive_float(source_num_samples) or self._metadata_value(
+                item,
+                "audio_num_samples",
+                "num_samples",
+            )
+            if num_samples is not None and sample_rate is not None:
+                duration = num_samples / sample_rate
+
+        if duration is None and time_length is not None:
+            if not is_feature and sample_rate is not None:
+                duration = float(time_length) / sample_rate
+            elif is_feature:
+                frame_rate = self._metadata_value(
+                    item,
+                    "audio_frame_rate",
+                    "feature_frame_rate",
+                    "frame_rate",
+                    "frames_per_second",
+                )
+                if frame_rate is not None:
+                    duration = float(time_length) / frame_rate
+                else:
+                    hop_length = self._metadata_value(
+                        item,
+                        "audio_hop_length",
+                        "feature_hop_length",
+                        "hop_length",
+                    ) or self._positive_float(getattr(self.config, "audio_hop_length", None))
+                    if hop_length is not None and sample_rate is not None:
+                        duration = float(time_length) * hop_length / sample_rate
+
+        duration = self._positive_float(duration)
+        if duration is not None:
+            item[self.duration_metadata_key] = duration
+        return duration
 
     @staticmethod
     def _read_wav(path: Path) -> Tuple[np.ndarray, int]:
@@ -535,7 +644,14 @@ class AudioProcessingMixin:
                 item[feature_key] if feature_key is not None else item["audio_values"],
                 dtype=torch.float,
             )
-            if tensor.dim() > 1 and not self._expects_feature_input(item):
+            is_feature = self._expects_feature_input(item)
+            source_time_length = self._time_length(tensor)
+            self._preserve_audio_duration(
+                item,
+                time_length=source_time_length,
+                is_feature=is_feature,
+            )
+            if tensor.dim() > 1 and not is_feature:
                 tensor = tensor.reshape(-1)
             return tensor, self._time_length(tensor)
 
@@ -547,6 +663,11 @@ class AudioProcessingMixin:
             raise ValueError("Only WAV files are supported without an external audio backend.")
         audio, sample_rate = self._read_wav(path)
         item.setdefault("sample_rate", sample_rate)
+        self._preserve_audio_duration(
+            item,
+            source_num_samples=int(audio.size),
+            source_sample_rate=sample_rate,
+        )
         tensor = self._apply_audio_processor(audio, sample_rate)
         return tensor, self._time_length(tensor)
 
@@ -554,12 +675,14 @@ class AudioProcessingMixin:
         if not self._has_audio_inputs():
             return {}
         audio_tensors = []
+        audio_durations = []
         max_audio_shape = None
         max_audio_len = 0
         for item in batch_list:
             tensor, time_length = self.load_audio(item)
             item["_audio_num_samples"] = time_length
             audio_tensors.append(tensor)
+            audio_durations.append(item.get(self.duration_metadata_key))
             shape = tuple(tensor.shape)
             if max_audio_shape is None:
                 max_audio_shape = list(shape)
@@ -578,6 +701,7 @@ class AudioProcessingMixin:
         return {
             "audio_values": audio_values,
             "audio_attention_mask": audio_attention_mask,
+            self.duration_metadata_key: audio_durations,
         }
 
     def _augment_label_item(self, item, batch, batch_idx):
@@ -586,6 +710,13 @@ class AudioProcessingMixin:
             item["audio_values"] = batch["audio_values"][batch_idx]
         if batch.get("audio_attention_mask") is not None:
             item["_audio_num_samples"] = int(batch["audio_attention_mask"][batch_idx].sum().item())
+        durations = batch.get(self.duration_metadata_key)
+        if (
+            durations is not None
+            and batch_idx < len(durations)
+            and durations[batch_idx] is not None
+        ):
+            item[self.duration_metadata_key] = durations[batch_idx]
 
 
 class LayoutProcessingMixin:
@@ -1478,7 +1609,7 @@ class GLiNextAudioProcessor(AudioProcessingMixin, BaseGLiNextProcessor):
             for field in (
                 "segments", "audio_segments", "labels", "classes", "all_labels",
                 "true_labels", "name", "duration", "audio_duration", "sample_rate",
-                "audio_classification", "audio_segmentation",
+                self.duration_metadata_key, "audio_classification", "audio_segmentation",
             ):
                 values = batch.get(field)
                 if values is not None and i < len(values) and values[i] is not None:
@@ -1689,7 +1820,7 @@ class GLiNextOmniProcessor(
 
         image_tensors = [None for _ in batch_list]
         image_sizes = [(0, 0) for _ in batch_list]
-        max_shape = None
+        tensor_shape = None
         any_payload = False
 
         for idx, item in enumerate(batch_list):
@@ -1702,17 +1833,19 @@ class GLiNextOmniProcessor(
             any_payload = True
 
             shape = tuple(tensor.shape)
-            if max_shape is None:
-                max_shape = list(shape)
-            elif len(shape) != len(max_shape):
-                raise ValueError("All image tensors in an omni batch must have the same rank.")
-            else:
-                max_shape = [max(current, int(dim)) for current, dim in zip(max_shape, shape)]
+            if tensor_shape is None:
+                tensor_shape = shape
+            elif shape != tensor_shape:
+                raise ValueError(
+                    "Omni vision batches require one processed tensor shape. "
+                    "Configure vision resizing instead of spatial padding, which "
+                    "would misalign normalized boxes and dense patch coordinates."
+                )
 
         if not any_payload:
             return {}
 
-        pixel_values = torch.zeros((len(batch_list), *max_shape), dtype=torch.float)
+        pixel_values = torch.zeros((len(batch_list), *tensor_shape), dtype=torch.float)
         vision_input_mask = torch.zeros(len(batch_list), dtype=torch.long)
         for idx, tensor in enumerate(image_tensors):
             if tensor is None:
@@ -1732,6 +1865,7 @@ class GLiNextOmniProcessor(
             return {}
 
         audio_tensors = [None for _ in batch_list]
+        audio_durations = [None for _ in batch_list]
         max_audio_shape = None
         max_audio_len = 0
         any_payload = False
@@ -1742,6 +1876,7 @@ class GLiNextOmniProcessor(
             tensor, time_length = self.load_audio(item)
             item["_audio_num_samples"] = time_length
             audio_tensors[idx] = tensor
+            audio_durations[idx] = item.get(self.duration_metadata_key)
             any_payload = True
 
             shape = tuple(tensor.shape)
@@ -1771,6 +1906,7 @@ class GLiNextOmniProcessor(
             "audio_values": audio_values,
             "audio_attention_mask": audio_attention_mask,
             "audio_input_mask": audio_input_mask,
+            self.duration_metadata_key: audio_durations,
         }
 
     def collate_raw_batch(self, batch_list, **kwargs):

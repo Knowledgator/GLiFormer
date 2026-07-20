@@ -6,13 +6,8 @@ otherwise the head falls back to scoring all directed entity pairs, matching
 the original GLiNER behavior.
 """
 
-from typing import Dict, Optional
 
 import torch
-from torch import nn
-from torch.nn import functional as F
-
-from gliner.modeling.loss_functions import focal_loss_with_logits
 from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from gliner.modeling.multitask.triples_layers import TriplesScoreLayer
 from gliner.modeling.span_rep import SpanRepLayer
@@ -22,10 +17,12 @@ from gliner.modeling.utils import (
     extract_prompt_features,
     extract_spans_from_tokens,
 )
+from torch.nn import functional as F
 
-from .. import TaskHeadOutput, SharedRepresentations
-from ..ner.model import NERHead
 from ...layers import PairRepLayer
+from .. import TaskHeadOutput
+from ..losses import binary_focal_or_bce
+from ..ner.model import NERHead
 
 
 class JointRelexHead(NERHead):
@@ -220,8 +217,8 @@ class JointRelexHead(NERHead):
     def _call_elementwise_loss(loss_fn, logits, labels, normalize_prob=True, **kwargs):
         """Call BaseModel._loss when available, falling back to focal loss.
 
-        Unit tests sometimes pass focal_loss_with_logits directly; production
-        GLiNExTModel passes BaseModel._loss, which supports negative sampling.
+        Unit tests may pass another compatible loss directly; production uses
+        GLiNExT's stable elementwise binary-loss primitive.
         """
         if loss_fn is not None:
             try:
@@ -236,7 +233,7 @@ class JointRelexHead(NERHead):
             "alpha", "gamma", "prob_margin", "label_smoothing",
         }
         fallback_kwargs = {k: v for k, v in kwargs.items() if k in supported}
-        return focal_loss_with_logits(
+        return binary_focal_or_bce(
             logits, labels, normalize_prob=normalize_prob, **fallback_kwargs,
         )
 

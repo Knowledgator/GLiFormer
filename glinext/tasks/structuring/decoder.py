@@ -135,14 +135,10 @@ class StructuringDecoder(SpanDecoder):
         """Decode from token-level BIO logits (BN, X, L, C, 3)."""
         BN, X, L, C, _ = logits.shape
         flat_results = []
-        print(f"[DEBUG structuring_decoder] token-level logits.shape=(BN={BN}, X={X}, L={L}, C={C}, 3) "
-              f"anchor_mask.sum_per_group={anchor_mask.sum(dim=-1).tolist() if anchor_mask is not None else 'None'} "
-              f"threshold={threshold}")
 
         for b in range(BN):
             text_bi = batch_origin[b].item()
             instances = []
-            anchors_with_spans = 0
             field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
                 i: str(i) for i in range(C)
             }
@@ -156,11 +152,8 @@ class StructuringDecoder(SpanDecoder):
                 )
 
                 if spans:
-                    anchors_with_spans += 1
                     fields = self._spans_to_fields(spans, texts, text_bi)
                     instances.append(fields)
-            print(f"[DEBUG structuring_decoder]   group={b} text_bi={text_bi} "
-                  f"anchors_with_spans={anchors_with_spans}/{X} → instances={len(instances)}")
             flat_results.append(instances)
 
         return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
@@ -172,14 +165,10 @@ class StructuringDecoder(SpanDecoder):
         BN, X, S, C = span_logits.shape
         span_probs = torch.sigmoid(span_logits)
         flat_results = []
-        print(f"[DEBUG structuring_decoder] span-level span_logits.shape=(BN={BN}, X={X}, S={S}, C={C}) "
-              f"anchor_mask.sum_per_group={anchor_mask.sum(dim=-1).tolist() if anchor_mask is not None else 'None'} "
-              f"threshold={threshold}")
 
         for b in range(BN):
             text_bi = batch_origin[b].item()
             instances = []
-            anchors_with_spans = 0
             field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
                 i: str(i) for i in range(C)
             }
@@ -209,11 +198,8 @@ class StructuringDecoder(SpanDecoder):
                 spans = self.greedy_search(spans, flat_ner, multi_label)
 
                 if spans:
-                    anchors_with_spans += 1
                     fields = self._spans_to_fields(spans, texts, text_bi)
                     instances.append(fields)
-            print(f"[DEBUG structuring_decoder]   group={b} text_bi={text_bi} "
-                  f"anchors_with_spans={anchors_with_spans}/{X} → instances={len(instances)}")
             flat_results.append(instances)
 
         return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
