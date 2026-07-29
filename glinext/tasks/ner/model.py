@@ -17,8 +17,25 @@ class NERHead(AnchoredSpanExtractionHead):
     name = "ner"
     dependencies = []
 
-    def __init__(self, config, hidden_size, dropout, shared_layers=None):
-        super().__init__(config.ner_config, config, hidden_size, dropout, shared_layers)
+    def __init__(
+        self,
+        config,
+        hidden_size,
+        dropout,
+        shared_layers=None,
+        task_config=None,
+    ):
+        # Composite entity-first heads can reuse the exact NER pipeline with
+        # their own task-local loss/span settings.  Ordinary NER continues to
+        # use ``ner_config``.
+        task_config = task_config or config.ner_config
+        super().__init__(
+            task_config,
+            config,
+            hidden_size,
+            dropout,
+            shared_layers,
+        )
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):

@@ -1,6 +1,6 @@
 """Joint NER + Relation Extraction head (GLiNER-relex style).
 
-Inherits NER scoring from NERHead and adds relation scoring against [REL]
+Inherits NER scoring from NERHead and adds relation scoring against [RELATION]
 type embeddings. When enabled, the adjacency layer filters candidate pairs;
 otherwise the head falls back to scoring all directed entity pairs, matching
 the original GLiNER behavior.
@@ -31,7 +31,7 @@ class JointRelexHead(NERHead):
     Inherits NER forward pass from NERHead, then:
     1. Selects entity spans from NER scores
     2. Optionally builds an adjacency matrix between entities
-    3. Scores candidate entity pairs against [REL] type embeddings
+    3. Scores candidate entity pairs against [RELATION] type embeddings
     """
 
     name = "joint_relex"
@@ -45,6 +45,11 @@ class JointRelexHead(NERHead):
         self.adjacency_loss_coef = rel_cfg.adjacency_loss_coef
         self.rel_token_index = rel_cfg.rel_token_index
         self.embed_rel_token = rel_cfg.embed_rel_token
+        self.max_relation_span_width = rel_cfg.max_relation_span_width
+        self.relation_span_nms = rel_cfg.relation_span_nms
+        self.max_relation_entities = rel_cfg.max_relation_entities
+        self.relation_top_k_neighbors = rel_cfg.relation_top_k_neighbors
+        self.relation_neighbor_chunk_size = rel_cfg.relation_neighbor_chunk_size
         # This head combines its own NER and relation losses internally. Keep
         # the orchestrator from multiplying the combined loss a second time.
         self.loss_coef = 1.0
@@ -82,8 +87,225 @@ class JointRelexHead(NERHead):
         span_rep = span_rep * span_mask.unsqueeze(-1).to(span_rep.dtype)
         return span_rep, span_mask.to(torch.long)
 
+    def _relation_span_safeguards_enabled(self):
+        return (
+            self.max_relation_span_width is not None
+            or self.relation_span_nms
+            or self.max_relation_entities is not None
+        )
+
+    @staticmethod
+    def _score_relation_spans(ner_scores, spans, span_ids, batch_idx):
+        """Score spans by their strongest consistent BIO entity class."""
+        probabilities = torch.sigmoid(ner_scores[batch_idx]).detach()
+        confidences = probabilities.new_zeros(span_ids.numel())
+        for output_idx, span_id in enumerate(span_ids.tolist()):
+            start = int(spans[span_id, 0].item())
+            end = int(spans[span_id, 1].item())
+            if start < 0 or end < start or end >= probabilities.shape[0]:
+                continue
+            start_scores = probabilities[start, :, 0]
+            end_scores = probabilities[end, :, 1]
+            inside_scores = probabilities[start:end + 1, :, 2].amin(dim=0)
+            confidences[output_idx] = torch.minimum(
+                torch.minimum(start_scores, end_scores), inside_scores,
+            ).amax()
+        return confidences
+
+    def _select_relation_spans(self, ner_scores, span_idx, span_mask):
+        """Apply optional width, flat-NMS, and entity-count safeguards.
+
+        Returns compacted spans plus source indices into the original entity
+        axis. Source indices let training relation targets be remapped without
+        relying on the filtered spans retaining their original positions.
+        """
+        if not self._relation_span_safeguards_enabled():
+            return span_idx, span_mask, None
+
+        selected_per_batch = []
+        needs_ranking = self.relation_span_nms or self.max_relation_entities is not None
+        for batch_idx in range(span_idx.shape[0]):
+            source_ids = torch.where(span_mask[batch_idx].bool())[0]
+            if self.max_relation_span_width is not None and source_ids.numel() > 0:
+                spans = span_idx[batch_idx, source_ids]
+                widths = spans[:, 1] - spans[:, 0] + 1
+                source_ids = source_ids[widths <= self.max_relation_span_width]
+
+            if needs_ranking and source_ids.numel() > 0:
+                confidences = self._score_relation_spans(
+                    ner_scores, span_idx[batch_idx], source_ids, batch_idx,
+                )
+                order = torch.argsort(confidences, descending=True, stable=True)
+                source_ids = source_ids[order]
+
+            if self.relation_span_nms and source_ids.numel() > 0:
+                kept = []
+                for source_id in source_ids.tolist():
+                    start = int(span_idx[batch_idx, source_id, 0].item())
+                    end = int(span_idx[batch_idx, source_id, 1].item())
+                    overlaps = any(
+                        not (
+                            end < int(span_idx[batch_idx, kept_id, 0].item())
+                            or start > int(span_idx[batch_idx, kept_id, 1].item())
+                        )
+                        for kept_id in kept
+                    )
+                    if not overlaps:
+                        kept.append(source_id)
+                source_ids = torch.tensor(
+                    kept, dtype=torch.long, device=span_idx.device,
+                )
+
+            if self.max_relation_entities is not None:
+                source_ids = source_ids[:self.max_relation_entities]
+            selected_per_batch.append(source_ids)
+
+        max_entities = max((ids.numel() for ids in selected_per_batch), default=0)
+        max_entities = max(max_entities, 1)
+        selected_spans = span_idx.new_zeros(span_idx.shape[0], max_entities, 2)
+        selected_mask = span_mask.new_zeros(span_idx.shape[0], max_entities)
+        source_indices = torch.full(
+            (span_idx.shape[0], max_entities), -1,
+            dtype=torch.long, device=span_idx.device,
+        )
+        for batch_idx, source_ids in enumerate(selected_per_batch):
+            count = source_ids.numel()
+            if count == 0:
+                continue
+            selected_spans[batch_idx, :count] = span_idx[batch_idx, source_ids]
+            selected_mask[batch_idx, :count] = True
+            source_indices[batch_idx, :count] = source_ids
+        return selected_spans, selected_mask, source_indices
+
+    @staticmethod
+    def _remap_relation_targets(rel_labels, rel_pair_mask, source_indices, span_mask):
+        """Project dense entity-axis targets onto a filtered entity set."""
+        if source_indices is None:
+            return rel_labels, rel_pair_mask
+
+        batch_size, entity_count = source_indices.shape
+        valid_pairs = span_mask.bool().unsqueeze(2) & span_mask.bool().unsqueeze(1)
+        batch_indices = torch.arange(
+            batch_size, device=source_indices.device,
+        ).view(batch_size, 1, 1)
+
+        def remap(tensor, has_class_axis):
+            if tensor is None:
+                return None
+            if tensor.shape[1] == 0 or tensor.shape[2] == 0:
+                output_shape = (batch_size, entity_count, entity_count)
+                if has_class_axis:
+                    output_shape += (tensor.shape[-1],)
+                return tensor.new_zeros(output_shape)
+            safe_indices = source_indices.clamp(min=0, max=tensor.shape[1] - 1)
+            heads = safe_indices.unsqueeze(2).expand(batch_size, entity_count, entity_count)
+            tails = safe_indices.unsqueeze(1).expand(batch_size, entity_count, entity_count)
+            result = tensor[batch_indices, heads, tails]
+            mask = valid_pairs.unsqueeze(-1) if has_class_axis else valid_pairs
+            return result * mask.to(result.dtype)
+
+        return remap(rel_labels, True), remap(rel_pair_mask, False)
+
+    @staticmethod
+    def _empty_entity_pairs(span_rep):
+        batch_size, _, hidden_size = span_rep.shape
+        pair_idx = torch.full(
+            (batch_size, 1, 2), -1, dtype=torch.long, device=span_rep.device,
+        )
+        pair_mask = torch.zeros(
+            (batch_size, 1), dtype=torch.bool, device=span_rep.device,
+        )
+        empty_rep = span_rep.new_zeros(batch_size, 1, hidden_size)
+        return pair_idx, pair_mask, empty_rep, empty_rep
+
+    def _build_top_k_dot_pairs(self, span_rep, span_mask, threshold):
+        """Select at most k dot-adjacency neighbors without a dense E x E tensor."""
+        batch_size, entity_count, _ = span_rep.shape
+        neighbor_count = min(
+            self.relation_top_k_neighbors, max(entity_count - 1, 0),
+        )
+        if neighbor_count == 0:
+            return self._empty_entity_pairs(span_rep)
+
+        tail_indices = torch.zeros(
+            batch_size, entity_count, neighbor_count,
+            dtype=torch.long, device=span_rep.device,
+        )
+        selected_mask = torch.zeros(
+            batch_size, entity_count, neighbor_count,
+            dtype=torch.bool, device=span_rep.device,
+        )
+        key_mask = span_mask.bool()
+        for start in range(0, entity_count, self.relation_neighbor_chunk_size):
+            end = min(start + self.relation_neighbor_chunk_size, entity_count)
+            scores = torch.sigmoid(torch.bmm(
+                span_rep[:, start:end], span_rep.transpose(1, 2),
+            ))
+            valid = (
+                key_mask[:, None, :]
+                & key_mask[:, start:end, None]
+            )
+            query_ids = torch.arange(start, end, device=span_rep.device)
+            valid[:, torch.arange(end - start, device=span_rep.device), query_ids] = False
+            scores = scores.masked_fill(~valid, float("-inf"))
+            top_scores, top_indices = scores.topk(neighbor_count, dim=-1)
+            gathered_key_mask = torch.gather(
+                key_mask, 1, top_indices.reshape(batch_size, -1),
+            ).reshape_as(top_indices)
+            current_mask = (
+                key_mask[:, start:end, None]
+                & gathered_key_mask
+                & torch.isfinite(top_scores)
+                & (top_scores > threshold)
+            )
+            tail_indices[:, start:end] = top_indices
+            selected_mask[:, start:end] = current_mask
+
+        head_indices = torch.arange(
+            entity_count, device=span_rep.device,
+        ).view(1, entity_count, 1).expand_as(tail_indices)
+        pair_idx = torch.stack((head_indices, tail_indices), dim=-1).reshape(
+            batch_size, entity_count * neighbor_count, 2,
+        )
+        pair_mask = selected_mask.reshape(batch_size, entity_count * neighbor_count)
+        pair_idx = pair_idx.masked_fill(~pair_mask.unsqueeze(-1), -1)
+        batch_indices = torch.arange(batch_size, device=span_rep.device).unsqueeze(1)
+        safe_pair_idx = pair_idx.clamp_min(0)
+        head_rep = span_rep[batch_indices, safe_pair_idx[..., 0]]
+        tail_rep = span_rep[batch_indices, safe_pair_idx[..., 1]]
+        head_rep = head_rep * pair_mask.unsqueeze(-1).to(head_rep.dtype)
+        tail_rep = tail_rep * pair_mask.unsqueeze(-1).to(tail_rep.dtype)
+        return pair_idx, pair_mask, head_rep, tail_rep
+
+    def _chunked_dot_adjacency_loss(
+        self, span_rep, span_mask, adjacency_labels, base_loss_fn, loss_kwargs,
+    ):
+        """Compute the dense dot-adjacency objective without storing its matrix."""
+        total_loss = span_rep.new_zeros(())
+        entity_count = span_rep.shape[1]
+        for start in range(0, entity_count, self.relation_neighbor_chunk_size):
+            end = min(start + self.relation_neighbor_chunk_size, entity_count)
+            probabilities = torch.sigmoid(torch.bmm(
+                span_rep[:, start:end], span_rep.transpose(1, 2),
+            ))
+            labels = adjacency_labels[:, start:end]
+            valid = (
+                span_mask[:, start:end].bool().unsqueeze(2)
+                & span_mask.bool().unsqueeze(1)
+            )
+            batch_size = span_rep.shape[0]
+            probabilities = probabilities.reshape(batch_size, -1, 1)
+            labels = labels.reshape(batch_size, -1, 1)
+            valid = valid.reshape(batch_size, -1, 1)
+            losses = self._call_elementwise_loss(
+                base_loss_fn, probabilities, labels,
+                normalize_prob=False, **loss_kwargs,
+            )
+            total_loss = total_loss + (losses * valid.to(losses.dtype)).sum()
+        return total_loss
+
     def _get_rel_prompts(self, shared, rel_label_embeds, flat_rel_prompts, flat_rel_prompts_mask):
-        """Return per-group (BN, C_rel, D) [REL] embeddings.
+        """Return per-group (BN, C_rel, D) [RELATION] embeddings.
 
         Prefers processor/model-provided flat tensors (already split per
         extraction group). Falls back to batch-level extraction when those
@@ -113,8 +335,11 @@ class JointRelexHead(NERHead):
         """Relation scoring with optional adjacency-based pair selection."""
         B, E_ent, D = target_span_rep.shape
         use_adjacency = hasattr(self, "relations_rep_layer")
+        use_sparse_neighbors = (
+            use_adjacency and self.relation_top_k_neighbors is not None
+        )
         pred_adj_matrix = None
-        if use_adjacency:
+        if use_adjacency and not use_sparse_neighbors:
             pred_adj_matrix = self.relations_rep_layer(target_span_rep, target_span_mask)
 
         rel_prompts, rel_prompts_mask = self._get_rel_prompts(
@@ -132,10 +357,18 @@ class JointRelexHead(NERHead):
             adj_matrix = None
 
         if use_adjacency:
-            adj_for_selection = adj_matrix if adj_matrix is not None else pred_adj_matrix
-            pair_idx, pair_mask, head_rep, tail_rep = build_entity_pairs(
-                adj_for_selection, target_span_rep, threshold=adjacency_threshold,
-            )
+            if adj_matrix is not None:
+                pair_idx, pair_mask, head_rep, tail_rep = build_entity_pairs(
+                    adj_matrix, target_span_rep, threshold=adjacency_threshold,
+                )
+            elif use_sparse_neighbors:
+                pair_idx, pair_mask, head_rep, tail_rep = self._build_top_k_dot_pairs(
+                    target_span_rep, target_span_mask, adjacency_threshold,
+                )
+            else:
+                pair_idx, pair_mask, head_rep, tail_rep = build_entity_pairs(
+                    pred_adj_matrix, target_span_rep, threshold=adjacency_threshold,
+                )
         else:
             pair_idx, pair_mask, head_rep, tail_rep = build_all_entity_pairs(
                 target_span_rep, target_span_mask,
@@ -176,14 +409,20 @@ class JointRelexHead(NERHead):
             )
             rel_loss = (rel_losses * combined).sum()
 
-            if use_adjacency and pred_adj_matrix is not None and adj_matrix is not None:
-                adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
-                adj_logits = pred_adj_matrix.unsqueeze(-1).view(B, -1, 1)
-                adj_labels = adj_matrix.unsqueeze(-1).view(B, -1, 1)
-                adj_losses = self._call_elementwise_loss(
-                    base_loss_fn, adj_logits, adj_labels, normalize_prob=False, **loss_kwargs,
-                )
-                adj_loss = (adj_losses * adj_mask.unsqueeze(-1).view(B, -1, 1)).sum()
+            if use_adjacency and adj_matrix is not None:
+                if use_sparse_neighbors:
+                    adj_loss = self._chunked_dot_adjacency_loss(
+                        target_span_rep, target_span_mask, adj_matrix,
+                        base_loss_fn, loss_kwargs,
+                    )
+                else:
+                    adj_mask = target_span_mask.float().unsqueeze(1) * target_span_mask.float().unsqueeze(2)
+                    adj_logits = pred_adj_matrix.unsqueeze(-1).view(B, -1, 1)
+                    adj_labels = adj_matrix.unsqueeze(-1).view(B, -1, 1)
+                    adj_losses = self._call_elementwise_loss(
+                        base_loss_fn, adj_logits, adj_labels, normalize_prob=False, **loss_kwargs,
+                    )
+                    adj_loss = (adj_losses * adj_mask.unsqueeze(-1).view(B, -1, 1)).sum()
                 loss = adj_loss * self.adjacency_loss_coef + rel_loss * self.rel_loss_coef
             else:
                 loss = rel_loss * self.rel_loss_coef
@@ -199,9 +438,18 @@ class JointRelexHead(NERHead):
         """Mirror GLiNER-relex relation-loss kwargs, including rel_* overrides."""
         kwargs = {}
         for out_key, sources in (
-            ("alpha", ("rel_alpha", "alpha")),
-            ("gamma", ("rel_gamma", "gamma")),
-            ("prob_margin", ("rel_prob_margin", "prob_margin")),
+            (
+                "focal_loss_alpha",
+                ("rel_focal_loss_alpha", "focal_loss_alpha"),
+            ),
+            (
+                "focal_loss_gamma",
+                ("rel_focal_loss_gamma", "focal_loss_gamma"),
+            ),
+            (
+                "focal_loss_prob_margin",
+                ("rel_focal_loss_prob_margin", "focal_loss_prob_margin"),
+            ),
             ("label_smoothing", ("rel_label_smoothing", "label_smoothing")),
             ("negatives", ("rel_negatives", "negatives")),
             ("masking", ("rel_masking", "masking")),
@@ -225,12 +473,18 @@ class JointRelexHead(NERHead):
                 return loss_fn(logits, labels, normalize_prob=normalize_prob, **kwargs)
             except TypeError:
                 supported = {
-                    "alpha", "gamma", "prob_margin", "label_smoothing",
+                    "focal_loss_alpha",
+                    "focal_loss_gamma",
+                    "focal_loss_prob_margin",
+                    "label_smoothing",
                 }
                 fallback_kwargs = {k: v for k, v in kwargs.items() if k in supported}
                 return loss_fn(logits, labels, normalize_prob=normalize_prob, **fallback_kwargs)
         supported = {
-            "alpha", "gamma", "prob_margin", "label_smoothing",
+            "focal_loss_alpha",
+            "focal_loss_gamma",
+            "focal_loss_prob_margin",
+            "label_smoothing",
         }
         fallback_kwargs = {k: v for k, v in kwargs.items() if k in supported}
         return binary_focal_or_bce(
@@ -252,13 +506,34 @@ class JointRelexHead(NERHead):
         ner_scores = ner_output.logits
         words_embedding = ner_output.extra.get("words_embedding", shared.words_embedding)
 
+        # A multi-task checkpoint can contain this head even when the current
+        # request is NER-only.  In that case there are no relation prompts, so
+        # constructing every possible predicted entity pair is both useless
+        # and potentially quadratic in a large number of noisy NER spans.
+        rel_prompts, rel_prompts_mask = self._get_rel_prompts(
+            shared, rel_label_embeds, flat_rel_prompts, flat_rel_prompts_mask,
+        )
+        if rel_prompts.size(1) == 0:
+            return TaskHeadOutput(
+                loss=(
+                    ner_output.loss * self.ner_loss_coef
+                    if ner_output.loss is not None else None
+                ),
+                logits=ner_output.logits,
+                extra={
+                    **ner_output.extra,
+                    "rel_logits": None,
+                    "rel_idx": None,
+                    "rel_mask": None,
+                    "rel_entity_spans": None,
+                },
+            )
+
         rel_span_idx = batch.get("rel_span_idx")
         rel_span_mask = batch.get("rel_span_mask")
 
         if rel_span_idx is not None and rel_span_mask is not None:
-            target_span_rep, target_span_mask = self._pool_entity_spans(
-                words_embedding, rel_span_idx, rel_span_mask,
-            )
+            span_idx, span_mask = rel_span_idx, rel_span_mask
         else:
             span_idx = ner_output.extra.get("span_idx")
             span_mask = ner_output.extra.get("span_mask")
@@ -266,18 +541,26 @@ class JointRelexHead(NERHead):
                 span_idx, span_mask = extract_spans_from_tokens(
                     ner_scores, labels=None, threshold=batch.get("threshold", 0.5),
                 )
-            target_span_rep, target_span_mask = self._pool_entity_spans(
-                words_embedding, span_idx, span_mask,
-            )
+
+        span_idx, span_mask, source_indices = self._select_relation_spans(
+            ner_scores, span_idx, span_mask,
+        )
+        target_span_rep, target_span_mask = self._pool_entity_spans(
+            words_embedding, span_idx, span_mask,
+        )
+        rel_labels, rel_pair_mask = self._remap_relation_targets(
+            batch.get("rel_labels"), batch.get("rel_pair_mask"),
+            source_indices, target_span_mask,
+        )
 
         # 3. Build candidate pairs and score relation types
         rel_output = self._forward_relations(
             shared, target_span_rep, target_span_mask,
-            batch.get("rel_labels"), batch.get("adjacency_threshold", 0.5),
+            rel_labels, batch.get("adjacency_threshold", 0.5),
             rel_label_embeds,
-            flat_rel_prompts=flat_rel_prompts,
-            flat_rel_prompts_mask=flat_rel_prompts_mask,
-            rel_pair_mask=batch.get("rel_pair_mask"),
+            flat_rel_prompts=rel_prompts,
+            flat_rel_prompts_mask=rel_prompts_mask,
+            rel_pair_mask=rel_pair_mask,
             base_loss_fn=base_loss_fn,
             loss_kwargs=self._relation_loss_kwargs(batch),
         )
@@ -298,6 +581,6 @@ class JointRelexHead(NERHead):
                 "rel_logits": rel_output.logits,
                 "rel_idx": rel_output.extra.get("rel_idx"),
                 "rel_mask": rel_output.extra.get("rel_mask"),
-                "rel_entity_spans": rel_span_idx if rel_span_idx is not None else span_idx,
+                "rel_entity_spans": span_idx,
             },
         )

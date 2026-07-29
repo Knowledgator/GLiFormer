@@ -28,7 +28,7 @@ model:
 
 data:
   root_dir: logs/ner
-  train_data: "data/ner_train.json"
+  train_data: "data/bio_post_ner_glinext.jsonl"
   val_data: "none"
 
 training:

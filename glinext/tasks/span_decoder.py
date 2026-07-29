@@ -75,7 +75,16 @@ class SpanDecoder(TaskDecoder):
         id_to_classes: Dict[int, str],
         threshold: float,
     ) -> List[Span]:
-        """Match start/end positions of the same class, validate inside scores."""
+        """Match start/end positions and validate inside/boundary scores.
+
+        ``inside`` is trained as zero immediately outside a gold span.  Using
+        that signal when ranking candidates prevents a high-scoring suffix
+        from suppressing the complete value.  This is especially important
+        for punctuation-heavy values: a model can predict both ``$1,000`` and
+        ``000``, with the shorter suffix receiving a marginally higher local
+        score even though the comma immediately before it is confidently
+        inside the full value.
+        """
         spans = []
         for st, cls_st in zip(*start_idx):
             for ed, cls_ed in zip(*end_idx):
@@ -85,7 +94,20 @@ class SpanDecoder(TaskDecoder):
                         continue
                     start_score = scores_start[st, cls_st]
                     end_score = scores_end[ed, cls_ed]
-                    combined = torch.cat([ins, start_score.unsqueeze(0), end_score.unsqueeze(0)])
+                    score_parts = [
+                        ins,
+                        start_score.unsqueeze(0),
+                        end_score.unsqueeze(0),
+                    ]
+                    if st > 0:
+                        score_parts.append(
+                            (1.0 - scores_inside[st - 1, cls_st]).unsqueeze(0)
+                        )
+                    if ed + 1 < scores_inside.shape[0]:
+                        score_parts.append(
+                            (1.0 - scores_inside[ed + 1, cls_st]).unsqueeze(0)
+                        )
+                    combined = torch.cat(score_parts)
                     score = combined.min().item()
                     if id_to_classes and cls_st not in id_to_classes:
                         continue

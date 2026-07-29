@@ -27,12 +27,22 @@ model:
     focal_loss_prob_margin: null
 
   audio_segmentation_config:
-    anchor_mode: "fixed"
+    anchor_layer:
+      type: "fixed"
+      params:
+        num_slots: 100
+    anchor_normalization: "none"
     anchor_modeling: "linear"
-    num_fixed_slots: 100
-    max_count: 100
-    anchor_num_heads: 4
-    anchor_num_layers: 2
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 2
+        num_heads: 8
+    anchor_memory_position:
+      type: "sine1d"
+    anchor_query_position:
+      type: "sine1d"
+    anchor_memory_position_usage: "keys_and_values"
     num_prototypes: 32
     mask_size: 256
     segment_loss_coef: 5.0

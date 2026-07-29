@@ -14,7 +14,7 @@ from ..box_ops import (
     box_cxcywh_to_xyxy,
     box_xyxy_to_cxcywh,
 )
-from ...layers import PositionEmbedding, covering_grid_2d, normalized_grid_2d
+from ...layers import covering_grid_2d, normalized_grid_2d
 from ...layers.mlp import create_mlp
 from ..media import (
     MediaClassificationHead,
@@ -135,7 +135,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             geometry_cost=getattr(cfg, "matcher_bbox_cost", 5.0),
             giou_cost=getattr(cfg, "matcher_giou_cost", 2.0),
         )
-        self.anchor_mode = "rotary" if cfg.anchor_mode == "rnn" else cfg.anchor_mode
+        self.anchor_mode = cfg.effective_anchor_mode()
 
         self.bbox_head = create_mlp(
             input_dim=hidden_size,
@@ -170,51 +170,6 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             dropout=dropout,
             activation="gelu",
         )
-        # Position features are consumed only by cross-attention refinement.
-        # Avoid constructing learned modules with no forward consumer when the
-        # configured anchor pipeline has no refinement layers.
-        self.memory_position_embedding = None
-        self.query_position_embedding = None
-        if hasattr(self, "anchor_refine"):
-            memory_type = getattr(
-                cfg,
-                "memory_position_embedding_type",
-                "sine2d",
-            )
-            query_type = getattr(
-                cfg,
-                "query_position_embedding_type",
-                "sine2d",
-            )
-            memory_kwargs = dict(
-                getattr(cfg, "memory_position_embedding_kwargs", None) or {}
-            )
-            query_kwargs = dict(
-                getattr(cfg, "query_position_embedding_kwargs", None) or {}
-            )
-            if PositionEmbedding.strategy_class(query_type).requires_num_embeddings:
-                query_kwargs.setdefault(
-                    "num_embeddings",
-                    int(getattr(cfg, "num_fixed_slots", 100)),
-                )
-            if PositionEmbedding.strategy_class(query_type).requires_grid_size:
-                query_kwargs.setdefault(
-                    "grid_size",
-                    covering_grid_2d(
-                        int(getattr(cfg, "num_fixed_slots", 100))
-                    ),
-                )
-            self.memory_position_embedding = PositionEmbedding.from_config(
-                memory_type,
-                hidden_size,
-                **memory_kwargs,
-            )
-            self.query_position_embedding = PositionEmbedding.from_config(
-                query_type,
-                hidden_size,
-                **query_kwargs,
-            )
-
         self.reference_boxes = None
         if getattr(cfg, "reference_box_mode", "learned") == "learned":
             fixed_modes = {"fixed", "fixed_rnn", "fixed_transformer"}
@@ -223,7 +178,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                     "reference_box_mode='learned' requires a fixed anchor mode; "
                     f"got {self.anchor_mode!r}"
                 )
-            num_slots = int(getattr(cfg, "num_fixed_slots", 100))
+            num_slots = cfg.effective_anchor_num_slots()
             initializer = (
                 _random_reference_boxes
                 if getattr(cfg, "reference_box_initialization", "grid") == "random"
@@ -306,6 +261,31 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             )
         return positions[:, : anchors.shape[1]]
 
+    def _slot_query_coordinates(
+        self,
+        anchors: torch.Tensor,
+        reference_boxes: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Return raw query geometry for positions and attention biases."""
+
+        if reference_boxes is None and self.reference_boxes is not None:
+            reference_boxes = self.reference_boxes.sigmoid()
+        if reference_boxes is None:
+            return None
+        if anchors.shape[1] != reference_boxes.shape[-2]:
+            raise ValueError(
+                "Anchor count does not match configured reference boxes: "
+                f"{anchors.shape[1]} vs {reference_boxes.shape[-2]}"
+            )
+        coordinate_dimensions = getattr(
+            getattr(self.anchor_refine_positions, "query_strategy", None),
+            "coordinate_dimensions",
+            None,
+        )
+        if coordinate_dimensions is None:
+            return reference_boxes
+        return reference_boxes[..., :coordinate_dimensions]
+
     def _spatial_attention_bias(
         self,
         reference_boxes: Optional[torch.Tensor],
@@ -366,12 +346,20 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         for old_name, new_name in (
             ("reference_points", "reference_boxes"),
             (
-                "slot_pos_emb.weight",
                 "query_position_embedding.embedding.weight",
+                "anchor_refine_positions.query_embedding.embedding.weight",
+            ),
+            (
+                "memory_position_embedding.projection.weight",
+                "anchor_refine_positions.memory_embedding.projection.weight",
+            ),
+            (
+                "slot_pos_emb.weight",
+                "anchor_refine_positions.query_embedding.embedding.weight",
             ),
             (
                 "coord_proj.weight",
-                "memory_position_embedding.projection.weight",
+                "anchor_refine_positions.memory_embedding.projection.weight",
             ),
         ):
             old_key = f"{prefix}{old_name}"
@@ -380,7 +368,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 continue
             if new_name in current_keys and new_key not in state_dict:
                 state_dict[new_key] = state_dict.pop(old_key)
-            elif new_name not in current_keys:
+            else:
                 state_dict.pop(old_key)
         super()._load_from_state_dict(
             state_dict,
@@ -391,6 +379,18 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             unexpected_keys,
             error_msgs,
         )
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """Emit the two pre-component position aliases for old tooling."""
+
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        positions = self.anchor_refine_positions
+        if positions is None:
+            return
+        for role in ("query", "memory"):
+            module = getattr(positions, f"{role}_embedding")
+            for name, value in module.state_dict(keep_vars=keep_vars).items():
+                destination[f"{prefix}{role}_position_embedding.{name}"] = value
 
     def _dense_features(self, flat_inputs):
         image_features, image_mask = flat_features(flat_inputs)
@@ -426,21 +426,23 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             dtype=torch.float32,
         )
         memory_positions = None
-        if self.memory_position_embedding is not None:
-            memory_positions = self.memory_position_embedding(
-                coordinates,
-                count=dense_count,
+        if self.anchor_refine_positions is not None:
+            memory_positions = self.anchor_refine_positions.memory_positions(
+                image_features,
+                image_mask,
+                coordinates=coordinates,
                 spatial_shape=(rows, cols),
-                dtype=image_features.dtype,
-                device=image_features.device,
             )
-        if memory_positions is not None and memory_positions.dim() == 2:
-            memory_positions = memory_positions.unsqueeze(0)
         return image_features, image_mask, memory_positions, (rows, cols)
 
     def _compute_detection(self, flat_inputs, count=None, threshold=0.5) -> DetectionPredictions:
         image_features, image_mask, memory_positions, spatial_shape = self._dense_features(flat_inputs)
-        anchors, anchor_mask = self.anchor_layer(
+        memory_coordinates = normalized_grid_2d(
+            *spatial_shape,
+            device=image_features.device,
+            dtype=torch.float32,
+        )
+        anchors, anchor_mask = self._generate_anchors(
             flat_inputs.parent_embedding,
             image_features,
             count=count,
@@ -462,6 +464,9 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 image_features,
                 image_mask,
                 memory_positions,
+                memory_coordinates=memory_coordinates,
+                memory_spatial_shape=spatial_shape,
+                position_encoding=self.anchor_refine_positions,
             )
             reference_logits = self.reference_boxes.unsqueeze(0).expand(
                 anchors.shape[0],
@@ -476,21 +481,14 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                     anchors,
                     memory,
                     query_mask=anchor_mask,
-                    query_pos_emb=self._slot_query_pos(
+                    query_coordinates=self._slot_query_coordinates(
                         anchors,
                         reference_boxes,
                     ),
-                    memory_position_in_values=getattr(
-                        self.det_cfg,
-                        "memory_position_in_values",
-                        True,
-                    ),
-                    cross_attention_bias=self._spatial_attention_bias(
-                        reference_boxes,
-                        spatial_shape,
-                        dtype=anchors.dtype,
-                        device=anchors.device,
-                    ),
+                    query_spatial_shape=covering_grid_2d(anchors.shape[1]),
+                    position_encoding=self.anchor_refine_positions,
+                    self_attention_bias_module=self.anchor_self_attention_bias,
+                    cross_attention_bias_module=self.anchor_cross_attention_bias,
                 )
                 bbox_head = (
                     self.bbox_head
@@ -505,6 +503,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                             anchors,
                             flat_inputs.child_embedding,
                             flat_inputs.child_mask,
+                            anchor_mask,
                         ),
                         boxes_xyxy=box_cxcywh_to_xyxy(boxes_cxcywh),
                         boxes_cxcywh=boxes_cxcywh,
@@ -532,35 +531,34 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 auxiliary_predictions=tuple(stage_predictions[:-1]),
             )
 
-        if hasattr(self, "anchor_refine"):
-            static_references = None
-            if self.reference_boxes is not None:
-                static_references = self.reference_boxes.sigmoid().unsqueeze(0).expand(
-                    anchors.shape[0],
-                    -1,
-                    -1,
-                )
-            anchors = self.anchor_refine(
-                anchors,
-                image_features,
-                token_mask=image_mask,
-                query_mask=anchor_mask,
-                query_pos_emb=self._slot_query_pos(anchors, static_references),
-                memory_pos_emb=memory_positions,
-                memory_position_in_values=getattr(
-                    self.det_cfg,
-                    "memory_position_in_values",
-                    True,
-                ),
-                cross_attention_bias=self._spatial_attention_bias(
-                    static_references,
-                    spatial_shape,
-                    dtype=anchors.dtype,
-                    device=anchors.device,
-                ),
+        static_references = None
+        if self.reference_boxes is not None:
+            static_references = self.reference_boxes.sigmoid().unsqueeze(0).expand(
+                anchors.shape[0],
+                -1,
+                -1,
             )
+        anchors = self._refine_anchors(
+            anchors,
+            image_features,
+            memory_mask=image_mask,
+            anchor_mask=anchor_mask,
+            query_coordinates=self._slot_query_coordinates(
+                anchors,
+                static_references,
+            ),
+            memory_coordinates=memory_coordinates,
+            memory_positions=memory_positions,
+            query_spatial_shape=covering_grid_2d(anchors.shape[1]),
+            memory_spatial_shape=spatial_shape,
+        )
 
-        class_logits = self._score_anchor_labels(anchors, flat_inputs.child_embedding, flat_inputs.child_mask)
+        class_logits = self._score_anchor_labels(
+            anchors,
+            flat_inputs.child_embedding,
+            flat_inputs.child_mask,
+            anchor_mask,
+        )
         bbox_raw = self.bbox_head(anchors).float()
         if self.reference_boxes is not None:
             if bbox_raw.shape[1] != self.reference_boxes.shape[0]:

@@ -26,7 +26,7 @@ class ClassificationHead(TaskHead):
         if shared_layers is None:
             shared_layers = {}
 
-        self._init_anchor_pipeline(cat_cfg, config, hidden_size, dropout, shared_layers)
+        self._init_anchor_components(cat_cfg, config, hidden_size, dropout, shared_layers)
 
         self.pooling = Pooling.from_config(
             pooling_type=getattr(cat_cfg, "pooling_type", "mean"),
@@ -57,16 +57,24 @@ class ClassificationHead(TaskHead):
         context = flat_inputs.parent_embedding            # (BN, D)
 
         # Anchor paradigm: anchor_layer → anchor_modeling → dot product
-        anchor_rep, anchor_mask = self.anchor_layer(context, feature_embeddings, feature_mask=feature_mask)
-        if hasattr(self, "anchor_refine"):
-            anchor_rep = self.anchor_refine(
-                anchor_rep,
-                feature_embeddings,
-                token_mask=feature_mask,
-                query_mask=anchor_mask,
-            )
+        anchor_rep, anchor_mask = self._generate_anchors(
+            context,
+            feature_embeddings,
+            feature_mask=feature_mask,
+        )
+        anchor_rep = self._refine_anchors(
+            anchor_rep,
+            feature_embeddings,
+            memory_mask=feature_mask,
+            anchor_mask=anchor_mask,
+        )
         fused = self._reduce_fused_anchors(
-            self.anchor_modeling(anchor_rep, cat_embedding),
+            self._model_anchors(
+                anchor_rep,
+                cat_embedding,
+                anchor_mask=anchor_mask,
+                child_mask=cat_embedding_mask,
+            ),
             anchor_mask,
         )
         scores = self.scorer(text_rep, fused)

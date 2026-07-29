@@ -9,7 +9,14 @@ import torch
 from torch import nn
 from transformers.utils import ModelOutput
 
-from ..layers import AnchorLayer, AnchorModeling, AnchorCrossAttentionLayer
+from ..layers import (
+    AnchorCrossAttentionLayer,
+    AnchorLayer,
+    AnchorModeling,
+    AnchorNormalizer,
+    AttentionBias,
+    RefinementPositionEncoding,
+)
 
 
 @dataclass
@@ -67,26 +74,25 @@ class TaskHead(ABC, nn.Module):
     dependencies: List[str] = []
     loss_coef: float = 1.0
 
-    def _init_anchor_pipeline(self, task_cfg, config, hidden_size, dropout, shared_layers):
-        """Initialize anchor acquisition, modeling, and optional refinement.
-
-        Span representations are added only for configs in the span-capable
-        text hierarchy; media and classification heads do not receive dead span
-        attributes.
-        """
-        anchor_mode = getattr(task_cfg, "anchor_mode", "parent")
-        if anchor_mode == "rnn":
-            anchor_mode = "rotary"
-
-        self.anchor_layer = AnchorLayer.from_config(
-            anchor_mode, hidden_size,
+    @staticmethod
+    def _build_anchor_layer(task_cfg, hidden_size, dropout):
+        anchor_spec = getattr(task_cfg, "anchor_layer", None)
+        if anchor_spec is None:
+            anchor_spec = getattr(task_cfg, "anchor_mode", "parent")
+        return AnchorLayer.from_config(
+            anchor_spec,
+            hidden_size,
             max_count=getattr(task_cfg, "max_count", 20),
             num_slots=getattr(task_cfg, "num_fixed_slots", 10),
             num_heads=getattr(task_cfg, "anchor_num_heads", 4),
             num_layers=getattr(task_cfg, "anchor_num_layers", 2),
             dropout=dropout,
             feature_mlp=getattr(task_cfg, "feature_anchor_mlp", False),
-            feature_mlp_hidden_multiplier=getattr(task_cfg, "feature_anchor_mlp_hidden_multiplier", 1),
+            feature_mlp_hidden_multiplier=getattr(
+                task_cfg,
+                "feature_anchor_mlp_hidden_multiplier",
+                1,
+            ),
             context_gate_init=getattr(
                 task_cfg,
                 "anchor_context_gate_init",
@@ -97,6 +103,200 @@ class TaskHead(ABC, nn.Module):
                 "anchor_context_gate_trainable",
                 True,
             ),
+            position_bucket_normalization=getattr(
+                task_cfg,
+                "position_bucket_normalization",
+                "none",
+            ),
+        )
+
+    @staticmethod
+    def _build_anchor_normalizer(task_cfg, hidden_size):
+        return AnchorNormalizer.from_config(
+            getattr(task_cfg, "anchor_normalization", "none"),
+            hidden_size,
+        )
+
+    @staticmethod
+    def _build_anchor_refinement(
+        task_cfg,
+        hidden_size,
+        dropout,
+        shared_layers,
+    ):
+        if "anchor_refine" in shared_layers:
+            return shared_layers["anchor_refine"]
+        refinement_spec = getattr(task_cfg, "anchor_refinement", None)
+        if refinement_spec is None:
+            refinement_spec = {
+                "type": "cross_attention",
+                "params": {
+                    "num_heads": getattr(task_cfg, "anchor_refine_heads", 8),
+                    "num_layers": getattr(task_cfg, "anchor_refine_layers", 0),
+                    "dropout": dropout,
+                    "norm_style": getattr(
+                        task_cfg,
+                        "anchor_refine_norm",
+                        "post_norm",
+                    ),
+                    "layer_scale_init": getattr(
+                        task_cfg,
+                        "anchor_refine_layer_scale_init",
+                        None,
+                    ),
+                },
+            }
+        return AnchorCrossAttentionLayer.from_config(
+            refinement_spec,
+            hidden_size,
+            dropout=dropout,
+        )
+
+    @staticmethod
+    def _position_component_spec(task_cfg, role):
+        component = getattr(task_cfg, f"anchor_{role}_position", None)
+        if component is not None:
+            return component
+        return {
+            "type": getattr(
+                task_cfg,
+                f"{role}_position_embedding_type",
+                "none",
+            ),
+            "params": dict(
+                getattr(
+                    task_cfg,
+                    f"{role}_position_embedding_kwargs",
+                    None,
+                )
+                or {}
+            ),
+        }
+
+    @classmethod
+    def _build_refinement_positions(cls, task_cfg, hidden_size):
+        memory_usage = getattr(
+            task_cfg,
+            "anchor_memory_position_usage",
+            None,
+        )
+        if memory_usage is None:
+            memory_usage = (
+                "keys_and_values"
+                if getattr(task_cfg, "memory_position_in_values", False)
+                else "keys_only"
+            )
+        capacity_resolver = getattr(
+            task_cfg,
+            "effective_anchor_num_slots",
+            None,
+        )
+        num_query_embeddings = (
+            capacity_resolver()
+            if capacity_resolver is not None
+            else getattr(task_cfg, "num_fixed_slots", None)
+        )
+        return RefinementPositionEncoding.from_config(
+            {
+                "memory": cls._position_component_spec(task_cfg, "memory"),
+                "query": cls._position_component_spec(task_cfg, "query"),
+                "memory_usage": memory_usage,
+            },
+            hidden_size,
+            num_query_embeddings=num_query_embeddings,
+        )
+
+    @staticmethod
+    def _legacy_cross_attention_bias_spec(task_cfg):
+        bucket_bias = getattr(
+            task_cfg,
+            "position_bucket_attention_bias_type",
+            "none",
+        )
+        if bucket_bias != "none":
+            return {
+                "type": "gaussian_distance",
+                "params": {
+                    "sigma": getattr(
+                        task_cfg,
+                        "position_bucket_attention_sigma",
+                        0.5,
+                    ),
+                    "weight": getattr(
+                        task_cfg,
+                        "position_bucket_attention_bias_weight",
+                        1.0,
+                    ),
+                    "units": "query_steps",
+                },
+            }
+        spatial_bias = getattr(
+            task_cfg,
+            "spatial_attention_bias_type",
+            "none",
+        )
+        if spatial_bias != "none":
+            return {
+                "type": "gaussian_distance",
+                "params": {
+                    "sigma": getattr(
+                        task_cfg,
+                        "spatial_attention_sigma",
+                        0.2,
+                    ),
+                    "weight": getattr(
+                        task_cfg,
+                        "spatial_attention_bias_weight",
+                        1.0,
+                    ),
+                    "units": "normalized",
+                    "query_dimensions": [0, 1],
+                    "key_dimensions": [0, 1],
+                },
+            }
+        return None
+
+    @classmethod
+    def _build_refinement_biases(cls, task_cfg, num_heads):
+        self_bias_spec = getattr(
+            task_cfg,
+            "anchor_self_attention_bias",
+            None,
+        )
+        cross_bias_spec = getattr(
+            task_cfg,
+            "anchor_cross_attention_bias",
+            None,
+        )
+        if cross_bias_spec is None:
+            cross_bias_spec = cls._legacy_cross_attention_bias_spec(task_cfg)
+        return (
+            AttentionBias.from_config(self_bias_spec, num_heads=num_heads),
+            AttentionBias.from_config(cross_bias_spec, num_heads=num_heads),
+        )
+
+    def _init_anchor_components(
+        self,
+        task_cfg,
+        config,
+        hidden_size,
+        dropout,
+        shared_layers,
+    ):
+        """Initialize independent anchor components owned by this task head.
+
+        Span representations are added only for configs in the span-capable
+        text hierarchy; media and classification heads do not receive dead span
+        attributes.
+        """
+        self.anchor_layer = self._build_anchor_layer(
+            task_cfg,
+            hidden_size,
+            dropout,
+        )
+        self.anchor_normalizer = self._build_anchor_normalizer(
+            task_cfg,
+            hidden_size,
         )
 
         if "anchor_modeling" in shared_layers:
@@ -107,25 +307,30 @@ class TaskHead(ABC, nn.Module):
                 hidden_size, dropout=dropout,
             )
 
-        if "anchor_refine" in shared_layers:
-            self.anchor_refine = shared_layers["anchor_refine"]
-        else:
-            refine_layers = getattr(task_cfg, "anchor_refine_layers", 0)
-            if refine_layers > 0:
-                refine_heads = getattr(task_cfg, "anchor_refine_heads", 8)
-                self.anchor_refine = AnchorCrossAttentionLayer(
-                    hidden_size, num_heads=refine_heads,
-                    num_layers=refine_layers, dropout=dropout,
-                    norm_first=(
-                        getattr(task_cfg, "anchor_refine_norm", "post_norm")
-                        == "pre_norm"
-                    ),
-                    layer_scale_init=getattr(
-                        task_cfg,
-                        "anchor_refine_layer_scale_init",
-                        None,
-                    ),
-                )
+        refinement = self._build_anchor_refinement(
+            task_cfg,
+            hidden_size,
+            dropout,
+            shared_layers,
+        )
+        if refinement is not None:
+            self.anchor_refine = refinement
+
+        self.anchor_refine_positions = None
+        self.anchor_self_attention_bias = None
+        self.anchor_cross_attention_bias = None
+        if hasattr(self, "anchor_refine"):
+            self.anchor_refine_positions = self._build_refinement_positions(
+                task_cfg,
+                hidden_size,
+            )
+            (
+                self.anchor_self_attention_bias,
+                self.anchor_cross_attention_bias,
+            ) = self._build_refinement_biases(
+                task_cfg,
+                num_heads=self.anchor_refine.num_heads,
+            )
 
         if hasattr(task_cfg, "represent_spans"):
             self.represent_spans = bool(task_cfg.represent_spans)
@@ -138,6 +343,144 @@ class TaskHead(ABC, nn.Module):
                 max_width=getattr(config, "max_width", 12),
                 dropout=dropout,
             )
+
+    # Compatibility for external task heads that still call the old helper.
+    def _init_anchor_pipeline(self, *args, **kwargs):
+        return self._init_anchor_components(*args, **kwargs)
+
+    def _generate_anchors(
+        self,
+        context_embedding: torch.Tensor,
+        feature_embeddings: torch.Tensor | None = None,
+        *,
+        count: torch.Tensor | None = None,
+        threshold: float = 0.5,
+        feature_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        anchors, anchor_mask = self.anchor_layer(
+            context_embedding,
+            feature_embeddings,
+            count=count,
+            threshold=threshold,
+            feature_mask=feature_mask,
+        )
+        anchors = self.anchor_normalizer(
+            anchors,
+            anchor_mask,
+            source_embeddings=feature_embeddings,
+            source_mask=feature_mask,
+        )
+        return anchors, anchor_mask
+
+    def _refine_anchors(
+        self,
+        anchors: torch.Tensor,
+        memory: torch.Tensor,
+        *,
+        memory_mask: torch.Tensor | None = None,
+        anchor_mask: torch.Tensor | None = None,
+        query_coordinates: torch.Tensor | None = None,
+        memory_coordinates: torch.Tensor | None = None,
+        memory_positions: torch.Tensor | None = None,
+        query_spatial_shape: tuple[int, int] | None = None,
+        memory_spatial_shape: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        if not hasattr(self, "anchor_refine"):
+            return anchors
+        if not isinstance(self.anchor_refine, AnchorCrossAttentionLayer):
+            return self.anchor_refine(
+                anchors,
+                memory,
+                token_mask=memory_mask,
+                query_mask=anchor_mask,
+            )
+        return self.anchor_refine(
+            anchors,
+            memory,
+            token_mask=memory_mask,
+            query_mask=anchor_mask,
+            query_coordinates=query_coordinates,
+            memory_coordinates=memory_coordinates,
+            memory_pos_emb=memory_positions,
+            query_spatial_shape=query_spatial_shape,
+            memory_spatial_shape=memory_spatial_shape,
+            position_encoding=self.anchor_refine_positions,
+            memory_position_in_values=(
+                self.anchor_refine_positions.memory_position_in_values
+                if self.anchor_refine_positions is not None
+                else False
+            ),
+            self_attention_bias_module=self.anchor_self_attention_bias,
+            cross_attention_bias_module=self.anchor_cross_attention_bias,
+        )
+
+    @property
+    def memory_position_embedding(self):
+        positions = getattr(self, "anchor_refine_positions", None)
+        return None if positions is None else positions.memory_embedding
+
+    @property
+    def query_position_embedding(self):
+        positions = getattr(self, "anchor_refine_positions", None)
+        return None if positions is None else positions.query_embedding
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Migrate modality-owned position modules into the shared object."""
+
+        current_keys = set(self.state_dict())
+        for old_prefix, new_prefix in (
+            (
+                "memory_position_embedding.",
+                "anchor_refine_positions.memory_embedding.",
+            ),
+            (
+                "query_position_embedding.",
+                "anchor_refine_positions.query_embedding.",
+            ),
+        ):
+            for old_key in tuple(state_dict):
+                qualified_old_prefix = f"{prefix}{old_prefix}"
+                if not old_key.startswith(qualified_old_prefix):
+                    continue
+                suffix = old_key[len(qualified_old_prefix) :]
+                new_name = f"{new_prefix}{suffix}"
+                new_key = f"{prefix}{new_name}"
+                if new_name in current_keys and new_key not in state_dict:
+                    state_dict[new_key] = state_dict[old_key]
+                state_dict.pop(old_key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def _model_anchors(
+        self,
+        anchors: torch.Tensor,
+        children: torch.Tensor,
+        *,
+        anchor_mask: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.anchor_modeling(
+            anchors,
+            children,
+            anchor_mask=anchor_mask,
+            child_mask=child_mask,
+        )
 
     def _reduce_fused_anchors(self, fused: torch.Tensor, anchor_mask: torch.Tensor) -> torch.Tensor:
         if fused.dim() != 4:
@@ -312,6 +655,12 @@ TASK_REGISTRY = TaskRegistry(
         TaskDefinition("joint_relex", "glinext.tasks.joint_relex.model", "JointRelexHead", "text"),
         TaskDefinition("open_relex", "glinext.tasks.open_relex.model", "OpenRelexHead", "text"),
         TaskDefinition("structuring", "glinext.tasks.structuring.model", "StructuringHead", "text"),
+        TaskDefinition(
+            "set_structuring",
+            "glinext.tasks.set_structuring.model",
+            "SetStructuringHead",
+            "text",
+        ),
         TaskDefinition("image_classification", "glinext.tasks.vision.model", "ImageClassificationHead", "vision"),
         TaskDefinition("object_detection", "glinext.tasks.vision.model", "ObjectDetectionHead", "vision"),
         TaskDefinition("segmentation", "glinext.tasks.vision.model", "SegmentationHead", "vision"),

@@ -135,12 +135,18 @@ def score_anchor_labels(
     anchors: torch.Tensor,
     label_representations: torch.Tensor,
     label_mask: torch.Tensor | None = None,
+    anchor_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fuse and score anchor/label pairs through the shared anchor hierarchy."""
 
     batch_size, anchor_count, hidden_size = anchors.shape
     class_count = label_representations.shape[1]
-    fused_labels = anchor_modeling(anchors, label_representations)
+    fused_labels = anchor_modeling(
+        anchors,
+        label_representations,
+        anchor_mask=anchor_mask,
+        child_mask=label_mask,
+    )
     logits = scorer(
         anchors.reshape(batch_size * anchor_count, hidden_size),
         fused_labels.reshape(
@@ -233,7 +239,7 @@ class MediaSetPredictionHead(TaskHead):
             geometry_cost=geometry_cost,
             giou_cost=giou_cost,
         )
-        self._init_anchor_pipeline(
+        self._init_anchor_components(
             task_config,
             model_config,
             hidden_size,
@@ -245,13 +251,20 @@ class MediaSetPredictionHead(TaskHead):
             hidden_size=hidden_size,
         )
 
-    def _score_anchor_labels(self, anchors, label_reps, label_mask=None):
+    def _score_anchor_labels(
+        self,
+        anchors,
+        label_reps,
+        label_mask=None,
+        anchor_mask=None,
+    ):
         return score_anchor_labels(
             self.anchor_modeling,
             self.cls_head,
             anchors,
             label_reps,
             label_mask,
+            anchor_mask,
         )
 
     def _match_geometry(
@@ -287,9 +300,9 @@ class MediaSetPredictionHead(TaskHead):
 
         loss_kwargs = {}
         for config_name, loss_name in (
-            ("objectness_focal_loss_alpha", "alpha"),
-            ("objectness_focal_loss_gamma", "gamma"),
-            ("objectness_focal_loss_prob_margin", "prob_margin"),
+            ("objectness_focal_loss_alpha", "focal_loss_alpha"),
+            ("objectness_focal_loss_gamma", "focal_loss_gamma"),
+            ("objectness_focal_loss_prob_margin", "focal_loss_prob_margin"),
         ):
             value = getattr(self.set_prediction_config, config_name, None)
             if value is not None:
@@ -428,8 +441,8 @@ class MediaClassificationHead(TaskHead):
     """Shared pooled classification head for feature-sequence modalities.
 
     Concrete modality heads only provide ``config_attribute`` and
-    ``labels_key``. The anchor pipeline remains the same hierarchy used by the
-    project's text classification heads.
+    ``labels_key``. It composes the same independent anchor components used by
+    the project's text classification heads.
     """
 
     config_attribute: str = ""
@@ -443,7 +456,7 @@ class MediaClassificationHead(TaskHead):
         self.loss_coef = head_config.loss_coef
         if shared_layers is None:
             shared_layers = {}
-        self._init_anchor_pipeline(
+        self._init_anchor_components(
             head_config,
             config,
             hidden_size,
@@ -481,20 +494,24 @@ class MediaClassificationHead(TaskHead):
         base_loss_fn = batch.get("base_loss_fn")
         features, feature_mask = flat_features(flat_inputs)
         media_representation = self.pooling(features, feature_mask)
-        anchors, anchor_mask = self.anchor_layer(
+        anchors, anchor_mask = self._generate_anchors(
             flat_inputs.parent_embedding,
             features,
             feature_mask=feature_mask,
         )
-        if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(
-                anchors,
-                features,
-                token_mask=feature_mask,
-                query_mask=anchor_mask,
-            )
+        anchors = self._refine_anchors(
+            anchors,
+            features,
+            memory_mask=feature_mask,
+            anchor_mask=anchor_mask,
+        )
         fused = self._reduce_fused_anchors(
-            self.anchor_modeling(anchors, flat_inputs.child_embedding),
+            self._model_anchors(
+                anchors,
+                flat_inputs.child_embedding,
+                anchor_mask=anchor_mask,
+                child_mask=flat_inputs.child_mask,
+            ),
             anchor_mask,
         )
         logits = self.scorer(media_representation, fused)

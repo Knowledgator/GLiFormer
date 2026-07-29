@@ -62,6 +62,11 @@ class GLiNExTDecoder:
             if hasattr(StructuringDecoder, 'from_config'):
                 self.task_decoders["structuring"] = StructuringDecoder.from_config(config)
 
+        if config.set_structuring_config is not None:
+            from ..tasks.set_structuring.decoder import SetStructuringDecoder
+            if hasattr(SetStructuringDecoder, 'from_config'):
+                self.task_decoders["set_structuring"] = SetStructuringDecoder.from_config(config)
+
         if config.embedding_config is not None:
             from ..tasks.embedding.decoder import EmbeddingDecoder
             if hasattr(EmbeddingDecoder, 'from_config'):

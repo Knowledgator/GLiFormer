@@ -30,12 +30,13 @@ model:
     represent_spans: false
 
   structuring_config:
-    anchor_mode: "fixed"
+    anchor_layer:
+      type: "fixed"
+      params:
+        num_slots: 20
+    anchor_normalization: "none"
     anchor_modeling: "linear"
-    anchor_num_heads: 4
-    anchor_num_layers: 2
-    max_count: 20
-    num_fixed_slots: 20
+    anchor_refinement: "none"
     loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null

@@ -1,5 +1,7 @@
 import dataclasses
+import copy
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
@@ -9,6 +11,57 @@ from gliner.config import BaseGLiNERConfig
 
 from . import backbones as _layout_backbones  # noqa: F401 - registers custom AutoConfig entries
 from .backbones import get_backbone, normalize_backbone_type
+
+
+def _split_component_spec(
+    value: str | Mapping[str, Any] | None,
+    *,
+    default_type: str,
+    component_name: str,
+) -> tuple[str, dict[str, Any]]:
+    """Return a defensive, normalized ``(type, params)`` component spec."""
+
+    if value is None:
+        return default_type, {}
+    if isinstance(value, str):
+        return value.lower().replace("-", "_"), {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{component_name} must be a string, mapping, or None")
+    raw = copy.deepcopy(dict(value))
+    component_type = raw.pop("type", raw.pop("name", default_type))
+    configured_params = raw.pop("params", {})
+    if not isinstance(configured_params, Mapping):
+        raise TypeError(f"{component_name} params must be a mapping")
+    params = dict(configured_params)
+    params.update(raw)
+    return str(component_type).lower().replace("-", "_"), params
+
+
+def _validate_attention_bias_spec(value, *, num_heads: int) -> None:
+    """Validate bias component names/options without retaining a module."""
+
+    from .layers.attention_bias import AttentionBias
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for item in value:
+            _validate_attention_bias_spec(item, num_heads=num_heads)
+        return
+    bias_type, params = _split_component_spec(
+        value,
+        default_type="none",
+        component_name="anchor attention bias",
+    )
+    strategy = AttentionBias.strategy_class(bias_type)
+    unknown = set(params) - set(strategy.config_fields)
+    if unknown:
+        raise ValueError(
+            f"Unsupported {bias_type!r} attention bias options: "
+            f"{sorted(unknown)}. Available: {sorted(strategy.config_fields)}"
+        )
+    # Constructors own semantic validation (positive sigma, supported units,
+    # coordinate width, and so on). Building this small temporary object keeps
+    # invalid configs from failing only after the full model is allocated.
+    strategy(num_heads=num_heads, **params)
 
 
 @dataclass
@@ -38,10 +91,27 @@ class TaskHeadConfig:
 
 @dataclass
 class AnchorHeadConfig(TaskHeadConfig):
-    """Configuration for heads that acquire and model semantic anchors."""
+    """Configuration for heads that acquire and model semantic anchors.
+
+    Component fields accept a strategy name or a strict ``{type, params}``
+    mapping. ``anchor_refinement`` configures only the reusable decoder core;
+    query/memory positions and self/cross-attention biases remain independent
+    objects so a shared core can be used across different modalities. Legacy
+    flat fields are retained as fallbacks when their component field is None.
+    """
 
     anchor_mode: str = "parent"
-    anchor_modeling: str = "linear"
+    # New component specifications. ``None`` means derive the component from
+    # the corresponding legacy flat fields so existing configs remain exact.
+    anchor_layer: Optional[str | dict[str, Any]] = None
+    anchor_normalization: str | dict[str, Any] = "none"
+    anchor_modeling: str | dict[str, Any] = "linear"
+    anchor_refinement: Optional[str | dict[str, Any]] = None
+    anchor_memory_position: Optional[str | dict[str, Any]] = None
+    anchor_query_position: Optional[str | dict[str, Any]] = None
+    anchor_memory_position_usage: Optional[str] = None
+    anchor_self_attention_bias: Any = None
+    anchor_cross_attention_bias: Any = None
     feature_anchor_mlp: bool = False
     feature_anchor_mlp_hidden_multiplier: int = 1
     anchor_refine_layers: int = 0
@@ -58,10 +128,253 @@ class AnchorHeadConfig(TaskHeadConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        from .layers import AnchorLayer, AnchorModeling, AnchorNormalizer
+        from .layers.groups import AnchorCrossAttentionLayer
+        from .layers.position import PositionEmbedding
+
+        for name in (
+            "anchor_layer",
+            "anchor_normalization",
+            "anchor_modeling",
+            "anchor_refinement",
+            "anchor_memory_position",
+            "anchor_query_position",
+            "anchor_self_attention_bias",
+            "anchor_cross_attention_bias",
+        ):
+            setattr(self, name, copy.deepcopy(getattr(self, name)))
+
+        if self.anchor_layer is not None:
+            layer_type, layer_params = _split_component_spec(
+                self.anchor_layer,
+                default_type="parent",
+                component_name="anchor_layer",
+            )
+            strategy = AnchorLayer.strategy_class(layer_type)
+            unknown = set(layer_params) - set(strategy.config_fields)
+            if unknown:
+                raise ValueError(
+                    f"Unsupported {layer_type!r} anchor layer options: "
+                    f"{sorted(unknown)}. Available: "
+                    f"{sorted(strategy.config_fields)}"
+                )
+            if "num_slots" in layer_params:
+                num_slots = layer_params["num_slots"]
+                if (
+                    isinstance(num_slots, bool)
+                    or int(num_slots) != num_slots
+                    or num_slots <= 0
+                ):
+                    raise ValueError(
+                        "anchor layer num_slots must be a positive integer"
+                    )
+
+        normalization_type, normalization_params = _split_component_spec(
+            self.anchor_normalization,
+            default_type="none",
+            component_name="anchor_normalization",
+        )
+        normalization_strategy = AnchorNormalizer.strategy_class(
+            normalization_type
+        )
+        unknown = set(normalization_params) - set(
+            normalization_strategy.config_fields
+        )
+        if unknown:
+            raise ValueError(
+                f"Unsupported {normalization_type!r} anchor normalization "
+                f"options: {sorted(unknown)}. Available: "
+                f"{sorted(normalization_strategy.config_fields)}"
+            )
+        AnchorNormalizer.from_config(
+            self.anchor_normalization,
+            hidden_size=1,
+        )
+
+        modeling_type, modeling_params = _split_component_spec(
+            self.anchor_modeling,
+            default_type="linear",
+            component_name="anchor_modeling",
+        )
+        modeling_strategy = AnchorModeling.strategy_class(modeling_type)
+        unknown = set(modeling_params) - set(modeling_strategy.config_fields)
+        if unknown:
+            raise ValueError(
+                f"Unsupported {modeling_type!r} anchor modeling options: "
+                f"{sorted(unknown)}. Available: "
+                f"{sorted(modeling_strategy.config_fields)}"
+            )
+
+        if self.anchor_refinement is not None:
+            refinement_type, refinement_params = _split_component_spec(
+                self.anchor_refinement,
+                default_type="cross_attention",
+                component_name="anchor_refinement",
+            )
+            if refinement_type not in {
+                "none",
+                "disabled",
+                "cross_attention",
+                "decoder",
+            }:
+                raise ValueError(
+                    f"Unknown anchor refinement type {refinement_type!r}"
+                )
+            aliases = {
+                "heads": "num_heads",
+                "layers": "num_layers",
+                "norm": "norm_style",
+            }
+            for old_name, new_name in aliases.items():
+                if old_name in refinement_params:
+                    if new_name in refinement_params:
+                        raise ValueError(
+                            "anchor_refinement specifies both "
+                            f"{old_name!r} and {new_name!r}"
+                        )
+                    refinement_params[new_name] = refinement_params.pop(old_name)
+            unknown = set(refinement_params) - set(
+                AnchorCrossAttentionLayer.config_fields
+            )
+            if unknown:
+                raise ValueError(
+                    "Unsupported anchor refinement options: "
+                    f"{sorted(unknown)}. Available: "
+                    f"{sorted(AnchorCrossAttentionLayer.config_fields)}"
+                )
+            if "num_layers" in refinement_params:
+                layers = refinement_params["num_layers"]
+                if (
+                    isinstance(layers, bool)
+                    or int(layers) != layers
+                    or layers < 0
+                ):
+                    raise ValueError(
+                        "anchor refinement num_layers must be a non-negative integer"
+                    )
+            if "num_heads" in refinement_params:
+                heads = refinement_params["num_heads"]
+                if (
+                    isinstance(heads, bool)
+                    or int(heads) != heads
+                    or heads <= 0
+                ):
+                    raise ValueError(
+                        "anchor refinement num_heads must be a positive integer"
+                    )
+            if "dropout" in refinement_params:
+                refinement_dropout = float(refinement_params["dropout"])
+                if not math.isfinite(refinement_dropout) or not (
+                    0.0 <= refinement_dropout <= 1.0
+                ):
+                    raise ValueError(
+                        "anchor refinement dropout must be finite and in [0, 1]"
+                    )
+            refinement_norm_style = str(
+                refinement_params.get("norm_style", "post_norm")
+            ).lower().replace("-", "_")
+            if refinement_norm_style not in {
+                "pre_norm",
+                "post_norm",
+            }:
+                raise ValueError(
+                    "anchor refinement norm_style must be 'pre_norm' or 'post_norm'"
+                )
+            refinement_norm_type = str(
+                refinement_params.get("norm_type", "layer_norm")
+            ).lower().replace("-", "_")
+            if refinement_norm_type not in {
+                "layer_norm",
+                "layernorm",
+                "rms_norm",
+                "rmsnorm",
+            }:
+                raise ValueError(
+                    "anchor refinement norm_type must be 'layer_norm' or 'rms_norm'"
+                )
+            if "ffn_multiplier" in refinement_params:
+                multiplier = refinement_params["ffn_multiplier"]
+                if (
+                    isinstance(multiplier, bool)
+                    or int(multiplier) != multiplier
+                    or multiplier <= 0
+                ):
+                    raise ValueError(
+                        "anchor refinement ffn_multiplier must be a positive integer"
+                    )
+            refinement_activation = str(
+                refinement_params.get("activation", "gelu")
+            ).lower()
+            if refinement_activation not in {
+                "gelu",
+                "relu",
+                "silu",
+                "swish",
+            }:
+                raise ValueError(
+                    "anchor refinement activation must be gelu, relu, or silu"
+                )
+            if refinement_params.get("layer_scale_init") is not None:
+                layer_scale = float(refinement_params["layer_scale_init"])
+                if not math.isfinite(layer_scale) or layer_scale < 0:
+                    raise ValueError(
+                        "anchor refinement layer_scale_init must be finite and "
+                        "non-negative"
+                    )
+
+        for role in ("memory", "query"):
+            value = getattr(self, f"anchor_{role}_position")
+            if value is None:
+                continue
+            position_type, position_params = _split_component_spec(
+                value,
+                default_type="none",
+                component_name=f"anchor_{role}_position",
+            )
+            PositionEmbedding.validate_kwargs(position_type, position_params)
+
+        if self.anchor_memory_position_usage is not None:
+            self.anchor_memory_position_usage = str(
+                self.anchor_memory_position_usage
+            ).lower().replace("-", "_")
+            if self.anchor_memory_position_usage not in {
+                "none",
+                "keys_only",
+                "keys_and_values",
+            }:
+                raise ValueError(
+                    "anchor_memory_position_usage must be 'none', "
+                    "'keys_only', or 'keys_and_values'"
+                )
+        if self.anchor_self_attention_bias is not None:
+            _validate_attention_bias_spec(
+                self.anchor_self_attention_bias,
+                num_heads=self.anchor_refine_heads,
+            )
+        if self.anchor_cross_attention_bias is not None:
+            _validate_attention_bias_spec(
+                self.anchor_cross_attention_bias,
+                num_heads=self.anchor_refine_heads,
+            )
+
         if self.anchor_refine_norm not in {"post_norm", "pre_norm"}:
             raise ValueError(
                 "anchor_refine_norm must be 'post_norm' or 'pre_norm'"
             )
+        if (
+            isinstance(self.anchor_refine_layers, bool)
+            or int(self.anchor_refine_layers) != self.anchor_refine_layers
+            or self.anchor_refine_layers < 0
+        ):
+            raise ValueError(
+                "anchor_refine_layers must be a non-negative integer"
+            )
+        if (
+            isinstance(self.anchor_refine_heads, bool)
+            or int(self.anchor_refine_heads) != self.anchor_refine_heads
+            or self.anchor_refine_heads <= 0
+        ):
+            raise ValueError("anchor_refine_heads must be a positive integer")
         if self.anchor_refine_layer_scale_init is not None:
             layer_scale = float(self.anchor_refine_layer_scale_init)
             if not math.isfinite(layer_scale) or layer_scale < 0:
@@ -70,6 +383,42 @@ class AnchorHeadConfig(TaskHeadConfig):
                 )
         if not math.isfinite(float(self.anchor_context_gate_init)):
             raise ValueError("anchor_context_gate_init must be finite")
+
+    def effective_anchor_mode(self) -> str:
+        if self.anchor_layer is None:
+            mode = self.anchor_mode
+        else:
+            mode, _ = _split_component_spec(
+                self.anchor_layer,
+                default_type="parent",
+                component_name="anchor_layer",
+            )
+        return "rotary" if mode == "rnn" else mode
+
+    def effective_anchor_num_slots(self) -> int:
+        """Return fixed query capacity from the component or legacy field."""
+
+        legacy_slots = int(getattr(self, "num_fixed_slots", 10))
+        if self.anchor_layer is None or isinstance(self.anchor_layer, str):
+            return legacy_slots
+        _, params = _split_component_spec(
+            self.anchor_layer,
+            default_type=self.anchor_mode,
+            component_name="anchor_layer",
+        )
+        return int(params.get("num_slots", legacy_slots))
+
+    def effective_anchor_refine_layers(self) -> int:
+        if self.anchor_refinement is None:
+            return int(self.anchor_refine_layers)
+        refinement_type, params = _split_component_spec(
+            self.anchor_refinement,
+            default_type="cross_attention",
+            component_name="anchor_refinement",
+        )
+        if refinement_type in {"none", "disabled"}:
+            return 0
+        return int(params.get("num_layers", params.get("layers", 1)))
 
 
 @dataclass
@@ -180,7 +529,15 @@ class SetPredictionHeadConfig(AnchorHeadConfig):
 class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
     PREDICTION_ARCHITECTURE_FIELDS: ClassVar[tuple[str, ...]] = (
         "anchor_mode",
+        "anchor_layer",
+        "anchor_normalization",
         "anchor_modeling",
+        "anchor_refinement",
+        "anchor_memory_position",
+        "anchor_query_position",
+        "anchor_memory_position_usage",
+        "anchor_self_attention_bias",
+        "anchor_cross_attention_bias",
         "feature_anchor_mlp",
         "feature_anchor_mlp_hidden_multiplier",
         "anchor_refine_layers",
@@ -251,15 +608,35 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
         self.query_position_embedding_kwargs = dict(
             self.query_position_embedding_kwargs or {}
         )
+        if self.anchor_memory_position is None:
+            memory_position_type = self.memory_position_embedding_type
+            memory_position_kwargs = self.memory_position_embedding_kwargs
+        else:
+            memory_position_type, memory_position_kwargs = _split_component_spec(
+                self.anchor_memory_position,
+                default_type="none",
+                component_name="anchor_memory_position",
+            )
+        if self.anchor_query_position is None:
+            query_position_type = self.query_position_embedding_type
+            query_position_kwargs = self.query_position_embedding_kwargs
+        else:
+            query_position_type, query_position_kwargs = _split_component_spec(
+                self.anchor_query_position,
+                default_type="none",
+                component_name="anchor_query_position",
+            )
+        anchor_mode = self.effective_anchor_mode()
+        refine_layers = self.effective_anchor_refine_layers()
         if not 0.0 < self.reference_box_initial_size < 1.0:
             raise ValueError("reference_box_initial_size must be between 0 and 1")
         if not 0.0 <= self.reference_box_grid_margin < 0.5:
             raise ValueError("reference_box_grid_margin must be in [0, 0.5)")
         memory_strategy = PositionEmbedding.strategy_class(
-            self.memory_position_embedding_type
+            memory_position_type
         )
         query_strategy = PositionEmbedding.strategy_class(
-            self.query_position_embedding_type
+            query_position_type
         )
         if memory_strategy.coordinate_dimensions not in {None, 2}:
             raise ValueError("Detection memory positions must be two-dimensional")
@@ -268,28 +645,28 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
                 "Detection query positions must encode 2D centers or 2D boxes"
             )
         if query_strategy.requires_num_embeddings:
-            self.query_position_embedding_kwargs.setdefault(
+            query_position_kwargs.setdefault(
                 "num_embeddings",
-                self.num_fixed_slots,
+                self.effective_anchor_num_slots(),
             )
         if query_strategy.requires_grid_size:
-            self.query_position_embedding_kwargs.setdefault(
+            query_position_kwargs.setdefault(
                 "grid_size",
-                covering_grid_2d(self.num_fixed_slots),
+                covering_grid_2d(self.effective_anchor_num_slots()),
             )
         if memory_strategy.requires_grid_size and "grid_size" not in (
-            self.memory_position_embedding_kwargs
+            memory_position_kwargs
         ):
             raise ValueError(
                 "memory learned-grid positions require an explicit base grid_size"
             )
         PositionEmbedding.validate_kwargs(
-            self.memory_position_embedding_type,
-            self.memory_position_embedding_kwargs,
+            memory_position_type,
+            memory_position_kwargs,
         )
         PositionEmbedding.validate_kwargs(
-            self.query_position_embedding_type,
-            self.query_position_embedding_kwargs,
+            query_position_type,
+            query_position_kwargs,
         )
         if memory_strategy.requires_num_embeddings:
             raise ValueError(
@@ -305,11 +682,11 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
             raise ValueError(
                 "iterative_box_refinement requires reference_box_mode='learned'"
             )
-        if self.iterative_box_refinement and self.anchor_refine_layers <= 0:
+        if self.iterative_box_refinement and refine_layers <= 0:
             raise ValueError(
                 "iterative_box_refinement requires anchor_refine_layers > 0"
             )
-        if self.reference_box_mode == "learned" and self.anchor_mode not in {
+        if self.reference_box_mode == "learned" and anchor_mode not in {
             "fixed",
             "fixed_rnn",
             "fixed_transformer",
@@ -321,7 +698,7 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
             raise ValueError(
                 "Coordinate-based query positions require reference_box_mode='learned'"
             )
-        if query_strategy.requires_num_embeddings and self.anchor_mode not in {
+        if query_strategy.requires_num_embeddings and anchor_mode not in {
             "fixed",
             "fixed_rnn",
             "fixed_transformer",
@@ -355,7 +732,7 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
             )
         if (
             self.spatial_attention_bias_type != "none"
-            and self.anchor_refine_layers <= 0
+            and refine_layers <= 0
         ):
             raise ValueError(
                 "spatial attention bias requires anchor_refine_layers > 0"
@@ -378,7 +755,7 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
                 "spatial_attention_bias_weight must be finite and non-negative"
             )
         if self.auxiliary_detection_loss_coef > 0 and (
-            not self.iterative_box_refinement or self.anchor_refine_layers < 2
+            not self.iterative_box_refinement or refine_layers < 2
         ):
             raise ValueError(
                 "auxiliary_detection_loss_coef requires iterative refinement "
@@ -388,9 +765,17 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
     def prediction_architecture_signature(self) -> tuple[tuple[str, Any], ...]:
         """Return only fields that construct or parameterize prediction modules."""
 
-        mode = "rotary" if self.anchor_mode == "rnn" else self.anchor_mode
+        mode = self.effective_anchor_mode()
         fields = [
+            "anchor_layer",
+            "anchor_normalization",
             "anchor_modeling",
+            "anchor_refinement",
+            "anchor_memory_position",
+            "anchor_query_position",
+            "anchor_memory_position_usage",
+            "anchor_self_attention_bias",
+            "anchor_cross_attention_bias",
             "parent_token_index",
             "embed_parent_token",
             "scorer_type",
@@ -418,7 +803,7 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
             fields.append("max_count")
         if mode in {"fixed_transformer", "query_transformer"}:
             fields.extend(("anchor_num_heads", "anchor_num_layers"))
-        if self.anchor_refine_layers > 0:
+        if self.effective_anchor_refine_layers() > 0:
             fields.extend(
                 (
                     "anchor_refine_heads",
@@ -484,11 +869,30 @@ class AudioSegmentationHeadConfig(SetPredictionHeadConfig):
         self.query_position_embedding_kwargs = dict(
             self.query_position_embedding_kwargs or {}
         )
+        if self.anchor_memory_position is None:
+            memory_position_type = self.memory_position_embedding_type
+            memory_position_kwargs = self.memory_position_embedding_kwargs
+        else:
+            memory_position_type, memory_position_kwargs = _split_component_spec(
+                self.anchor_memory_position,
+                default_type="none",
+                component_name="anchor_memory_position",
+            )
+        if self.anchor_query_position is None:
+            query_position_type = self.query_position_embedding_type
+            query_position_kwargs = self.query_position_embedding_kwargs
+        else:
+            query_position_type, query_position_kwargs = _split_component_spec(
+                self.anchor_query_position,
+                default_type="none",
+                component_name="anchor_query_position",
+            )
+        anchor_mode = self.effective_anchor_mode()
         memory_strategy = PositionEmbedding.strategy_class(
-            self.memory_position_embedding_type
+            memory_position_type
         )
         query_strategy = PositionEmbedding.strategy_class(
-            self.query_position_embedding_type
+            query_position_type
         )
         for role, strategy in (
             ("memory", memory_strategy),
@@ -507,11 +911,11 @@ class AudioSegmentationHeadConfig(SetPredictionHeadConfig):
                 "Audio memory positions must support variable sequence lengths"
             )
         if query_strategy.requires_num_embeddings:
-            self.query_position_embedding_kwargs.setdefault(
+            query_position_kwargs.setdefault(
                 "num_embeddings",
-                self.num_fixed_slots,
+                self.effective_anchor_num_slots(),
             )
-            if self.anchor_mode not in {
+            if anchor_mode not in {
                 "fixed",
                 "fixed_rnn",
                 "fixed_transformer",
@@ -520,12 +924,12 @@ class AudioSegmentationHeadConfig(SetPredictionHeadConfig):
                     "Learned index query positions require a fixed anchor mode"
                 )
         PositionEmbedding.validate_kwargs(
-            self.memory_position_embedding_type,
-            self.memory_position_embedding_kwargs,
+            memory_position_type,
+            memory_position_kwargs,
         )
         PositionEmbedding.validate_kwargs(
-            self.query_position_embedding_type,
-            self.query_position_embedding_kwargs,
+            query_position_type,
+            query_position_kwargs,
         )
         if self.num_prototypes <= 0:
             raise ValueError("num_prototypes must be positive")
@@ -549,14 +953,51 @@ class JointRelexHeadConfig(BaseHeadConfig):
     """Config for joint NER + relation extraction (GLiNER-relex style).
 
     Inherits NER scoring from NERHead and adds adjacency-based
-    entity pair scoring against [REL] type embeddings.
+    entity pair scoring against [RELATION] type embeddings.
     """
-    layer_type: str = "none"                # "dot", "weighted-dot", "mlp"
+    # ``dot``, ``mlp``, ``attention``/``attn``, ``bilinear``, ``gcn``, or
+    # ``gat``. ``none`` scores every directed pair without adjacency pruning.
+    layer_type: str = "none"
     pair_rep_type: str = "concat_proj"     # pair representation type
     triples_layer: Optional[str] = None    # optional triples scoring layer
     embed_rel_token: bool = True
     rel_token_index: int = -1
     adjacency_loss_coef: float = 1.0
+    # Optional safeguards for the entity set passed to relation extraction.
+    # ``None``/``False`` preserve the historical behavior.
+    max_relation_span_width: Optional[int] = None
+    relation_span_nms: bool = False
+    max_relation_entities: Optional[int] = None
+    # Sparse top-k neighbor selection currently matches the GLiNER ``dot``
+    # adjacency exactly while evaluating it in bounded query chunks.
+    relation_top_k_neighbors: Optional[int] = None
+    relation_neighbor_chunk_size: int = 64
+
+    def __post_init__(self):
+        super().__post_init__()
+        for name in (
+            "max_relation_span_width",
+            "max_relation_entities",
+            "relation_top_k_neighbors",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or int(value) != value or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer or None")
+        if (
+            isinstance(self.relation_neighbor_chunk_size, bool)
+            or int(self.relation_neighbor_chunk_size) != self.relation_neighbor_chunk_size
+            or self.relation_neighbor_chunk_size <= 0
+        ):
+            raise ValueError("relation_neighbor_chunk_size must be a positive integer")
+        if (
+            self.relation_top_k_neighbors is not None
+            and str(self.layer_type).lower() != "dot"
+        ):
+            raise ValueError(
+                "relation_top_k_neighbors currently requires layer_type='dot'"
+            )
 
 
 @dataclass
@@ -566,6 +1007,7 @@ class OpenRelexHeadConfig(BaseHeadConfig):
     Standalone head — no NER dependency. Uses configurable anchor layers
     to extract head/tail spans directly per (anchor, rel_type) pair.
     """
+    head_type: str = "open_relex"
     anchor_mode: str = "fixed"          # "fixed", "features", "rotary", "query_rnn", "query_transformer"
     num_fixed_slots: int = 10
     max_count: int = 20
@@ -574,14 +1016,60 @@ class OpenRelexHeadConfig(BaseHeadConfig):
     rel_token_index: int = -1
     embed_rel_token: bool = True
 
+    def __post_init__(self):
+        super().__post_init__()
+        if self.head_type not in {"open_relex", "set_open_relex"}:
+            raise ValueError(
+                "head_type must be 'open_relex' or 'set_open_relex'"
+            )
+
+
+@dataclass
+class SetOpenRelexHeadConfig(OpenRelexHeadConfig):
+    """Pair-first set-prediction open-relation configuration."""
+
+    head_type: str = "set_open_relex"
+    anchor_mode: str = "fixed_transformer"
+    anchor_modeling: str = "identity"
+    scorer_type: str = "dot"
+
+
+SetOpenRelationExtractionHeadConfig = SetOpenRelexHeadConfig
+
 
 @dataclass
 class StructuringHeadConfig(BaseHeadConfig):
+    # Serialized implementation discriminator.  New configurations should use
+    # ``set_structuring_config`` for the independent entity-first head.  The
+    # alternate value is retained solely to migrate older checkpoints which
+    # stored that head inside ``structuring_config``.
+    head_type: str = "structuring"
     anchor_mode: str = "rnn"  # "rnn", "features", "query_rnn", "query_transformer", "fixed"
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
     max_count: int = 20
     num_fixed_slots: int = 10  # number of learnable anchor slots (for anchor_mode="fixed")
+    # Raw contextual bucket means are often almost collinear because every
+    # token carries a strong document-wide component. ``center_rms`` removes
+    # that component and scales each bucket residual without adding parameters.
+    position_bucket_normalization: str = "none"  # "none" | "center_rms"
+    # Optional locality prior for position-bucket cross-attention. Sigma is in
+    # bucket widths, so it remains meaningful when num_fixed_slots changes.
+    position_bucket_attention_bias_type: str = "none"  # "none" | "gaussian"
+    position_bucket_attention_sigma: float = 0.5
+    position_bucket_attention_bias_weight: float = 1.0
+    # Add normalized slot-to-record distance to the Hungarian assignment cost.
+    # This keeps positional buckets paired with records in their own region.
+    position_bucket_matcher_cost: float = 0.0
+    # Optional explicit 1D coordinates for anchor refinement. Memory positions
+    # identify valid word locations; query positions identify anchor slots.
+    # ``none`` preserves historical checkpoints. Parameter-free choices include
+    # ``fixed_sinusoidal`` and ``fourier``.
+    memory_position_embedding_type: str = "none"
+    query_position_embedding_type: str = "none"
+    memory_position_embedding_kwargs: Optional[dict[str, Any]] = None
+    query_position_embedding_kwargs: Optional[dict[str, Any]] = None
+    memory_position_in_values: bool = False
     child_token_index: int = -1
     embed_child_token: bool = True
     # When True, BIO/span loss is computed against the optimal Hungarian
@@ -598,6 +1086,7 @@ class StructuringHeadConfig(BaseHeadConfig):
     # granularity at which negatives are sampled.
     #   "none"   — no sampling (keep all negatives)
     #   "global" — Bernoulli per-element over labels==0
+    #   "global_weighted" — retain all negatives with ``negatives`` weight
     #   "label"  — drop negatives only for (anchor, field) cells with no
     #              positives anywhere in the sequence
     #   "span"   — drop negatives only for (anchor, token) positions with no
@@ -618,6 +1107,218 @@ class StructuringHeadConfig(BaseHeadConfig):
     # to diagnose the imbalance behind "many fields return None".
     log_loss_stats: bool = False
     log_loss_stats_every: int = 50  # log cadence in optimiser steps
+
+    def __post_init__(self):
+        super().__post_init__()
+        anchor_mode = self.effective_anchor_mode()
+        refine_layers = self.effective_anchor_refine_layers()
+        if self.head_type not in {"structuring", "set_structuring"}:
+            raise ValueError(
+                "head_type must be 'structuring' or 'set_structuring'"
+            )
+        self.position_bucket_normalization = str(
+            self.position_bucket_normalization
+        ).lower().replace("-", "_")
+        if self.position_bucket_normalization not in {"none", "center_rms"}:
+            raise ValueError(
+                "position_bucket_normalization must be 'none' or "
+                "'center_rms'"
+            )
+        self.position_bucket_attention_bias_type = str(
+            self.position_bucket_attention_bias_type
+        ).lower().replace("-", "_")
+        if self.position_bucket_attention_bias_type not in {"none", "gaussian"}:
+            raise ValueError(
+                "position_bucket_attention_bias_type must be 'none' or "
+                "'gaussian'"
+            )
+        if anchor_mode != "position_buckets" and (
+            self.position_bucket_normalization != "none"
+            or self.position_bucket_attention_bias_type != "none"
+        ):
+            raise ValueError(
+                "position-bucket normalization and attention bias require "
+                "anchor_mode='position_buckets'"
+            )
+        if (
+            self.position_bucket_attention_bias_type != "none"
+            and refine_layers <= 0
+        ):
+            raise ValueError(
+                "position-bucket attention bias requires "
+                "anchor_refine_layers > 0"
+            )
+        if (
+            not math.isfinite(float(self.position_bucket_attention_sigma))
+            or self.position_bucket_attention_sigma <= 0
+        ):
+            raise ValueError(
+                "position_bucket_attention_sigma must be finite and positive"
+            )
+        if (
+            not math.isfinite(float(self.position_bucket_attention_bias_weight))
+            or self.position_bucket_attention_bias_weight < 0
+        ):
+            raise ValueError(
+                "position_bucket_attention_bias_weight must be finite and "
+                "non-negative"
+            )
+        if (
+            not math.isfinite(float(self.position_bucket_matcher_cost))
+            or self.position_bucket_matcher_cost < 0
+        ):
+            raise ValueError(
+                "position_bucket_matcher_cost must be finite and non-negative"
+            )
+        if (
+            self.position_bucket_matcher_cost > 0
+            and anchor_mode != "position_buckets"
+        ):
+            raise ValueError(
+                "position_bucket_matcher_cost requires "
+                "anchor_mode='position_buckets'"
+            )
+        self.masking = "none" if self.masking is None else str(self.masking)
+        if self.masking not in {
+            "none",
+            "global",
+            "global_weighted",
+            "label",
+            "span",
+            "anchor",
+        }:
+            raise ValueError(
+                "masking must be 'none', 'global', 'global_weighted', "
+                "'label', 'span', or 'anchor'"
+            )
+        if (
+            not math.isfinite(float(self.negatives))
+            or not 0.0 <= self.negatives <= 1.0
+        ):
+            raise ValueError("negatives must be finite and in [0, 1]")
+        if self.bio_loss_reduction not in {"sum", "mean"}:
+            raise ValueError("bio_loss_reduction must be 'sum' or 'mean'")
+        from .layers.position import (
+            FixedSinusoidal1DPositionEmbedding,
+            PositionEmbedding,
+        )
+
+        self.memory_position_embedding_kwargs = dict(
+            self.memory_position_embedding_kwargs or {}
+        )
+        self.query_position_embedding_kwargs = dict(
+            self.query_position_embedding_kwargs or {}
+        )
+        if self.anchor_memory_position is None:
+            memory_position_type = self.memory_position_embedding_type
+            memory_position_kwargs = self.memory_position_embedding_kwargs
+        else:
+            memory_position_type, memory_position_kwargs = _split_component_spec(
+                self.anchor_memory_position,
+                default_type="none",
+                component_name="anchor_memory_position",
+            )
+        if self.anchor_query_position is None:
+            query_position_type = self.query_position_embedding_type
+            query_position_kwargs = self.query_position_embedding_kwargs
+        else:
+            query_position_type, query_position_kwargs = _split_component_spec(
+                self.anchor_query_position,
+                default_type="none",
+                component_name="anchor_query_position",
+            )
+        memory_strategy = PositionEmbedding.strategy_class(
+            memory_position_type
+        )
+        query_strategy = PositionEmbedding.strategy_class(
+            query_position_type
+        )
+        fixed_width_modes = {
+            "fixed",
+            "fixed_rnn",
+            "fixed_transformer",
+            "position_buckets",
+            "topk_norm",
+            "topk_distinct",
+            "topk_parent",
+            "topk_density_distinct",
+        }
+        if anchor_mode in fixed_width_modes:
+            # Query slots and memory tokens share one normalized document axis.
+            # Using the anchor count as its sinusoidal extent maps bucket i to
+            # conventional position i while keeping tokens inside that bucket
+            # close to the same query position.
+            for strategy, strategy_kwargs in (
+                (memory_strategy, memory_position_kwargs),
+                (query_strategy, query_position_kwargs),
+            ):
+                if issubclass(
+                    strategy,
+                    FixedSinusoidal1DPositionEmbedding,
+                ):
+                    strategy_kwargs.setdefault(
+                        "max_position",
+                        float(self.effective_anchor_num_slots()),
+                    )
+        for role, strategy in (
+            ("memory", memory_strategy),
+            ("query", query_strategy),
+        ):
+            if strategy.coordinate_dimensions not in {None, 1}:
+                raise ValueError(
+                    f"Structuring {role} positions must be one-dimensional"
+                )
+            if strategy.requires_grid_size:
+                raise ValueError(
+                    f"Structuring {role} positions cannot use a 2D grid"
+                )
+        if memory_strategy.requires_num_embeddings:
+            raise ValueError(
+                "Structuring memory positions must support variable sequence "
+                "lengths"
+            )
+        if query_strategy.requires_num_embeddings:
+            if anchor_mode not in fixed_width_modes:
+                raise ValueError(
+                    "Learned index query positions require a fixed-width "
+                    "structuring anchor mode"
+                )
+            query_position_kwargs.setdefault(
+                "num_embeddings",
+                self.effective_anchor_num_slots(),
+            )
+        PositionEmbedding.validate_kwargs(
+            memory_position_type,
+            memory_position_kwargs,
+        )
+        PositionEmbedding.validate_kwargs(
+            query_position_type,
+            query_position_kwargs,
+        )
+
+
+@dataclass
+class SetStructuringHeadConfig(StructuringHeadConfig):
+    """Independent NER-first entity-to-record set prediction."""
+
+    head_type: str = "set_structuring"
+    # Fixed transformer queries represent output records. Entity extraction
+    # always uses a separate parent anchor, so these settings affect only the
+    # second-stage record queries.
+    anchor_mode: str = "fixed_transformer"
+    anchor_modeling: str = "linear"
+    represent_spans: bool = True
+    entity_loss_coef: float = 1.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if (
+            not math.isfinite(float(self.entity_loss_coef))
+            or self.entity_loss_coef < 0
+        ):
+            raise ValueError(
+                "entity_loss_coef must be finite and non-negative"
+            )
 
 
 @dataclass
@@ -649,7 +1350,9 @@ class GLiNextConfig(BaseGLiNERConfig):
         "audio_segmentation": "audio_segmentation_config",
         "joint_relex": "joint_relex_config",
         "open_relex": "open_relex_config",
+        "set_open_relex": "set_open_relex_config",
         "structuring": "structuring_config",
+        "set_structuring": "set_structuring_config",
         "count": "count_config",
         "embedding": "embedding_config",
     }
@@ -813,11 +1516,14 @@ class GLiNextConfig(BaseGLiNERConfig):
         relations_config: Optional[dict] = None,  # backward compat alias for joint_relex_config
         joint_relex_config: Optional[dict] = None,
         open_relex_config: Optional[dict] = None,
+        set_open_relex_config: Optional[dict] = None,
         structuring_config: Optional[dict] = None,
+        set_structuring_config: Optional[dict] = None,
         count_config: Optional[dict] = None,
         embedding_config: Optional[dict] = None,
         # Shared layers across tasks (None = each task creates its own)
-        shared_anchor_modeling: Optional[str] = None,  # "linear", "rnn", "mlp" — shared AnchorModeling layer
+        shared_anchor_modeling: Optional[str | dict[str, Any]] = None,
+        shared_anchor_refinement: Optional[str | dict[str, Any]] = None,
         shared_anchor_refine_layers: int = 0,  # shared AnchorCrossAttentionLayer (0 = disabled)
         shared_anchor_refine_heads: int = 8,
         # Labels encoder (bi-encoder style)
@@ -866,13 +1572,23 @@ class GLiNextConfig(BaseGLiNERConfig):
         omni_modalities: Optional[list[str]] = None,
         # Special tokens
         seq_token: str = "[SEQ]",
-        cat_token: str = "[CAT]",
-        rel_token: str = "[REL]",
-        parent_token: str = "[PARENT]",
-        child_token: str = "[CHILD]",
-        obj_token: str = "[OBJ]",
+        sep_token: str = "[SEP]",
+        ent_token: str = "[ENTITY]",
+        cat_token: str = "[CLASS]",
+        rel_token: str = "[RELATION]",
+        parent_token: str = "[SCHEMA]",
+        child_token: str = "[FIELD]",
+        obj_token: str = "[OBJECT]",
+        # Descriptive aliases for the marker-token parameters above. The
+        # shorter names remain the serialized/public compatibility surface.
+        entity_token: Optional[str] = None,
+        class_token: Optional[str] = None,
+        relation_token: Optional[str] = None,
+        schema_token: Optional[str] = None,
+        field_token: Optional[str] = None,
+        object_token: Optional[str] = None,
         # Per-task parent tokens
-        per_task_parents: Optional[bool] = None,  # True = distinct per-task tokens; False = shared [PARENT]; None = auto-detect
+        per_task_parents: Optional[bool] = None,  # True = distinct per-task tokens; False = shared [SCHEMA]; None = auto-detect
         ner_parent_token: Optional[str] = None,
         cat_parent_token: Optional[str] = None,
         open_rel_parent_token: Optional[str] = None,
@@ -975,6 +1691,16 @@ class GLiNextConfig(BaseGLiNERConfig):
                 f"{sorted(allowed_audio_formats)}, got {audio_processor_output_format!r}."
             )
 
+        # BaseGLiNERConfig owns ``ent_token`` and ``sep_token``, so they must
+        # be forwarded before its initializer runs.
+        ent_token = entity_token or ent_token
+        cat_token = class_token or cat_token
+        rel_token = relation_token or rel_token
+        parent_token = schema_token or parent_token
+        child_token = field_token or child_token
+        obj_token = object_token or obj_token
+        kwargs["ent_token"] = ent_token
+        kwargs["sep_token"] = sep_token
         super().__init__(**kwargs)
 
         # ── Migrate flat params to sub-configs if sub-configs not provided ──
@@ -1122,14 +1848,78 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Backward compat alias
         self.relations_config = self.joint_relex_config
 
-        # Open Relex
+        # Open Relex. The set-prediction implementation shares the canonical
+        # processor, targets, output fields, and decoder with open_relex.
+        if open_relex_config is not None and set_open_relex_config is not None:
+            raise ValueError(
+                "open_relex_config and set_open_relex_config are mutually exclusive"
+            )
+        if set_open_relex_config is not None:
+            if isinstance(set_open_relex_config, dict):
+                set_open_relex_config = dict(set_open_relex_config)
+                configured_type = set_open_relex_config.get(
+                    "head_type", "set_open_relex"
+                )
+                if configured_type != "set_open_relex":
+                    raise ValueError(
+                        "set_open_relex_config requires "
+                        "head_type='set_open_relex'"
+                    )
+                set_open_relex_config["head_type"] = "set_open_relex"
+            elif getattr(
+                set_open_relex_config, "head_type", None
+            ) != "set_open_relex":
+                raise ValueError(
+                    "set_open_relex_config must be a mapping or a "
+                    "SetOpenRelexHeadConfig"
+                )
+            open_relex_config = set_open_relex_config
+
         if isinstance(open_relex_config, dict):
-            self.open_relex_config = OpenRelexHeadConfig(**open_relex_config)
+            open_relex_config = dict(open_relex_config)
+            head_type = open_relex_config.get("head_type", "open_relex")
+            config_class = (
+                SetOpenRelexHeadConfig
+                if head_type == "set_open_relex"
+                else OpenRelexHeadConfig
+            )
+            self.open_relex_config = config_class(**open_relex_config)
         else:
             self.open_relex_config = open_relex_config
 
-        # Structuring
-        if structuring_config is None and groups_layer is not None:
+        # Structuring heads are independent tasks.  For checkpoint
+        # compatibility, migrate the former discriminator-based spelling
+        # ``structuring_config: {head_type: set_structuring}`` into the new
+        # dedicated config field.
+        if (
+            isinstance(structuring_config, dict)
+            and structuring_config.get("head_type") == "set_structuring"
+        ):
+            if set_structuring_config is not None:
+                raise ValueError(
+                    "set structuring is configured in both structuring_config "
+                    "and set_structuring_config"
+                )
+            set_structuring_config = structuring_config
+            structuring_config = None
+        elif (
+            structuring_config is not None
+            and getattr(structuring_config, "head_type", "structuring")
+            == "set_structuring"
+        ):
+            if set_structuring_config is not None:
+                raise ValueError(
+                    "set structuring is configured in both structuring_config "
+                    "and set_structuring_config"
+                )
+            set_structuring_config = structuring_config
+            structuring_config = None
+
+        if (
+            structuring_config is None
+            and set_structuring_config is None
+            and groups_layer is not None
+        ):
             structuring_config = {
                 "anchor_mode": groups_layer,
                 "anchor_num_heads": anchor_num_heads,
@@ -1140,9 +1930,37 @@ class GLiNextConfig(BaseGLiNERConfig):
                 "loss_coef": structuring_loss_coef,
             }
         if isinstance(structuring_config, dict):
-            self.structuring_config = StructuringHeadConfig(**structuring_config)
+            self.structuring_config = StructuringHeadConfig(
+                **dict(structuring_config)
+            )
         else:
             self.structuring_config = structuring_config
+
+        if isinstance(set_structuring_config, dict):
+            set_structuring_config = dict(set_structuring_config)
+            configured_type = set_structuring_config.get(
+                "head_type", "set_structuring"
+            )
+            if configured_type != "set_structuring":
+                raise ValueError(
+                    "set_structuring_config requires "
+                    "head_type='set_structuring'"
+                )
+            set_structuring_config["head_type"] = "set_structuring"
+            self.set_structuring_config = SetStructuringHeadConfig(
+                **set_structuring_config
+            )
+        elif set_structuring_config is None:
+            self.set_structuring_config = None
+        elif getattr(
+            set_structuring_config, "head_type", None
+        ) == "set_structuring":
+            self.set_structuring_config = set_structuring_config
+        else:
+            raise ValueError(
+                "set_structuring_config must be a mapping or a "
+                "SetStructuringHeadConfig"
+            )
 
         # Count
         if count_config is None and count_layer is not None:
@@ -1331,7 +2149,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Projector
         self.projector_hidden_act = kwargs.pop("projector_hidden_act", "gelu")
 
-        # Special tokens
+        # Special tokens. The shorter attribute names remain the serialized
+        # compatibility surface; descriptive aliases are accepted above.
         self.seq_token = seq_token
         self.cat_token = cat_token
         self.rel_token = rel_token
@@ -1355,10 +2174,10 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
-            self.ner_parent_token = ner_parent_token or "[ENT_P]"
-            self.cat_parent_token = cat_parent_token or "[CAT_P]"
-            self.open_rel_parent_token = open_rel_parent_token or "[REL_P]"
-            self.struct_parent_token = struct_parent_token or "[STRUCT_P]"
+            self.ner_parent_token = ner_parent_token or "[ENTITY_SCHEMA]"
+            self.cat_parent_token = cat_parent_token or "[CLASS_SCHEMA]"
+            self.open_rel_parent_token = open_rel_parent_token or "[RELATION_SCHEMA]"
+            self.struct_parent_token = struct_parent_token or "[STRUCTURE_SCHEMA]"
         else:
             # Shared parent token (or explicit per-task overrides for backward compat)
             self.ner_parent_token = ner_parent_token or parent_token
@@ -1376,7 +2195,13 @@ class GLiNextConfig(BaseGLiNERConfig):
         # ── Backward compat: keep flat attributes for code that reads them ──
         self.relations_layer = relations_layer or (self.joint_relex_config.layer_type if self.joint_relex_config else None)
         self.classifier_layer = classifier_layer
-        self.groups_layer = groups_layer or (self.structuring_config.anchor_mode if self.structuring_config else None)
+        effective_structuring_config = (
+            self.structuring_config or self.set_structuring_config
+        )
+        self.groups_layer = groups_layer or (
+            effective_structuring_config.effective_anchor_mode()
+            if effective_structuring_config else None
+        )
         self.count_layer = count_layer or ("regression" if self.count_config else None)
 
         self.rel_mode = rel_mode
@@ -1391,10 +2216,10 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.neg_spans_ratio = self.ner_config.neg_spans_ratio if self.ner_config else neg_spans_ratio
         self.span_loss_coef = self.ner_config.span_loss_coef if self.ner_config else span_loss_coef
 
-        self.anchor_num_heads = self.structuring_config.anchor_num_heads if self.structuring_config else anchor_num_heads
-        self.anchor_num_layers = self.structuring_config.anchor_num_layers if self.structuring_config else anchor_num_layers
-        self.child_token_index = self.structuring_config.child_token_index if self.structuring_config else child_token_index
-        self.embed_child_token = self.structuring_config.embed_child_token if self.structuring_config else embed_child_token
+        self.anchor_num_heads = effective_structuring_config.anchor_num_heads if effective_structuring_config else anchor_num_heads
+        self.anchor_num_layers = effective_structuring_config.anchor_num_layers if effective_structuring_config else anchor_num_layers
+        self.child_token_index = effective_structuring_config.child_token_index if effective_structuring_config else child_token_index
+        self.embed_child_token = effective_structuring_config.embed_child_token if effective_structuring_config else embed_child_token
 
         self.count_mode = self.count_config.mode if self.count_config else count_mode
         self.max_count = max_count
@@ -1426,10 +2251,13 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.count_loss_coef = self.count_config.loss_coef if self.count_config else count_loss_coef
         self.groups_loss_coef = groups_loss_coef
         self.embedding_loss_coef = self.embedding_config.loss_coef if self.embedding_config else embedding_loss_coef
-        self.structuring_loss_coef = self.structuring_config.loss_coef if self.structuring_config else structuring_loss_coef
+        self.structuring_loss_coef = effective_structuring_config.loss_coef if effective_structuring_config else structuring_loss_coef
 
         # Shared layers config
         self.shared_anchor_modeling = shared_anchor_modeling
+        self.shared_anchor_refinement = copy.deepcopy(
+            shared_anchor_refinement
+        )
         self.shared_anchor_refine_layers = shared_anchor_refine_layers
         self.shared_anchor_refine_heads = shared_anchor_refine_heads
 
@@ -1437,6 +2265,19 @@ class GLiNextConfig(BaseGLiNERConfig):
     def uses_per_task_parents(self) -> bool:
         """True when per-task parent tokens are distinct from each other."""
         return self.per_task_parents
+
+    @property
+    def set_open_relex_config(self):
+        """Return the pair-first config when set open relex is selected."""
+
+        open_relex_config = getattr(self, "open_relex_config", None)
+        if (
+            open_relex_config is not None
+            and getattr(open_relex_config, "head_type", "open_relex")
+            == "set_open_relex"
+        ):
+            return open_relex_config
+        return None
 
     def get_task_config(self, task_name: str):
         """Return the task sub-config for a canonical task name."""
@@ -1460,6 +2301,7 @@ _TEXT_CONFIG_FIELDS = (
     "joint_relex_config",
     "open_relex_config",
     "structuring_config",
+    "set_structuring_config",
     "count_config",
     "embedding_config",
 )
@@ -1506,6 +2348,7 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "neg_spans_ratio",
         # Shared GLiNExT fields.
         "shared_anchor_modeling",
+        "shared_anchor_refinement",
         "shared_anchor_refine_layers",
         "shared_anchor_refine_heads",
         "labels_encoder",
@@ -1545,6 +2388,7 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "relations_config",
         "open_relex_config",
         "structuring_config",
+        "set_structuring_config",
         "count_config",
         "embedding_config",
         "relations_layer",

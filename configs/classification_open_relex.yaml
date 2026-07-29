@@ -29,22 +29,20 @@ model:
 
   open_relex_config:
     # Anchor acquisition strategy:
-    #   "fixed"             — learnable embedding table with num_fixed_slots anchor slots
+    #   "fixed"             — learnable embedding table with num_slots anchors
     #   "rotary" / "rnn"    — rotary position-conditioned anchors via RotaryGroupRNN
     #   "query_rnn"         — similarity-based token selection + GRU (uses word embeddings)
     #   "query_transformer" — similarity-based token selection + Transformer (uses word embeddings)
-    anchor_mode: "fixed"
+    anchor_layer:
+      type: "fixed"
+      params:
+        num_slots: 10
+    anchor_normalization: "none"
     # Anchor-child fusion strategy:
     #   "linear" — linear projection of concatenated anchor + child (default)
     #   "rnn"    — GRU-based recurrent processing (GLiNER2-style)
     #   "mlp"    — multi-layer perceptron fusion
     anchor_modeling: "linear"
-    # Number of learnable anchor slots (only used when anchor_mode="fixed")
-    num_fixed_slots: 10
-    # Maximum anchor count (used by rotary/query anchor modes)
-    max_count: 20
-    anchor_num_heads: 4
-    anchor_num_layers: 2
     loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null
@@ -55,10 +53,11 @@ model:
     # neg_spans_ratio: 1.0
     # Loss coefficient for span representation loss (only used when represent_spans=true)
     # span_loss_coef: 1.0
-    # Number of cross-attention layers for anchor refinement (0 = disabled)
-    # anchor_refine_layers: 0
-    # Number of attention heads for anchor refinement
-    # anchor_refine_heads: 8
+    # Optional refinement core:
+    # anchor_refinement:
+    #   type: "cross_attention"
+    #   params: {num_layers: 2, num_heads: 8, norm_style: "pre_norm"}
+    anchor_refinement: "none"
 
 data:
   root_dir: logs/classification_open_relex

@@ -20,9 +20,18 @@ class StructuringDecoder(SpanDecoder):
     2. Span-level: structuring_span_logits (B, X, S, C) + span_idx/span_mask
     """
 
+    config_attr = "structuring_config"
+    token_logits_attr = "structuring_logits"
+    span_logits_attr = "structuring_span_logits"
+    batch_origin_attr = "structuring_batch_origin"
+    anchor_mask_attr = "structuring_anchor_mask"
+    objectness_logits_attr = "structuring_objectness_logits"
+    span_idx_attr = "structuring_span_idx"
+    span_mask_attr = "structuring_span_mask"
+
     def __init__(self, config):
         super().__init__(config)
-        struct_cfg = getattr(config, "structuring_config", None)
+        struct_cfg = getattr(config, self.config_attr, None)
         self.objectness_threshold = (
             getattr(struct_cfg, "anchor_objectness_threshold", 0.5)
             if struct_cfg is not None else 0.5
@@ -78,35 +87,37 @@ class StructuringDecoder(SpanDecoder):
         ``objectness_threshold`` are filtered before BIO decoding so that
         empty slots do not leak into the output.
         """
-        if model_output.structuring_logits is None and model_output.structuring_span_logits is None:
+        token_logits = getattr(model_output, self.token_logits_attr, None)
+        span_logits = getattr(model_output, self.span_logits_attr, None)
+        span_idx = getattr(model_output, self.span_idx_attr, None)
+        span_mask = getattr(model_output, self.span_mask_attr, None)
+        if token_logits is None and span_logits is None:
             return []
 
         threshold = threshold or self.threshold
         anchor_mask = self._resolve_anchor_mask(
-            model_output.structuring_anchor_mask,
-            getattr(model_output, "structuring_objectness_logits", None),
+            getattr(model_output, self.anchor_mask_attr, None),
+            getattr(model_output, self.objectness_logits_attr, None),
             objectness_threshold,
         )
 
         # Determine batch size from whichever output is available
-        if model_output.structuring_logits is not None:
-            B = model_output.structuring_logits.shape[0]
+        if token_logits is not None:
+            B = token_logits.shape[0]
         else:
-            B = model_output.structuring_span_logits.shape[0]
+            B = span_logits.shape[0]
 
         id_to_fields = self._build_field_class_maps(classes_mapping, B)
 
-        batch_origin = model_output.structuring_batch_origin
+        batch_origin = getattr(model_output, self.batch_origin_attr, None)
         batch_size = model_output.batch_size
 
         # Prefer span-level decoding when available
-        if (model_output.structuring_span_logits is not None
-                and model_output.structuring_span_idx is not None
-                and model_output.structuring_span_mask is not None):
+        if span_logits is not None and span_idx is not None and span_mask is not None:
             return self._decode_from_spans(
-                model_output.structuring_span_logits,
-                model_output.structuring_span_idx,
-                model_output.structuring_span_mask,
+                span_logits,
+                span_idx,
+                span_mask,
                 anchor_mask,
                 id_to_fields,
                 threshold,
@@ -119,7 +130,7 @@ class StructuringDecoder(SpanDecoder):
 
         # Fall back to token-level BIO decoding
         return self._decode_token_level(
-            model_output.structuring_logits,
+            token_logits,
             anchor_mask,
             id_to_fields,
             threshold,

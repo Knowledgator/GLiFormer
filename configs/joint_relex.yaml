@@ -19,6 +19,13 @@ model:
     pair_rep_type: "concat_proj"
     loss_coef: 1.0
     adjacency_loss_coef: 1.0
+    # Optional relation-candidate safeguards. null/false preserves the
+    # historical dense behavior.
+    max_relation_span_width: null
+    relation_span_nms: false
+    max_relation_entities: null
+    relation_top_k_neighbors: null
+    relation_neighbor_chunk_size: 64
     focal_loss_alpha: null
     focal_loss_gamma: null
     focal_loss_prob_margin: null

@@ -13,7 +13,7 @@ from ...processing.mappings import (
 class OpenRelexProcessor(SpanProcessor):
     """Processor for anchor-based open relation extraction.
 
-    Builds its own extraction groups with [P] and [REL] tokens.
+    Builds its own extraction groups with [SCHEMA] and [RELATION] tokens.
     Input data uses the 'open_relex' key with text-based head/tail mentions.
     """
 

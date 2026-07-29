@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from ...encoders.audio import validate_audio_attention_mask
-from ...layers import PositionEmbedding, normalized_grid_1d
 from ...layers.mlp import create_mlp
 from .. import TaskHeadOutput
 from ..media import (
@@ -15,7 +14,6 @@ from ..media import (
     matched_classification_loss,
     matched_mask_loss,
     normalized_objectness_loss,
-    score_anchor_labels,
 )
 
 
@@ -67,32 +65,6 @@ class AudioSegmentationHead(MediaSetPredictionHead):
             activation="gelu",
         )
         self.objectness_head = nn.Linear(hidden_size, 1)
-        self.memory_position_embedding = None
-        self.query_position_embedding = None
-        if hasattr(self, "anchor_refine"):
-            self.memory_position_embedding = PositionEmbedding.from_config(
-                getattr(cfg, "memory_position_embedding_type", "sine1d"),
-                hidden_size,
-                **dict(
-                    getattr(cfg, "memory_position_embedding_kwargs", None)
-                    or {}
-                ),
-            )
-            query_kwargs = dict(
-                getattr(cfg, "query_position_embedding_kwargs", None) or {}
-            )
-            query_type = getattr(
-                cfg,
-                "query_position_embedding_type",
-                "sine1d",
-            )
-            if PositionEmbedding.strategy_class(query_type).requires_num_embeddings:
-                query_kwargs.setdefault("num_embeddings", cfg.num_fixed_slots)
-            self.query_position_embedding = PositionEmbedding.from_config(
-                query_type,
-                hidden_size,
-                **query_kwargs,
-            )
         self.num_prototypes = int(getattr(cfg, "num_prototypes", 32))
         self.mask_size = int(getattr(cfg, "mask_size", 256))
         self.proto_proj = nn.Linear(hidden_size, self.num_prototypes)
@@ -115,7 +87,7 @@ class AudioSegmentationHead(MediaSetPredictionHead):
         )
 
     def _memory_positions(self, audio_features, audio_mask):
-        if self.memory_position_embedding is None:
+        if self.anchor_refine_positions is None:
             return None
         batch_size, token_count, hidden_size = audio_features.shape
         audio_mask = validate_audio_attention_mask(
@@ -124,106 +96,36 @@ class AudioSegmentationHead(MediaSetPredictionHead):
             time_length=token_count,
             name="audio feature mask",
         )
-        valid_lengths = (
-            audio_mask.long().sum(dim=-1)
-            if audio_mask is not None
-            else torch.full(
-                (batch_size,),
-                token_count,
-                dtype=torch.long,
-                device=audio_features.device,
-            )
+        return self.anchor_refine_positions.memory_positions(
+            audio_features,
+            audio_mask,
         )
-        positions = audio_features.new_zeros(
-            batch_size,
-            token_count,
-            hidden_size,
-        )
-        for batch_idx, valid_length in enumerate(valid_lengths.tolist()):
-            if valid_length <= 0:
-                continue
-            coordinates = normalized_grid_1d(
-                valid_length,
-                device=audio_features.device,
-                dtype=torch.float32,
-            )
-            row_positions = self.memory_position_embedding(
-                coordinates,
-                count=valid_length,
-                dtype=audio_features.dtype,
-                device=audio_features.device,
-            )
-            if row_positions is None:
-                return None
-            if row_positions.dim() == 3 and row_positions.shape[0] == 1:
-                row_positions = row_positions[0]
-            if row_positions.shape != (valid_length, hidden_size):
-                raise ValueError(
-                    "Audio memory positions must have shape (valid_time, hidden_size)"
-                )
-            positions[batch_idx, :valid_length] = row_positions
-        return positions
 
     def _query_positions(self, anchors):
-        if self.query_position_embedding is None or anchors.shape[1] == 0:
+        if self.anchor_refine_positions is None or anchors.shape[1] == 0:
             return None
-        coordinates = normalized_grid_1d(
-            anchors.shape[1],
-            device=anchors.device,
-            dtype=torch.float32,
-        )
-        positions = self.query_position_embedding(
-            coordinates,
-            count=anchors.shape[1],
-            dtype=anchors.dtype,
-            device=anchors.device,
-        )
-        if positions is None:
-            return None
-        if positions.dim() == 2:
-            positions = positions.unsqueeze(0)
-        if positions.shape[-2:] != anchors.shape[-2:] or positions.shape[0] not in {
-            1,
-            anchors.shape[0],
-        }:
-            raise ValueError(
-                "Audio query positions must have shape (1, slots, hidden_size) "
-                "or (batch, slots, hidden_size)"
-            )
-        return positions
+        return self.anchor_refine_positions.query_positions(anchors)
 
     def _compute_segmentation(self, flat_inputs, count=None, threshold=0.5):
         audio_features, audio_mask = flat_features(flat_inputs)
-        anchors, anchor_mask = self.anchor_layer(
+        anchors, anchor_mask = self._generate_anchors(
             flat_inputs.parent_embedding,
             audio_features,
             count=count,
             threshold=threshold,
             feature_mask=audio_mask,
         )
-        if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(
-                anchors,
-                audio_features,
-                token_mask=audio_mask,
-                query_mask=anchor_mask,
-                query_pos_emb=self._query_positions(anchors),
-                memory_pos_emb=self._memory_positions(
-                    audio_features,
-                    audio_mask,
-                ),
-                memory_position_in_values=getattr(
-                    self.seg_cfg,
-                    "memory_position_in_values",
-                    True,
-                ),
-            )
-        class_logits = score_anchor_labels(
-            self.anchor_modeling,
-            self.cls_head,
+        anchors = self._refine_anchors(
+            anchors,
+            audio_features,
+            memory_mask=audio_mask,
+            anchor_mask=anchor_mask,
+        )
+        class_logits = self._score_anchor_labels(
             anchors,
             flat_inputs.child_embedding,
             flat_inputs.child_mask,
+            anchor_mask,
         )
         segment_preds = _segments_from_raw(self.segment_head(anchors))
         objectness_logits = self.objectness_head(anchors).squeeze(-1)

@@ -184,6 +184,8 @@ class BatchClassesMapping:
         if task_name in ("ner", "joint_relex"):
             return len(self.extraction_mapping[batch_idx].items)
 
+        if task_name == "set_structuring":
+            task_name = "structuring"
         mapping_attr = f"{task_name}_mapping"
         mapping_list = getattr(self, mapping_attr, None)
         if mapping_list is None or batch_idx >= len(mapping_list):
@@ -196,7 +198,10 @@ class BatchClassesMapping:
 
     def parent_offset_for_item(self, task_name: str, batch_idx: int) -> int:
         """First parent-token position for a task within one batch item."""
-        effective_task = "ner" if task_name == "joint_relex" else task_name
+        effective_task = {
+            "joint_relex": "ner",
+            "set_structuring": "structuring",
+        }.get(task_name, task_name)
         offset = 0
         for current_task in self.PROMPT_TASK_ORDER:
             if current_task == effective_task:
@@ -204,13 +209,36 @@ class BatchClassesMapping:
             offset += self.group_count(current_task, batch_idx)
         return offset
 
-    def child_size(self, task_name: str, batch_idx: int, group_idx: int) -> int:
-        """Number of child labels for a task group."""
+    def label_size(
+        self,
+        task_name: str,
+        batch_idx: int,
+        group_idx: int,
+        label_kind: str = "primary",
+    ) -> int:
+        """Number of labels of one kind for a task group."""
+
+        if label_kind == "relation":
+            if task_name != "joint_relex":
+                raise ValueError(
+                    f"Relation labels are not defined for task {task_name!r}"
+                )
+            relation_mapping = self.extraction_mapping[batch_idx].items[
+                group_idx
+            ].rel_class_to_id
+            return (
+                len(relation_mapping.class_to_id)
+                if relation_mapping is not None
+                else 0
+            )
+        if label_kind != "primary":
+            raise ValueError(f"Unknown label kind: {label_kind!r}")
+
         if task_name in ("ner", "joint_relex"):
             return len(self.extraction_mapping[batch_idx].items[group_idx].ner_class_to_id.class_to_id)
         if task_name == "classification":
             return len(self.cat_mapping[batch_idx].cat_class_to_id[group_idx].class_to_id)
-        if task_name == "structuring":
+        if task_name in ("structuring", "set_structuring"):
             return len(self.structuring_mapping[batch_idx].items[group_idx].field_class_to_id.class_to_id)
         if task_name == "open_relex":
             return len(self.open_relex_mapping[batch_idx].items[group_idx].rel_class_to_id.class_to_id)
@@ -222,6 +250,11 @@ class BatchClassesMapping:
             return len(mapping_list[batch_idx].items[group_idx].class_to_id.class_to_id)
         return 0
 
+    def child_size(self, task_name: str, batch_idx: int, group_idx: int) -> int:
+        """Backward-compatible alias for the task's primary label count."""
+
+        return self.label_size(task_name, batch_idx, group_idx)
+
     def flat_iter(self, task_name: str):
         """Return the appropriate flat iterator for a task."""
         iters = {
@@ -229,6 +262,7 @@ class BatchClassesMapping:
             "joint_relex": self.flat_extraction_iter,
             "classification": self.flat_cat_iter,
             "structuring": self.flat_structuring_iter,
+            "set_structuring": self.flat_structuring_iter,
             "open_relex": self.flat_open_relex_iter,
             "image_classification": self.flat_image_classification_iter,
             "audio_classification": self.flat_audio_classification_iter,

@@ -1,9 +1,5 @@
 model:
-  model_variant: layout
-  use_layout: true
-  backbone_type: deberta_2d
-  model_name: microsoft/deberta-v3-base
-  labels_encoder: null
+  model_name: microsoft/deberta-v3-small
   name: "glinext"
   max_width: 12
   hidden_size: 768
@@ -16,62 +12,65 @@ model:
   max_neg_type_ratio: 1
 
   ner_config:
+    scorer_type: "gliner"
     loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null
     focal_loss_prob_margin: null
     represent_spans: false
 
+  classification_config:
+    layer_type: "dot"
+    pooling_type: "mean"
+    loss_coef: 1.0
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+
   structuring_config:
     anchor_layer:
-      type: "fixed"
+      type: "rotary"
       params:
-        num_slots: 20
+        max_count: 20
     anchor_normalization: "none"
     anchor_modeling: "linear"
     anchor_refinement: "none"
+    max_count: 20
     loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null
     focal_loss_prob_margin: null
     represent_spans: false
     use_anchor_matching: true
-    anchor_objectness: true
-    anchor_objectness_loss_coef: 0.5
-    anchor_objectness_threshold: 0.5
+    bio_loss_reduction: "mean"
+    anchor_objectness: false
 
-  classification_config: null
   joint_relex_config: null
   open_relex_config: null
   count_config: null
   embedding_config: null
 
 data:
-  root_dir: logs/layout_deberta2d
-  train_data: "data/layoutlmv3_invoice_train.json"
+  root_dir: logs/ner_classification_structuring
+  train_data: "data/bio_post_ner_gliclass_logic_structuring.jsonl"
   val_data: "none"
 
 training:
   prev_path: null
-  num_steps: 30000
-  train_batch_size: 2
-  gradient_accumulation_steps: 2
-  eval_every: 1000
+  num_steps: 200000
+  train_batch_size: 1
+  gradient_accumulation_steps: 8
+  eval_every: 10000
   warmup_ratio: 0.05
   scheduler_type: "cosine"
   focal_loss_alpha: 0.75
   focal_loss_gamma: 0
-  focal_loss_prob_margin: 0
   loss_reduction: "sum"
-  negatives: 1.0
-  masking: "none"
-  lr_encoder: 1e-5
+  lr_encoder: 2e-5
   lr_others: 3e-5
   weight_decay_encoder: 0.01
   weight_decay_other: 0.01
   max_grad_norm: 10.0
   save_total_limit: 3
   train_head_only: false
-  freeze_components: null
   bf16: true
-  compile_model: false

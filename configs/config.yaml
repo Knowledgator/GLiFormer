@@ -18,15 +18,16 @@ model:
   # ── Task heads (set to null to disable) ──
 
   ner_config:
-    scorer_type: "gliner"         # "gliner" (GLiNER Scorer), "anchored" (AnchoredSpanScorer)
     loss_coef: 1.0
     focal_loss_alpha: null        # null = use training.focal_loss_alpha
     focal_loss_gamma: null        # null = use training.focal_loss_gamma
     focal_loss_prob_margin: null  # null = use training.focal_loss_prob_margin
-    anchor_mode: "parent"         # "parent", "fixed" (only used when scorer_type="anchored")
-    anchor_modeling: "linear"     # "linear", "rnn", "mlp" (only used when scorer_type="anchored")
-    anchor_refine_layers: 0       # cross-attention layers for anchor refinement (0 = disabled)
-    anchor_refine_heads: 8
+    # Independent anchor components. A component can be a strategy name or a
+    # strict {type, params} mapping.
+    anchor_layer: "parent"
+    anchor_normalization: "none"
+    anchor_modeling: "linear"
+    anchor_refinement: "none"
     represent_spans: false
     neg_spans_ratio: 1.0
     span_loss_coef: 1.0
@@ -44,25 +45,30 @@ model:
 
   joint_relex_config: null
   # joint_relex_config:
-  #   layer_type: "dot"           # "dot", "weighted-dot", "mlp"
+  #   layer_type: "dot"           # "dot", "mlp", "attention", "bilinear", "gcn", "gat"
   #   pair_rep_type: "concat_proj"  # "concat_proj", "bilinear", "additive", "mlp"
   #   triples_layer: null
   #   embed_rel_token: true
   #   rel_token_index: -1
   #   loss_coef: 1.0
   #   adjacency_loss_coef: 1.0
+  #   max_relation_span_width: null  # null disables inclusive-width filtering
+  #   relation_span_nms: false       # greedily keep flat, non-overlapping spans
+  #   max_relation_entities: null    # rank and cap entities by NER confidence
+  #   relation_top_k_neighbors: null # dot mode only; avoids predicted dense E x E adjacency
+  #   relation_neighbor_chunk_size: 64
   #   focal_loss_alpha: null
   #   focal_loss_gamma: null
   #   focal_loss_prob_margin: null
 
   open_relex_config: null
   # open_relex_config:
-  #   anchor_mode: "fixed"        # "fixed", "rotary", "query_rnn", "query_transformer"
-  #   anchor_modeling: "linear"   # "linear", "rnn", "mlp"
-  #   num_fixed_slots: 10
-  #   max_count: 20
-  #   anchor_num_heads: 4
-  #   anchor_num_layers: 2
+  #   anchor_layer:
+  #     type: "fixed"
+  #     params: {num_slots: 10}
+  #   anchor_normalization: "none"
+  #   anchor_modeling: "linear"
+  #   anchor_refinement: "none"
   #   rel_token_index: -1
   #   embed_rel_token: true
   #   loss_coef: 1.0
@@ -72,17 +78,16 @@ model:
   #   represent_spans: false
   #   neg_spans_ratio: 1.0
   #   span_loss_coef: 1.0
-  #   anchor_refine_layers: 0
-  #   anchor_refine_heads: 8
 
   structuring_config: null
   # structuring_config:
-  #   anchor_mode: "rnn"          # "rnn", "query_rnn", "query_transformer", "fixed"
-  #   anchor_modeling: "linear"   # "linear", "rnn", "mlp"
-  #   anchor_num_heads: 4
-  #   anchor_num_layers: 2
+  #   anchor_layer:
+  #     type: "rotary"
+  #     params: {max_count: 20}
+  #   anchor_normalization: "none"
+  #   anchor_modeling: "linear"
+  #   anchor_refinement: "none"
   #   max_count: 20
-  #   num_fixed_slots: 10         # only used when anchor_mode="fixed"
   #   child_token_index: -1
   #   embed_child_token: true
   #   loss_coef: 1.0
@@ -92,8 +97,6 @@ model:
   #   represent_spans: false
   #   neg_spans_ratio: 1.0
   #   span_loss_coef: 1.0
-  #   anchor_refine_layers: 0
-  #   anchor_refine_heads: 8
   #   use_anchor_matching: true   # Hungarian-matched permutation-invariant BIO/span loss
 
   count_config: null

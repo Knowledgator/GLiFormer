@@ -11,8 +11,15 @@ model:
 
   vision_model_name: google/vit-base-patch16-384
   vision_encoder_type: auto
-  vision_in_channels: 3
-  vision_patch_size: 16
+  # Explicit final-grid stride for backbones that return flattened tokens.
+  vision_feature_stride: 16
+  # google/vit-base-patch16-384 returns one CLS token before its 24x24 grid.
+  # Keeping this explicit makes dense detection fail fast if the backbone
+  # contract changes.
+  vision_feature_prefix_tokens: 1
+  # Local patch encoders may set vision_position_embedding_type to any
+  # PositionEmbedding registry strategy. This AutoModel backbone owns its
+  # internal positional table, so no second encoder-level table is configured.
   image_size: 384
   vision_processor_type: custom
   vision_processor_name: null
@@ -35,59 +42,105 @@ model:
     focal_loss_prob_margin: null
 
   object_detection_config:
-    anchor_mode: "fixed"
-    anchor_modeling: "linear"
-    anchor_refine_layers: 4
-    anchor_refine_heads: 8
-    # After resolution-aware filtering, 30 slots retain about 97.7% of usable
-    # Web-COCO boxes and avoid diluting objectness with needless background
-    # queries.
-    num_fixed_slots: 30
-    max_count: 30
-    # Web-COCO originates from segmentation polygons. Ignore contour fragments
-    # smaller than one 16px ViT patch, collapse near-identical same-class boxes,
-    # and prevent source-file label ordering from monopolizing the query budget.
-    min_bbox_side_pixels: 16.0
-    bbox_dedup_iou_threshold: 0.95
-    object_selection_strategy: "class_balanced_largest"
-    anchor_num_heads: 4
-    anchor_num_layers: 2
-    # DAB/Conditional-DETR reference points. Each slot owns a learnable
-    # (cx, cy, w, h) reference that (a) supplies a sinusoidal positional query
-    # steering its cross-attention to its own image region and (b) biases its box
-    # regression as an offset. This is what stops the boxes collapsing to the
-    # dataset-mean box: without it the slots have no spatial conditioning and the
-    # loss-minimizing constant output is a single centered medium box.
-    # Supersedes slot_pos_emb_std and bbox_prior_grid when enabled.
-    reference_points: true
-    pos_emb_scale: 1.0          # magnitude of the sinusoidal position query (~norm sqrt(D))
-    default_box_size: 0.1       # initial box side; LVIS objects are small (median ~0.06)
-    slot_pos_emb_std: 1.0       # legacy fallback, ignored when reference_points: true
-    bbox_prior_grid: false      # ignored when reference_points: true
-    bbox_prior_margin: 0.1      # also seeds the reference-point grid layout
-    # When reference_points is on, patch tokens get the same sinusoidal 2D PE as
-    # the slot queries (not the learnable coord projection) so cross-attention is
-    # spatially peaked. The CLS token is still dropped so the grid is square.
-    dense_coord_features: true
-    drop_cls_token_for_dense: true
+    anchor_layer:
+      type: "fixed"
+      params:
+        num_slots: 128
+        # Queries remain image-conditioned by cross-attention; disabling the
+        # shared context offset preserves distinct slot identities.
+        context_gate_init: 0.0
+        context_gate_trainable: false
+    anchor_normalization: "center_rms"
+    # Detection uses independent sigmoid classes. Identity fusion avoids the
+    # class-independent quadratic offset introduced by linear anchor fusion.
+    anchor_modeling: "identity"
+    # Multi-label sigmoid scores require calibrated absolute logits. Scaling by
+    # sqrt(hidden_size) prevents the raw 768-D dot product from saturating.
+    scorer_type: "scaled-dot"
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 4
+        num_heads: 8
+        # Preserve each learned slot through residual paths. Post-norm
+        # refinement allowed a common response to erase slot identity.
+        norm_style: "pre_norm"
+        layer_scale_init: 0.1
+    # Query count is a compute/capacity choice only; target preprocessing does
+    # not filter, deduplicate, reorder, balance, or truncate objects. In the
+    # current Web-COCO training set p99.5 is 128 objects (maximum 379), so 128
+    # covers nearly every image without the cost of a 400-query decoder.
+    # The position strategies are registry-backed and independently configurable
+    # for dense image memory and detector queries.
+    anchor_memory_position:
+      type: "sine2d"
+      params:
+        scale: 1.0
+        temperature: 10000.0
+    anchor_query_position:
+      type: "sine_bbox2d"
+      params:
+        scale: 1.0
+        temperature: 10000.0
+    # The box head consumes the refined values, so keep explicit spatial
+    # coordinates in that stream as well as in the attention keys. Disabling
+    # this reproduces the keys-only ablation, where slots regress their static
+    # reference grid instead of image-dependent boxes.
+    anchor_memory_position_usage: "keys_and_values"
+    # Each slot owns a learnable (cx, cy, w, h) reference. Its center drives the
+    # query position and the complete reference biases box regression.
+    reference_box_mode: "learned"
+    # A regular grid became a direct prediction shortcut. Random references
+    # still cover the image but do not encode a fixed output grid.
+    reference_box_initialization: "random"
+    reference_box_initial_size: 0.1
+    reference_box_grid_margin: 0.1
+    # Each decoder layer predicts a per-image delta from the previous layer's
+    # reference. Intermediate layers have their own box heads and supervision.
+    iterative_box_refinement: true
+    bbox_refinement_detach: true
+    bbox_head_zero_init: true
+    auxiliary_detection_loss_coef: 1.0
+    # Enforce distinct query regions in attention. Learned positional
+    # projections alone can converge to a shared global-memory average.
+    anchor_cross_attention_bias:
+      type: "gaussian_distance"
+      params:
+        sigma: 0.2
+        weight: 1.0
+        units: "normalized"
+        query_dimensions: [0, 1]
+        key_dimensions: [0, 1]
+    multi_label: true
+    class_probability: "sigmoid"
     bbox_loss_coef: 5.0
+    bbox_l1_format: "cxcywh"
     iou_loss_coef: 2.0
     class_loss_coef: 1.0
     objectness_loss_coef: 1.0
-    # Do not up-weight positives here. Combined with focal alpha=0.75, the old
-    # value of 5 made an almost-constant foreground probability optimal.
+    # Foreground/background are normalized independently. Their relative weights
+    # therefore stay stable as query count and image density change.
     objectness_positive_weight: 1.0
+    objectness_negative_weight: 1.0
+    # Objectness sees many more negatives than matched-slot classification and
+    # must not inherit the classification-oriented global alpha=0.75. At 0.25,
+    # focal loss penalizes unused query slots instead of favoring a nearly
+    # constant foreground score.
+    objectness_focal_loss_alpha: 0.25
+    objectness_focal_loss_gamma: 2.0
+    objectness_focal_loss_prob_margin: 0.0
     matcher_class_cost: 1.0
     matcher_bbox_cost: 5.0
     # GIoU term in the Hungarian assignment cost (DETR-style class:1 / L1:5 / giou:2).
     # L1 alone under-separates small LVIS boxes, whose absolute coordinate
     # differences are tiny; GIoU disambiguates which slot owns each object.
     matcher_giou_cost: 2.0
-    # The query set is small enough that plain BCE provides a better-calibrated
-    # objectness signal than the previous doubly weighted focal objective.
-    focal_loss_alpha: -1.0
-    focal_loss_gamma: 0
-    focal_loss_prob_margin: 0
+    # Matched-slot classification inherits focal controls from training. Set
+    # both values <= 0 to use BCE for classification; objectness has the
+    # independent controls above and can be switched the same way.
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
     loss_coef: 1.0
 
   segmentation_config: null
@@ -103,12 +156,15 @@ model:
   audio_segmentation_config: null
 
 data:
-  # Preserve both earlier detector runs while retraining with cleaned targets.
-  root_dir: logs/vision_only_v3
+  # v6 learned a static-reference-grid shortcut. The iterative decoder changes
+  # the parameter hierarchy and must be trained from scratch in a clean run.
+  root_dir: logs/vision_only_v7
   train_data: "data/web_coco_train.json"
   val_data: "data/web_coco_val.json"
 
 training:
+  # Start a new GLiNExT detector/classifier run. The named DeBERTa and ViT
+  # backbones are still initialized from their pretrained weights.
   prev_path: null
   num_steps: 50000
   train_batch_size: 4
@@ -119,6 +175,8 @@ training:
   focal_loss_alpha: 0.75
   focal_loss_gamma: 2
   focal_loss_prob_margin: 0
+  # Required by the shared trainer; media heads apply their own explicit
+  # normalized reductions for class, box, GIoU, and objectness terms.
   loss_reduction: "sum"
   negatives: 1.0
   masking: "none"
@@ -128,7 +186,11 @@ training:
   weight_decay_other: 0.0
   max_grad_norm: 1.0
   save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
   train_head_only: false
   freeze_components: null
+  # Set false on hardware without native bfloat16 training support.
   bf16: true
   compile_model: false

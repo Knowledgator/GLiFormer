@@ -18,16 +18,52 @@ class StructuringProcessor(SpanProcessor):
         super().__init__(config, tokenizer, words_splitter,
                          parent_token=getattr(config, 'struct_parent_token', None), **kwargs)
         self.child_token = config.child_token
-        # Fixed-slot anchors always emit ``num_slots`` anchors; labels must be
-        # padded to that size so Hungarian sees unmatched slots and trains
-        # them as negatives.
-        struct_cfg = getattr(config, 'structuring_config', None)
-        anchor_mode = getattr(struct_cfg, 'anchor_mode', '') if struct_cfg else ''
-        self._fixed_slot_pad = (
-            getattr(struct_cfg, 'num_fixed_slots', 0)
-            if anchor_mode in ('fixed', 'fixed_rnn', 'fixed_transformer')
-            else 0
+        # Fixed-width anchors always emit ``num_slots`` anchors; labels must
+        # be padded to that size so Hungarian sees unmatched slots and trains
+        # them as negatives. This includes learned slots and parameter-free
+        # token selectors.
+        struct_configs = [
+            struct_cfg
+            for struct_cfg in (
+                getattr(config, 'structuring_config', None),
+                getattr(config, 'set_structuring_config', None),
+            )
+            if struct_cfg is not None
+        ]
+        set_structuring_config = getattr(
+            config,
+            'set_structuring_config',
+            None,
         )
+        # Entity spans are mandatory targets for the independent second
+        # stage, not an optional auxiliary representation.  Regular
+        # structuring still honors its ``represent_spans`` switch.
+        self._span_config = set_structuring_config or next(
+            (
+                struct_cfg
+                for struct_cfg in struct_configs
+                if getattr(struct_cfg, 'represent_spans', False)
+            ),
+            None,
+        )
+        self._fixed_slot_pad = max(
+            (
+                struct_cfg.effective_anchor_num_slots()
+                if struct_cfg.effective_anchor_mode()
+                in (
+                    'fixed',
+                    'fixed_rnn',
+                    'fixed_transformer',
+                    'position_buckets',
+                    'topk_norm',
+                    'topk_distinct',
+                    'topk_parent',
+                    'topk_density_distinct',
+                )
+                else 0
+            )
+            for struct_cfg in struct_configs
+        ) if struct_configs else 0
 
     @staticmethod
     def _instance_sort_key(instance):
@@ -66,11 +102,24 @@ class StructuringProcessor(SpanProcessor):
         structuring_mapping = []
         for item in batch_list:
             structuring_data = item.get('structuring', {})
+            structuring_schema = item.get('structuring_schema') or {}
             prompt = item.get('prompt')
             item_mappings = []
             for schema_name, instances in structuring_data.items():
                 field_names = []
                 seen = set()
+                # Inference stubs and explicitly supplied schemas carry the
+                # complete field list separately from their (empty) values.
+                # Prefer that list so invalid training annotations can be
+                # pruned without making inference depend on placeholder
+                # strings surviving span resolution.
+                schema_field_names = self._structure_fields(
+                    structuring_schema.get(schema_name, [])
+                )
+                for field_name in schema_field_names:
+                    if field_name not in seen:
+                        field_names.append(field_name)
+                        seen.add(field_name)
                 for instance in instances:
                     for field_name in instance:
                         if field_name not in seen:
@@ -122,7 +171,11 @@ class StructuringProcessor(SpanProcessor):
 
     @staticmethod
     def _structure_fields(fields):
-        return fields if isinstance(fields, list) else fields.get("fields", [])
+        if isinstance(fields, list):
+            return fields
+        if isinstance(fields, dict):
+            return fields.get("fields", [])
+        return []
 
     def contribute_inference_input(self, item, structures=None, **kwargs):
         if not structures:
@@ -142,7 +195,15 @@ class StructuringProcessor(SpanProcessor):
             return None
         return {"structuring": [{} for _ in range(num_texts)]}
 
-    def _normalize_field_value(self, text, tokens_with_spans, field_name, value, first_only=False):
+    def _normalize_field_value(
+        self,
+        text,
+        tokens_with_spans,
+        field_name,
+        value,
+        first_only=True,
+        used_spans=None,
+    ):
         value_text = value.get('text') if isinstance(value, dict) else value
         if value_text is None and isinstance(value, dict) and 'start' in value and 'end' in value:
             try:
@@ -151,14 +212,27 @@ class StructuringProcessor(SpanProcessor):
                 value_text = ''
 
         spans = self._resolve_labeled_span(
-            text, tokens_with_spans, value, label=field_name, first_only=first_only,
+            text,
+            tokens_with_spans,
+            value,
+            label=field_name,
+            # Resolve all candidates here so repeated scalar values can be
+            # assigned to successive records instead of copied onto every
+            # record containing that value.
+            first_only=False,
         )
+        if used_spans is not None:
+            spans = [
+                span for span in spans
+                if (span[0], span[1]) not in used_spans
+            ]
+        if first_only:
+            spans = spans[:1]
         if not spans:
-            return [{
-                'text': str(value_text),
-                'start': -1,
-                'end': -1,
-            }]
+            return []
+
+        if used_spans is not None:
+            used_spans.update((start, end) for start, end, _ in spans)
 
         return [
             {
@@ -181,21 +255,45 @@ class StructuringProcessor(SpanProcessor):
         if tokens_with_spans is None:
             return
 
-        for schema_name, instances in structuring.items():
+        for schema_name, instances in list(structuring.items()):
+            used_spans_by_field = {}
+            resolved_instances = []
             for instance in instances:
+                if not isinstance(instance, dict):
+                    continue
                 for field_name, value in list(instance.items()):
+                    used_spans = used_spans_by_field.setdefault(field_name, set())
                     if isinstance(value, list):
                         resolved_list = []
                         for v in value:
                             resolved_list.extend(self._normalize_field_value(
-                                text, tokens_with_spans, field_name, v,
+                                text,
+                                tokens_with_spans,
+                                field_name,
+                                v,
+                                used_spans=used_spans,
                             ))
-                        instance[field_name] = resolved_list
+                        if resolved_list:
+                            instance[field_name] = resolved_list
+                        else:
+                            # An annotated value that cannot be grounded must
+                            # not become an all-zero (false-negative) target.
+                            instance.pop(field_name, None)
                     else:
                         normalized = self._normalize_field_value(
-                            text, tokens_with_spans, field_name, value,
+                            text,
+                            tokens_with_spans,
+                            field_name,
+                            value,
+                            used_spans=used_spans,
                         )
-                        instance[field_name] = normalized[0] if len(normalized) == 1 else normalized
+                        if normalized:
+                            instance[field_name] = normalized[0]
+                        else:
+                            instance.pop(field_name, None)
+                if instance:
+                    resolved_instances.append(instance)
+            structuring[schema_name] = resolved_instances
         item['_glinext_structuring_spans_resolved'] = True
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
@@ -294,8 +392,8 @@ class StructuringProcessor(SpanProcessor):
             structuring_span_mask: (total_groups, max_spans)
             structuring_span_batch_idx: (total_groups,)
         """
-        struct_cfg = getattr(self.config, 'structuring_config', None)
-        if struct_cfg is None or not getattr(struct_cfg, 'represent_spans', False):
+        struct_cfg = self._span_config
+        if struct_cfg is None:
             return None
 
         for item in batch_list:
@@ -324,7 +422,12 @@ class StructuringProcessor(SpanProcessor):
             positive_spans = set()
 
             if schema_name in structuring_data:
-                instances = sorted(structuring_data[schema_name], key=self._instance_sort_key)
+                instances = [
+                    instance
+                    for instance in structuring_data[schema_name]
+                    if self._instance_has_valid_span(instance, max_seq_len)
+                ]
+                instances = sorted(instances, key=self._instance_sort_key)
                 max_instances = max(max_instances, len(instances))
 
                 for inst_idx, instance in enumerate(instances):

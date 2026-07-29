@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 from torch import nn
@@ -92,10 +94,26 @@ class PositionEmbedding(nn.Module):
     @classmethod
     def from_config(
         cls,
-        position_type: str,
+        position_type: str | Mapping[str, Any],
         hidden_size: int,
         **kwargs,
     ) -> PositionEmbedding:
+        if isinstance(position_type, Mapping):
+            raw = dict(position_type)
+            position_type = raw.pop("type", raw.pop("name", "none"))
+            configured_params = raw.pop("params", {})
+            if not isinstance(configured_params, Mapping):
+                raise TypeError("position embedding params must be a mapping")
+            params = dict(configured_params)
+            params.update(raw)
+            overlap = set(params) & set(kwargs)
+            if overlap:
+                raise ValueError(
+                    "position embedding parameters were supplied twice: "
+                    f"{sorted(overlap)}"
+                )
+            params.update(kwargs)
+            kwargs = params
         strategy = cls.strategy_class(position_type)
         cls.validate_kwargs(position_type, kwargs)
         return strategy(hidden_size=hidden_size, **kwargs)
@@ -119,6 +137,27 @@ class PositionEmbedding(nn.Module):
             _positive_temperature(kwargs["temperature"])
         if "init_std" in kwargs:
             _nonnegative_init_std(kwargs["init_std"])
+        for name in ("max_position", "min_frequency", "max_frequency"):
+            if name in kwargs:
+                value = _finite_float(name, kwargs[name])
+                if value <= 0.0:
+                    raise ValueError(
+                        f"position embedding {name} must be positive"
+                    )
+        if (
+            "min_frequency" in kwargs
+            and "max_frequency" in kwargs
+            and float(kwargs["max_frequency"]) < float(kwargs["min_frequency"])
+        ):
+            raise ValueError(
+                "position embedding max_frequency must be at least "
+                "min_frequency"
+            )
+        if (
+            "frequency_spacing" in kwargs
+            and str(kwargs["frequency_spacing"]).lower() not in {"linear", "log"}
+        ):
+            raise ValueError("frequency_spacing must be 'linear' or 'log'")
 
     @classmethod
     def strategy_class(cls, position_type: str) -> type[PositionEmbedding]:
@@ -468,6 +507,155 @@ class Sine1DPositionEmbedding(PositionEmbedding, position_type="sine1d"):
         return (self.scale * output).to(dtype=dtype or coordinates.dtype)
 
 
+class FixedSinusoidal1DPositionEmbedding(
+    PositionEmbedding,
+    position_type="fixed_sinusoidal",
+):
+    """Parameter-free Transformer sinusoidal features for normalized 1D positions.
+
+    ``coordinates`` remain normalized to ``[0, 1]`` so query slots and memory
+    tokens with different sequence lengths share one coordinate system.  The
+    configurable ``max_position`` maps that coordinate to the conventional
+    Transformer position scale before applying the temperature schedule.
+    """
+
+    requires_coordinates = True
+    coordinate_dimensions = 1
+    config_fields = frozenset({"scale", "temperature", "max_position"})
+
+    def __init__(
+        self,
+        hidden_size: int,
+        scale: float = 1.0,
+        temperature: float = 10_000.0,
+        max_position: float = 512.0,
+        **kwargs,
+    ):
+        super().__init__()
+        if hidden_size % 2 != 0:
+            raise ValueError(
+                "fixed sinusoidal positional embeddings require an even "
+                "hidden_size"
+            )
+        self.hidden_size = int(hidden_size)
+        self.scale = _finite_float("scale", scale)
+        self.temperature = _positive_temperature(temperature)
+        self.max_position = _finite_float("max_position", max_position)
+        if self.max_position <= 0.0:
+            raise ValueError(
+                "position embedding max_position must be positive"
+            )
+        pair_count = self.hidden_size // 2
+        dimensions = torch.arange(
+            pair_count,
+            dtype=torch.float32,
+        )
+        inverse_wavelengths = self.temperature ** (
+            -dimensions / pair_count
+        )
+        self.register_buffer(
+            "inverse_wavelengths",
+            inverse_wavelengths,
+            persistent=False,
+        )
+
+    def forward(self, coordinates=None, *, dtype=None, device=None, **kwargs):
+        if coordinates is None or coordinates.shape[-1] != 1:
+            raise ValueError(
+                "fixed sinusoidal positions require (..., 1) coordinates"
+            )
+        coordinates = coordinates.to(
+            device=device or coordinates.device,
+            dtype=torch.float32,
+        )
+        inverse_wavelengths = self.inverse_wavelengths.to(
+            device=coordinates.device,
+            dtype=torch.float32,
+        )
+        angles = coordinates * self.max_position * inverse_wavelengths
+        output = torch.stack((angles.sin(), angles.cos()), dim=-1).flatten(-2)
+        return (self.scale * output).to(dtype=dtype or coordinates.dtype)
+
+
+class Fourier1DPositionEmbedding(PositionEmbedding, position_type="fourier"):
+    """Fixed multi-frequency Fourier features for normalized 1D positions.
+
+    Frequencies are deterministic and stored as a non-persistent buffer, so
+    this strategy introduces no trainable parameters and no checkpoint state.
+    Log spacing supplies both document-scale and token-scale positional bands.
+    """
+
+    requires_coordinates = True
+    coordinate_dimensions = 1
+    config_fields = frozenset(
+        {"scale", "min_frequency", "max_frequency", "frequency_spacing"}
+    )
+
+    def __init__(
+        self,
+        hidden_size: int,
+        scale: float = 1.0,
+        min_frequency: float = 1.0,
+        max_frequency: float = 64.0,
+        frequency_spacing: str = "log",
+        **kwargs,
+    ):
+        super().__init__()
+        if hidden_size % 2 != 0:
+            raise ValueError(
+                "fourier positional embeddings require an even hidden_size"
+            )
+        self.hidden_size = int(hidden_size)
+        self.scale = _finite_float("scale", scale)
+        min_frequency = _finite_float("min_frequency", min_frequency)
+        max_frequency = _finite_float("max_frequency", max_frequency)
+        if min_frequency <= 0.0 or max_frequency <= 0.0:
+            raise ValueError(
+                "position embedding frequencies must be positive"
+            )
+        if max_frequency < min_frequency:
+            raise ValueError(
+                "position embedding max_frequency must be at least "
+                "min_frequency"
+            )
+        frequency_spacing = str(frequency_spacing).lower()
+        if frequency_spacing not in {"linear", "log"}:
+            raise ValueError(
+                "frequency_spacing must be 'linear' or 'log'"
+            )
+        pair_count = self.hidden_size // 2
+        if frequency_spacing == "linear":
+            frequencies = torch.linspace(
+                min_frequency,
+                max_frequency,
+                pair_count,
+                dtype=torch.float32,
+            )
+        else:
+            frequencies = torch.logspace(
+                math.log10(min_frequency),
+                math.log10(max_frequency),
+                pair_count,
+                dtype=torch.float32,
+            )
+        self.register_buffer("frequencies", frequencies, persistent=False)
+
+    def forward(self, coordinates=None, *, dtype=None, device=None, **kwargs):
+        if coordinates is None or coordinates.shape[-1] != 1:
+            raise ValueError("fourier positions require (..., 1) coordinates")
+        coordinates = coordinates.to(
+            device=device or coordinates.device,
+            dtype=torch.float32,
+        )
+        frequencies = self.frequencies.to(
+            device=coordinates.device,
+            dtype=torch.float32,
+        )
+        angles = coordinates * (2.0 * math.pi) * frequencies
+        output = torch.stack((angles.sin(), angles.cos()), dim=-1).flatten(-2)
+        return (self.scale * output).to(dtype=dtype or coordinates.dtype)
+
+
 class Linear1DPositionEmbedding(PositionEmbedding, position_type="linear1d"):
     """Learned linear projection of normalized temporal coordinates."""
 
@@ -519,6 +707,668 @@ class MLP1DPositionEmbedding(PositionEmbedding, position_type="mlp1d"):
         )
         return (self.scale * self.projection(coordinates)).to(
             dtype=dtype or parameter.dtype
+        )
+
+
+def masked_normalized_grid_1d(
+    mask: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Return padding-independent cell-centre coordinates for valid positions."""
+
+    if mask.dim() != 2:
+        raise ValueError(
+            f"1D coordinate mask must have shape (B, L), got {tuple(mask.shape)}"
+        )
+    valid = mask.bool()
+    counts = valid.sum(dim=1, keepdim=True).clamp_min(1)
+    ranks = valid.long().cumsum(dim=1).to(torch.float32) - 0.5
+    coordinates = (ranks / counts).unsqueeze(-1)
+    coordinates = torch.where(
+        valid.unsqueeze(-1),
+        coordinates,
+        torch.zeros_like(coordinates),
+    )
+    return coordinates.to(dtype=dtype)
+
+
+class RefinementPositionEncoding(nn.Module):
+    """Independent query/memory positional conditioning for anchor refinement.
+
+    The object owns the two position encoders but not modality geometry. Callers
+    may supply arbitrary normalized coordinates. For one-dimensional sequences,
+    padding-independent valid-rank coordinates are generated automatically when
+    coordinates are omitted; fixed query slots similarly use normalized index
+    centres by default.
+    """
+
+    _MEMORY_USAGES = frozenset({"none", "keys_only", "keys_and_values"})
+
+    @staticmethod
+    def _split_position_config(
+        config: str | Mapping[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        if config is None:
+            return "none", {}
+        if isinstance(config, str):
+            return config, {}
+        if not isinstance(config, Mapping):
+            raise TypeError("position component must be a string, mapping, or None")
+        raw = dict(config)
+        position_type = raw.pop("type", raw.pop("name", "none"))
+        configured_params = raw.pop("params", {})
+        if not isinstance(configured_params, Mapping):
+            raise TypeError("position embedding params must be a mapping")
+        params = dict(configured_params)
+        params.update(raw)
+        return str(position_type), params
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Mapping[str, Any] | None,
+        hidden_size: int,
+        *,
+        num_query_embeddings: int | None = None,
+    ) -> "RefinementPositionEncoding":
+        """Build query/memory position components from one strict object."""
+
+        raw = dict(config or {})
+        allowed = {"memory", "query", "memory_usage"}
+        unknown = set(raw) - allowed
+        if unknown:
+            raise ValueError(
+                "Unsupported refinement position options: "
+                f"{sorted(unknown)}. Available: {sorted(allowed)}"
+            )
+        memory_type, memory_kwargs = cls._split_position_config(
+            raw.get("memory")
+        )
+        query_type, query_kwargs = cls._split_position_config(raw.get("query"))
+        return cls(
+            hidden_size,
+            memory_type=memory_type,
+            query_type=query_type,
+            memory_kwargs=memory_kwargs,
+            query_kwargs=query_kwargs,
+            num_query_embeddings=num_query_embeddings,
+            memory_usage=raw.get("memory_usage", "keys_only"),
+        )
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        memory_type: str = "none",
+        query_type: str = "none",
+        memory_kwargs: dict | None = None,
+        query_kwargs: dict | None = None,
+        num_query_embeddings: int | None = None,
+        memory_usage: str = "keys_only",
+    ):
+        super().__init__()
+        memory_kwargs = dict(memory_kwargs or {})
+        query_kwargs = dict(query_kwargs or {})
+        memory_strategy = PositionEmbedding.strategy_class(memory_type)
+        query_strategy = PositionEmbedding.strategy_class(query_type)
+        if num_query_embeddings is not None:
+            for strategy, strategy_kwargs in (
+                (memory_strategy, memory_kwargs),
+                (query_strategy, query_kwargs),
+            ):
+                if issubclass(strategy, FixedSinusoidal1DPositionEmbedding):
+                    strategy_kwargs.setdefault(
+                        "max_position",
+                        float(num_query_embeddings),
+                    )
+        if memory_strategy.requires_num_embeddings:
+            raise ValueError(
+                "Refinement memory positions must support variable sequence lengths"
+            )
+        if query_strategy.requires_num_embeddings:
+            if num_query_embeddings is None:
+                raise ValueError(
+                    "Learned refinement query positions require "
+                    "num_query_embeddings"
+                )
+            query_kwargs.setdefault("num_embeddings", int(num_query_embeddings))
+        if query_strategy.requires_grid_size:
+            if num_query_embeddings is None:
+                raise ValueError(
+                    "Grid refinement query positions require "
+                    "num_query_embeddings"
+                )
+            query_kwargs.setdefault(
+                "grid_size",
+                covering_grid_2d(int(num_query_embeddings)),
+            )
+        memory_usage = str(memory_usage).lower().replace("-", "_")
+        if memory_usage not in self._MEMORY_USAGES:
+            raise ValueError(
+                "refinement position memory_usage must be 'none', "
+                "'keys_only', or 'keys_and_values'"
+            )
+        self.hidden_size = int(hidden_size)
+        self.memory_strategy = memory_strategy
+        self.query_strategy = query_strategy
+        self.memory_embedding = PositionEmbedding.from_config(
+            memory_type,
+            hidden_size,
+            **memory_kwargs,
+        )
+        self.query_embedding = PositionEmbedding.from_config(
+            query_type,
+            hidden_size,
+            **query_kwargs,
+        )
+        self.memory_usage = memory_usage
+
+    @property
+    def memory_position_in_values(self) -> bool:
+        return self.memory_usage == "keys_and_values"
+
+    @staticmethod
+    def _mask(
+        mask: torch.Tensor | None,
+        shape: tuple[int, int],
+        *,
+        device: torch.device,
+        name: str,
+    ) -> torch.Tensor:
+        if mask is None:
+            return torch.ones(shape, dtype=torch.bool, device=device)
+        if mask.shape != shape:
+            raise ValueError(
+                f"{name} mask must have shape {shape}, got {tuple(mask.shape)}"
+            )
+        return mask.to(device=device).bool()
+
+    @staticmethod
+    def _coordinate_batch(
+        coordinates: torch.Tensor,
+        *,
+        batch_size: int,
+        count: int,
+        dimensions: int | None,
+        device: torch.device,
+        name: str,
+    ) -> torch.Tensor:
+        if coordinates.dim() == 2:
+            coordinates = coordinates.unsqueeze(0)
+        if coordinates.dim() != 3:
+            raise ValueError(
+                f"{name} coordinates must have shape (N, C), (1, N, C), "
+                f"or (B, N, C), got {tuple(coordinates.shape)}"
+            )
+        if coordinates.shape[0] not in {1, batch_size} or coordinates.shape[1] != count:
+            raise ValueError(
+                f"{name} coordinates must have batch 1 or {batch_size} and "
+                f"length {count}, got {tuple(coordinates.shape)}"
+            )
+        if dimensions is not None and coordinates.shape[-1] != dimensions:
+            raise ValueError(
+                f"{name} coordinates require width {dimensions}, "
+                f"got {coordinates.shape[-1]}"
+            )
+        return coordinates.to(device=device, dtype=torch.float32)
+
+    def _default_memory_coordinates(
+        self,
+        mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.memory_strategy.requires_coordinates:
+            return None
+        if self.memory_strategy.coordinate_dimensions != 1:
+            raise ValueError(
+                "Explicit memory coordinates are required for non-1D "
+                "refinement position encoders"
+            )
+        return masked_normalized_grid_1d(mask)
+
+    def _default_query_coordinates(
+        self,
+        anchors: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.query_strategy.requires_coordinates:
+            return None
+        if self.query_strategy.coordinate_dimensions != 1:
+            raise ValueError(
+                "Explicit query coordinates are required for non-1D "
+                "refinement position encoders"
+            )
+        return normalized_grid_1d(
+            anchors.shape[1],
+            device=anchors.device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+
+    @staticmethod
+    def _normalize_output(
+        positions: torch.Tensor | None,
+        *,
+        batch_size: int,
+        count: int,
+        hidden_size: int,
+        mask: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor | None:
+        if positions is None:
+            return None
+        if positions.dim() == 2:
+            positions = positions.unsqueeze(0)
+        if positions.shape[0] == 1 and batch_size != 1:
+            positions = positions.expand(batch_size, -1, -1)
+        expected = (batch_size, count, hidden_size)
+        if positions.shape != expected:
+            raise ValueError(
+                f"{name} positions must have shape {expected}, "
+                f"got {tuple(positions.shape)}"
+            )
+        return positions * mask.unsqueeze(-1).to(dtype=positions.dtype)
+
+    def memory_positions(
+        self,
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor | None = None,
+        *,
+        coordinates: torch.Tensor | None = None,
+        spatial_shape: tuple[int, int] | None = None,
+    ) -> torch.Tensor | None:
+        batch_size, count, hidden_size = memory.shape
+        if hidden_size != self.hidden_size:
+            raise ValueError(
+                f"Memory hidden size must be {self.hidden_size}, got {hidden_size}"
+            )
+        if (
+            self.memory_usage == "none"
+            or isinstance(self.memory_embedding, NoPositionEmbedding)
+        ):
+            return None
+        valid = self._mask(
+            memory_mask,
+            (batch_size, count),
+            device=memory.device,
+            name="memory",
+        )
+        if coordinates is None:
+            coordinates = self._default_memory_coordinates(valid)
+        elif self.memory_strategy.requires_coordinates:
+            coordinates = self._coordinate_batch(
+                coordinates,
+                batch_size=batch_size,
+                count=count,
+                dimensions=self.memory_strategy.coordinate_dimensions,
+                device=memory.device,
+                name="memory",
+            )
+        positions = self.memory_embedding(
+            coordinates,
+            count=count,
+            spatial_shape=spatial_shape,
+            dtype=memory.dtype,
+            device=memory.device,
+        )
+        return self._normalize_output(
+            positions,
+            batch_size=batch_size,
+            count=count,
+            hidden_size=hidden_size,
+            mask=valid,
+            name="memory",
+        )
+
+    def query_positions(
+        self,
+        anchors: torch.Tensor,
+        query_mask: torch.Tensor | None = None,
+        *,
+        coordinates: torch.Tensor | None = None,
+        spatial_shape: tuple[int, int] | None = None,
+    ) -> torch.Tensor | None:
+        batch_size, count, hidden_size = anchors.shape
+        if hidden_size != self.hidden_size:
+            raise ValueError(
+                f"Anchor hidden size must be {self.hidden_size}, got {hidden_size}"
+            )
+        if isinstance(self.query_embedding, NoPositionEmbedding):
+            return None
+        valid = self._mask(
+            query_mask,
+            (batch_size, count),
+            device=anchors.device,
+            name="query",
+        )
+        if coordinates is None:
+            coordinates = self._default_query_coordinates(anchors)
+        elif self.query_strategy.requires_coordinates:
+            coordinates = self._coordinate_batch(
+                coordinates,
+                batch_size=batch_size,
+                count=count,
+                dimensions=self.query_strategy.coordinate_dimensions,
+                device=anchors.device,
+                name="query",
+            )
+        positions = self.query_embedding(
+            coordinates,
+            count=count,
+            spatial_shape=spatial_shape,
+            dtype=anchors.dtype,
+            device=anchors.device,
+        )
+        return self._normalize_output(
+            positions,
+            batch_size=batch_size,
+            count=count,
+            hidden_size=hidden_size,
+            mask=valid,
+            name="query",
+        )
+
+    def forward(
+        self,
+        anchors: torch.Tensor,
+        memory: torch.Tensor,
+        *,
+        query_mask: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        query_coordinates: torch.Tensor | None = None,
+        memory_coordinates: torch.Tensor | None = None,
+        query_spatial_shape: tuple[int, int] | None = None,
+        memory_spatial_shape: tuple[int, int] | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return (
+            self.query_positions(
+                anchors,
+                query_mask,
+                coordinates=query_coordinates,
+                spatial_shape=query_spatial_shape,
+            ),
+            self.memory_positions(
+                memory,
+                memory_mask,
+                coordinates=memory_coordinates,
+                spatial_shape=memory_spatial_shape,
+            ),
+        )
+
+    def position_bucket_attention_bias(
+        self,
+        anchors: torch.Tensor,
+        memory: torch.Tensor,
+        *,
+        memory_mask: torch.Tensor | None = None,
+        sigma: float = 0.5,
+        weight: float = 1.0,
+    ) -> torch.Tensor:
+        """Compatibility helper for the former text-only position object."""
+
+        from .attention_bias import GaussianDistanceAttentionBias
+
+        query_coordinates = normalized_grid_1d(
+            anchors.shape[1],
+            device=anchors.device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        valid = self._mask(
+            memory_mask,
+            memory.shape[:2],
+            device=memory.device,
+            name="memory",
+        )
+        return GaussianDistanceAttentionBias(
+            num_heads=1,
+            sigma=sigma,
+            weight=weight,
+            units="query_steps",
+        )(
+            query_coordinates=query_coordinates,
+            key_coordinates=masked_normalized_grid_1d(valid),
+            query_length=anchors.shape[1],
+            key_length=memory.shape[1],
+            dtype=anchors.dtype,
+            device=anchors.device,
+        )
+
+
+class AnchorRefinementPositionEmbeddings(nn.Module):
+    """Build configurable 1D query and memory positions for anchor decoding.
+
+    Memory coordinates are assigned by valid-token rank, which makes them
+    independent of right padding. Query coordinates use absolute slot centres;
+    for position-bucket anchors this is exactly the centre of each text bucket.
+    The returned tensors are supplied to every cross-attention decoder layer.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        memory_type: str = "none",
+        query_type: str = "none",
+        memory_kwargs: dict | None = None,
+        query_kwargs: dict | None = None,
+        num_query_embeddings: int | None = None,
+    ):
+        super().__init__()
+        memory_kwargs = dict(memory_kwargs or {})
+        query_kwargs = dict(query_kwargs or {})
+        memory_strategy = PositionEmbedding.strategy_class(memory_type)
+        query_strategy = PositionEmbedding.strategy_class(query_type)
+        for role, strategy in (
+            ("memory", memory_strategy),
+            ("query", query_strategy),
+        ):
+            if strategy.coordinate_dimensions not in {None, 1}:
+                raise ValueError(
+                    f"Anchor-refinement {role} positions must be one-dimensional"
+                )
+            if strategy.requires_grid_size:
+                raise ValueError(
+                    f"Anchor-refinement {role} positions cannot use a 2D grid"
+                )
+        if memory_strategy.requires_num_embeddings:
+            raise ValueError(
+                "Anchor-refinement memory positions must support variable "
+                "sequence lengths"
+            )
+        if query_strategy.requires_num_embeddings:
+            if num_query_embeddings is None:
+                raise ValueError(
+                    "Fixed-capacity query positions require "
+                    "num_query_embeddings"
+                )
+            query_kwargs.setdefault(
+                "num_embeddings",
+                int(num_query_embeddings),
+            )
+        self.hidden_size = int(hidden_size)
+        self.memory_requires_coordinates = memory_strategy.requires_coordinates
+        self.memory_embedding = PositionEmbedding.from_config(
+            memory_type,
+            hidden_size,
+            **memory_kwargs,
+        )
+        self.query_embedding = PositionEmbedding.from_config(
+            query_type,
+            hidden_size,
+            **query_kwargs,
+        )
+
+    @staticmethod
+    def _validate_mask(mask, expected_shape, name, device):
+        if mask is None:
+            return torch.ones(expected_shape, dtype=torch.bool, device=device)
+        if mask.shape != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {tuple(mask.shape)}"
+            )
+        return mask.to(device=device).bool()
+
+    def memory_positions(
+        self,
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """Encode valid token ranks in a normalized document coordinate system."""
+
+        batch_size, token_count, hidden_size = memory.shape
+        if hidden_size != self.hidden_size:
+            raise ValueError(
+                f"Memory hidden size must be {self.hidden_size}, got {hidden_size}"
+            )
+        if isinstance(self.memory_embedding, NoPositionEmbedding):
+            return None
+        if token_count == 0:
+            return memory.new_empty(memory.shape)
+        valid = self._validate_mask(
+            memory_mask,
+            (batch_size, token_count),
+            "memory_mask",
+            memory.device,
+        )
+        coordinates = None
+        if self.memory_requires_coordinates:
+            valid_counts = valid.sum(dim=1, keepdim=True).clamp_min(1)
+            valid_ranks = valid.long().cumsum(dim=1).to(torch.float32) - 0.5
+            coordinates = (valid_ranks / valid_counts).unsqueeze(-1)
+            coordinates = torch.where(
+                valid.unsqueeze(-1),
+                coordinates,
+                torch.zeros_like(coordinates),
+            )
+        positions = self.memory_embedding(
+            coordinates,
+            count=token_count,
+            dtype=memory.dtype,
+            device=memory.device,
+        )
+        if positions is None:
+            return None
+        if positions.dim() == 2:
+            positions = positions.unsqueeze(0)
+        if positions.shape[0] == 1 and batch_size != 1:
+            positions = positions.expand(batch_size, -1, -1)
+        if positions.shape != memory.shape:
+            raise ValueError(
+                "Anchor-refinement memory positions must have shape "
+                "(batch, tokens, hidden_size)"
+            )
+        return positions * valid.unsqueeze(-1).to(positions.dtype)
+
+    def query_positions(self, anchors: torch.Tensor) -> torch.Tensor | None:
+        """Encode normalized slot centres shared by every batch item."""
+
+        anchor_count, hidden_size = anchors.shape[1:]
+        if hidden_size != self.hidden_size:
+            raise ValueError(
+                f"Anchor hidden size must be {self.hidden_size}, got {hidden_size}"
+            )
+        if isinstance(self.query_embedding, NoPositionEmbedding):
+            return None
+        if anchor_count == 0:
+            return anchors.new_empty(1, 0, hidden_size)
+        coordinates = normalized_grid_1d(
+            anchor_count,
+            device=anchors.device,
+            dtype=torch.float32,
+        )
+        positions = self.query_embedding(
+            coordinates,
+            count=anchor_count,
+            dtype=anchors.dtype,
+            device=anchors.device,
+        )
+        if positions is None:
+            return None
+        if positions.dim() == 2:
+            positions = positions.unsqueeze(0)
+        if positions.shape[-2:] != (anchor_count, hidden_size) or positions.shape[0] not in {
+            1,
+            anchors.shape[0],
+        }:
+            raise ValueError(
+                "Anchor-refinement query positions must have shape "
+                "(1, anchors, hidden_size) or (batch, anchors, hidden_size)"
+            )
+        return positions
+
+    def position_bucket_attention_bias(
+        self,
+        anchors: torch.Tensor,
+        memory: torch.Tensor,
+        *,
+        memory_mask: torch.Tensor | None = None,
+        sigma: float = 0.5,
+        weight: float = 1.0,
+    ) -> torch.Tensor:
+        """Return a Gaussian locality prior for relative-position buckets.
+
+        Distances are measured in bucket widths rather than raw normalized
+        coordinates.  A sigma of 0.5 therefore has the same meaning for ten
+        or twenty slots. Padding is excluded by assigning memory coordinates
+        from valid-token rank; the attention layer applies the hard padding
+        mask after combining it with this finite additive bias.
+        """
+
+        sigma = float(sigma)
+        weight = float(weight)
+        if not math.isfinite(sigma) or sigma <= 0:
+            raise ValueError("position-bucket attention sigma must be positive")
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(
+                "position-bucket attention bias weight must be non-negative"
+            )
+        if anchors.dim() != 3 or memory.dim() != 3:
+            raise ValueError("anchors and memory must both be three-dimensional")
+        batch_size, anchor_count, _ = anchors.shape
+        if memory.shape[0] != batch_size:
+            raise ValueError("anchors and memory must have the same batch size")
+        token_count = memory.shape[1]
+        if anchor_count == 0 or token_count == 0:
+            return anchors.new_zeros(batch_size, anchor_count, token_count)
+
+        valid = self._validate_mask(
+            memory_mask,
+            (batch_size, token_count),
+            "memory_mask",
+            memory.device,
+        )
+        valid_counts = valid.sum(dim=1, keepdim=True).clamp_min(1)
+        memory_coordinates = (
+            valid.long().cumsum(dim=1).to(torch.float32) - 0.5
+        ) / valid_counts
+        memory_coordinates = torch.where(
+            valid,
+            memory_coordinates,
+            torch.zeros_like(memory_coordinates),
+        )
+        query_coordinates = normalized_grid_1d(
+            anchor_count,
+            device=anchors.device,
+            dtype=torch.float32,
+        ).squeeze(-1)
+
+        distances_in_buckets = (
+            memory_coordinates.unsqueeze(1)
+            - query_coordinates.view(1, anchor_count, 1)
+        ) * anchor_count
+        bias = -0.5 * weight * (distances_in_buckets / sigma).square()
+        # Extremely small user-provided sigmas should produce a hard locality
+        # prior, not overflow to -inf and make an attention row undefined.
+        return bias.clamp_min(-10_000.0).to(dtype=anchors.dtype)
+
+    def forward(
+        self,
+        anchors: torch.Tensor,
+        memory: torch.Tensor,
+        *,
+        memory_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return (
+            self.query_positions(anchors),
+            self.memory_positions(memory, memory_mask),
         )
 
 

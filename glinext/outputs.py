@@ -51,6 +51,16 @@ class GLiNExTTextOutput(GLiNExTBaseOutput):
     structuring_span_idx: Optional[torch.LongTensor] = None
     structuring_span_mask: Optional[torch.Tensor] = None
 
+    # Independent entity-first set structuring.  Entity BIO logits and the
+    # second-stage per-entity record/field logits are deliberately separate.
+    set_structuring_entity_logits: Optional[torch.FloatTensor] = None
+    set_structuring_logits: Optional[torch.FloatTensor] = None
+    set_structuring_batch_origin: Optional[torch.LongTensor] = None
+    set_structuring_anchor_mask: Optional[torch.Tensor] = None
+    set_structuring_objectness_logits: Optional[torch.FloatTensor] = None
+    set_structuring_span_idx: Optional[torch.LongTensor] = None
+    set_structuring_span_mask: Optional[torch.Tensor] = None
+
     embedding_logits: Optional[torch.FloatTensor] = None
 
     words_embedding: Optional[torch.FloatTensor] = None

@@ -1,15 +1,64 @@
 """Structuring task head."""
 
 import logging
+import warnings
 
 import torch
 from torch import nn
 
+from ...layers.mlp import create_mlp
 from .. import TaskHeadOutput
 from ..anchored_extraction import AnchoredSpanExtractionHead
-from ...layers.mlp import create_mlp
 
 logger = logging.getLogger(__name__)
+
+
+def validate_structuring_anchor_capacity(
+    labels,
+    label_count,
+    anchor_count,
+    *,
+    anchor_dim,
+    task_name="Structuring",
+):
+    """Warn when supervision cannot fit in the predicted record slots.
+
+    The historical losses sliced predictions and labels to their shared anchor
+    width. Keep that behavior for oversized samples, but make the loss of gold
+    records explicit. Counts produced by the processor are authoritative; the
+    positive tail check also protects direct/manual loss calls that omit them.
+    """
+
+    max_gold = None
+    if label_count is not None and label_count.numel() > 0:
+        observed = int(label_count.detach().max().item())
+        if observed > anchor_count:
+            max_gold = observed
+
+    if (
+        max_gold is None
+        and labels is not None
+        and labels.shape[anchor_dim] > anchor_count
+    ):
+        tail = labels.narrow(
+            anchor_dim,
+            anchor_count,
+            labels.shape[anchor_dim] - anchor_count,
+        )
+        if torch.count_nonzero(tail).item() > 0:
+            max_gold = labels.shape[anchor_dim]
+
+    if max_gold is not None:
+        excess = max_gold - anchor_count
+        warnings.warn(
+            f"{task_name} supervision contains {max_gold} visible records, "
+            f"but the head produced only {anchor_count} record anchors. "
+            f"The {excess} excess record(s) will not contribute to this batch's "
+            "loss. Increase anchor_layer.params.num_slots/max_count to train on "
+            "all records.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 class StructuringHead(AnchoredSpanExtractionHead):
@@ -28,8 +77,8 @@ class StructuringHead(AnchoredSpanExtractionHead):
     dependencies = []
 
     def __init__(self, config, hidden_size, dropout, shared_layers=None):
-        super().__init__(config.structuring_config, config, hidden_size, dropout, shared_layers)
         struct_cfg = config.structuring_config
+        super().__init__(struct_cfg, config, hidden_size, dropout, shared_layers)
         self.child_token_index = struct_cfg.child_token_index
         self.embed_child_token = struct_cfg.embed_child_token
         self.max_count = struct_cfg.max_count
@@ -44,6 +93,9 @@ class StructuringHead(AnchoredSpanExtractionHead):
         self.bio_loss_reduction = getattr(struct_cfg, "bio_loss_reduction", "sum")
         self.negatives = getattr(struct_cfg, "negatives", 1.0)
         self.masking_mode = getattr(struct_cfg, "masking", "none")
+        self.position_bucket_matcher_cost = float(
+            getattr(struct_cfg, "position_bucket_matcher_cost", 0.0)
+        )
 
         # Diagnostic logging
         self.log_loss_stats = getattr(struct_cfg, "log_loss_stats", False)
@@ -71,10 +123,55 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
-        if config.structuring_config is None:
+        struct_cfg = config.structuring_config
+        if struct_cfg is None:
+            return None
+        if getattr(struct_cfg, "head_type", "structuring") != cls.name:
             return None
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
                    shared_layers=shared_layers)
+
+    def _compute_structuring_scores(self, flat_inputs, batch):
+        """Return the public BIO scores plus implementation-specific values."""
+
+        return self._compute_bio_scores(flat_inputs, batch), {}
+
+    def _span_proposal_tensors(
+        self,
+        scores,
+        structuring_labels,
+        prediction_extra,
+        anchor_count,
+    ):
+        """Return the BIO tensors used to propose direct span candidates.
+
+        The regular head proposes spans from its anchor-conditioned scores.
+        Alternative implementations can expose an earlier extraction stage
+        without changing the public structuring forward contract.
+        """
+
+        return scores, None, anchor_count
+
+    def _compute_structuring_span_logits(
+        self,
+        feature_embeddings,
+        span_idx,
+        anchors,
+        fused_flat,
+        dims,
+        prediction_extra,
+    ):
+        """Score supplied spans through the regular fused-anchor path."""
+
+        batch_size, anchor_count, class_count, _ = dims
+        return self._span_logits_from_fused(
+            feature_embeddings,
+            fused_flat,
+            batch_size,
+            anchor_count,
+            class_count,
+            span_idx,
+        )
 
     def _anchor_kwargs(self, batch):
         """Pass structuring/count-head-predicted anchor counts when available.
@@ -118,36 +215,60 @@ class StructuringHead(AnchoredSpanExtractionHead):
                 dtype=torch.long,
             )
 
-        scores, anchors, anchor_mask, fused_flat, (B, A, C, L) = self._compute_bio_scores(
-            flat_inputs, batch,
-        )
+        (
+            (scores, anchors, anchor_mask, fused_flat, (B, A, C, L)),
+            prediction_extra,
+        ) = self._compute_structuring_scores(flat_inputs, batch)
+        label_count = batch.get("structuring_count")
+        if label_count is None:
+            label_count = batch.get("count_val")
 
         # Anchor-objectness logits (one sigmoid score per anchor slot).
         objectness_logits = None
         if self.use_anchor_objectness:
             objectness_logits = self.objectness_head(anchors).squeeze(-1)  # (BN, A)
 
-        # Optional span-level rescoring — auxiliary training signal only.
+        # Optional span-level rescoring. It remains training-only for the
+        # regular head; implementations whose primary semantic unit is an
+        # extracted entity span may opt into inference via ``span_inference``.
         span_logits_out = None
         if (
             self.represent_spans and hasattr(self, "span_rep_layer")
-            and structuring_labels is not None
+            and (
+                structuring_labels is not None
+                or getattr(self, "span_inference", False)
+            )
         ):
+            proposal_scores, proposal_labels, proposal_anchor_count = (
+                self._span_proposal_tensors(
+                    scores,
+                    structuring_labels,
+                    prediction_extra,
+                    A,
+                )
+            )
             span_idx, span_mask = self._maybe_extract_spans(
-                scores, A=A, span_idx=span_idx, span_mask=span_mask, threshold=threshold,
+                proposal_scores,
+                A=proposal_anchor_count,
+                span_idx=span_idx,
+                span_mask=span_mask,
+                threshold=threshold,
+                labels=proposal_labels,
             )
             if span_idx is not None:
-                span_logits_out = self._span_logits_from_fused(
-                    flat_inputs.words_embedding, fused_flat, B, A, C, span_idx,
+                span_logits_out = self._compute_structuring_span_logits(
+                    flat_inputs.words_embedding,
+                    span_idx,
+                    anchors,
+                    fused_flat,
+                    (B, A, C, L),
+                    prediction_extra,
                 )
 
         loss = None
         loss_stats = None
         if structuring_labels is not None and base_loss_fn is not None:
             if self.use_anchor_matching:
-                label_count = batch.get("structuring_count")
-                if label_count is None:
-                    label_count = batch.get("count_val")
                 loss, anchor_matches, supervised_anchor_mask, loss_stats = self._anchor_matched_bio_loss(
                     scores=scores, labels=structuring_labels,
                     anchor_mask=anchor_mask,
@@ -181,6 +302,7 @@ class StructuringHead(AnchoredSpanExtractionHead):
                     word_mask=flat_inputs.mask,
                     child_mask=flat_inputs.child_mask,
                     base_loss_fn=base_loss_fn,
+                    label_count=label_count,
                 )
                 if span_labels is not None and span_logits_out is not None:
                     span_loss = self._span_loss(
@@ -192,9 +314,6 @@ class StructuringHead(AnchoredSpanExtractionHead):
                 if objectness_logits is not None:
                     # Without matching, supervise objectness against the
                     # heuristic gold-anchor mask (slots < label_count).
-                    label_count = batch.get("structuring_count")
-                    if label_count is None:
-                        label_count = batch.get("count_val")
                     if label_count is not None:
                         gold_mask = self._label_anchor_mask(
                             structuring_labels, label_count,
@@ -212,18 +331,21 @@ class StructuringHead(AnchoredSpanExtractionHead):
             if loss_stats is not None and self.log_loss_stats and self.training:
                 self._maybe_log_stats(loss_stats)
 
+        output_extra = {
+            "groups_output": anchors,
+            "anchor_mask": anchor_mask,
+            "objectness_logits": objectness_logits,
+            "span_logits": span_logits_out,
+            "span_idx": span_idx,
+            "span_mask": span_mask,
+            "loss_stats": loss_stats,
+        }
+        output_extra.update(prediction_extra)
+
         return TaskHeadOutput(
             loss=loss,
             logits=scores,
-            extra={
-                "groups_output": anchors,
-                "anchor_mask": anchor_mask,
-                "objectness_logits": objectness_logits,
-                "span_logits": span_logits_out,
-                "span_idx": span_idx,
-                "span_mask": span_mask,
-                "loss_stats": loss_stats,
-            },
+            extra=output_extra,
         )
 
     # ── Loss reduction & negative masking ────────────────────────────
@@ -232,11 +354,13 @@ class StructuringHead(AnchoredSpanExtractionHead):
         """GLiNER-style negative sampling mask, adapted to BIO/span shapes.
 
         Positives (``labels > 0``) are always kept (mask=1). Negatives are
-        kept independently with probability ``self.negatives`` according to
+        sampled or weighted by ``self.negatives`` according to
         ``self.masking_mode``:
 
         - ``"none"``    → mask is 1 everywhere (no sampling).
         - ``"global"``  → element-wise Bernoulli over labels==0.
+        - ``"global_weighted"`` → retain every negative with weight
+                          ``self.negatives`` instead of stochastic sampling.
         - ``"label"``   → drop negatives only at (anchor, field) cells whose
                           labels sum to 0 across the (sequence, BIO) dims.
         - ``"span"``    → drop negatives only at (anchor, token) positions
@@ -252,6 +376,13 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
         keep = float(self.negatives)
         labels_pos = labels > 0  # treat any non-zero as positive
+        if self.masking_mode == "global_weighted":
+            return torch.where(
+                labels_pos,
+                torch.ones_like(labels),
+                torch.full_like(labels, keep),
+            )
+
         rand = torch.rand_like(labels)
         sampled = (rand < keep).to(labels.dtype)
 
@@ -302,14 +433,22 @@ class StructuringHead(AnchoredSpanExtractionHead):
     def _reduce(self, weighted_losses, full_mask):
         """Apply configured reduction over masked element-wise losses.
 
-        ``weighted_losses`` is the focal loss already multiplied by any
-        per-element weights (negative-sampling, etc.). ``full_mask`` is the
-        structural mask (anchor / token / field validity).
+        ``weighted_losses`` is the element-wise focal loss. ``full_mask``
+        combines structural validity with any negative sampling/weighting, so
+        the mean denominator represents the same effective cells as the sum.
         """
         if self.bio_loss_reduction == "mean":
             denom = full_mask.sum().clamp(min=1.0)
             return (weighted_losses * full_mask).sum() / denom
         return (weighted_losses * full_mask).sum()
+
+    @staticmethod
+    def _apply_negative_mask(full_mask, negative_mask):
+        """Fold sampling into the loss mask, including the mean denominator."""
+
+        if negative_mask is None:
+            return full_mask
+        return full_mask * negative_mask.to(dtype=full_mask.dtype)
 
     # ── Anchor-matched losses ────────────────────────────────────────
 
@@ -332,6 +471,12 @@ class StructuringHead(AnchoredSpanExtractionHead):
         claims a prediction for a gold instance if doing so beats the
         per-prediction "train as negative" cost.
         """
+        validate_structuring_anchor_capacity(
+            labels,
+            label_count,
+            scores.shape[1],
+            anchor_dim=1,
+        )
         min_A = min(scores.shape[1], labels.shape[1])
         min_L = min(scores.shape[2], labels.shape[2])
         min_C = min(scores.shape[3], labels.shape[3])
@@ -360,18 +505,17 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
         losses = base_loss_fn(pred, target)
         neg_mask = self._build_negative_mask(target)
-        if neg_mask is not None:
-            losses = losses * neg_mask
         full_mask = (
             pred_anchor_mask.float()[:, :, None, None, None]
             * word_mask_f[:, None, :, None, None]
             * child_mask_f[:, None, None, :, None]
         )
+        loss_mask = self._apply_negative_mask(full_mask, neg_mask)
         loss_stats = self._compute_loss_stats(
-            losses=losses, target=target, full_mask=full_mask,
+            losses=losses, target=target, full_mask=loss_mask,
             pred_anchor_mask=pred_anchor_mask, matches=matches,
         )
-        return self._reduce(losses, full_mask), matches, pred_anchor_mask, loss_stats
+        return self._reduce(losses, loss_mask), matches, pred_anchor_mask, loss_stats
 
     def _anchor_matched_span_loss(
         self,
@@ -404,20 +548,25 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
         losses = base_loss_fn(pred, target)
         neg_mask = self._build_negative_mask(target)
-        if neg_mask is not None:
-            losses = losses * neg_mask
         full_mask = (
             supervised_anchor_mask[:, :min_A].float()[:, :, None, None]
             * span_mask[:, :min_S].float()[:, None, :, None]
             * child_mask[:, :min_C].float()[:, None, None, :]
         )
-        return self._reduce(losses, full_mask)
+        loss_mask = self._apply_negative_mask(full_mask, neg_mask)
+        return self._reduce(losses, loss_mask)
 
     # ── Positional (non-matched) losses with stats ───────────────────
 
     def _bio_loss_with_stats(self, scores, labels, anchor_mask, word_mask,
-                             child_mask, base_loss_fn):
+                             child_mask, base_loss_fn, label_count=None):
         """Positional BIO loss + diagnostic stats (no Hungarian matching)."""
+        validate_structuring_anchor_capacity(
+            labels,
+            label_count,
+            scores.shape[1],
+            anchor_dim=1,
+        )
         min_A = min(scores.shape[1], labels.shape[1])
         min_L = min(scores.shape[2], labels.shape[2])
         min_C = min(scores.shape[3], labels.shape[3])
@@ -427,18 +576,17 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
         losses = base_loss_fn(pred, lbl)
         neg_mask = self._build_negative_mask(lbl)
-        if neg_mask is not None:
-            losses = losses * neg_mask
         full_mask = (
             anchor_mask[:, :min_A].float()[:, :, None, None, None]
             * word_mask[:, :min_L].float()[:, None, :, None, None]
             * child_mask[:, :min_C].float()[:, None, None, :, None]
         )
+        loss_mask = self._apply_negative_mask(full_mask, neg_mask)
         loss_stats = self._compute_loss_stats(
-            losses=losses, target=lbl, full_mask=full_mask,
+            losses=losses, target=lbl, full_mask=loss_mask,
             pred_anchor_mask=anchor_mask[:, :min_A].bool(), matches=None,
         )
-        return self._reduce(losses, full_mask), loss_stats
+        return self._reduce(losses, loss_mask), loss_stats
 
     # ── Anchor objectness ────────────────────────────────────────────
 
@@ -591,13 +739,52 @@ class StructuringHead(AnchoredSpanExtractionHead):
                 pair_cost = (pair_losses * mask_b[None, None]).sum(dim=(-3, -2, -1))
                 # pair_cost: (n_pred, n_label)
 
+                # Express BIO matching cost per valid (token, field) cell so
+                # a normalized spatial cost has stable meaning across document
+                # lengths and schema widths. This common scalar does not alter
+                # historical assignments when the spatial coefficient is zero.
+                cost_normalizer = mask_b.sum().clamp(min=1.0)
+                pair_cost = pair_cost / cost_normalizer
+
                 if n_pred > n_label:
                     # Subtract per-prediction "train as negative" cost so the
                     # matcher only assigns a gold instance to predictions that
                     # gain from it. Constant per row, so safe to subtract.
                     zero_losses = base_loss_fn(pred_b, torch.zeros_like(pred_b))
                     zero_cost = (zero_losses * mask_b.unsqueeze(0)).sum(dim=(-3, -2, -1))
+                    zero_cost = zero_cost / cost_normalizer
                     pair_cost = pair_cost - zero_cost[:, None]
+
+                if self.position_bucket_matcher_cost > 0:
+                    valid_tokens = word_mask_f[b].bool()
+                    valid_count = valid_tokens.sum().clamp_min(1)
+                    token_coordinates = (
+                        valid_tokens.long().cumsum(dim=0).float() - 0.5
+                    ) / valid_count
+                    token_coordinates = torch.where(
+                        valid_tokens,
+                        token_coordinates,
+                        torch.zeros_like(token_coordinates),
+                    )
+                    gold_token_mask = lbl_b.gt(0).any(dim=(-1, -2))
+                    gold_token_mask = gold_token_mask & valid_tokens.unsqueeze(0)
+                    gold_token_count = gold_token_mask.sum(dim=1)
+                    gold_centers = (
+                        gold_token_mask.to(token_coordinates.dtype)
+                        * token_coordinates.unsqueeze(0)
+                    ).sum(dim=1) / gold_token_count.clamp_min(1)
+                    prediction_centers = (
+                        pred_idx.to(dtype=token_coordinates.dtype) + 0.5
+                    ) / pred.shape[1]
+                    position_cost = (
+                        prediction_centers[:, None] - gold_centers[None]
+                    ).abs()
+                    position_cost = position_cost * (
+                        gold_token_count > 0
+                    ).to(position_cost.dtype).unsqueeze(0)
+                    pair_cost = pair_cost + (
+                        self.position_bucket_matcher_cost * position_cost
+                    )
 
                 # Hungarian implementation requires rows <= cols.
                 if n_pred <= n_label:

@@ -14,12 +14,13 @@ model:
   ner_config: null
 
   open_relex_config:
-    anchor_mode: "fixed"
+    anchor_layer:
+      type: "fixed"
+      params:
+        num_slots: 10
+    anchor_normalization: "none"
     anchor_modeling: "linear"
-    num_fixed_slots: 10
-    max_count: 20
-    anchor_num_heads: 4
-    anchor_num_layers: 2
+    anchor_refinement: "none"
     loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null

@@ -64,7 +64,7 @@ class BaseGLiNExT(BaseGLiNER):
 
     Example::
 
-        model = GLiNExT.from_pretrained("urchade/glinext-base")
+        model = GLiNExT.from_pretrained("knowledgator/glinext-base")
 
         # Single-task
         entities = model.predict_entities("Apple is a company", ["company", "person"])
@@ -224,7 +224,10 @@ class BaseGLiNExT(BaseGLiNER):
                 or self.config.open_relex_config is not None):
             tokens.append(self.config.rel_token)
 
-        if self.config.structuring_config is not None:
+        if (
+            self.config.structuring_config is not None
+            or self.config.set_structuring_config is not None
+        ):
             tokens.append(self.config.child_token)
 
         if (self.config.image_classification_config is not None
@@ -259,6 +262,10 @@ class BaseGLiNExT(BaseGLiNER):
             self.config.open_relex_config.parent_token_index = _idx(self.config.open_rel_parent_token)
         if self.config.structuring_config is not None:
             self.config.structuring_config.parent_token_index = _idx(self.config.struct_parent_token)
+        if self.config.set_structuring_config is not None:
+            self.config.set_structuring_config.parent_token_index = _idx(
+                self.config.struct_parent_token
+            )
         for cfg_name in (
             "image_classification_config", "object_detection_config", "segmentation_config",
             "audio_classification_config", "audio_segmentation_config",
@@ -283,9 +290,15 @@ class BaseGLiNExT(BaseGLiNER):
             if self.config.open_relex_config is not None:
                 self.config.open_relex_config.rel_token_index = rel_idx
 
-        if self.config.structuring_config is not None:
+        if (
+            self.config.structuring_config is not None
+            or self.config.set_structuring_config is not None
+        ):
             child_idx = _idx(self.config.child_token)
-            self.config.structuring_config.child_token_index = child_idx
+            if self.config.structuring_config is not None:
+                self.config.structuring_config.child_token_index = child_idx
+            if self.config.set_structuring_config is not None:
+                self.config.set_structuring_config.child_token_index = child_idx
             self.config.child_token_index = child_idx
 
         if (self.config.image_classification_config is not None
@@ -491,7 +504,7 @@ class BaseGLiNExT(BaseGLiNER):
             configured = [
                 name for name in (
                     "ner", "classification", "joint_relex", "open_relex",
-                    "structuring", "image_classification", "object_detection",
+                    "structuring", "set_structuring", "image_classification", "object_detection",
                     "segmentation", "audio_classification", "audio_segmentation",
                     "count", "embedding",
                 )
@@ -519,7 +532,11 @@ class BaseGLiNExT(BaseGLiNER):
         if joint_relations is not None:
             self._require_task_heads("joint_relex")
         if structures is not None:
-            self._require_task_heads("structuring")
+            if (
+                self.config.structuring_config is None
+                and self.config.set_structuring_config is None
+            ):
+                self._require_task_heads("structuring")
 
     @torch.no_grad()
     def inference(
@@ -1081,7 +1098,13 @@ class BaseGLiNExT(BaseGLiNER):
             text_batch, structures=structures, threshold=threshold,
             flat_ner=flat_ner, **kwargs,
         )
-        return self._single_or_batch(results.get("structuring", [{} for _ in text_batch]), single)
+        task_results = results.get("structuring")
+        if task_results is None:
+            task_results = results.get(
+                "set_structuring",
+                [{} for _ in text_batch],
+            )
+        return self._single_or_batch(task_results, single)
 
     def classify_images(
         self,
@@ -1365,6 +1388,10 @@ class BaseGLiNExT(BaseGLiNER):
         formatter = schema.build_output_formatter()
         if formatter is not None and "structuring" in results:
             results["structuring"] = formatter.format_batch(results["structuring"])
+        if formatter is not None and "set_structuring" in results:
+            results["set_structuring"] = formatter.format_batch(
+                results["set_structuring"]
+            )
 
         return results
 

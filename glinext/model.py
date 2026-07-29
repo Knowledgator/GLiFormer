@@ -1,6 +1,6 @@
 """GLiNExT: unified multi-task model — thin orchestrator over modular task heads."""
 
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -52,6 +52,28 @@ _SET_PREDICTION_COUNT_KEYS = {
     "segmentation": "segmentation_count",
     "audio_segmentation": "audio_segmentation_count",
 }
+
+
+@dataclass(frozen=True)
+class _FlatGroupLayout:
+    """Indexes one task's groups in flattened BN order."""
+
+    batch_origin: torch.Tensor
+    group_index: torch.Tensor
+    starts: torch.Tensor
+    sizes: torch.Tensor
+
+    @property
+    def count(self) -> int:
+        return int(self.batch_origin.numel())
+
+
+@dataclass(frozen=True)
+class _FlatEmbeddingBatch:
+    """Padded embeddings and validity mask aligned to a flat group layout."""
+
+    embeddings: torch.Tensor
+    mask: torch.Tensor
 
 
 def _has_labels_encoder(module: nn.Module) -> bool:
@@ -130,19 +152,35 @@ class BaseGLiNextModel(BaseModel):
             )
             shared_layers["anchor_modeling"] = self.shared_anchor_modeling
 
-        if config.shared_anchor_refine_layers > 0:
-            self.shared_anchor_refine = AnchorCrossAttentionLayer(
+        shared_refinement_spec = getattr(
+            config,
+            "shared_anchor_refinement",
+            None,
+        )
+        if shared_refinement_spec is None and config.shared_anchor_refine_layers > 0:
+            shared_refinement_spec = {
+                "type": "cross_attention",
+                "params": {
+                    "num_heads": config.shared_anchor_refine_heads,
+                    "num_layers": config.shared_anchor_refine_layers,
+                    "dropout": config.dropout,
+                },
+            }
+        if shared_refinement_spec is not None:
+            shared_refinement = AnchorCrossAttentionLayer.from_config(
+                shared_refinement_spec,
                 config.hidden_size,
-                num_heads=config.shared_anchor_refine_heads,
-                num_layers=config.shared_anchor_refine_layers,
                 dropout=config.dropout,
             )
-            shared_layers["anchor_refine"] = self.shared_anchor_refine
+            if shared_refinement is not None:
+                self.shared_anchor_refine = shared_refinement
+                shared_layers["anchor_refine"] = self.shared_anchor_refine
 
         self.heads = nn.ModuleDict()
         enabled_task_names = getattr(self, "enabled_task_names", None)
         enabled_task_names = set(enabled_task_names) if enabled_task_names is not None else None
-        for HeadClass in TASK_REGISTRY.head_classes():
+        for task_definition in TASK_REGISTRY:
+            HeadClass = task_definition.load_head_class()
             head_kwargs = {
                 "from_pretrained": from_pretrained,
                 "cache_dir": cache_dir,
@@ -156,9 +194,10 @@ class BaseGLiNextModel(BaseModel):
                 )
             head = HeadClass.from_config(config, **head_kwargs)
             if head is not None:
-                if enabled_task_names is not None and head.name not in enabled_task_names:
+                canonical_name = task_definition.name
+                if enabled_task_names is not None and canonical_name not in enabled_task_names:
                     continue
-                self.heads[head.name] = head
+                self.heads[canonical_name] = head
 
     def _init_token_rep_layer(self, config, from_pretrained, cache_dir):
         if config.labels_encoder is not None:
@@ -206,38 +245,23 @@ class BaseGLiNextModel(BaseModel):
 
         return predicted[-struct_bn:]
 
-    @staticmethod
-    def _runtime_loss_value(runtime_kwargs: dict, focal_name: str, short_name: str):
-        if focal_name in runtime_kwargs and runtime_kwargs[focal_name] is not None:
-            return runtime_kwargs[focal_name]
-        if short_name in runtime_kwargs and runtime_kwargs[short_name] is not None:
-            return runtime_kwargs[short_name]
-        return None
-
-    def _resolve_task_focal_loss_kwargs(self, task_name: str, runtime_kwargs: dict) -> dict:
-        task_cfg = self.config.get_task_config(task_name)
-        resolved = {}
-        for cfg_name, loss_name in (
-            ("focal_loss_alpha", "alpha"),
-            ("focal_loss_gamma", "gamma"),
-            ("focal_loss_prob_margin", "prob_margin"),
-        ):
-            value = getattr(task_cfg, cfg_name, None) if task_cfg is not None else None
-            if value is None:
-                value = self._runtime_loss_value(runtime_kwargs, cfg_name, loss_name)
-            if value is not None:
-                resolved[loss_name] = value
-        return resolved
-
     def _make_task_loss_fn(self, task_name: str, runtime_kwargs: dict):
-        loss_defaults = self._resolve_task_focal_loss_kwargs(
-            task_name,
-            runtime_kwargs,
-        )
+        task_cfg = self.config.get_task_config(task_name)
+        loss_defaults = {}
+        for name in (
+            "focal_loss_alpha",
+            "focal_loss_gamma",
+            "focal_loss_prob_margin",
+        ):
+            value = getattr(task_cfg, name, None) if task_cfg is not None else None
+            if value is None:
+                value = runtime_kwargs.get(name)
+            if value is not None:
+                loss_defaults[name] = value
         # Focal is the project-wide binary-loss default.  BCE is an explicit
         # opt-out made by setting both alpha and gamma to non-positive values.
-        loss_defaults.setdefault("alpha", 0.25)
-        loss_defaults.setdefault("gamma", 2.0)
+        loss_defaults.setdefault("focal_loss_alpha", 0.25)
+        loss_defaults.setdefault("focal_loss_gamma", 2.0)
         for name in ("label_smoothing", "negatives", "masking"):
             value = runtime_kwargs.get(name)
             if value is not None:
@@ -318,9 +342,74 @@ class BaseGLiNextModel(BaseModel):
             )
         return count.index_select(0, batch_origin)
 
+    def _encode_label_inputs_batched(
+        self,
+        label_inputs: Dict[
+            str,
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor]],
+        ],
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Encode named label-token batches in one padded encoder pass."""
+
+        encoded = {name: None for name in label_inputs}
+        if not _has_labels_encoder(self.token_rep_layer):
+            return encoded
+
+        active_names = []
+        input_ids_parts = []
+        attention_mask_parts = []
+        sizes = []
+        for name, (input_ids, attention_mask) in label_inputs.items():
+            if input_ids is None and attention_mask is None:
+                continue
+            if input_ids is None or attention_mask is None:
+                raise ValueError(
+                    f"{name} label input IDs and attention mask must be provided together"
+                )
+            if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    f"{name} label input IDs and attention mask must have the same 2D shape"
+                )
+            if input_ids.shape[0] == 0:
+                continue
+            active_names.append(name)
+            input_ids_parts.append(input_ids)
+            attention_mask_parts.append(attention_mask)
+            sizes.append(input_ids.shape[0])
+
+        if not active_names:
+            return encoded
+
+        max_length = max(input_ids.shape[1] for input_ids in input_ids_parts)
+        for index, (input_ids, attention_mask) in enumerate(
+            zip(input_ids_parts, attention_mask_parts)
+        ):
+            padding = max_length - input_ids.shape[1]
+            if padding > 0:
+                input_ids_parts[index] = torch.nn.functional.pad(
+                    input_ids,
+                    (0, padding),
+                    value=0,
+                )
+                attention_mask_parts[index] = torch.nn.functional.pad(
+                    attention_mask,
+                    (0, padding),
+                    value=0,
+                )
+
+        all_embeddings = self.token_rep_layer.encode_labels(
+            torch.cat(input_ids_parts, dim=0),
+            torch.cat(attention_mask_parts, dim=0),
+        )
+        for name, embeddings in zip(
+            active_names,
+            all_embeddings.split(sizes, dim=0),
+        ):
+            encoded[name] = embeddings
+        return encoded
+
     def _encode_all_labels_batched(
         self,
-        batch_size: int,
         cat_labels_input_ids: Optional[torch.Tensor] = None,
         cat_labels_attention_mask: Optional[torch.Tensor] = None,
         rel_labels_input_ids: Optional[torch.Tensor] = None,
@@ -331,113 +420,50 @@ class BaseGLiNextModel(BaseModel):
         open_rel_labels_attention_mask: Optional[torch.Tensor] = None,
     ):
         """Batch text-task label inputs into one BiEncoder pass, then split results."""
-        if not _has_labels_encoder(self.token_rep_layer):
-            return None, None, None, None
-
-        # Collect all non-None label inputs with their sizes
-        parts = []
-        sizes = []
-        for ids, mask in [
-            (cat_labels_input_ids, cat_labels_attention_mask),
-            (rel_labels_input_ids, rel_labels_attention_mask),
-            (child_labels_input_ids, child_labels_attention_mask),
-            (open_rel_labels_input_ids, open_rel_labels_attention_mask),
-        ]:
-            if ids is not None:
-                parts.append((ids, mask))
-                sizes.append(ids.shape[0])
-            else:
-                parts.append(None)
-                sizes.append(0)
-
-        total = sum(sizes)
-        if total == 0:
-            return None, None, None, None
-
-        # Concatenate all label inputs along batch dim
-        all_ids = []
-        all_masks = []
-        for part in parts:
-            if part is not None:
-                all_ids.append(part[0])
-                all_masks.append(part[1])
-
-        if not all_ids:
-            return None, None, None, None
-
-        # Pad to same seq length and concatenate
-        max_len = max(ids.shape[1] for ids in all_ids)
-        padded_ids = []
-        padded_masks = []
-        for ids, m in zip(all_ids, all_masks):
-            if ids.shape[1] < max_len:
-                pad_size = max_len - ids.shape[1]
-                ids = torch.nn.functional.pad(ids, (0, pad_size), value=0)
-                m = torch.nn.functional.pad(m, (0, pad_size), value=0)
-            padded_ids.append(ids)
-            padded_masks.append(m)
-
-        batched_ids = torch.cat(padded_ids, dim=0)
-        batched_masks = torch.cat(padded_masks, dim=0)
-
-        # Single encoder pass
-        all_embeds = self.token_rep_layer.encode_labels(batched_ids, batched_masks)
-
-        # Split back as flat label embeddings. _build_flat_inputs packs them
-        # into (flattened_groups, max_classes, dim) using labels_group_size.
-        results = []
-        offset = 0
-        for size in sizes:
-            if size > 0:
-                embeds = all_embeds[offset:offset + size]
-                results.append(embeds)
-                offset += size
-            else:
-                results.append(None)
-
-        return results[0], results[1], results[2], results[3]
+        embeddings = self._encode_label_inputs_batched(
+            {
+                "classification": (
+                    cat_labels_input_ids,
+                    cat_labels_attention_mask,
+                ),
+                "joint_relex": (
+                    rel_labels_input_ids,
+                    rel_labels_attention_mask,
+                ),
+                "structuring": (
+                    child_labels_input_ids,
+                    child_labels_attention_mask,
+                ),
+                "open_relex": (
+                    open_rel_labels_input_ids,
+                    open_rel_labels_attention_mask,
+                ),
+            }
+        )
+        return (
+            embeddings["classification"],
+            embeddings["joint_relex"],
+            embeddings["structuring"],
+            embeddings["open_relex"],
+        )
 
     def _encode_media_labels_batched(self, kwargs: dict) -> Dict[str, torch.Tensor]:
         """Encode media-task label inputs as flat per-label embeddings."""
-        if not _has_labels_encoder(self.token_rep_layer):
-            return {}
-
-        task_names = [
-            task_name
-            for task_name in self._media_task_names
-            if task_name in self.heads
-            and kwargs.get(f"{task_name}_labels_input_ids") is not None
-            and kwargs.get(f"{task_name}_labels_attention_mask") is not None
-        ]
-        if not task_names:
-            return {}
-
-        ids_by_task = [kwargs[f"{task_name}_labels_input_ids"] for task_name in task_names]
-        masks_by_task = [kwargs[f"{task_name}_labels_attention_mask"] for task_name in task_names]
-        max_len = max(ids.shape[1] for ids in ids_by_task)
-        padded_ids = []
-        padded_masks = []
-        sizes = []
-        for ids, mask in zip(ids_by_task, masks_by_task):
-            sizes.append(ids.shape[0])
-            if ids.shape[1] < max_len:
-                pad_size = max_len - ids.shape[1]
-                ids = torch.nn.functional.pad(ids, (0, pad_size), value=0)
-                mask = torch.nn.functional.pad(mask, (0, pad_size), value=0)
-            padded_ids.append(ids)
-            padded_masks.append(mask)
-
-        all_embeds = self.token_rep_layer.encode_labels(
-            torch.cat(padded_ids, dim=0),
-            torch.cat(padded_masks, dim=0),
+        embeddings = self._encode_label_inputs_batched(
+            {
+                task_name: (
+                    kwargs.get(f"{task_name}_labels_input_ids"),
+                    kwargs.get(f"{task_name}_labels_attention_mask"),
+                )
+                for task_name in self._media_task_names
+                if task_name in self.heads
+            }
         )
-
-        media_label_embeds = {}
-        offset = 0
-        for task_name, size in zip(task_names, sizes):
-            media_label_embeds[task_name] = all_embeds[offset:offset + size]
-            offset += size
-        return media_label_embeds
+        return {
+            task_name: task_embeddings
+            for task_name, task_embeddings in embeddings.items()
+            if task_embeddings is not None
+        }
 
     def _vision_feature_encoder(self):
         encoder = getattr(self, "vision_encoder", None)
@@ -530,13 +556,172 @@ class BaseGLiNextModel(BaseModel):
         audio_mask = apply_input_mask(audio_mask, kwargs.get("audio_input_mask"))
         return audio_tokens, audio_mask
 
+    @staticmethod
+    def _build_group_layout(
+        classes_mapping,
+        task_name: str,
+        *,
+        device,
+        label_kind: str = "primary",
+        explicit_sizes: Optional[torch.Tensor] = None,
+    ) -> _FlatGroupLayout:
+        """Describe task groups, their source slices, and original batch rows."""
+
+        groups = list(classes_mapping.flat_iter(task_name))
+        batch_origin = torch.tensor(
+            [batch_idx for _, batch_idx, _, _ in groups],
+            dtype=torch.long,
+            device=device,
+        )
+        group_index = torch.tensor(
+            [group_idx for _, _, group_idx, _ in groups],
+            dtype=torch.long,
+            device=device,
+        )
+
+        if explicit_sizes is not None:
+            sizes = explicit_sizes.to(device=device, dtype=torch.long).flatten()
+            if sizes.numel() != len(groups):
+                raise ValueError(
+                    f"{task_name} has {len(groups)} flat groups but received "
+                    f"{sizes.numel()} label-group sizes"
+                )
+            if bool((sizes < 0).any()):
+                raise ValueError("label-group sizes must be non-negative")
+            starts = torch.cumsum(sizes, dim=0) - sizes
+        else:
+            offsets = {}
+            starts_list = []
+            sizes_list = []
+            for _, batch_idx, group_idx, _ in groups:
+                size = classes_mapping.label_size(
+                    task_name,
+                    batch_idx,
+                    group_idx,
+                    label_kind=label_kind,
+                )
+                start = offsets.get(batch_idx, 0)
+                starts_list.append(start)
+                sizes_list.append(size)
+                offsets[batch_idx] = start + size
+            starts = torch.tensor(starts_list, dtype=torch.long, device=device)
+            sizes = torch.tensor(sizes_list, dtype=torch.long, device=device)
+
+        return _FlatGroupLayout(
+            batch_origin=batch_origin,
+            group_index=group_index,
+            starts=starts,
+            sizes=sizes,
+        )
+
+    @staticmethod
+    def _flatten_grouped_embeddings(
+        embeddings: torch.Tensor,
+        layout: _FlatGroupLayout,
+        source_mask: Optional[torch.Tensor] = None,
+        *,
+        mask_dtype: torch.dtype = torch.float,
+    ) -> _FlatEmbeddingBatch:
+        """Slice packed 2D or batch-packed 3D embeddings into padded groups."""
+
+        if embeddings.dim() not in {2, 3}:
+            raise ValueError(
+                "grouped embeddings must have shape (labels, D) or (B, labels, D)"
+            )
+        if source_mask is not None:
+            expected_mask_shape = (
+                embeddings.shape[:1]
+                if embeddings.dim() == 2
+                else embeddings.shape[:2]
+            )
+            if source_mask.shape != expected_mask_shape:
+                raise ValueError(
+                    "grouped embedding mask must match the embedding label axes"
+                )
+
+        max_size = int(layout.sizes.max().item()) if layout.count else 0
+        flat_embeddings = embeddings.new_zeros(
+            layout.count,
+            max_size,
+            embeddings.shape[-1],
+        )
+        flat_mask = torch.zeros(
+            layout.count,
+            max_size,
+            device=embeddings.device,
+            dtype=mask_dtype,
+        )
+        descriptors = zip(
+            layout.batch_origin.tolist(),
+            layout.starts.tolist(),
+            layout.sizes.tolist(),
+        )
+        for flat_idx, (batch_idx, start, size) in enumerate(descriptors):
+            if size <= 0:
+                continue
+            end = start + size
+            if embeddings.dim() == 2:
+                if end > embeddings.shape[0]:
+                    continue
+                flat_embeddings[flat_idx, :size] = embeddings[start:end]
+            else:
+                if batch_idx >= embeddings.shape[0] or end > embeddings.shape[1]:
+                    continue
+                flat_embeddings[flat_idx, :size] = embeddings[
+                    batch_idx,
+                    start:end,
+                ]
+
+            if source_mask is None:
+                flat_mask[flat_idx, :size] = 1
+            elif embeddings.dim() == 2:
+                flat_mask[flat_idx, :size] = source_mask[start:end].to(
+                    device=flat_mask.device,
+                    dtype=mask_dtype,
+                )
+            else:
+                flat_mask[flat_idx, :size] = source_mask[
+                    batch_idx,
+                    start:end,
+                ].to(device=flat_mask.device, dtype=mask_dtype)
+
+        return _FlatEmbeddingBatch(flat_embeddings, flat_mask)
+
+    @staticmethod
+    def _gather_flat_parents(
+        parent_embeddings: torch.Tensor,
+        layout: _FlatGroupLayout,
+        classes_mapping,
+        task_name: str,
+        *,
+        per_task_parents: bool,
+    ) -> torch.Tensor:
+        """Gather one parent embedding for each flattened task group."""
+
+        flat_parents = parent_embeddings.new_zeros(
+            layout.count,
+            parent_embeddings.shape[-1],
+        )
+        for flat_idx, (batch_idx, group_idx) in enumerate(
+            zip(layout.batch_origin.tolist(), layout.group_index.tolist())
+        ):
+            parent_idx = group_idx
+            if not per_task_parents:
+                parent_idx += classes_mapping.parent_offset_for_item(
+                    task_name,
+                    batch_idx,
+                )
+            if (
+                batch_idx < parent_embeddings.shape[0]
+                and parent_idx < parent_embeddings.shape[1]
+            ):
+                flat_parents[flat_idx] = parent_embeddings[batch_idx, parent_idx]
+        return flat_parents
+
     def _build_flat_rel_prompts(
         self,
         rel_prompts: torch.Tensor,
         classes_mapping,
-        embed_dim: int,
-        device,
-        dtype,
         rel_prompts_mask: Optional[torch.Tensor] = None,
         label_group_sizes: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -550,50 +735,30 @@ class BaseGLiNextModel(BaseModel):
         if label_group_sizes is None and rel_prompts_mask is None:
             return None, None
 
-        slices: List[Tuple[int, int, int]] = []
-        if label_group_sizes is not None:
-            cumsum = torch.cumsum(label_group_sizes, 0)
-            for flat_idx, batch_idx, _, _ in classes_mapping.flat_extraction_iter():
-                c_start = 0 if flat_idx == 0 else int(cumsum[flat_idx - 1].item())
-                c_end = int(cumsum[flat_idx].item())
-                slices.append((batch_idx, c_start, c_end))
-        else:
-            item_rel_offset: dict = {}
-            for _, batch_idx, _, ext_mapping in classes_mapping.flat_extraction_iter():
-                rel_map = ext_mapping.rel_class_to_id
-                n_rel = len(rel_map.class_to_id) if rel_map is not None else 0
-                start = item_rel_offset.get(batch_idx, 0)
-                slices.append((batch_idx, start, start + n_rel))
-                item_rel_offset[batch_idx] = start + n_rel
-
-        BN = len(slices)
-        if BN == 0:
+        layout = self._build_group_layout(
+            classes_mapping,
+            "joint_relex",
+            device=rel_prompts.device,
+            label_kind="relation",
+            explicit_sizes=label_group_sizes,
+        )
+        if layout.count == 0:
             return None, None
-
-        max_C = max((ce - cs for _, cs, ce in slices), default=0)
-        mask_dtype = rel_prompts_mask.dtype if rel_prompts_mask is not None else torch.long
-        flat = torch.zeros(BN, max_C, embed_dim, device=device, dtype=dtype)
-        flat_mask = torch.zeros(BN, max_C, device=device, dtype=mask_dtype)
-        for idx, (bi, cs, ce) in enumerate(slices):
-            n = ce - cs
-            if n <= 0:
-                continue
-            if rel_prompts.dim() == 2:
-                if ce <= rel_prompts.shape[0]:
-                    flat[idx, :n] = rel_prompts[cs:ce]
-                    flat_mask[idx, :n] = 1
-            elif ce <= rel_prompts.shape[1]:
-                flat[idx, :n] = rel_prompts[bi, cs:ce]
-                if rel_prompts_mask is not None:
-                    flat_mask[idx, :n] = rel_prompts_mask[bi, cs:ce]
-                else:
-                    flat_mask[idx, :n] = 1
-        return flat, flat_mask
+        flattened = self._flatten_grouped_embeddings(
+            rel_prompts,
+            layout,
+            rel_prompts_mask,
+            mask_dtype=(
+                rel_prompts_mask.dtype
+                if rel_prompts_mask is not None
+                else torch.long
+            ),
+        )
+        return flattened.embeddings, flattened.mask
 
     def _build_flat_inputs(
         self,
         parent_embeds: torch.Tensor,
-        parent_mask: torch.Tensor,
         child_embeds: torch.Tensor,
         child_mask: Optional[torch.Tensor],
         words_embedding: torch.Tensor,
@@ -607,7 +772,6 @@ class BaseGLiNextModel(BaseModel):
 
         Args:
             parent_embeds: (B, max_P, D) parent token embeddings
-            parent_mask: (B, max_P) parent mask
             child_embeds: (B, max_C, D) task-specific child embeddings
             child_mask: (B, max_C) or None
             words_embedding: (B, W, D)
@@ -619,96 +783,38 @@ class BaseGLiNextModel(BaseModel):
                 (no offset needed); when False, uses shared parent tensor with offset computation
         """
         device = words_embedding.device
-        D = words_embedding.shape[-1]
-
-        flat_iter = classes_mapping.flat_iter(task_name)
-
-        # Collect group descriptors
-        batch_origins: List[int] = []
-        parent_positions: List[Tuple[int, int]] = []  # (batch_idx, parent_pos)
-        child_slices: List[Tuple[int, int, int]] = []  # (batch_idx, start, end)
-
-        # Track per-item child offset for prompt-based splitting
-        item_child_offset: dict = {}
-
-        for flat_idx, batch_idx, group_idx, _ in flat_iter:
-            batch_origins.append(batch_idx)
-
-            # Parent position within the parent tensor
-            if per_task_parents:
-                # Per-task parents: positions are task-local (no offset)
-                parent_positions.append((batch_idx, group_idx))
-            else:
-                # Shared parents: offset by preceding tasks in prompt order
-                p_offset = classes_mapping.parent_offset_for_item(task_name, batch_idx)
-                parent_positions.append((batch_idx, p_offset + group_idx))
-
-            if label_group_sizes is None:
-                # Prompt path: children within batch item, accumulated by group
-                if batch_idx not in item_child_offset:
-                    item_child_offset[batch_idx] = 0
-                c_start = item_child_offset[batch_idx]
-                c_size = classes_mapping.child_size(task_name, batch_idx, group_idx)
-                child_slices.append((batch_idx, c_start, c_start + c_size))
-                item_child_offset[batch_idx] = c_start + c_size
-
-        BN = len(batch_origins)
-        if BN == 0:
+        layout = self._build_group_layout(
+            classes_mapping,
+            task_name,
+            device=device,
+            explicit_sizes=label_group_sizes,
+        )
+        if layout.count == 0:
             return None
 
-        batch_origin = torch.tensor(batch_origins, dtype=torch.long, device=device)
-
-        # Gather words (BN, W, D) and mask (BN, W)
-        flat_words = words_embedding[batch_origin]
-        flat_word_mask = word_mask[batch_origin]
-
-        # Gather parent embeddings (BN, D)
-        flat_parent = torch.zeros(BN, D, device=device, dtype=parent_embeds.dtype)
-        for idx, (bi, pp) in enumerate(parent_positions):
-            if pp < parent_embeds.shape[1]:
-                flat_parent[idx] = parent_embeds[bi, pp]
-
-        # Gather and pad child embeddings (BN, max_C_per_group, D)
-        if label_group_sizes is not None:
-            # Labels encoder path: children indexed flat across all groups
-            cumsum = torch.cumsum(label_group_sizes, 0)
-            max_C = int(label_group_sizes.max().item()) if BN > 0 else 0
-            flat_children = torch.zeros(BN, max_C, D, device=device, dtype=child_embeds.dtype)
-            flat_child_mask = torch.zeros(BN, max_C, device=device, dtype=torch.float)
-            for g in range(BN):
-                c_start = 0 if g == 0 else int(cumsum[g - 1].item())
-                c_end = int(cumsum[g].item())
-                n = c_end - c_start
-                if n <= 0:
-                    continue
-                if child_embeds.dim() == 2:
-                    if c_end <= child_embeds.shape[0]:
-                        flat_children[g, :n] = child_embeds[c_start:c_end]
-                        flat_child_mask[g, :n] = 1.0
-                elif c_end <= child_embeds.shape[1]:
-                    flat_children[g, :n] = child_embeds[batch_origins[g], c_start:c_end]
-                    flat_child_mask[g, :n] = 1.0
-        else:
-            # Prompt path: children per batch item, split by group sizes
-            max_C = max((ce - cs for _, cs, ce in child_slices), default=0)
-            flat_children = torch.zeros(BN, max_C, D, device=device, dtype=child_embeds.dtype)
-            flat_child_mask = torch.zeros(BN, max_C, device=device, dtype=torch.float)
-            for idx, (bi, cs, ce) in enumerate(child_slices):
-                n = ce - cs
-                if n > 0 and ce <= child_embeds.shape[1]:
-                    flat_children[idx, :n] = child_embeds[bi, cs:ce]
-                    if child_mask is not None:
-                        flat_child_mask[idx, :n] = child_mask[bi, cs:ce].float()
-                    else:
-                        flat_child_mask[idx, :n] = 1.0
+        flat_words = words_embedding[layout.batch_origin]
+        flat_word_mask = word_mask[layout.batch_origin]
+        flat_parent = self._gather_flat_parents(
+            parent_embeds,
+            layout,
+            classes_mapping,
+            task_name,
+            per_task_parents=per_task_parents,
+        )
+        flat_children = self._flatten_grouped_embeddings(
+            child_embeds,
+            layout,
+            child_mask,
+            mask_dtype=torch.float,
+        )
 
         return TaskFlatInputs(
             words_embedding=flat_words,
             mask=flat_word_mask,
             parent_embedding=flat_parent,
-            child_embedding=flat_children,
-            child_mask=flat_child_mask,
-            batch_origin=batch_origin,
+            child_embedding=flat_children.embeddings,
+            child_mask=flat_children.mask,
+            batch_origin=layout.batch_origin,
             feature_embedding=flat_words,
             feature_mask=flat_word_mask,
         )
@@ -785,13 +891,15 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         "audio_classification", "audio_segmentation",
     )
     _flat_input_task_names = (
-        "ner", "joint_relex", "classification", "structuring", "open_relex",
+        "ner", "joint_relex", "classification", "structuring",
+        "set_structuring", "open_relex",
         "image_classification", "object_detection", "segmentation",
         "audio_classification", "audio_segmentation",
     )
     _flat_required_task_names = _flat_input_task_names + ("count",)
     _focal_loss_task_names = (
         "ner", "classification", "joint_relex", "open_relex", "structuring",
+        "set_structuring",
         "image_classification", "object_detection", "segmentation",
         "audio_classification", "audio_segmentation",
     )
@@ -961,9 +1069,17 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         vision_prefix_tokens: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, TaskFlatInputs], Optional[torch.Tensor], Optional[torch.Tensor]]:
         parent_embeds = None
-        parent_mask_t = None
-        per_task_parent_embeds: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        per_task_parent_embeds: Dict[str, torch.Tensor] = {}
         media_tasks = self._media_task_names if include_media else ()
+        joint_relex_active = (
+            "joint_relex" in self.heads
+            and classes_mapping is not None
+            and any(
+                ext_mapping.rel_class_to_id is not None
+                and bool(ext_mapping.rel_class_to_id.class_to_id)
+                for _, _, _, ext_mapping in classes_mapping.flat_extraction_iter()
+            )
+        )
 
         if classes_mapping is not None:
             if self.config.uses_per_task_parents:
@@ -972,6 +1088,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                     "classification": self.config.classification_config,
                     "open_relex": self.config.open_relex_config,
                     "structuring": self.config.structuring_config,
+                    "set_structuring": self.config.set_structuring_config,
                 }
                 if include_media:
                     task_parent_cfgs.update(
@@ -985,7 +1102,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                     )
                 for task_name, task_cfg in task_parent_cfgs.items():
                     if task_cfg is not None and getattr(task_cfg, "parent_token_index", -1) > 0:
-                        parent_e, parent_m = extract_prompt_features(
+                        parent_e, _ = extract_prompt_features(
                             task_cfg.parent_token_index,
                             token_embeds,
                             input_ids,
@@ -994,11 +1111,11 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                             embed_dim,
                             getattr(task_cfg, "embed_parent_token", True),
                         )
-                        per_task_parent_embeds[task_name] = (parent_e, parent_m)
+                        per_task_parent_embeds[task_name] = parent_e
                 if "ner" in per_task_parent_embeds:
                     per_task_parent_embeds["joint_relex"] = per_task_parent_embeds["ner"]
             elif self.config.parent_token_index > 0:
-                parent_embeds, parent_mask_t = extract_prompt_features(
+                parent_embeds, _ = extract_prompt_features(
                     self.config.parent_token_index,
                     token_embeds,
                     input_ids,
@@ -1032,7 +1149,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             )
 
         joint_rel_flat_prompts, joint_rel_flat_mask = None, None
-        if "joint_relex" in self.heads and rel_label_embeds is None and classes_mapping is not None:
+        if joint_relex_active and rel_label_embeds is None:
             jr_cfg = self.config.joint_relex_config
             rel_prompts_batch, rel_prompts_batch_mask = extract_prompt_features(
                 jr_cfg.rel_token_index,
@@ -1046,18 +1163,12 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             joint_rel_flat_prompts, joint_rel_flat_mask = self._build_flat_rel_prompts(
                 rel_prompts_batch,
                 classes_mapping,
-                embed_dim,
-                device=words_embedding.device,
-                dtype=rel_prompts_batch.dtype,
                 rel_prompts_mask=rel_prompts_batch_mask,
             )
-        elif "joint_relex" in self.heads and rel_label_embeds is not None and classes_mapping is not None:
+        elif joint_relex_active and rel_label_embeds is not None:
             joint_rel_flat_prompts, joint_rel_flat_mask = self._build_flat_rel_prompts(
                 rel_label_embeds,
                 classes_mapping,
-                embed_dim,
-                device=words_embedding.device,
-                dtype=rel_label_embeds.dtype,
                 label_group_sizes=kwargs.get("rel_labels_group_size"),
             )
 
@@ -1082,8 +1193,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             )
 
         struct_child_embeds, struct_child_mask = None, None
-        if "structuring" in self.heads and child_label_embeds is None:
-            s_cfg = self.config.structuring_config
+        if (
+            "structuring" in self.heads or "set_structuring" in self.heads
+        ) and child_label_embeds is None:
+            s_cfg = (
+                self.config.structuring_config
+                or self.config.set_structuring_config
+            )
             struct_child_embeds, struct_child_mask = extract_prompt_features(
                 s_cfg.child_token_index,
                 token_embeds,
@@ -1164,6 +1280,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 "ner": kwargs.get("ner_labels_group_size"),
                 "classification": kwargs.get("cat_labels_group_size"),
                 "structuring": kwargs.get("child_labels_group_size"),
+                "set_structuring": kwargs.get("child_labels_group_size"),
                 "open_relex": kwargs.get("open_rel_labels_group_size"),
                 "image_classification": kwargs.get("image_classification_labels_group_size"),
                 "audio_classification": kwargs.get("audio_classification_labels_group_size"),
@@ -1176,6 +1293,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 "joint_relex": (ner_child_embeds, ner_child_mask),
                 "classification": (cat_child_embeds, cat_child_mask),
                 "structuring": (struct_child_embeds, struct_child_mask),
+                "set_structuring": (struct_child_embeds, struct_child_mask),
                 "open_relex": (open_rel_child_embeds, open_rel_child_mask),
                 "image_classification": (
                     media_label_embeds.get("image_classification"),
@@ -1200,11 +1318,14 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             }
 
             task_names = (
-                "ner", "joint_relex", "classification", "structuring", "open_relex",
+                "ner", "joint_relex", "classification", "structuring",
+                "set_structuring", "open_relex",
                 *media_tasks,
             )
             for task_name in task_names:
                 if task_name not in self.heads:
+                    continue
+                if task_name == "joint_relex" and not joint_relex_active:
                     continue
                 child_e, child_m = task_child_map.get(task_name, (None, None))
                 if child_e is None:
@@ -1213,9 +1334,9 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 if use_per_task:
                     if task_name not in per_task_parent_embeds:
                         continue
-                    task_parent_e, task_parent_m = per_task_parent_embeds[task_name]
+                    task_parent_e = per_task_parent_embeds[task_name]
                 else:
-                    task_parent_e, task_parent_m = parent_embeds, parent_mask_t
+                    task_parent_e = parent_embeds
 
                 label_group_sizes = label_group_sizes_map.get(
                     "ner" if task_name == "joint_relex" else task_name
@@ -1231,7 +1352,6 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 )
                 flat_inputs = self._build_flat_inputs(
                     task_parent_e,
-                    task_parent_m,
                     child_e,
                     child_m,
                     flat_words,
@@ -1305,7 +1425,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         mask: torch.Tensor,
         embed_dim: int,
         parent_embeds: Optional[torch.Tensor],
-        per_task_parent_embeds: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        per_task_parent_embeds: Dict[str, torch.Tensor],
         use_per_task: bool,
     ) -> None:
         count_batch_origins = []
@@ -1318,10 +1438,9 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
 
         for task_name, flat_iter in count_tasks:
             if use_per_task:
-                task_parent_pair = per_task_parent_embeds.get(task_name)
-                if task_parent_pair is None:
+                task_parent_e = per_task_parent_embeds.get(task_name)
+                if task_parent_e is None:
                     continue
-                task_parent_e, _ = task_parent_pair
                 for _, batch_idx, group_idx, _ in flat_iter():
                     count_batch_origins.append(batch_idx)
                     if group_idx < task_parent_e.shape[1]:
@@ -1419,6 +1538,17 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             if name == "joint_relex":
                 extra_kwargs["flat_rel_prompts"] = joint_rel_flat_prompts
                 extra_kwargs["flat_rel_prompts_mask"] = joint_rel_flat_mask
+                for runtime_name in (
+                    "rel_focal_loss_alpha",
+                    "rel_focal_loss_gamma",
+                    "rel_focal_loss_prob_margin",
+                    "rel_label_smoothing",
+                    "rel_negatives",
+                    "rel_masking",
+                ):
+                    value = runtime_kwargs.get(runtime_name)
+                    if value is not None:
+                        extra_kwargs[runtime_name] = value
 
             if name in self._focal_loss_task_names:
                 extra_kwargs["base_loss_fn"] = self._make_task_loss_fn(name, runtime_kwargs)
@@ -1463,6 +1593,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         open_rel_out = head_outputs.get("open_relex", TaskHeadOutput())
         count_out = head_outputs.get("count", TaskHeadOutput())
         struct_out = head_outputs.get("structuring", TaskHeadOutput())
+        set_struct_out = head_outputs.get("set_structuring", TaskHeadOutput())
         image_cls_out = head_outputs.get("image_classification", TaskHeadOutput())
         audio_cls_out = head_outputs.get("audio_classification", TaskHeadOutput())
         det_out = head_outputs.get("object_detection", TaskHeadOutput())
@@ -1515,6 +1646,22 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             structuring_span_logits=struct_out.extra.get("span_logits"),
             structuring_span_idx=struct_out.extra.get("span_idx"),
             structuring_span_mask=struct_out.extra.get("span_mask"),
+            set_structuring_entity_logits=set_struct_out.logits,
+            set_structuring_logits=set_struct_out.extra.get(
+                "structuring_logits"
+            ),
+            set_structuring_batch_origin=(
+                flat_inputs_map["set_structuring"].batch_origin
+                if "set_structuring" in flat_inputs_map else None
+            ),
+            set_structuring_anchor_mask=set_struct_out.extra.get(
+                "anchor_mask"
+            ),
+            set_structuring_objectness_logits=set_struct_out.extra.get(
+                "objectness_logits"
+            ),
+            set_structuring_span_idx=set_struct_out.extra.get("span_idx"),
+            set_structuring_span_mask=set_struct_out.extra.get("span_mask"),
             embedding_logits=emb_out.logits,
             image_classification_logits=image_cls_out.logits,
             image_classification_batch_origin=flat_inputs_map["image_classification"].batch_origin if "image_classification" in flat_inputs_map else None,
@@ -1681,7 +1828,6 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         # ── 1b. Encode task-specific labels via labels encoder ──────────
         cat_label_embeds, rel_label_embeds, child_label_embeds, open_rel_label_embeds = (
             self._encode_all_labels_batched(
-                batch_size,
                 cat_labels_input_ids, cat_labels_attention_mask,
                 rel_labels_input_ids, rel_labels_attention_mask,
                 child_labels_input_ids, child_labels_attention_mask,
@@ -1888,7 +2034,6 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         embed_dim = words_embedding.shape[-1]
         cat_label_embeds, rel_label_embeds, child_label_embeds, open_rel_label_embeds = (
             self._encode_all_labels_batched(
-                batch_size,
                 cat_labels_input_ids, cat_labels_attention_mask,
                 rel_labels_input_ids, rel_labels_attention_mask,
                 child_labels_input_ids, child_labels_attention_mask,
@@ -2040,11 +2185,10 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
         media_mask: torch.Tensor,
         device,
         dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         counts = classes_mapping.group_counts(task_name, batch_size)
         max_groups = max(max(counts, default=0), 1)
         parent = torch.zeros(batch_size, max_groups, self.config.hidden_size, device=device, dtype=dtype)
-        parent_mask = torch.zeros(batch_size, max_groups, device=device, dtype=torch.long)
         task_parent = self._media_parent_embedding_for_task(
             task_name,
             media_tokens,
@@ -2055,8 +2199,7 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
         for batch_idx, count in enumerate(counts):
             if count > 0:
                 parent[batch_idx, :count] = task_parent[batch_idx]
-                parent_mask[batch_idx, :count] = 1
-        return parent, parent_mask
+        return parent
 
     def _media_parent_embedding_for_task(
         self,
@@ -2135,7 +2278,7 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
             )
             if child_embeds is None:
                 continue
-            parent_embeds, parent_mask = self._parent_inputs_for_task(
+            parent_embeds = self._parent_inputs_for_task(
                 classes_mapping,
                 task_name,
                 batch_size,
@@ -2146,7 +2289,6 @@ class _MediaOnlyBiEncoderModel(BaseGLiNextModel):
             )
             flat_inputs = self._build_flat_inputs(
                 parent_embeds,
-                parent_mask,
                 child_embeds,
                 child_mask,
                 media_tokens,

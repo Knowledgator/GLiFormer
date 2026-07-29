@@ -1,11 +1,20 @@
 """Group/anchor generation layers for structuring tasks."""
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
 
+from .attention_bias import AttentionBias, NoAttentionBias
 from .mlp import create_mlp
+from .position import (
+    RefinementPositionEncoding,
+    masked_normalized_grid_1d,
+    normalized_grid_1d,
+)
 from .rotary import RotaryEmbedding, apply_rotary_pos_emb
 
 
@@ -166,10 +175,40 @@ class AnchorCrossAttentionMemory:
     token_mask: torch.Tensor | None
     memory_pos_emb: torch.Tensor | None
     source_length: int
+    coordinates: torch.Tensor | None = None
+    spatial_shape: tuple[int, int] | None = None
 
 
 def _apply_layer_scale(value: torch.Tensor, scale: nn.Parameter | None):
     return value if scale is None else value * scale
+
+
+class _RMSNorm(nn.Module):
+    """Small local RMSNorm implementation with a stable state-dict layout."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = float(eps)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        rms = value.float().square().mean(dim=-1, keepdim=True).add(
+            self.eps
+        ).rsqrt()
+        return (value * rms.to(dtype=value.dtype)) * self.weight.to(
+            dtype=value.dtype
+        )
+
+
+def _refinement_norm(norm_type: str, hidden_size: int) -> nn.Module:
+    norm_type = str(norm_type).lower().replace("-", "_")
+    if norm_type in {"layer_norm", "layernorm"}:
+        return nn.LayerNorm(hidden_size)
+    if norm_type in {"rms_norm", "rmsnorm"}:
+        return _RMSNorm(hidden_size)
+    raise ValueError(
+        "anchor refinement norm type must be 'layer_norm' or 'rms_norm'"
+    )
 
 
 class _AnchorCrossAttentionBlock(nn.Module):
@@ -181,6 +220,9 @@ class _AnchorCrossAttentionBlock(nn.Module):
         num_heads: int,
         dropout: float,
         norm_first: bool = False,
+        norm_type: str = "layer_norm",
+        ffn_multiplier: int = 4,
+        activation: str = "gelu",
         layer_scale_init: float | None = None,
     ):
         super().__init__()
@@ -192,28 +234,49 @@ class _AnchorCrossAttentionBlock(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.norm0 = nn.LayerNorm(hidden_size)
+        self.norm0 = _refinement_norm(norm_type, hidden_size)
         self.cross_attn = nn.MultiheadAttention(
             hidden_size,
             num_heads,
             dropout=dropout,
             batch_first=True,
         )
-        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm1 = _refinement_norm(norm_type, hidden_size)
+        ffn_multiplier = int(ffn_multiplier)
+        if ffn_multiplier <= 0:
+            raise ValueError("anchor refinement ffn_multiplier must be positive")
+        activation = str(activation).lower()
+        activation_layer: nn.Module
+        if activation == "gelu":
+            activation_layer = nn.GELU()
+        elif activation == "relu":
+            activation_layer = nn.ReLU()
+        elif activation in {"silu", "swish"}:
+            activation_layer = nn.SiLU()
+        else:
+            raise ValueError(
+                "anchor refinement activation must be 'gelu', 'relu', or 'silu'"
+            )
+        ffn_size = hidden_size * ffn_multiplier
         self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
+            nn.Linear(hidden_size, ffn_size),
+            activation_layer,
             nn.Dropout(dropout),
-            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Linear(ffn_size, hidden_size),
             nn.Dropout(dropout),
         )
-        self.norm2 = nn.LayerNorm(hidden_size)
+        self.norm2 = _refinement_norm(norm_type, hidden_size)
         if layer_scale_init is None:
             self.register_parameter("self_attn_scale", None)
             self.register_parameter("cross_attn_scale", None)
             self.register_parameter("ffn_scale", None)
         else:
             scale = float(layer_scale_init)
+            if not math.isfinite(scale) or scale < 0.0:
+                raise ValueError(
+                    "anchor refinement layer_scale_init must be finite and "
+                    "non-negative"
+                )
             self.self_attn_scale = nn.Parameter(torch.full((hidden_size,), scale))
             self.cross_attn_scale = nn.Parameter(torch.full((hidden_size,), scale))
             self.ffn_scale = nn.Parameter(torch.full((hidden_size,), scale))
@@ -223,13 +286,48 @@ class _AnchorCrossAttentionBlock(nn.Module):
         anchor_rep: torch.Tensor,
         query_pos_emb: torch.Tensor | None,
         self_attention_mask: torch.Tensor | None,
+        self_attention_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         q = anchor_rep if query_pos_emb is None else anchor_rep + query_pos_emb
+        attention_mask = None
+        key_padding_mask = self_attention_mask
+        if self_attention_bias is not None:
+            batch_size, query_length = anchor_rep.shape[:2]
+            attention_mask = self._expand_cross_attention_bias(
+                self_attention_bias,
+                batch_size=batch_size,
+                query_length=query_length,
+                memory_length=query_length,
+                source_length=query_length,
+                dtype=anchor_rep.dtype,
+                device=anchor_rep.device,
+            )
+            if key_padding_mask is not None:
+                padding_bias = torch.zeros(
+                    batch_size,
+                    1,
+                    1,
+                    query_length,
+                    dtype=anchor_rep.dtype,
+                    device=anchor_rep.device,
+                )
+                padding_bias.masked_fill_(
+                    key_padding_mask[:, None, None, :],
+                    float("-inf"),
+                )
+                attention_mask = attention_mask + padding_bias.expand(
+                    batch_size,
+                    self.num_heads,
+                    query_length,
+                    query_length,
+                ).reshape_as(attention_mask)
+                key_padding_mask = None
         return self.self_attn(
             q,
             q,
             anchor_rep,
-            key_padding_mask=self_attention_mask,
+            attn_mask=attention_mask,
+            key_padding_mask=key_padding_mask,
         )[0]
 
     def _expand_cross_attention_bias(
@@ -392,6 +490,7 @@ class _AnchorCrossAttentionBlock(nn.Module):
         query_pos_emb=None,
         memory_pos_emb=None,
         memory_position_in_values: bool = False,
+        self_attention_bias: torch.Tensor | None = None,
         cross_attention_bias: torch.Tensor | None = None,
         source_length: int | None = None,
     ):
@@ -421,6 +520,7 @@ class _AnchorCrossAttentionBlock(nn.Module):
                 normalized,
                 query_pos_emb,
                 self_attention_mask,
+                self_attention_bias,
             )
             x = anchor_rep + _apply_layer_scale(sa_out, self.self_attn_scale)
             normalized = self.norm1(x)
@@ -442,6 +542,7 @@ class _AnchorCrossAttentionBlock(nn.Module):
                 anchor_rep,
                 query_pos_emb,
                 self_attention_mask,
+                self_attention_bias,
             )
             anchor_rep = self.norm0(anchor_rep + _apply_layer_scale(sa_out, self.self_attn_scale))
             attn_out = self._cross_attention(
@@ -461,12 +562,117 @@ class _AnchorCrossAttentionBlock(nn.Module):
         return x
 
 
-class AnchorCrossAttentionLayer(nn.Module):
-    """Pre-processing layer that refines anchor embeddings via cross-attention with token embeddings.
+class PreNormAnchorRefinementBlock(_AnchorCrossAttentionBlock):
+    """Anchor decoder block whose residual branches receive normalized inputs."""
 
-    Sits between anchor acquisition (AnchorLayer) and anchor modeling (AnchorModeling).
-    Each layer applies: anchor attends to tokens → residual + norm → FFN → residual + norm.
+    def __init__(self, hidden_size, num_heads, dropout, **kwargs):
+        kwargs.pop("norm_first", None)
+        super().__init__(
+            hidden_size,
+            num_heads,
+            dropout,
+            norm_first=True,
+            **kwargs,
+        )
+
+
+class PostNormAnchorRefinementBlock(_AnchorCrossAttentionBlock):
+    """Anchor decoder block that normalizes after every residual update."""
+
+    def __init__(self, hidden_size, num_heads, dropout, **kwargs):
+        kwargs.pop("norm_first", None)
+        super().__init__(
+            hidden_size,
+            num_heads,
+            dropout,
+            norm_first=False,
+            **kwargs,
+        )
+
+
+class AnchorCrossAttentionLayer(nn.Module):
+    """Reusable self/cross-attention refinement for generated anchors.
+
+    Positional encoding and attention-bias modules are independent components.
+    They may be installed as defaults on this module or supplied per call, which
+    allows a shared refinement core to retain modality-specific conditioning.
     """
+
+    config_fields = frozenset(
+        {
+            "num_heads",
+            "num_layers",
+            "dropout",
+            "norm_style",
+            "norm_type",
+            "ffn_multiplier",
+            "activation",
+            "layer_scale_init",
+        }
+    )
+
+    @classmethod
+    def from_config(
+        cls,
+        config: str | Mapping[str, Any] | None,
+        hidden_size: int,
+        **defaults,
+    ) -> "AnchorCrossAttentionLayer | None":
+        """Build the independent refinement core from a strict component spec."""
+
+        if config is None:
+            refinement_type = "cross_attention"
+            params: dict[str, Any] = {}
+        elif isinstance(config, str):
+            refinement_type = config
+            params = {}
+        elif isinstance(config, Mapping):
+            raw = dict(config)
+            refinement_type = raw.pop(
+                "type", raw.pop("name", "cross_attention")
+            )
+            configured_params = raw.pop("params", {})
+            if not isinstance(configured_params, Mapping):
+                raise TypeError("anchor refinement params must be a mapping")
+            params = dict(configured_params)
+            params.update(raw)
+        else:
+            raise TypeError(
+                "anchor refinement must be a string, mapping, or None"
+            )
+        refinement_type = str(refinement_type).lower().replace("-", "_")
+        if refinement_type in {"none", "disabled"}:
+            return None
+        if refinement_type not in {"cross_attention", "decoder"}:
+            raise ValueError(
+                f"Unknown anchor refinement type {refinement_type!r}. "
+                "Available: ['cross_attention', 'none']"
+            )
+        aliases = {
+            "heads": "num_heads",
+            "layers": "num_layers",
+            "norm": "norm_style",
+        }
+        for old_name, new_name in aliases.items():
+            if old_name in params:
+                if new_name in params:
+                    raise ValueError(
+                        f"anchor refinement specifies both {old_name!r} and "
+                        f"{new_name!r}"
+                    )
+                params[new_name] = params.pop(old_name)
+        unknown = set(params) - set(cls.config_fields)
+        if unknown:
+            raise ValueError(
+                "Unsupported anchor refinement options: "
+                f"{sorted(unknown)}. Available: {sorted(cls.config_fields)}"
+            )
+        for name in cls.config_fields:
+            if name not in params and name in defaults:
+                params[name] = defaults[name]
+        if int(params.get("num_layers", 1)) <= 0:
+            return None
+        return cls(hidden_size, **params)
 
     def __init__(
         self,
@@ -475,16 +681,65 @@ class AnchorCrossAttentionLayer(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.1,
         norm_first: bool = False,
+        norm_style: str | None = None,
+        norm_type: str = "layer_norm",
+        ffn_multiplier: int = 4,
+        activation: str = "gelu",
         layer_scale_init: float | None = None,
+        position_encoding: RefinementPositionEncoding | None = None,
+        self_attention_bias: AttentionBias | None = None,
+        cross_attention_bias: AttentionBias | None = None,
     ):
         super().__init__()
+        if (
+            isinstance(num_heads, bool)
+            or int(num_heads) != num_heads
+            or num_heads <= 0
+        ):
+            raise ValueError("anchor refinement num_heads must be positive")
+        if (
+            isinstance(num_layers, bool)
+            or int(num_layers) != num_layers
+            or num_layers < 0
+        ):
+            raise ValueError(
+                "anchor refinement num_layers must be non-negative"
+            )
+        dropout = float(dropout)
+        if not math.isfinite(dropout) or not 0.0 <= dropout <= 1.0:
+            raise ValueError(
+                "anchor refinement dropout must be finite and in [0, 1]"
+            )
+        if norm_style is None:
+            norm_style = "pre_norm" if norm_first else "post_norm"
+        norm_style = str(norm_style).lower().replace("-", "_")
+        if norm_style not in {"pre_norm", "post_norm"}:
+            raise ValueError(
+                "anchor refinement norm_style must be 'pre_norm' or 'post_norm'"
+            )
+        block_type = (
+            PreNormAnchorRefinementBlock
+            if norm_style == "pre_norm"
+            else PostNormAnchorRefinementBlock
+        )
+        self.norm_style = norm_style
+        self.num_heads = int(num_heads)
+        self.position_encoding = position_encoding
+        self.self_attention_bias = self_attention_bias or NoAttentionBias(
+            num_heads=self.num_heads
+        )
+        self.cross_attention_bias = cross_attention_bias or NoAttentionBias(
+            num_heads=self.num_heads
+        )
         self.layers = nn.ModuleList(
             [
-                _AnchorCrossAttentionBlock(
+                block_type(
                     hidden_size,
                     num_heads,
                     dropout,
-                    norm_first=norm_first,
+                    norm_type=norm_type,
+                    ffn_multiplier=ffn_multiplier,
+                    activation=activation,
                     layer_scale_init=layer_scale_init,
                 )
                 for _ in range(num_layers)
@@ -502,10 +757,39 @@ class AnchorCrossAttentionLayer(nn.Module):
         token_emb: torch.Tensor,
         token_mask: torch.Tensor | None = None,
         memory_pos_emb: torch.Tensor | None = None,
+        *,
+        memory_coordinates: torch.Tensor | None = None,
+        memory_spatial_shape: tuple[int, int] | None = None,
+        position_encoding: RefinementPositionEncoding | None = None,
     ) -> AnchorCrossAttentionMemory:
         """Prepare encoder memory once for one or more decoder layers."""
 
         source_length = token_emb.shape[1]
+        conditioning = position_encoding or self.position_encoding
+        if memory_coordinates is None:
+            coordinate_dimensions = (
+                conditioning.memory_strategy.coordinate_dimensions
+                if conditioning is not None
+                else None
+            )
+            if coordinate_dimensions in {None, 1}:
+                valid = (
+                    token_mask.to(device=token_emb.device).bool()
+                    if token_mask is not None
+                    else torch.ones(
+                        token_emb.shape[:2],
+                        dtype=torch.bool,
+                        device=token_emb.device,
+                    )
+                )
+                memory_coordinates = masked_normalized_grid_1d(valid)
+        if memory_pos_emb is None and conditioning is not None:
+            memory_pos_emb = conditioning.memory_positions(
+                token_emb,
+                token_mask,
+                coordinates=memory_coordinates,
+                spatial_shape=memory_spatial_shape,
+            )
         token_emb, token_mask, memory_pos_emb = _safe_cross_attention_memory(
             token_emb,
             token_mask,
@@ -516,6 +800,50 @@ class AnchorCrossAttentionLayer(nn.Module):
             token_mask=token_mask,
             memory_pos_emb=memory_pos_emb,
             source_length=source_length,
+            coordinates=memory_coordinates,
+            spatial_shape=memory_spatial_shape,
+        )
+
+    @staticmethod
+    def _query_coordinates(
+        anchor_rep: torch.Tensor,
+        coordinates: torch.Tensor | None,
+        conditioning: RefinementPositionEncoding | None,
+    ) -> torch.Tensor | None:
+        if coordinates is not None:
+            return coordinates
+        coordinate_dimensions = (
+            conditioning.query_strategy.coordinate_dimensions
+            if conditioning is not None
+            else None
+        )
+        if coordinate_dimensions in {None, 1}:
+            return normalized_grid_1d(
+                anchor_rep.shape[1],
+                device=anchor_rep.device,
+                dtype=torch.float32,
+            ).unsqueeze(0)
+        return None
+
+    @staticmethod
+    def _configured_bias(
+        module: AttentionBias,
+        *,
+        query_coordinates: torch.Tensor | None,
+        key_coordinates: torch.Tensor | None,
+        query_length: int,
+        key_length: int,
+        anchor_rep: torch.Tensor,
+        layer_index: int,
+    ) -> torch.Tensor | None:
+        return module(
+            query_coordinates=query_coordinates,
+            key_coordinates=key_coordinates,
+            query_length=query_length,
+            key_length=key_length,
+            dtype=anchor_rep.dtype,
+            device=anchor_rep.device,
+            layer_index=layer_index,
         )
 
     def forward_layer(
@@ -525,8 +853,15 @@ class AnchorCrossAttentionLayer(nn.Module):
         memory: AnchorCrossAttentionMemory,
         query_mask: torch.Tensor | None = None,
         query_pos_emb: torch.Tensor | None = None,
-        memory_position_in_values: bool = False,
+        memory_position_in_values: bool | None = None,
+        self_attention_bias: torch.Tensor | None = None,
         cross_attention_bias: torch.Tensor | None = None,
+        *,
+        query_coordinates: torch.Tensor | None = None,
+        query_spatial_shape: tuple[int, int] | None = None,
+        position_encoding: RefinementPositionEncoding | None = None,
+        self_attention_bias_module: AttentionBias | None = None,
+        cross_attention_bias_module: AttentionBias | None = None,
     ) -> torch.Tensor:
         """Run one decoder layer against prepared memory.
 
@@ -542,16 +877,55 @@ class AnchorCrossAttentionLayer(nn.Module):
             raise IndexError(
                 f"layer_index {layer_index} is out of range for {self.num_layers} decoder layers"
             ) from error
-        return layer(
+        conditioning = position_encoding or self.position_encoding
+        query_coordinates = self._query_coordinates(
             anchor_rep,
-            memory.token_emb,
-            memory.token_mask,
-            query_mask,
-            query_pos_emb,
-            memory.memory_pos_emb,
-            memory_position_in_values,
-            cross_attention_bias,
-            memory.source_length,
+            query_coordinates,
+            conditioning,
+        )
+        if query_pos_emb is None and conditioning is not None:
+            query_pos_emb = conditioning.query_positions(
+                anchor_rep,
+                query_mask,
+                coordinates=query_coordinates,
+                spatial_shape=query_spatial_shape,
+            )
+        if memory_position_in_values is None:
+            memory_position_in_values = bool(
+                conditioning is not None
+                and conditioning.memory_position_in_values
+            )
+        if self_attention_bias is None:
+            self_attention_bias = self._configured_bias(
+                self_attention_bias_module or self.self_attention_bias,
+                query_coordinates=query_coordinates,
+                key_coordinates=query_coordinates,
+                query_length=anchor_rep.shape[1],
+                key_length=anchor_rep.shape[1],
+                anchor_rep=anchor_rep,
+                layer_index=layer_index,
+            )
+        if cross_attention_bias is None:
+            cross_attention_bias = self._configured_bias(
+                cross_attention_bias_module or self.cross_attention_bias,
+                query_coordinates=query_coordinates,
+                key_coordinates=memory.coordinates,
+                query_length=anchor_rep.shape[1],
+                key_length=memory.source_length,
+                anchor_rep=anchor_rep,
+                layer_index=layer_index,
+            )
+        return layer(
+            anchor_rep=anchor_rep,
+            token_emb=memory.token_emb,
+            token_mask=memory.token_mask,
+            query_mask=query_mask,
+            query_pos_emb=query_pos_emb,
+            memory_pos_emb=memory.memory_pos_emb,
+            memory_position_in_values=memory_position_in_values,
+            self_attention_bias=self_attention_bias,
+            cross_attention_bias=cross_attention_bias,
+            source_length=memory.source_length,
         )
 
     def forward(
@@ -562,8 +936,17 @@ class AnchorCrossAttentionLayer(nn.Module):
         query_mask: torch.Tensor | None = None,
         query_pos_emb: torch.Tensor | None = None,
         memory_pos_emb: torch.Tensor | None = None,
-        memory_position_in_values: bool = False,
+        memory_position_in_values: bool | None = None,
+        self_attention_bias: torch.Tensor | None = None,
         cross_attention_bias: torch.Tensor | None = None,
+        *,
+        query_coordinates: torch.Tensor | None = None,
+        memory_coordinates: torch.Tensor | None = None,
+        query_spatial_shape: tuple[int, int] | None = None,
+        memory_spatial_shape: tuple[int, int] | None = None,
+        position_encoding: RefinementPositionEncoding | None = None,
+        self_attention_bias_module: AttentionBias | None = None,
+        cross_attention_bias_module: AttentionBias | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -592,6 +975,9 @@ class AnchorCrossAttentionLayer(nn.Module):
             token_emb,
             token_mask,
             memory_pos_emb,
+            memory_coordinates=memory_coordinates,
+            memory_spatial_shape=memory_spatial_shape,
+            position_encoding=position_encoding,
         )
         for layer_index in range(self.num_layers):
             anchor_rep = self.forward_layer(
@@ -601,7 +987,13 @@ class AnchorCrossAttentionLayer(nn.Module):
                 query_mask=query_mask,
                 query_pos_emb=query_pos_emb,
                 memory_position_in_values=memory_position_in_values,
+                self_attention_bias=self_attention_bias,
                 cross_attention_bias=cross_attention_bias,
+                query_coordinates=query_coordinates,
+                query_spatial_shape=query_spatial_shape,
+                position_encoding=position_encoding,
+                self_attention_bias_module=self_attention_bias_module,
+                cross_attention_bias_module=cross_attention_bias_module,
             )
         return anchor_rep
 

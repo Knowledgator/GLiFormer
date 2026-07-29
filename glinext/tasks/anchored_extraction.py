@@ -10,8 +10,8 @@ greater than one; flattening (A, C) yields the same scoring pipeline as NER.
 import torch
 from gliner.modeling.utils import extract_spans_from_tokens
 
-from . import TaskHead
 from ..layers import AnchoredSpanScorer
+from . import TaskHead
 
 
 class AnchoredSpanExtractionHead(TaskHead):
@@ -29,7 +29,13 @@ class AnchoredSpanExtractionHead(TaskHead):
         self.loss_coef = task_cfg.loss_coef
         if shared_layers is None:
             shared_layers = {}
-        self._init_anchor_pipeline(task_cfg, config, hidden_size, dropout, shared_layers)
+        self._init_anchor_components(
+            task_cfg,
+            config,
+            hidden_size,
+            dropout,
+            shared_layers,
+        )
         self.scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
 
     # ── Extension hooks ──────────────────────────────────────────────
@@ -65,18 +71,25 @@ class AnchoredSpanExtractionHead(TaskHead):
         child_embedding = flat_inputs.child_embedding
         parent_embedding = flat_inputs.parent_embedding
 
-        anchors, anchor_mask = self.anchor_layer(
-            parent_embedding, feature_embeddings, feature_mask=feature_mask, **self._anchor_kwargs(batch),
+        anchors, anchor_mask = self._generate_anchors(
+            parent_embedding,
+            feature_embeddings,
+            feature_mask=feature_mask,
+            **self._anchor_kwargs(batch),
         )
-        if hasattr(self, "anchor_refine"):
-            anchors = self.anchor_refine(
-                anchors,
-                feature_embeddings,
-                token_mask=feature_mask,
-                query_mask=anchor_mask,
-            )
+        anchors = self._refine_anchors(
+            anchors,
+            feature_embeddings,
+            memory_mask=feature_mask,
+            anchor_mask=anchor_mask,
+        )
 
-        fused = self.anchor_modeling(anchors, child_embedding)   # (BN, A, C, D)
+        fused = self._model_anchors(
+            anchors,
+            child_embedding,
+            anchor_mask=anchor_mask,
+            child_mask=flat_inputs.child_mask,
+        )
         B, A, C, D = fused.shape
         L = feature_embeddings.shape[1]
         fused_flat = fused.reshape(B, A * C, D)
@@ -132,7 +145,10 @@ class AnchoredSpanExtractionHead(TaskHead):
         """
         if span_idx is not None:
             return span_idx, span_mask
-        source = scores.squeeze(1) if A == 1 else scores.max(dim=1).values
+        if scores.dim() == 4:
+            source = scores
+        else:
+            source = scores.squeeze(1) if A == 1 else scores.max(dim=1).values
         span_idx, span_mask = extract_spans_from_tokens(source, labels, threshold)
         span_idx = span_idx * span_mask.unsqueeze(-1).long()
         return span_idx, span_mask

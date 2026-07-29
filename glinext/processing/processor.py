@@ -46,6 +46,7 @@ _TEXT_TASKS = (
     "open_relex",
     "count",
     "structuring",
+    "set_structuring",
     "embedding",
 )
 _ALL_TASKS = (*_TEXT_TASKS, *_VISION_TASKS, *_AUDIO_TASKS)
@@ -952,7 +953,13 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             self.task_processors["open_relex"] = OpenRelexProcessor(config, tokenizer, words_splitter)
         if "count" in allowed_tasks and config.count_config is not None:
             self.task_processors["count"] = CountProcessor(config)
-        if "structuring" in allowed_tasks and config.structuring_config is not None:
+        if (
+            {"structuring", "set_structuring"} & allowed_tasks
+            and (
+                config.structuring_config is not None
+                or config.set_structuring_config is not None
+            )
+        ):
             self.task_processors["structuring"] = StructuringProcessor(config, tokenizer, words_splitter)
         if "embedding" in allowed_tasks and config.embedding_config is not None:
             self.task_processors["embedding"] = EmbeddingProcessor(config)
@@ -1361,6 +1368,36 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
 
     processor_task_names = _TEXT_TASKS
 
+    def _canonicalize_structuring_tokens(self, item):
+        """Use the configured inference splitter for raw structuring rows.
+
+        A ``tokenized_text`` field is often emitted by dataset generators as
+        a convenience.  Treating it as authoritative during training can
+        silently create a different word sequence from inference.  Raw
+        structuring values are character/text grounded, so retokenize them
+        with the configured splitter before resolving spans.  Already
+        resolved annotations and layout/PDF inputs keep their supplied word
+        grid because their integer spans or boxes depend on it.
+        """
+        if not item.get("structuring") or not item.get("text"):
+            return
+        if item.get("_glinext_structuring_spans_resolved"):
+            return
+        if item.get("_glinext_tokens_are_authoritative"):
+            return
+        if any(
+            item.get(key) is not None
+            for key in ("word_bboxes", "bboxes", "bbox", "layout")
+        ):
+            return
+
+        tokens = [
+            token
+            for token, _, _ in self.words_splitter(item["text"])
+        ]
+        if tokens:
+            item["tokenized_text"] = tokens
+
     def _augment_label_item(self, item, batch, batch_idx):
         """Hook for modality processors to add per-item label context."""
         return None
@@ -1391,6 +1428,7 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
 
     def collate_raw_batch(self, batch_list, **kwargs):
         for item in batch_list:
+            self._canonicalize_structuring_tokens(item)
             for proc in self.task_processors.values():
                 proc.resolve_spans(item)
 

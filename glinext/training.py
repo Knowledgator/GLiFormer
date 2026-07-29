@@ -208,6 +208,41 @@ class GLiNExTTrainer(GLiNERTrainer):
         # (classes_mapping, tokens, etc. travel through **kwargs)
         self.args.remove_unused_columns = False
 
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch: int | None = None,
+    ):
+        """Call the model with the same focal-loss names used by task configs."""
+
+        del num_items_in_batch
+        rel_focal_loss_alpha = (
+            self.args.rel_focal_loss_alpha
+            if self.args.rel_focal_loss_alpha is not None
+            else self.args.focal_loss_alpha
+        )
+        rel_focal_loss_gamma = (
+            self.args.rel_focal_loss_gamma
+            if self.args.rel_focal_loss_gamma is not None
+            else self.args.focal_loss_gamma
+        )
+        outputs = model(
+            focal_loss_alpha=self.args.focal_loss_alpha,
+            focal_loss_gamma=self.args.focal_loss_gamma,
+            rel_focal_loss_alpha=rel_focal_loss_alpha,
+            rel_focal_loss_gamma=rel_focal_loss_gamma,
+            focal_loss_prob_margin=self.args.focal_loss_prob_margin,
+            label_smoothing=self.args.label_smoothing,
+            reduction=self.args.loss_reduction,
+            negatives=self.args.negatives,
+            masking=self.args.masking,
+            **inputs,
+        )
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        return (loss, outputs) if return_outputs else loss
+
     def training_step(
         self,
         model: nn.Module,

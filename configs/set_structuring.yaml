@@ -1,0 +1,84 @@
+model:
+  model_name: microsoft/deberta-v3-base
+  name: "glinext"
+  max_width: 12
+  hidden_size: 768
+  dropout: 0.3
+  fine_tune: true
+  subtoken_pooling: first
+  span_mode: markerV0
+  max_types: 100
+  max_len: 512
+  max_neg_type_ratio: 1
+
+  ner_config: null
+  default_ner_config: false
+  classification_config: null
+  joint_relex_config: null
+  open_relex_config: null
+  structuring_config: null
+
+  # Independent NER-first set structuring: an internal NER stage explicitly
+  # extracts field entities, then every pooled entity receives record/field
+  # logits from the set-prediction stage.
+  set_structuring_config:
+    head_type: "set_structuring"
+
+    # Stage 1: parent + field prompts drive the internal NER extractor.
+    # Record-anchor components below are isolated from this internal stage.
+    anchor_modeling: "linear"
+    entity_loss_coef: 1.0
+    neg_spans_ratio: 1.0
+
+    # Stage 2: fixed record queries score every extracted entity.
+    anchor_layer:
+      type: "fixed_transformer"
+      params:
+        num_slots: 32
+        num_heads: 4
+        num_layers: 2
+    anchor_normalization: "none"
+    anchor_refinement: "none"
+    # Match the largest synthetic-data count bucket; smaller capacities would
+    # leave some gold records without a record query.
+    max_count: 32
+    span_loss_coef: 1.0  # entity-to-record assignment loss
+    bio_loss_reduction: "mean"
+
+    # Coefficient applied to the complete two-stage head by the orchestrator.
+    loss_coef: 1.0
+    focal_loss_alpha: 0.75
+    focal_loss_gamma: 2.0
+
+    # Suppress unused record slots during decoding.
+    anchor_objectness: true
+    anchor_objectness_loss_coef: 0.5
+    anchor_objectness_threshold: 0.5
+
+  count_config: null
+  embedding_config: null
+
+data:
+  root_dir: logs/set_structuring
+  train_data: "data/structuring_synthetic.cleaned.jsonl"
+  val_data: "none"
+
+training:
+  prev_path: null
+  num_steps: 200000
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  eval_every: 1000
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"
+  focal_loss_alpha: 0.75
+  focal_loss_gamma: 2
+  loss_reduction: "sum"
+  lr_encoder: 3e-5
+  lr_others: 5e-5
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+  save_total_limit: 3
+  train_head_only: false
+  bf16: true

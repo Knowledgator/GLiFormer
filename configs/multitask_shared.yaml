@@ -15,8 +15,13 @@ model:
   # A single AnchorModeling instance shared by NER (anchored), Open Relex,
   # Structuring, and Joint Relex — per-task anchor_modeling settings are ignored.
   shared_anchor_modeling: "rnn"
-  shared_anchor_refine_layers: 2
-  shared_anchor_refine_heads: 8
+  # Only the parameterized refinement core is shared. Every task still owns
+  # its modality-specific query/memory positions and attention biases.
+  shared_anchor_refinement:
+    type: "cross_attention"
+    params:
+      num_layers: 2
+      num_heads: 8
 
   ner_config:
     scorer_type: "gliner"
@@ -24,7 +29,8 @@ model:
     focal_loss_alpha: null
     focal_loss_gamma: null
     focal_loss_prob_margin: null
-    anchor_mode: "parent"
+    anchor_layer: "parent"
+    anchor_normalization: "none"
     represent_spans: true
     neg_spans_ratio: 1.0
     span_loss_coef: 0.5
@@ -47,12 +53,13 @@ model:
     focal_loss_prob_margin: null
 
   structuring_config:
-    anchor_mode: "rnn"
+    anchor_layer:
+      type: "rotary"
+      params:
+        max_count: 20
+    anchor_normalization: "none"
     anchor_modeling: "linear"
-    anchor_num_heads: 4
-    anchor_num_layers: 2
     max_count: 20
-    num_fixed_slots: 10
     loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null
@@ -76,14 +83,14 @@ model:
 
 data:
   root_dir: logs/multitask_shared
-  train_data: "data/extraction_multi.json"
+  train_data: "data/combined_100k.jsonl"
   val_data: "none"
 
 training:
-  prev_path: /home/ingvar/GLiNext/GLiNext/logs/multitask_shared/130k                 # path to a GLiNExT checkpoint to init from (null = from scratch)
+  prev_path: null               # path to a GLiNExT checkpoint to init from (null = from scratch)
   num_steps: 50000
-  train_batch_size: 2
-  gradient_accumulation_steps: 1
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
   eval_every: 1000
   warmup_ratio: 0.05
   scheduler_type: "cosine"
