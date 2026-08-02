@@ -229,6 +229,20 @@ class BaseGLiNExT(BaseGLiNER):
             or self.config.set_structuring_config is not None
         ):
             tokens.append(self.config.child_token)
+            structuring_configs = (
+                self.config.structuring_config,
+                self.config.set_structuring_config,
+            )
+            if any(
+                cfg is not None and getattr(cfg, "multi_level", False)
+                for cfg in structuring_configs
+            ):
+                tokens.extend(
+                    [
+                        self.config.structuring_child_token,
+                        self.config.structuring_end_token,
+                    ]
+                )
 
         if (self.config.image_classification_config is not None
                 or self.config.object_detection_config is not None
@@ -546,13 +560,18 @@ class BaseGLiNExT(BaseGLiNER):
         classes: Optional[Union[List[str], Dict[str, List[str]]]] = None,
         relations: Optional[Union[List[str], Dict[str, List[str]]]] = None,
         joint_relations: Optional[Dict[str, dict]] = None,
-        structures: Optional[Dict[str, Union[List[str], dict]]] = None,
+        structures: Optional[
+            Union[Dict[str, Union[List[str], dict]], List[dict]]
+        ] = None,
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
         batch_size: int = 8,
         manual_structuring_count: Optional[int] = None,
         structuring_dedup: bool = True,
+        objectness_threshold: Optional[float] = None,
+        preserve_empty_records: bool = False,
+        return_anchor_diagnostics: bool = False,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -568,11 +587,22 @@ class BaseGLiNExT(BaseGLiNER):
             relations: Open relation types. Same format as entities.
             joint_relations: Joint NER + relex groups.
                 ``{parent_name: {"entities": [...], "relations": [...]}}``.
-            structures: Structuring schemas.
-                ``{schema_name: [field1, field2, ...]}`` or
-                ``{schema_name: {"fields": [...]}}``.
+            structures: Structuring schemas. Flat schemas use
+                ``{schema_name: [field1, ...]}``; multi-level schemas may use
+                nested dictionaries/lists. A list exemplar requests a raw
+                list root; wrap an object exemplar as ``{"$root": {...}}``
+                to request a raw object root rather than named schema groups.
             flat_ner: Enforce non-overlapping spans.
             threshold: Confidence threshold.
+            objectness_threshold: Optional structuring-anchor objectness
+                threshold. When omitted, structuring reuses ``threshold``.
+            preserve_empty_records: Keep objectness-selected records that have
+                no extracted field evidence. Disabled by default to avoid
+                emitting all-null records from unused set-prediction slots.
+            return_anchor_diagnostics: Include per-text diagnostics for
+                activated physical anchors, raw learned relations, and the
+                final hierarchy connections selected by the multi-level
+                decoder. Disabled by default.
             multi_label: Allow multiple labels per span.
             batch_size: Batch size for processing.
 
@@ -583,7 +613,7 @@ class BaseGLiNExT(BaseGLiNER):
                     "ner": List[List[dict]],                    # per text, list of entities
                     "classification": List[List[dict]],         # per text, list of labels
                     "open_relex": List[List[dict]],             # per text, list of triples
-                    "structuring": List[Dict[str, List[dict]]], # per text, {schema: [instances]}
+                    "structuring": List[Union[dict, list]],     # per text; preserves root shape
                 }
         """
         self.eval()
@@ -603,7 +633,7 @@ class BaseGLiNExT(BaseGLiNER):
         # Filter empty texts
         valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
         if not valid_texts:
-            return self.data_processor.empty_inference_results(
+            empty_results = self.data_processor.empty_inference_results(
                 num_original,
                 entities=entities,
                 classes=classes,
@@ -611,6 +641,26 @@ class BaseGLiNExT(BaseGLiNER):
                 joint_relations=joint_relations,
                 structures=structures,
             )
+            if return_anchor_diagnostics:
+                for task_name in ("structuring", "set_structuring"):
+                    if task_name not in empty_results:
+                        continue
+                    empty_results[
+                        f"{task_name}_anchor_diagnostics"
+                    ] = [
+                        {
+                            "summary": {
+                                "schema_group_count": 0,
+                                "activated_anchor_count": 0,
+                                "logical_anchor_count": 0,
+                                "selected_connection_count": 0,
+                                "raw_relation_connection_count": 0,
+                            },
+                            "groups": [],
+                        }
+                        for _ in range(num_original)
+                    ]
+            return empty_results
 
         kwargs = self._select_valid_forward_kwargs(kwargs, valid_to_orig_idx, num_original)
 
@@ -641,9 +691,15 @@ class BaseGLiNExT(BaseGLiNER):
         # Process batches
         if manual_structuring_count is not None:
             kwargs["manual_structuring_count"] = manual_structuring_count
+        decoder_kwargs = dict(kwargs.pop("decoder_kwargs", None) or {})
+        if objectness_threshold is not None:
+            decoder_kwargs["objectness_threshold"] = objectness_threshold
+        if preserve_empty_records:
+            decoder_kwargs["preserve_empty_records"] = True
 
         all_decoded, all_classes_mappings = self._process_multitask_batches(
             data_loader, threshold, flat_ner, multi_label,
+            decoder_kwargs=decoder_kwargs or None,
             **kwargs,
         )
 
@@ -658,6 +714,7 @@ class BaseGLiNExT(BaseGLiNER):
             all_classes_mappings,
             structures=structures,
             structuring_dedup=structuring_dedup,
+            return_anchor_diagnostics=return_anchor_diagnostics,
         )
 
     @torch.no_grad()
@@ -680,7 +737,9 @@ class BaseGLiNExT(BaseGLiNER):
         classes: Optional[Union[List[str], Dict[str, List[str]]]] = None,
         relations: Optional[Union[List[str], Dict[str, List[str]]]] = None,
         joint_relations: Optional[Dict[str, dict]] = None,
-        structures: Optional[Dict[str, Union[List[str], dict]]] = None,
+        structures: Optional[
+            Union[Dict[str, Union[List[str], dict]], List[dict]]
+        ] = None,
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
@@ -688,6 +747,7 @@ class BaseGLiNExT(BaseGLiNER):
         manual_structuring_count: Optional[int] = None,
         structuring_dedup: bool = True,
         return_pages: bool = False,
+        objectness_threshold: Optional[float] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run GLiNExT layout/text inference over PDF pages.
@@ -786,12 +846,16 @@ class BaseGLiNExT(BaseGLiNER):
 
         if manual_structuring_count is not None:
             kwargs["manual_structuring_count"] = manual_structuring_count
+        decoder_kwargs = dict(kwargs.pop("decoder_kwargs", None) or {})
+        if objectness_threshold is not None:
+            decoder_kwargs["objectness_threshold"] = objectness_threshold
 
         all_decoded, all_classes_mappings = self._process_multitask_batches(
             data_loader,
             threshold,
             flat_ner,
             multi_label,
+            decoder_kwargs=decoder_kwargs or None,
             **kwargs,
         )
         results = self._map_multitask_results(
@@ -995,8 +1059,11 @@ class BaseGLiNExT(BaseGLiNER):
         valid_texts: List[str],
         num_original: int,
         all_classes_mappings: Optional[list] = None,
-        structures: Optional[Dict[str, Union[List[str], dict]]] = None,
+        structures: Optional[
+            Union[Dict[str, Union[List[str], dict]], List[dict]]
+        ] = None,
         structuring_dedup: bool = True,
+        return_anchor_diagnostics: bool = False,
     ) -> Dict[str, List]:
         """Map decoded results back to original text indices and char positions."""
         return self.decoder.map_results(
@@ -1009,6 +1076,7 @@ class BaseGLiNExT(BaseGLiNER):
             all_classes_mappings=all_classes_mappings,
             structures=structures,
             structuring_dedup=structuring_dedup,
+            return_anchor_diagnostics=return_anchor_diagnostics,
         )
 
     # ── Per-task convenience methods ───────────────────────────────────
@@ -1081,30 +1149,66 @@ class BaseGLiNExT(BaseGLiNER):
     def structure(
         self,
         texts: Union[str, List[str]],
-        structures: Dict[str, Union[List[str], dict]],
+        structures: Union[Dict[str, Union[List[str], dict]], List[dict]],
         threshold: float = 0.5,
         flat_ner: bool = True,
+        objectness_threshold: Optional[float] = None,
+        preserve_empty_records: bool = False,
+        return_anchor_diagnostics: bool = False,
         **kwargs,
-    ) -> Union[Dict[str, List[Dict]], List[Dict[str, List[Dict]]]]:
+    ) -> Union[dict, list, List[Union[dict, list]]]:
         """Extract structured data from one text or a batch of texts.
 
         Returns:
-            A schema result dict for a single input, or one dict per input::
+            A schema result dict for a single input, or one result per input.
+            Multi-level root object/list schemas are returned in their original
+            root shape. Flat schemas retain the historical form::
 
                 {"person": [{"name": "John", "age": "30"}, ...]}
+
+            When ``return_anchor_diagnostics`` is true, returns
+            ``(structured_result, diagnostics)``. Diagnostics distinguish
+            physical model slots from decoder-created logical anchors and
+            report the final parent-child connections used to build the JSON.
         """
         text_batch, single = self._normalize_texts(texts)
         results = self.inference(
             text_batch, structures=structures, threshold=threshold,
-            flat_ner=flat_ner, **kwargs,
+            objectness_threshold=objectness_threshold,
+            preserve_empty_records=preserve_empty_records,
+            return_anchor_diagnostics=return_anchor_diagnostics,
+            flat_ner=flat_ner,
+            **kwargs,
         )
-        task_results = results.get("structuring")
+        task_name = "structuring"
+        task_results = results.get(task_name)
         if task_results is None:
+            task_name = "set_structuring"
             task_results = results.get(
-                "set_structuring",
+                task_name,
                 [{} for _ in text_batch],
             )
-        return self._single_or_batch(task_results, single)
+        structured_result = self._single_or_batch(task_results, single)
+        if not return_anchor_diagnostics:
+            return structured_result
+
+        diagnostics = results.get(
+            f"{task_name}_anchor_diagnostics",
+            [
+                {
+                    "summary": {
+                        "schema_group_count": 0,
+                        "activated_anchor_count": 0,
+                        "logical_anchor_count": 0,
+                        "selected_connection_count": 0,
+                        "raw_relation_connection_count": 0,
+                    },
+                    "groups": [],
+                }
+                for _ in text_batch
+            ],
+        )
+        return structured_result, self._single_or_batch(diagnostics, single)
 
     def classify_images(
         self,
@@ -1559,8 +1663,6 @@ class BaseGLiNExT(BaseGLiNER):
             )
         """
         from .training import GLiNExTTrainer
-        import transformers
-        from packaging import version
 
         if training_args is None:
             if output_dir is None:
@@ -1584,7 +1686,9 @@ class BaseGLiNExT(BaseGLiNER):
 
         data_collator = self._create_data_collator()
 
-        # Build trainer kwargs — handle transformers v4 vs v5 API
+        # Build trainer kwargs from the installed Trainer API. Development
+        # builds such as ``5.0.0.dev0`` compare lower than the final 5.0.0
+        # release even though they already use ``processing_class``.
         trainer_kwargs = {
             "model": self,
             "args": training_args,
@@ -1592,10 +1696,13 @@ class BaseGLiNExT(BaseGLiNER):
             "eval_dataset": eval_dataset,
             "data_collator": data_collator,
         }
-        if version.parse(transformers.__version__) < version.parse("5.0.0"):
-            trainer_kwargs["tokenizer"] = self.data_processor.transformer_tokenizer
-        else:
+        trainer_parameters = inspect.signature(
+            GLiNExTTrainer.__mro__[1].__init__
+        ).parameters
+        if "processing_class" in trainer_parameters:
             trainer_kwargs["processing_class"] = self.data_processor.transformer_tokenizer
+        else:
+            trainer_kwargs["tokenizer"] = self.data_processor.transformer_tokenizer
 
         trainer = GLiNExTTrainer(**trainer_kwargs)
         trainer.train()

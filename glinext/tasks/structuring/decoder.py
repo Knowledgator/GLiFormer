@@ -8,8 +8,14 @@ from typing import Dict, List, Optional
 
 import torch
 
-from ..span_decoder import Span, SpanDecoder
 from ...processing.decoder import unflatten_by_batch_origin
+from ..span_decoder import Span, SpanDecoder
+from .multilevel import MULTI_LEVEL_ROOT_KEY
+from .multilevel_decoder import (
+    MultiLevelStructuringDecoder,
+    is_multi_level_group_result,
+    make_multi_level_group_result,
+)
 
 
 class StructuringDecoder(SpanDecoder):
@@ -26,6 +32,7 @@ class StructuringDecoder(SpanDecoder):
     batch_origin_attr = "structuring_batch_origin"
     anchor_mask_attr = "structuring_anchor_mask"
     objectness_logits_attr = "structuring_objectness_logits"
+    relation_scores_attr = "structuring_anchor_relation_scores"
     span_idx_attr = "structuring_span_idx"
     span_mask_attr = "structuring_span_mask"
 
@@ -33,24 +40,57 @@ class StructuringDecoder(SpanDecoder):
         super().__init__(config)
         struct_cfg = getattr(config, self.config_attr, None)
         self.objectness_threshold = (
-            getattr(struct_cfg, "anchor_objectness_threshold", 0.5)
+            getattr(struct_cfg, "anchor_objectness_threshold", None)
+            if struct_cfg is not None else None
+        )
+        self.multi_level = bool(
+            getattr(struct_cfg, "multi_level", False)
+            if struct_cfg is not None else False
+        )
+        self.anchor_relations_threshold = float(
+            getattr(struct_cfg, "anchor_relations_threshold", 0.5)
             if struct_cfg is not None else 0.5
         )
+        self.multi_level_decoder = MultiLevelStructuringDecoder(
+            self.anchor_relations_threshold
+        )
 
-    def _resolve_anchor_mask(self, anchor_mask, objectness_logits,
-                              objectness_threshold):
+    def _resolve_anchor_mask(
+        self,
+        anchor_mask,
+        objectness_logits,
+        objectness_threshold,
+        *,
+        relation_scores=None,
+        expected_shape=None,
+    ):
         """Combine the structural anchor mask with objectness gating.
 
         Returns a boolean mask of the same shape as ``anchor_mask`` (or the
         objectness mask, when anchor_mask is None). Anchors where objectness
         falls below the threshold are dropped from decoding.
         """
-        threshold = objectness_threshold if objectness_threshold is not None \
-            else self.objectness_threshold
+        for value, name in (
+            (anchor_mask, self.anchor_mask_attr),
+            (objectness_logits, self.objectness_logits_attr),
+        ):
+            if (
+                value is not None
+                and expected_shape is not None
+                and tuple(value.shape) != tuple(expected_shape)
+            ):
+                raise ValueError(
+                    f"{name} must have shape (BN, A), got "
+                    f"{tuple(value.shape)}"
+                )
 
         obj_mask = None
         if objectness_logits is not None:
-            obj_mask = torch.sigmoid(objectness_logits) > threshold
+            # Objectness is the authoritative prediction that a slot exists.
+            # Relation logits are conditional attributes of existing slots;
+            # allowing them to revive a rejected slot makes an explicit high
+            # objectness threshold ineffective and creates phantom records.
+            obj_mask = torch.sigmoid(objectness_logits) > objectness_threshold
 
         if anchor_mask is None and obj_mask is None:
             return None
@@ -59,11 +99,52 @@ class StructuringDecoder(SpanDecoder):
         if obj_mask is None:
             return anchor_mask.bool() if anchor_mask.dtype != torch.bool else anchor_mask
 
-        # Align anchor counts (objectness comes from post-refine anchors which
-        # should match anchor_mask but be defensive about it).
-        min_A = min(anchor_mask.shape[1], obj_mask.shape[1])
-        combined = anchor_mask[:, :min_A].bool() & obj_mask[:, :min_A]
-        return combined
+        return anchor_mask.bool() & obj_mask
+
+    def _rescue_nested_relation_anchors(
+        self,
+        anchor_mask,
+        raw_anchor_mask,
+        relation_scores,
+        multi_level_contexts,
+    ):
+        """Retain relation-linked containers only inside real hierarchies.
+
+        A relation may bridge a fieldless parent/child container, but it must
+        be connected to at least one objectness-selected slot. Relations alone
+        never create a graph, and root-only schemas never use relation rescue.
+        """
+
+        if anchor_mask is None or relation_scores is None:
+            return anchor_mask
+        rescued = anchor_mask.bool().clone()
+        for batch_idx, context in enumerate(multi_level_contexts or []):
+            mapping = context.get("mapping") if context else None
+            hierarchy = list(getattr(mapping, "hierarchy", None) or [])
+            if not any(tuple(node.get("path") or ()) for node in hierarchy):
+                continue
+            edges = relation_scores[batch_idx] >= self.anchor_relations_threshold
+            edges = edges.clone()
+            edges.fill_diagonal_(False)
+            valid = (
+                raw_anchor_mask[batch_idx].bool()
+                if raw_anchor_mask is not None
+                else torch.ones_like(rescued[batch_idx])
+            )
+            active = rescued[batch_idx]
+            if not active.any():
+                continue
+            while True:
+                neighbours = (
+                    edges[active].any(dim=0)
+                    | edges[:, active].any(dim=1)
+                )
+                expanded = valid & (active | neighbours)
+                if torch.equal(expanded, active):
+                    break
+                active = expanded
+            rescued[batch_idx] = active
+        return rescued
 
     def decode(
         self,
@@ -74,6 +155,7 @@ class StructuringDecoder(SpanDecoder):
         multi_label=False,
         texts=None,
         objectness_threshold=None,
+        preserve_empty_records=False,
         **kwargs,
     ) -> List[List[dict]]:
         """Decode structuring predictions.
@@ -85,7 +167,10 @@ class StructuringDecoder(SpanDecoder):
 
         When the model has an anchor-objectness head, anchors below
         ``objectness_threshold`` are filtered before BIO decoding so that
-        empty slots do not leak into the output.
+        empty slots do not leak into the output. When it is omitted, the main
+        ``threshold`` is reused for objectness. Objectness-selected records
+        without field evidence are dropped unless ``preserve_empty_records``
+        is explicitly enabled.
         """
         token_logits = getattr(model_output, self.token_logits_attr, None)
         span_logits = getattr(model_output, self.span_logits_attr, None)
@@ -94,13 +179,16 @@ class StructuringDecoder(SpanDecoder):
         if token_logits is None and span_logits is None:
             return []
 
-        threshold = threshold or self.threshold
-        anchor_mask = self._resolve_anchor_mask(
-            getattr(model_output, self.anchor_mask_attr, None),
-            getattr(model_output, self.objectness_logits_attr, None),
-            objectness_threshold,
-        )
-
+        # A call-time objectness threshold is most specific. Otherwise reuse
+        # the call's main threshold; the configured value is retained only as
+        # a fallback for direct decoder calls that omit both.
+        if objectness_threshold is None and threshold is not None:
+            objectness_threshold = threshold
+        if objectness_threshold is None:
+            objectness_threshold = self.objectness_threshold
+        threshold = self.threshold if threshold is None else threshold
+        if objectness_threshold is None:
+            objectness_threshold = threshold
         # Determine batch size from whichever output is available
         if token_logits is not None:
             B = token_logits.shape[0]
@@ -108,6 +196,55 @@ class StructuringDecoder(SpanDecoder):
             B = span_logits.shape[0]
 
         id_to_fields = self._build_field_class_maps(classes_mapping, B)
+        multi_level_contexts = self._build_multi_level_contexts(
+            classes_mapping, B,
+        )
+        relation_scores = getattr(
+            model_output, self.relation_scores_attr, None,
+        )
+        expected_anchor_count = (
+            span_logits.shape[1]
+            if span_logits is not None and span_idx is not None and span_mask is not None
+            else token_logits.shape[1]
+        )
+        if relation_scores is not None and (
+            relation_scores.dim() != 3
+            or relation_scores.shape != (
+                B,
+                expected_anchor_count,
+                expected_anchor_count,
+            )
+        ):
+            raise ValueError(
+                f"{self.relation_scores_attr} must have shape (BN, A, A), "
+                f"got {tuple(relation_scores.shape)}"
+            )
+        objectness_logits = getattr(
+            model_output, self.objectness_logits_attr, None,
+        )
+        raw_anchor_mask = getattr(
+            model_output, self.anchor_mask_attr, None,
+        )
+        anchor_mask = self._resolve_anchor_mask(
+            raw_anchor_mask,
+            objectness_logits,
+            objectness_threshold,
+            relation_scores=relation_scores,
+            expected_shape=(B, expected_anchor_count),
+        )
+        anchor_mask = self._rescue_nested_relation_anchors(
+            anchor_mask,
+            raw_anchor_mask,
+            relation_scores,
+            multi_level_contexts,
+        )
+        reliable_presence_mask = None
+        if objectness_logits is not None:
+            reliable_presence_mask = (
+                torch.sigmoid(objectness_logits) > objectness_threshold
+            )
+            if raw_anchor_mask is not None:
+                reliable_presence_mask &= raw_anchor_mask.bool()
 
         batch_origin = getattr(model_output, self.batch_origin_attr, None)
         batch_size = model_output.batch_size
@@ -126,6 +263,10 @@ class StructuringDecoder(SpanDecoder):
                 texts,
                 batch_origin=batch_origin,
                 batch_size=batch_size,
+                multi_level_contexts=multi_level_contexts,
+                relation_scores=relation_scores,
+                reliable_presence_mask=reliable_presence_mask,
+                preserve_empty_records=preserve_empty_records,
             )
 
         # Fall back to token-level BIO decoding
@@ -139,10 +280,18 @@ class StructuringDecoder(SpanDecoder):
             texts,
             batch_origin=batch_origin,
             batch_size=batch_size,
+            multi_level_contexts=multi_level_contexts,
+            relation_scores=relation_scores,
+            reliable_presence_mask=reliable_presence_mask,
+            preserve_empty_records=preserve_empty_records,
         )
 
     def _decode_token_level(self, logits, anchor_mask, id_to_fields, threshold,
-                            flat_ner, multi_label, texts, batch_origin=None, batch_size=None):
+                            flat_ner, multi_label, texts, batch_origin=None,
+                            batch_size=None, multi_level_contexts=None,
+                            relation_scores=None,
+                            reliable_presence_mask=None,
+                            preserve_empty_records=False):
         """Decode from token-level BIO logits (BN, X, L, C, 3)."""
         BN, X, L, C, _ = logits.shape
         flat_results = []
@@ -150,6 +299,15 @@ class StructuringDecoder(SpanDecoder):
         for b in range(BN):
             text_bi = batch_origin[b].item()
             instances = []
+            nodes = []
+            context = (
+                multi_level_contexts[b]
+                if multi_level_contexts and b < len(multi_level_contexts)
+                else None
+            )
+            is_multi_level = bool(
+                context and getattr(context["mapping"], "multi_level", False)
+            )
             field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
                 i: str(i) for i in range(C)
             }
@@ -162,16 +320,37 @@ class StructuringDecoder(SpanDecoder):
                     instance_logits, field_id_to_class, threshold, flat_ner, multi_label,
                 )
 
-                if spans:
-                    fields = self._spans_to_fields(spans, texts, text_bi)
+                fields = self._spans_to_fields(spans, texts, text_bi)
+                if is_multi_level:
+                    nodes.append({
+                        "anchor_index": x,
+                        "fields": fields,
+                        "presence_is_reliable": bool(
+                            reliable_presence_mask is not None
+                            and reliable_presence_mask[b, x]
+                        ),
+                    })
+                elif spans:
                     instances.append(fields)
-            flat_results.append(instances)
+            if is_multi_level:
+                flat_results.append(make_multi_level_group_result(
+                    nodes,
+                    relation_scores[b] if relation_scores is not None else None,
+                    context["mapping"],
+                    context["output_mode"],
+                    preserve_empty_records=preserve_empty_records,
+                ))
+            else:
+                flat_results.append(instances)
 
         return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
 
     def _decode_from_spans(self, span_logits, span_idx, span_mask, anchor_mask,
                            id_to_fields, threshold, flat_ner, multi_label, texts,
-                           batch_origin=None, batch_size=None):
+                           batch_origin=None, batch_size=None,
+                           multi_level_contexts=None, relation_scores=None,
+                           reliable_presence_mask=None,
+                           preserve_empty_records=False):
         """Decode from span-level predictions (BN, X, S, C)."""
         BN, X, S, C = span_logits.shape
         span_probs = torch.sigmoid(span_logits)
@@ -180,6 +359,15 @@ class StructuringDecoder(SpanDecoder):
         for b in range(BN):
             text_bi = batch_origin[b].item()
             instances = []
+            nodes = []
+            context = (
+                multi_level_contexts[b]
+                if multi_level_contexts and b < len(multi_level_contexts)
+                else None
+            )
+            is_multi_level = bool(
+                context and getattr(context["mapping"], "multi_level", False)
+            )
             field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
                 i: str(i) for i in range(C)
             }
@@ -208,10 +396,28 @@ class StructuringDecoder(SpanDecoder):
 
                 spans = self.greedy_search(spans, flat_ner, multi_label)
 
-                if spans:
-                    fields = self._spans_to_fields(spans, texts, text_bi)
+                fields = self._spans_to_fields(spans, texts, text_bi)
+                if is_multi_level:
+                    nodes.append({
+                        "anchor_index": x,
+                        "fields": fields,
+                        "presence_is_reliable": bool(
+                            reliable_presence_mask is not None
+                            and reliable_presence_mask[b, x]
+                        ),
+                    })
+                elif spans:
                     instances.append(fields)
-            flat_results.append(instances)
+            if is_multi_level:
+                flat_results.append(make_multi_level_group_result(
+                    nodes,
+                    relation_scores[b] if relation_scores is not None else None,
+                    context["mapping"],
+                    context["output_mode"],
+                    preserve_empty_records=preserve_empty_records,
+                ))
+            else:
+                flat_results.append(instances)
 
         return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
 
@@ -251,6 +457,24 @@ class StructuringDecoder(SpanDecoder):
             maps.extend({} for _ in range(batch_size - len(maps)))
         return maps[:batch_size]
 
+    @staticmethod
+    def _build_multi_level_contexts(classes_mapping, batch_size: int) -> List[dict]:
+        if classes_mapping is None or not hasattr(
+            classes_mapping, "structuring_mapping"
+        ):
+            return [{} for _ in range(batch_size)]
+        contexts = []
+        for structuring_mapping in classes_mapping.structuring_mapping:
+            for item in structuring_mapping.items:
+                contexts.append({
+                    "mapping": item,
+                    "output_mode": getattr(
+                        structuring_mapping, "output_mode", "schemas"
+                    ),
+                })
+        contexts.extend({} for _ in range(max(0, batch_size - len(contexts))))
+        return contexts[:batch_size]
+
     def map_results(
         self,
         task_results: list,
@@ -262,9 +486,25 @@ class StructuringDecoder(SpanDecoder):
         all_classes_mappings: Optional[list] = None,
         structures=None,
         structuring_dedup: bool = True,
+        anchor_diagnostics_output: Optional[list] = None,
         **kwargs,
     ) -> List[Dict[str, List[Dict]]]:
-        output: List[Dict[str, List[Dict]]] = [{} for _ in range(num_original)]
+        raw_root_spec = (
+            structures.get(MULTI_LEVEL_ROOT_KEY)
+            if isinstance(structures, dict)
+            and set(structures) == {MULTI_LEVEL_ROOT_KEY}
+            else None
+        )
+        is_root_list = self.multi_level and (
+            isinstance(structures, list)
+            or isinstance(raw_root_spec, list)
+        )
+        output = [([] if is_root_list else {}) for _ in range(num_original)]
+        diagnostics = (
+            [{"summary": {}, "groups": []} for _ in range(num_original)]
+            if anchor_diagnostics_output is not None
+            else None
+        )
         schema_fields, schema_required_fields = self._extract_structuring_meta(structures)
 
         for valid_i, per_text_groups in enumerate(task_results):
@@ -278,6 +518,7 @@ class StructuringDecoder(SpanDecoder):
 
             result_dict: Dict[str, List[Dict]] = {}
             groups = per_text_groups if isinstance(per_text_groups, list) else [per_text_groups]
+            multi_level_mode = None
 
             for group_idx, group in enumerate(groups):
                 schema_name = (
@@ -285,11 +526,62 @@ class StructuringDecoder(SpanDecoder):
                     if group_idx < len(schema_names)
                     else f"schema_{group_idx}"
                 )
+                if is_multi_level_group_result(group):
+                    group_mapping = group.get("mapping")
+                    schema_name = (
+                        getattr(group_mapping, "name", None) or schema_name
+                    )
                 result_dict.setdefault(schema_name, [])
+                required_for_schema = schema_required_fields.get(
+                    schema_name, []
+                )
+
+                if is_multi_level_group_result(group):
+                    group_diagnostics = {} if diagnostics is not None else None
+                    roots = self.multi_level_decoder.reconstruct_group(
+                        group,
+                        start_map,
+                        end_map,
+                        text,
+                        diagnostics=group_diagnostics,
+                    )
+                    if group_diagnostics is not None:
+                        group_diagnostics = {
+                            "schema": schema_name,
+                            "output_mode": group.get(
+                                "output_mode", "schemas",
+                            ),
+                            **group_diagnostics,
+                        }
+                        diagnostics[orig_i]["groups"].append(
+                            group_diagnostics
+                        )
+                    group_spec = self._multi_level_group_spec(
+                        structures, schema_name,
+                    )
+                    roots = [
+                        filtered
+                        for root in roots
+                        if (
+                            filtered := self._filter_nested_required_fields(
+                                root, group_spec,
+                            )
+                        ) is not None
+                    ]
+                    if required_for_schema:
+                        roots = [
+                            root
+                            for root in roots
+                            if all(
+                                self._required_value(root, field) is not None
+                                for field in required_for_schema
+                            )
+                        ]
+                    result_dict[schema_name].extend(roots)
+                    multi_level_mode = group.get("output_mode", "schemas")
+                    continue
 
                 schema_field_list = schema_fields.get(schema_name, [])
-                required_for_schema = schema_required_fields.get(schema_name, [])
-
                 instances = group if isinstance(group, list) else [group]
                 schema_instances: List[Dict[str, object]] = []
                 for instance in instances:
@@ -315,13 +607,70 @@ class StructuringDecoder(SpanDecoder):
 
                 result_dict[schema_name].extend(schema_instances)
 
-            output[orig_i] = result_dict
+            if multi_level_mode == "object":
+                root_values = next(iter(result_dict.values()), [])
+                merged_root = {}
+                for root_value in root_values:
+                    self._merge_nested_result(merged_root, root_value)
+                output[orig_i] = merged_root
+            elif multi_level_mode == "list":
+                output[orig_i] = next(iter(result_dict.values()), [])
+            else:
+                output[orig_i] = result_dict
+
+        if diagnostics is not None:
+            for per_text in diagnostics:
+                groups = per_text["groups"]
+                per_text["summary"] = {
+                    "schema_group_count": len(groups),
+                    "activated_anchor_count": sum(
+                        int(group.get("active_anchor_count", 0))
+                        for group in groups
+                    ),
+                    "logical_anchor_count": sum(
+                        len(group.get("logical_nodes", []))
+                        for group in groups
+                    ),
+                    "selected_connection_count": sum(
+                        len(group.get("connections", []))
+                        for group in groups
+                    ),
+                    "raw_relation_connection_count": sum(
+                        len(group.get("raw_relation_connections", []))
+                        for group in groups
+                    ),
+                }
+            anchor_diagnostics_output.extend(diagnostics)
         return output
+
+    @classmethod
+    def _merge_nested_result(cls, target: dict, source: dict) -> None:
+        """Merge disconnected predictions for a single raw-object root."""
+
+        for key, value in source.items():
+            if key not in target or target[key] is None:
+                target[key] = value
+                continue
+            existing = target[key]
+            if isinstance(existing, dict) and isinstance(value, dict):
+                cls._merge_nested_result(existing, value)
+            elif isinstance(existing, list) and isinstance(value, list):
+                existing.extend(value)
+            elif existing != value:
+                target[key] = (
+                    existing + [value]
+                    if isinstance(existing, list)
+                    else [existing, value]
+                )
 
     @staticmethod
     def _extract_structuring_meta(structures):
-        if not structures:
+        if not structures or not isinstance(structures, dict):
             return {}, {}
+
+        if set(structures) == {MULTI_LEVEL_ROOT_KEY}:
+            root_spec = structures[MULTI_LEVEL_ROOT_KEY]
+            structures = {"root": root_spec}
 
         schema_fields: Dict[str, List[str]] = {}
         schema_required: Dict[str, List[str]] = {}
@@ -338,6 +687,72 @@ class StructuringDecoder(SpanDecoder):
             schema_fields[schema_name] = fields
             schema_required[schema_name] = [f for f in required if f in fields]
         return schema_fields, schema_required
+
+    @staticmethod
+    def _required_value(instance: dict, field: str):
+        """Resolve a required field, preferring an exact literal-dot key."""
+
+        if field in instance:
+            return instance[field]
+        value = instance
+        for segment in str(field).split("."):
+            if not isinstance(value, dict) or segment not in value:
+                return None
+            value = value[segment]
+        return value
+
+    @staticmethod
+    def _multi_level_group_spec(structures, schema_name: str):
+        if not isinstance(structures, dict):
+            return None
+        if set(structures) == {MULTI_LEVEL_ROOT_KEY}:
+            return structures[MULTI_LEVEL_ROOT_KEY]
+        return structures.get(schema_name)
+
+    @classmethod
+    def _filter_nested_required_fields(cls, instance: dict, spec):
+        """Apply descriptor requirements recursively to reconstructed JSON."""
+
+        if not isinstance(spec, dict):
+            return instance
+        descriptor_keys = {
+            "fields", "children", "required_fields", "description",
+        }
+        is_descriptor = set(spec).issubset(descriptor_keys) and (
+            isinstance(spec.get("fields"), (list, dict))
+            or "required_fields" in spec
+            or (
+                "fields" in spec
+                and isinstance(spec.get("children"), dict)
+            )
+        )
+        if not is_descriptor:
+            return instance
+
+        children = spec.get("children") or {}
+        if isinstance(children, dict):
+            for child_name, child_spec in children.items():
+                value = instance.get(str(child_name))
+                if isinstance(value, list):
+                    instance[str(child_name)] = [
+                        filtered
+                        for child in value
+                        if isinstance(child, dict)
+                        and (
+                            filtered := cls._filter_nested_required_fields(
+                                child, child_spec,
+                            )
+                        ) is not None
+                    ]
+                elif isinstance(value, dict):
+                    instance[str(child_name)] = (
+                        cls._filter_nested_required_fields(value, child_spec)
+                    )
+
+        required = spec.get("required_fields") or []
+        if any(cls._required_value(instance, field) is None for field in required):
+            return None
+        return instance
 
     @staticmethod
     def _fill_missing_fields(instance: Dict[str, object], schema_field_list: List[str]) -> Dict[str, object]:

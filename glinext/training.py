@@ -25,6 +25,7 @@ _LABEL_KEYS = frozenset(
         "structuring_labels",
         "structuring_span_labels",
         "structuring_count",
+        "structuring_relation_labels",
         "embedding_labels",
         "count_targets",
         # Vision tasks
@@ -58,9 +59,25 @@ _PREDICTION_FIELDS_BY_LABEL = {
     "rel_labels": ("joint_rel_logits",),
     "open_rel_labels": ("open_rel_logits",),
     "open_rel_span_labels": ("open_rel_span_logits",),
-    "structuring_labels": ("structuring_logits", "structuring_objectness_logits"),
-    "structuring_span_labels": ("structuring_span_logits",),
+    "structuring_labels": (
+        "structuring_logits",
+        "structuring_objectness_logits",
+        "set_structuring_entity_logits",
+    ),
+    "structuring_span_labels": (
+        "structuring_span_logits",
+        "set_structuring_field_logits",
+        "set_structuring_assignment_logits",
+        "set_structuring_span_idx",
+        "set_structuring_span_mask",
+        "set_structuring_objectness_logits",
+        "set_structuring_anchor_mask",
+    ),
     "structuring_count": ("count_logits",),
+    "structuring_relation_labels": (
+        "structuring_anchor_relation_scores",
+        "set_structuring_anchor_relation_scores",
+    ),
     "embedding_labels": ("embedding_logits",),
     "count_targets": ("count_logits",),
     "image_classification_labels": ("image_classification_logits",),
@@ -145,6 +162,13 @@ _PREDICTION_FIELDS_BY_LABEL = {
     ),
 }
 
+_STRUCTURING_RELATION_PREDICTION_FIELDS = frozenset(
+    {
+        "structuring_anchor_relation_scores",
+        "set_structuring_anchor_relation_scores",
+    }
+)
+
 
 def _present_label_keys(inputs: dict[str, Any]) -> tuple[str, ...]:
     """Return task supervision keys that carry a value in this batch."""
@@ -172,11 +196,22 @@ def _prediction_values(
             if field_name not in ignored and field_name not in field_names:
                 field_names.append(field_name)
 
-    values = [
-        value
-        for field_name in field_names
-        if (value := _get_output_value(outputs, field_name)) is not None
-    ]
+    values = []
+    for field_name in field_names:
+        value = _get_output_value(outputs, field_name)
+        if value is None:
+            continue
+        if (
+            field_name in _STRUCTURING_RELATION_PREDICTION_FIELDS
+            and isinstance(value, torch.Tensor)
+            and value.ndim >= 3
+        ):
+            # HF's evaluation accumulator pads only dimension 1. Flatten the
+            # two anchor axes so batches with different anchor counts can be
+            # concatenated. This preserves the model's row-major slot order;
+            # it does not attempt to apply training-time anchor matching.
+            value = value.flatten(start_dim=1)
+        values.append(value)
     if not values:
         fallback = _get_output_value(outputs, "logits")
         return None if "logits" in ignored else fallback
@@ -343,4 +378,13 @@ class GLiNExTTrainer(GLiNERTrainer):
         logits = nested_detach(logits) if logits is not None else None
 
         labels = {key: nested_detach(inputs[key]) for key in label_keys}
+        relation_labels = labels.get("structuring_relation_labels")
+        if isinstance(relation_labels, torch.Tensor) and relation_labels.ndim >= 3:
+            labels["structuring_relation_labels"] = relation_labels.flatten(start_dim=1)
+        if "structuring_relation_labels" in labels:
+            relation_group_mask = inputs.get("structuring_relation_group_mask")
+            if relation_group_mask is not None:
+                # Auxiliary metric metadata, deliberately not a supervision
+                # key: its presence alone must not make a batch "labelled".
+                labels["structuring_relation_group_mask"] = nested_detach(relation_group_mask)
         return (loss, logits, labels or None)

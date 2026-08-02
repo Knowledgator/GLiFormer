@@ -1,13 +1,23 @@
 """Structuring task processor."""
 
 import random
-from typing import Dict, List, Optional
+from copy import deepcopy
 
 import torch
 
-from ..span_processor import SpanProcessor
 from ...processing.mappings import (
-    BaseClassMapping, StructuringItemMapping, StructuringClassMapping, BatchClassesMapping,
+    BaseClassMapping,
+    StructuringClassMapping,
+    StructuringItemMapping,
+)
+from ..span_processor import SpanProcessor
+from .multilevel import (
+    MULTI_LEVEL_META_KEY,
+    MULTI_LEVEL_ROOT_KEY,
+    NODE_ID_KEY,
+    NODE_KEEP_KEY,
+    MultiLevelStructuringProcessor,
+    is_internal_instance_key,
 )
 
 
@@ -30,6 +40,30 @@ class StructuringProcessor(SpanProcessor):
             )
             if struct_cfg is not None
         ]
+        self.has_structuring_head = (
+            getattr(config, 'structuring_config', None) is not None
+        )
+        self.has_set_structuring_head = (
+            getattr(config, 'set_structuring_config', None) is not None
+        )
+        multi_level_flags = {
+            bool(getattr(struct_cfg, 'multi_level', False))
+            for struct_cfg in struct_configs
+        }
+        if len(multi_level_flags) > 1:
+            raise ValueError(
+                "structuring_config and set_structuring_config must use the "
+                "same multi_level value because they share one processor"
+            )
+        self.multi_level = bool(multi_level_flags and next(iter(multi_level_flags)))
+        self.multi_level_processor = (
+            MultiLevelStructuringProcessor(
+                child_token=config.structuring_child_token,
+                end_token=config.structuring_end_token,
+            )
+            if self.multi_level
+            else None
+        )
         set_structuring_config = getattr(
             config,
             'set_structuring_config',
@@ -46,6 +80,15 @@ class StructuringProcessor(SpanProcessor):
             ),
             None,
         )
+        # Only the classical structuring head consumes dense labels whose
+        # record axis must match its fixed query width. Set structuring uses a
+        # rectangular assignment (predicted slots versus gold records), so
+        # padding its gold axis to ``num_slots`` only wastes memory.
+        fixed_slot_configs = [
+            struct_cfg
+            for struct_cfg in (getattr(config, 'structuring_config', None),)
+            if struct_cfg is not None
+        ]
         self._fixed_slot_pad = max(
             (
                 struct_cfg.effective_anchor_num_slots()
@@ -62,14 +105,16 @@ class StructuringProcessor(SpanProcessor):
                 )
                 else 0
             )
-            for struct_cfg in struct_configs
-        ) if struct_configs else 0
+            for struct_cfg in fixed_slot_configs
+        ) if fixed_slot_configs else 0
 
     @staticmethod
     def _instance_sort_key(instance):
         """Return the earliest span start position across all fields in an instance."""
         min_start = float('inf')
-        for value in instance.values():
+        for key, value in instance.items():
+            if is_internal_instance_key(key):
+                continue
             if isinstance(value, dict):
                 st = value.get('start', -1)
                 if st >= 0:
@@ -83,29 +128,140 @@ class StructuringProcessor(SpanProcessor):
         return min_start
 
     @staticmethod
-    def _instance_has_valid_span(instance, max_seq_len=0):
-        for value in instance.values():
+    def _instance_has_valid_span(
+        instance,
+        max_seq_len=0,
+        *,
+        enforce_limit=False,
+    ):
+        if instance.get(NODE_KEEP_KEY, False) and not enforce_limit:
+            return True
+        for key, value in instance.items():
+            if is_internal_instance_key(key):
+                continue
             values = value if isinstance(value, list) else [value]
             for field_value in values:
                 if not isinstance(field_value, dict):
                     continue
                 st = field_value.get('start', -1)
                 ed = field_value.get('end', -1)
-                if st < 0 or ed < 0:
+                if st < 0 or ed < st:
                     continue
-                if max_seq_len > 0 and (st >= max_seq_len or ed >= max_seq_len):
+                if (
+                    (enforce_limit or max_seq_len > 0)
+                    and (st >= max_seq_len or ed >= max_seq_len)
+                ):
                     continue
                 return True
         return False
 
+    @staticmethod
+    def _normalize_sequence_lengths(batch_list, sequence_lengths, max_seq_len):
+        """Validate optional per-item source lengths retained by tokenization."""
+
+        if sequence_lengths is None:
+            return None, int(max_seq_len)
+        if torch.is_tensor(sequence_lengths):
+            values = sequence_lengths.detach().reshape(-1).cpu().tolist()
+        else:
+            values = list(sequence_lengths)
+        if len(values) != len(batch_list):
+            raise ValueError(
+                "sequence_lengths must contain one value per batch item"
+            )
+        normalized = []
+        for value in values:
+            if isinstance(value, bool) or int(value) != value or value < 0:
+                raise ValueError(
+                    "sequence_lengths values must be non-negative integers"
+                )
+            normalized.append(int(value))
+        return normalized, max(normalized, default=0)
+
+    def _filter_instances(
+        self,
+        item,
+        data_key,
+        instances,
+        max_seq_len,
+        *,
+        enforce_limit=False,
+    ):
+        """Keep visible records and, for hierarchies, their ancestors."""
+
+        visible = [
+            instance
+            for instance in instances
+            if self._instance_has_valid_span(
+                instance,
+                max_seq_len,
+                enforce_limit=enforce_limit,
+            )
+        ]
+        if not enforce_limit or not self.multi_level:
+            return visible
+
+        multi_meta = item.get(MULTI_LEVEL_META_KEY) or {}
+        group_meta = next(
+            (
+                group
+                for group in multi_meta.get('groups', [])
+                if group.get('data_key') == data_key
+            ),
+            {},
+        )
+        retained_node_ids = {
+            instance.get(NODE_ID_KEY)
+            for instance in visible
+            if instance.get(NODE_ID_KEY) is not None
+        }
+        changed = True
+        relations = group_meta.get('relations', [])
+        while changed:
+            changed = False
+            for parent_node, child_node in relations:
+                if (
+                    child_node in retained_node_ids
+                    and parent_node not in retained_node_ids
+                ):
+                    retained_node_ids.add(parent_node)
+                    changed = True
+
+        visible_object_ids = {id(instance) for instance in visible}
+        return [
+            instance
+            for instance in instances
+            if id(instance) in visible_object_ids
+            or instance.get(NODE_ID_KEY) in retained_node_ids
+        ]
+
+    @staticmethod
+    def _iter_field_values(value):
+        """Flatten nested value arrays into groundable scalar occurrences."""
+
+        if isinstance(value, list):
+            for child in value:
+                yield from StructuringProcessor._iter_field_values(child)
+        else:
+            yield value
+
     def get_classes_mapping(self, batch_list, shuffle_labels=False, **kwargs):
         structuring_mapping = []
         for item in batch_list:
+            if self.multi_level_processor is not None:
+                self.multi_level_processor.normalize_item(item)
             structuring_data = item.get('structuring', {})
             structuring_schema = item.get('structuring_schema') or {}
+            multi_meta = item.get(MULTI_LEVEL_META_KEY) or {}
+            meta_groups = {
+                group.get('data_key'): group
+                for group in multi_meta.get('groups', [])
+            }
             prompt = item.get('prompt')
             item_mappings = []
-            for schema_name, instances in structuring_data.items():
+            for data_key, instances in structuring_data.items():
+                group_meta = meta_groups.get(data_key, {})
+                schema_name = group_meta.get('name', data_key)
                 field_names = []
                 seen = set()
                 # Inference stubs and explicitly supplied schemas carry the
@@ -114,7 +270,7 @@ class StructuringProcessor(SpanProcessor):
                 # pruned without making inference depend on placeholder
                 # strings surviving span resolution.
                 schema_field_names = self._structure_fields(
-                    structuring_schema.get(schema_name, [])
+                    structuring_schema.get(data_key, [])
                 )
                 for field_name in schema_field_names:
                     if field_name not in seen:
@@ -122,6 +278,8 @@ class StructuringProcessor(SpanProcessor):
                         seen.add(field_name)
                 for instance in instances:
                     for field_name in instance:
+                        if is_internal_instance_key(field_name):
+                            continue
                         if field_name not in seen:
                             field_names.append(field_name)
                             seen.add(field_name)
@@ -146,8 +304,15 @@ class StructuringProcessor(SpanProcessor):
                     ),
                     name=schema_name,
                     description=description,
+                    data_key=data_key,
+                    hierarchy=deepcopy(group_meta.get('hierarchy') or []),
+                    multi_level=bool(group_meta),
                 ))
-            structuring_mapping.append(StructuringClassMapping(items=item_mappings))
+            structuring_mapping.append(StructuringClassMapping(
+                items=item_mappings,
+                output_mode=multi_meta.get('output_mode', 'schemas'),
+                multi_level=bool(multi_meta),
+            ))
         return structuring_mapping
 
     def contribute_prompt(self, classes_mapping, batch_idx, use_labels_encoder=False):
@@ -157,6 +322,15 @@ class StructuringProcessor(SpanProcessor):
             return []
         prompt = []
         for struct_item in classes_mapping.structuring_mapping[batch_idx].items:
+            if struct_item.multi_level and self.multi_level_processor is not None:
+                prompt.extend(self.multi_level_processor.contribute_prompt(
+                    struct_item,
+                    parent_token=self.parent_token,
+                    field_token=self.child_token,
+                    sep_token=self.sep_token,
+                    use_labels_encoder=use_labels_encoder,
+                ))
+                continue
             prompt.append(self.parent_token)
             field_map = struct_item.field_class_to_id
             if field_map.name:
@@ -178,13 +352,36 @@ class StructuringProcessor(SpanProcessor):
         return []
 
     def contribute_inference_input(self, item, structures=None, **kwargs):
-        if not structures:
+        if structures is None:
             return
+
+        if self.multi_level_processor is not None:
+            self.multi_level_processor.contribute_inference_input(item, structures)
+            return
+
+        if isinstance(structures, list):
+            raise ValueError(
+                "Root-list or nested structuring schemas require "
+                "multi_level=True on the structuring head"
+            )
+        if not isinstance(structures, dict):
+            raise TypeError("structures must be a dictionary or list")
 
         structuring = {}
         structuring_schema = {}
         for schema_name, fields in structures.items():
+            if isinstance(fields, dict) and "fields" not in fields:
+                raise ValueError(
+                    "Nested structuring schemas require multi_level=True on "
+                    "the structuring head"
+                )
             field_list = self._structure_fields(fields)
+            if not isinstance(field_list, list) or not all(
+                isinstance(field, str) for field in field_list
+            ):
+                raise TypeError(
+                    "Flat structuring schema fields must be a list of strings"
+                )
             structuring[schema_name] = [dict.fromkeys(field_list, "")] if field_list else []
             structuring_schema[schema_name] = field_list
         item["structuring"] = structuring
@@ -193,7 +390,25 @@ class StructuringProcessor(SpanProcessor):
     def empty_inference_result(self, num_texts: int, structures=None, **kwargs):
         if structures is None:
             return None
-        return {"structuring": [{} for _ in range(num_texts)]}
+        root_spec = (
+            structures.get(MULTI_LEVEL_ROOT_KEY)
+            if isinstance(structures, dict)
+            and set(structures) == {MULTI_LEVEL_ROOT_KEY}
+            else None
+        )
+        is_root_list = self.multi_level and (
+            isinstance(structures, list) or isinstance(root_spec, list)
+        )
+
+        def empty_values():
+            return [([] if is_root_list else {}) for _ in range(num_texts)]
+
+        result = {}
+        if self.has_structuring_head:
+            result["structuring"] = empty_values()
+        if self.has_set_structuring_head:
+            result["set_structuring"] = empty_values()
+        return result
 
     def _normalize_field_value(
         self,
@@ -244,6 +459,8 @@ class StructuringProcessor(SpanProcessor):
         ]
 
     def resolve_spans(self, item):
+        if self.multi_level_processor is not None:
+            self.multi_level_processor.normalize_item(item)
         if item.get('_glinext_structuring_spans_resolved'):
             return
         structuring = item.get('structuring', {})
@@ -262,10 +479,12 @@ class StructuringProcessor(SpanProcessor):
                 if not isinstance(instance, dict):
                     continue
                 for field_name, value in list(instance.items()):
+                    if is_internal_instance_key(field_name):
+                        continue
                     used_spans = used_spans_by_field.setdefault(field_name, set())
                     if isinstance(value, list):
                         resolved_list = []
-                        for v in value:
+                        for v in self._iter_field_values(value):
                             resolved_list.extend(self._normalize_field_value(
                                 text,
                                 tokens_with_spans,
@@ -291,12 +510,25 @@ class StructuringProcessor(SpanProcessor):
                             instance[field_name] = normalized[0]
                         else:
                             instance.pop(field_name, None)
-                if instance:
+                if any(
+                    not is_internal_instance_key(key)
+                    for key in instance
+                ) or instance.get(NODE_KEEP_KEY, False):
                     resolved_instances.append(instance)
             structuring[schema_name] = resolved_instances
         item['_glinext_structuring_spans_resolved'] = True
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
+        sequence_lengths, max_seq_len = self._normalize_sequence_lengths(
+            batch_list,
+            kwargs.get("sequence_lengths"),
+            max_seq_len,
+        )
+        source_sequence_lengths, _ = self._normalize_sequence_lengths(
+            batch_list,
+            kwargs.get("source_sequence_lengths"),
+            max_seq_len,
+        )
         for item in batch_list:
             self.resolve_spans(item)
 
@@ -310,16 +542,28 @@ class StructuringProcessor(SpanProcessor):
 
         for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
             structuring_data = batch_list[batch_idx].get('structuring', {})
-            schema_name = struct_item.name
-            if schema_name not in structuring_data:
+            data_key = struct_item.data_key or struct_item.name
+            if data_key not in structuring_data:
                 continue
-            instances = structuring_data[schema_name]
+            instances = structuring_data[data_key]
             if instances:
                 has_schema = True
-                valid_instances = [
-                    instance for instance in instances
-                    if self._instance_has_valid_span(instance, max_seq_len)
-                ]
+                item_limit = (
+                    sequence_lengths[batch_idx]
+                    if sequence_lengths is not None
+                    else max_seq_len
+                )
+                enforce_limit = sequence_lengths is not None and (
+                    source_sequence_lengths is None
+                    or item_limit < source_sequence_lengths[batch_idx]
+                )
+                valid_instances = self._filter_instances(
+                    batch_list[batch_idx],
+                    data_key,
+                    instances,
+                    item_limit,
+                    enforce_limit=enforce_limit,
+                )
                 max_instances = max(max_instances, len(valid_instances))
                 max_fields = max(max_fields, len(struct_item.field_class_to_id.class_to_id))
 
@@ -338,27 +582,90 @@ class StructuringProcessor(SpanProcessor):
         structuring_mask = torch.zeros(total_groups, dtype=torch.bool)
         structuring_batch_idx = torch.zeros(total_groups, dtype=torch.long)
         structuring_count = torch.zeros(total_groups, dtype=torch.long)
+        structuring_relation_labels = (
+            torch.zeros(
+                total_groups, max_instances, max_instances, dtype=torch.float,
+            )
+            if self.multi_level
+            else None
+        )
+        structuring_relation_group_mask = (
+            torch.zeros(total_groups, dtype=torch.bool)
+            if self.multi_level
+            else None
+        )
 
         for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
             structuring_batch_idx[flat_idx] = batch_idx
             structuring_data = batch_list[batch_idx].get('structuring', {})
-            schema_name = struct_item.name
-            if schema_name not in structuring_data:
+            data_key = struct_item.data_key or struct_item.name
+            if data_key not in structuring_data:
                 continue
 
-            instances = [
-                instance for instance in structuring_data[schema_name]
-                if self._instance_has_valid_span(instance, max_seq_len)
-            ]
+            item_limit = (
+                sequence_lengths[batch_idx]
+                if sequence_lengths is not None
+                else max_seq_len
+            )
+            enforce_limit = sequence_lengths is not None and (
+                source_sequence_lengths is None
+                or item_limit < source_sequence_lengths[batch_idx]
+            )
+            instances = self._filter_instances(
+                batch_list[batch_idx],
+                data_key,
+                structuring_data[data_key],
+                item_limit,
+                enforce_limit=enforce_limit,
+            )
             instances = sorted(instances, key=self._instance_sort_key)
             field_to_id = struct_item.field_class_to_id.class_to_id
             structuring_mask[flat_idx] = True
             structuring_count[flat_idx] = len(instances)
+            if structuring_relation_group_mask is not None:
+                # A root-only multi-level group has no meaningful directed
+                # hierarchy to supervise. In particular, repeated flat records
+                # must not turn every fixed-slot pair into an all-negative
+                # relation target merely because they share the multi-level
+                # processor with genuinely nested examples.
+                hierarchy = list(getattr(struct_item, 'hierarchy', None) or [])
+                structuring_relation_group_mask[flat_idx] = bool(
+                    struct_item.multi_level
+                    and any(
+                        node.get('parent_path') is not None
+                        for node in hierarchy
+                        if isinstance(node, dict)
+                    )
+                )
+
+            if struct_item.multi_level:
+                multi_meta = batch_list[batch_idx].get(MULTI_LEVEL_META_KEY) or {}
+                group_meta = next(
+                    (
+                        group for group in multi_meta.get('groups', [])
+                        if group.get('data_key') == data_key
+                    ),
+                    {},
+                )
+                node_to_instance = {
+                    instance.get(NODE_ID_KEY): inst_idx
+                    for inst_idx, instance in enumerate(instances[:max_instances])
+                    if instance.get(NODE_ID_KEY) is not None
+                }
+                for parent_node, child_node in group_meta.get('relations', []):
+                    parent_idx = node_to_instance.get(parent_node)
+                    child_idx = node_to_instance.get(child_node)
+                    if parent_idx is not None and child_idx is not None:
+                        structuring_relation_labels[
+                            flat_idx, parent_idx, child_idx
+                        ] = 1.0
 
             for inst_idx, instance in enumerate(instances):
                 if inst_idx >= max_instances:
                     break
                 for field_name, value in instance.items():
+                    if is_internal_instance_key(field_name):
+                        continue
                     if field_name not in field_to_id:
                         continue
                     field_id = field_to_id[field_name]
@@ -370,18 +677,29 @@ class StructuringProcessor(SpanProcessor):
                             continue
                         st = field_value.get('start', -1)
                         ed = field_value.get('end', -1)
-                        if st < 0 or ed < 0 or st >= max_seq_len or ed >= max_seq_len:
+                        if (
+                            st < 0
+                            or ed < st
+                            or st >= item_limit
+                            or ed >= item_limit
+                        ):
                             continue
                         structuring_labels[flat_idx, inst_idx, st, field_id, 0] = 1.0
                         structuring_labels[flat_idx, inst_idx, ed, field_id, 1] = 1.0
                         structuring_labels[flat_idx, inst_idx, st:ed + 1, field_id, 2] = 1.0
 
-        return {
+        result = {
             "structuring_labels": structuring_labels,
             "structuring_mask": structuring_mask,
             "structuring_batch_idx": structuring_batch_idx,
             "structuring_count": structuring_count,
         }
+        if structuring_relation_labels is not None:
+            result["structuring_relation_labels"] = structuring_relation_labels
+            result["structuring_relation_group_mask"] = (
+                structuring_relation_group_mask
+            )
+        return result
 
     def create_span_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
         """Create span-level labels for structuring when represent_spans is enabled.
@@ -395,6 +713,17 @@ class StructuringProcessor(SpanProcessor):
         struct_cfg = self._span_config
         if struct_cfg is None:
             return None
+
+        sequence_lengths, max_seq_len = self._normalize_sequence_lengths(
+            batch_list,
+            kwargs.get("sequence_lengths"),
+            max_seq_len,
+        )
+        source_sequence_lengths, _ = self._normalize_sequence_lengths(
+            batch_list,
+            kwargs.get("source_sequence_lengths"),
+            max_seq_len,
+        )
 
         for item in batch_list:
             self.resolve_spans(item)
@@ -413,25 +742,41 @@ class StructuringProcessor(SpanProcessor):
 
         for flat_idx, batch_idx, group_idx, struct_item in classes_mapping.flat_structuring_iter():
             structuring_data = batch_list[batch_idx].get('structuring', {})
-            schema_name = struct_item.name
+            data_key = struct_item.data_key or struct_item.name
             field_to_id = struct_item.field_class_to_id.class_to_id
             max_fields = max(max_fields, len(field_to_id))
             batch_indices.append(batch_idx)
 
-            group_spans = []  # (start, end, inst_idx, field_id)
-            positive_spans = set()
+            # One pooled candidate per unique entity boundary. The value is a
+            # set of (record, field) targets so multi-field/multi-record
+            # annotations remain expressible without sending duplicate span
+            # representations into the second stage.
+            span_targets = {}
+            item_limit = (
+                sequence_lengths[batch_idx]
+                if sequence_lengths is not None
+                else max_seq_len
+            )
+            enforce_limit = sequence_lengths is not None and (
+                source_sequence_lengths is None
+                or item_limit < source_sequence_lengths[batch_idx]
+            )
 
-            if schema_name in structuring_data:
-                instances = [
-                    instance
-                    for instance in structuring_data[schema_name]
-                    if self._instance_has_valid_span(instance, max_seq_len)
-                ]
+            if data_key in structuring_data:
+                instances = self._filter_instances(
+                    batch_list[batch_idx],
+                    data_key,
+                    structuring_data[data_key],
+                    item_limit,
+                    enforce_limit=enforce_limit,
+                )
                 instances = sorted(instances, key=self._instance_sort_key)
                 max_instances = max(max_instances, len(instances))
 
                 for inst_idx, instance in enumerate(instances):
                     for field_name, value in instance.items():
+                        if is_internal_instance_key(field_name):
+                            continue
                         if field_name not in field_to_id:
                             continue
                         field_id = field_to_id[field_name]
@@ -441,16 +786,25 @@ class StructuringProcessor(SpanProcessor):
                                 continue
                             st = field_value.get('start', -1)
                             ed = field_value.get('end', -1)
-                            if 0 <= st < max_seq_len and 0 <= ed < max_seq_len:
-                                group_spans.append((st, ed, inst_idx, field_id))
-                                positive_spans.add((st, ed))
+                            if 0 <= st <= ed < item_limit:
+                                span_targets.setdefault((st, ed), set()).add(
+                                    (inst_idx, field_id)
+                                )
                                 has_any = True
 
+            group_spans = [
+                (start, end, targets)
+                for (start, end), targets in span_targets.items()
+            ]
             neg_count = int(len(group_spans) * neg_ratio)
-            if neg_count > 0 and max_seq_len > 0:
-                negatives = self._generate_negative_spans(positive_spans, max_seq_len, neg_count)
+            if neg_count > 0 and item_limit > 0:
+                negatives = self._generate_negative_spans(
+                    set(span_targets),
+                    item_limit,
+                    neg_count,
+                )
                 for st, ed in negatives:
-                    group_spans.append((st, ed, -1, -1))
+                    group_spans.append((st, ed, set()))
 
             all_group_spans.append(group_spans)
 
@@ -470,11 +824,11 @@ class StructuringProcessor(SpanProcessor):
         span_batch_idx = torch.tensor(batch_indices, dtype=torch.long)
 
         for g, group_spans in enumerate(all_group_spans):
-            for s, (st, ed, inst_idx, field_id) in enumerate(group_spans):
+            for s, (st, ed, targets) in enumerate(group_spans):
                 span_idx[g, s, 0] = st
                 span_idx[g, s, 1] = ed
                 span_mask[g, s] = True
-                if inst_idx >= 0 and field_id >= 0:
+                for inst_idx, field_id in targets:
                     span_labels[g, s, inst_idx, field_id] = 1.0
 
         return {

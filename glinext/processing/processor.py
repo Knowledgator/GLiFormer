@@ -25,6 +25,7 @@ from ..tasks.embedding.processor import EmbeddingProcessor
 from ..tasks.joint_relex.processor import JointRelexProcessor
 from ..tasks.ner.processor import NERProcessor
 from ..tasks.open_relex.processor import OpenRelexProcessor
+from ..tasks.structuring.multilevel import MULTI_LEVEL_META_KEY
 from ..tasks.structuring.processor import StructuringProcessor
 from ..tasks.vision.processor import VisionProcessor
 from ..utils import pair_2d
@@ -351,16 +352,36 @@ class TextProcessingMixin:
     def tokenize_inputs(self, texts, classes_mapping, **kwargs):
         input_texts, prompt_lengths = self.prepare_inputs(texts, classes_mapping, **kwargs)
 
+        # ``max_len`` is also the encoder's sequence budget.  Capping the
+        # word list alone is insufficient: a single word can expand to many
+        # subtokens, and some saved tokenizers advertise an effectively
+        # unlimited ``model_max_length``.  In that case ``truncation=True``
+        # without an explicit limit leaves the transformer input unbounded.
         tokenizer_output = self.transformer_tokenizer(
             input_texts,
             is_split_into_words=True,
             return_tensors="pt",
             truncation=True,
+            max_length=int(self.config.max_len),
             padding="longest",
         )
         words_masks = self.prepare_word_mask(texts, tokenizer_output, prompt_lengths)
         tokenized_inputs = self._as_tokenized_mapping(tokenizer_output)
-        tokenized_inputs["words_mask"] = torch.tensor(words_masks)
+        words_mask = torch.tensor(words_masks)
+        tokenized_inputs["words_mask"] = words_mask
+        # Prompt and source share the transformer's token budget. The largest
+        # 1-based source-word id is therefore the exact number of source words
+        # that survived subtoken truncation (and is zero for prompt-only rows).
+        tokenized_inputs["text_lengths"] = (
+            words_mask.amax(dim=-1, keepdim=True).long()
+            if words_mask.shape[-1] > 0
+            else torch.zeros(
+                words_mask.shape[0],
+                1,
+                dtype=torch.long,
+                device=words_mask.device,
+            )
+        )
 
         label_enc = self.prepare_all_label_encoder_inputs(classes_mapping)
         tokenized_inputs.update(label_enc)
@@ -1268,14 +1289,29 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             return self.task_processors["embedding"].create_labels(batch_list, None)
         return None
 
-    def create_structuring_labels(self, batch_list, classes_mapping, max_seq_len):
+    def create_structuring_labels(
+        self,
+        batch_list,
+        classes_mapping,
+        max_seq_len,
+        *,
+        return_dict=False,
+        sequence_lengths=None,
+        source_sequence_lengths=None,
+    ):
         for item in batch_list:
             self.resolve_structuring_spans(item)
         if "structuring" in self.task_processors:
             result = self.task_processors["structuring"].create_labels(
-                batch_list, classes_mapping, max_seq_len=max_seq_len
+                batch_list,
+                classes_mapping,
+                max_seq_len=max_seq_len,
+                sequence_lengths=sequence_lengths,
+                source_sequence_lengths=source_sequence_lengths,
             )
             if result is not None:
+                if return_dict:
+                    return result
                 return (result["structuring_labels"], result["structuring_mask"],
                         result["structuring_batch_idx"], result["structuring_count"])
         return None
@@ -1327,6 +1363,12 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             "extraction": batch.get("extraction", [[] for _ in range(batch_size)]),
             "embedding": batch.get("embedding", [[] for _ in range(batch_size)]),
             "structuring": batch.get("structuring", [{} for _ in range(batch_size)]),
+            "structuring_schema": batch.get(
+                "structuring_schema", [{} for _ in range(batch_size)]
+            ),
+            MULTI_LEVEL_META_KEY: batch.get(
+                MULTI_LEVEL_META_KEY, [None for _ in range(batch_size)]
+            ),
             "open_relex": batch.get("open_relex", [[] for _ in range(batch_size)]),
             "image_classification": batch.get("image_classification", [None for _ in range(batch_size)]),
             "object_detection": batch.get("object_detection", [None for _ in range(batch_size)]),
@@ -1413,6 +1455,18 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
         }
             if "structuring" in batch and i < len(batch["structuring"]):
                 item["structuring"] = batch["structuring"][i]
+            if (
+                "structuring_schema" in batch
+                and i < len(batch["structuring_schema"])
+            ):
+                item["structuring_schema"] = batch["structuring_schema"][i]
+            multi_level_meta = batch.get(MULTI_LEVEL_META_KEY)
+            if (
+                multi_level_meta is not None
+                and i < len(multi_level_meta)
+                and multi_level_meta[i] is not None
+            ):
+                item[MULTI_LEVEL_META_KEY] = multi_level_meta[i]
             if "open_relex" in batch and i < len(batch["open_relex"]):
                 item["open_relex"] = batch["open_relex"][i]
             for field in (
@@ -1446,6 +1500,12 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
             "extraction": [item.get("extraction", []) for item in batch_list],
             "embedding": [item.get("embedding", []) for item in batch_list],
             "structuring": [item.get("structuring", {}) for item in batch_list],
+            "structuring_schema": [
+                item.get("structuring_schema", {}) for item in batch_list
+            ],
+            MULTI_LEVEL_META_KEY: [
+                item.get(MULTI_LEVEL_META_KEY) for item in batch_list
+            ],
             "open_relex": [item.get("open_relex", []) for item in batch_list],
             "image_classification": [item.get("image_classification") for item in batch_list],
             "object_detection": [item.get("object_detection") for item in batch_list],
@@ -1471,6 +1531,11 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
 
         if prepare_labels:
             max_seq_len = batch["seq_length"].max().item()
+            sequence_lengths = tokenized_input.get("text_lengths")
+            if isinstance(sequence_lengths, torch.Tensor):
+                structuring_max_seq_len = int(sequence_lengths.max().item())
+            else:
+                structuring_max_seq_len = max_seq_len
             batch_list = self._build_label_batch_list(batch)
 
             cat_result = self.create_cat_labels(batch_list, classes_mapping)
@@ -1525,7 +1590,11 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
 
             if "structuring" in self.task_processors:
                 struct_span_result = self.task_processors["structuring"].create_span_labels(
-                    batch_list, classes_mapping, max_seq_len=max_seq_len,
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=structuring_max_seq_len,
+                    sequence_lengths=sequence_lengths,
+                    source_sequence_lengths=batch["seq_length"],
                 )
                 if struct_span_result is not None:
                     tokenized_input.update(struct_span_result)
@@ -1537,12 +1606,16 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
                 if open_rel_span_result is not None:
                     tokenized_input.update(open_rel_span_result)
 
-            structuring_result = self.create_structuring_labels(batch_list, classes_mapping, max_seq_len)
+            structuring_result = self.create_structuring_labels(
+                batch_list,
+                classes_mapping,
+                structuring_max_seq_len,
+                return_dict=True,
+                sequence_lengths=sequence_lengths,
+                source_sequence_lengths=batch["seq_length"],
+            )
             if structuring_result is not None:
-                tokenized_input["structuring_labels"] = structuring_result[0]
-                tokenized_input["structuring_mask"] = structuring_result[1]
-                tokenized_input["structuring_batch_idx"] = structuring_result[2]
-                tokenized_input["structuring_count"] = structuring_result[3]
+                tokenized_input.update(structuring_result)
 
         if batch.get("bbox") is not None and "bbox" not in tokenized_input:
             tokenized_input["bbox"] = batch["bbox"]

@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 def _finite(name: str, value: float) -> float:
@@ -15,6 +16,22 @@ def _finite(name: str, value: float) -> float:
     if not math.isfinite(value):
         raise ValueError(f"attention bias {name} must be finite")
     return value
+
+
+def _strict_bool(name: str, value: bool) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"attention bias {name} must be a boolean")
+    return value
+
+
+def _inverse_softplus(value: float) -> float:
+    """Return a stable scalar whose softplus is approximately ``value``."""
+
+    if value == 0.0:
+        # There is no finite exact inverse at zero. This starts effectively
+        # disabled while retaining a small gradient so the gate can open.
+        return -20.0
+    return value + math.log(-math.expm1(-value))
 
 
 def _coordinates(
@@ -86,7 +103,7 @@ def _select_dimensions(
 class AttentionBias(nn.Module):
     """Base class and registry for additive self/cross-attention biases."""
 
-    _registry: dict[str, type["AttentionBias"]] = {}
+    _registry: dict[str, type[AttentionBias]] = {}
     config_fields: frozenset[str] = frozenset()
 
     def __init_subclass__(cls, bias_type: str | None = None, **kwargs):
@@ -95,7 +112,7 @@ class AttentionBias(nn.Module):
             AttentionBias._registry[bias_type] = cls
 
     @classmethod
-    def strategy_class(cls, bias_type: str) -> type["AttentionBias"]:
+    def strategy_class(cls, bias_type: str) -> type[AttentionBias]:
         normalized = str(bias_type or "none").lower().replace("-", "_")
         strategy = cls._registry.get(normalized)
         if strategy is None:
@@ -111,10 +128,10 @@ class AttentionBias(nn.Module):
         config: str | Mapping[str, Any] | Sequence[Any] | None,
         *,
         num_heads: int,
-    ) -> "AttentionBias":
+    ) -> AttentionBias:
         """Build one strategy or a sum of strategies from configuration."""
 
-        if isinstance(config, Sequence) and not isinstance(config, (str, bytes)):
+        if isinstance(config, Sequence) and not isinstance(config, str | bytes):
             return CompositeAttentionBias(
                 [cls.from_config(item, num_heads=num_heads) for item in config]
             )
@@ -172,7 +189,12 @@ class GaussianDistanceAttentionBias(
     AttentionBias,
     bias_type="gaussian_distance",
 ):
-    """Gaussian locality prior over normalized 1D or 2D coordinates."""
+    """Gaussian locality prior with optionally learnable width and strength.
+
+    Fixed scalars remain the default and introduce no parameters or checkpoint
+    state. Learnable values use a positive softplus parameterization and may be
+    shared by every attention head or learned independently per head.
+    """
 
     config_fields = frozenset(
         {
@@ -181,6 +203,9 @@ class GaussianDistanceAttentionBias(
             "units",
             "query_dimensions",
             "key_dimensions",
+            "learnable_sigma",
+            "learnable_weight",
+            "per_head",
         }
     )
 
@@ -192,15 +217,55 @@ class GaussianDistanceAttentionBias(
         units: str = "normalized",
         query_dimensions: Sequence[int] | None = None,
         key_dimensions: Sequence[int] | None = None,
+        learnable_sigma: bool = False,
+        learnable_weight: bool = False,
+        per_head: bool = False,
         **kwargs,
     ):
         super().__init__()
-        self.sigma = _finite("sigma", sigma)
-        if self.sigma <= 0.0:
+        sigma = _finite("sigma", sigma)
+        if sigma <= 0.0:
             raise ValueError("attention bias sigma must be positive")
-        self.weight = _finite("weight", weight)
-        if self.weight < 0.0:
+        weight = _finite("weight", weight)
+        if weight < 0.0:
             raise ValueError("attention bias weight must be non-negative")
+        if (
+            isinstance(num_heads, bool)
+            or int(num_heads) != num_heads
+            or num_heads <= 0
+        ):
+            raise ValueError("attention bias num_heads must be a positive integer")
+        self.num_heads = int(num_heads)
+        self.learnable_sigma = _strict_bool(
+            "learnable_sigma", learnable_sigma
+        )
+        self.learnable_weight = _strict_bool(
+            "learnable_weight", learnable_weight
+        )
+        self.per_head = _strict_bool("per_head", per_head)
+        self._fixed_sigma = sigma
+        self._fixed_weight = weight
+        parameter_shape = (self.num_heads,) if self.per_head else ()
+        if self.learnable_sigma:
+            self.raw_sigma = nn.Parameter(
+                torch.full(
+                    parameter_shape,
+                    _inverse_softplus(sigma),
+                    dtype=torch.float32,
+                )
+            )
+        else:
+            self.register_parameter("raw_sigma", None)
+        if self.learnable_weight:
+            self.raw_weight = nn.Parameter(
+                torch.full(
+                    parameter_shape,
+                    _inverse_softplus(weight),
+                    dtype=torch.float32,
+                )
+            )
+        else:
+            self.register_parameter("raw_weight", None)
         self.units = str(units).lower().replace("-", "_")
         if self.units not in {"normalized", "query_steps"}:
             raise ValueError(
@@ -213,6 +278,34 @@ class GaussianDistanceAttentionBias(
         self.key_dimensions = (
             None if key_dimensions is None else tuple(key_dimensions)
         )
+
+    @property
+    def sigma(self) -> float | torch.Tensor:
+        if self.raw_sigma is None:
+            return self._fixed_sigma
+        return F.softplus(self.raw_sigma)
+
+    @property
+    def weight(self) -> float | torch.Tensor:
+        if self.raw_weight is None:
+            return self._fixed_weight
+        return F.softplus(self.raw_weight)
+
+    def _broadcast_parameter(
+        self,
+        value: float | torch.Tensor,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        value = torch.as_tensor(
+            value,
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+        if not self.per_head:
+            return value
+        if value.dim() == 0:
+            value = value.expand(self.num_heads)
+        return value.reshape(1, self.num_heads, 1, 1)
 
     def forward(
         self,
@@ -247,7 +340,12 @@ class GaussianDistanceAttentionBias(
         if self.units == "query_steps":
             delta = delta * max(int(query_length), 1)
         squared_distance = delta.square().sum(dim=-1)
-        bias = -0.5 * self.weight * squared_distance / (self.sigma**2)
+        sigma = self._broadcast_parameter(self.sigma, squared_distance)
+        weight = self._broadcast_parameter(self.weight, squared_distance)
+        if self.per_head:
+            squared_distance = squared_distance.unsqueeze(1)
+        sigma_squared = sigma.square().clamp_min(1e-12)
+        bias = -0.5 * weight * squared_distance / sigma_squared
         return bias.clamp_min(-10_000.0).to(dtype=dtype)
 
 
@@ -457,12 +555,33 @@ class CompositeAttentionBias(AttentionBias):
         super().__init__()
         self.biases = nn.ModuleList(biases)
 
+    @staticmethod
+    def _promote(value: torch.Tensor, rank: int) -> torch.Tensor:
+        if value.dim() not in {2, 3, 4}:
+            raise ValueError(
+                "composite attention biases must have 2D, 3D, or 4D output"
+            )
+        if rank == 4:
+            if value.dim() == 2:
+                return value.unsqueeze(0).unsqueeze(0)
+            if value.dim() == 3:
+                return value.unsqueeze(1)
+        if rank == 3 and value.dim() == 2:
+            return value.unsqueeze(0)
+        return value
+
     def forward(self, **kwargs):
         result = None
         for bias in self.biases:
             value = bias(**kwargs)
             if value is not None:
-                result = value if result is None else result + value
+                if result is None:
+                    result = value
+                    continue
+                rank = max(result.dim(), value.dim())
+                result = self._promote(result, rank)
+                value = self._promote(value, rank)
+                result = result + value
         return result
 
 

@@ -263,7 +263,19 @@ class BaseGLiNextModel(BaseModel):
         loss_defaults.setdefault("focal_loss_alpha", 0.25)
         loss_defaults.setdefault("focal_loss_gamma", 2.0)
         for name in ("label_smoothing", "negatives", "masking"):
-            value = runtime_kwargs.get(name)
+            # Structuring heads own their negative-sampling policy because
+            # their unmatched anchor cells are part of the set objective, not
+            # expendable background examples.  In particular, applying the
+            # trainer's very small NER keep-rate to objectness and Hungarian
+            # matching makes the assignment stochastic and leaves almost all
+            # unused anchors unsupervised.
+            value = (
+                getattr(task_cfg, name, None)
+                if task_cfg is not None
+                else None
+            )
+            if value is None:
+                value = runtime_kwargs.get(name)
             if value is not None:
                 loss_defaults[name] = value
 
@@ -819,6 +831,28 @@ class BaseGLiNextModel(BaseModel):
             feature_mask=flat_word_mask,
         )
 
+    def _apply_word_rnn(self, words_embedding, mask):
+        """Run the packed RNN only for rows containing at least one word."""
+
+        if not hasattr(self, "rnn"):
+            return words_embedding
+        nonempty_rows = mask.bool().any(dim=1)
+        if not nonempty_rows.any():
+            return words_embedding
+        if nonempty_rows.all():
+            return self.rnn(words_embedding, mask)
+        row_indices = torch.where(nonempty_rows)[0]
+        encoded = self.rnn(
+            words_embedding[row_indices],
+            mask[row_indices],
+        )
+        output = encoded.new_zeros(
+            words_embedding.shape[0],
+            words_embedding.shape[1],
+            encoded.shape[-1],
+        )
+        return output.index_copy(0, row_indices, encoded)
+
     def get_representations(
         self,
         input_ids: torch.Tensor,
@@ -846,8 +880,7 @@ class BaseGLiNextModel(BaseModel):
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
             if hasattr(self, "cross_fuser"):
                 labels_embeds, words_embedding = self.cross_fuser(labels_embeds, words_embedding, labels_mask, mask)
-            if hasattr(self, "rnn"):
-                words_embedding = self.rnn(words_embedding, mask)
+            words_embedding = self._apply_word_rnn(words_embedding, mask)
             return token_embeds, labels_embeds, labels_mask, words_embedding, mask
         else:
             token_embeds = self.token_rep_layer(input_ids, attention_mask, **encoder_kwargs)
@@ -857,8 +890,7 @@ class BaseGLiNextModel(BaseModel):
                     text_lengths, words_mask, self.config.embed_ent_token,
                 )
             )
-            if hasattr(self, "rnn"):
-                words_embedding = self.rnn(words_embedding, mask)
+            words_embedding = self._apply_word_rnn(words_embedding, mask)
             return token_embeds, prompts_embedding, prompts_embedding_mask, words_embedding, mask
 
     def encode_embedding_tokens(
@@ -1643,12 +1675,21 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             structuring_batch_origin=flat_inputs_map["structuring"].batch_origin if "structuring" in flat_inputs_map else None,
             structuring_anchor_mask=struct_out.extra.get("anchor_mask"),
             structuring_objectness_logits=struct_out.extra.get("objectness_logits"),
+            structuring_anchor_relation_scores=struct_out.extra.get(
+                "anchor_relation_scores"
+            ),
             structuring_span_logits=struct_out.extra.get("span_logits"),
             structuring_span_idx=struct_out.extra.get("span_idx"),
             structuring_span_mask=struct_out.extra.get("span_mask"),
             set_structuring_entity_logits=set_struct_out.logits,
+            set_structuring_field_logits=set_struct_out.extra.get(
+                "entity_field_logits"
+            ),
             set_structuring_logits=set_struct_out.extra.get(
                 "structuring_logits"
+            ),
+            set_structuring_assignment_logits=set_struct_out.extra.get(
+                "entity_assignment_logits"
             ),
             set_structuring_batch_origin=(
                 flat_inputs_map["set_structuring"].batch_origin
@@ -1659,6 +1700,9 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             ),
             set_structuring_objectness_logits=set_struct_out.extra.get(
                 "objectness_logits"
+            ),
+            set_structuring_anchor_relation_scores=set_struct_out.extra.get(
+                "anchor_relation_scores"
             ),
             set_structuring_span_idx=set_struct_out.extra.get("span_idx"),
             set_structuring_span_mask=set_struct_out.extra.get("span_mask"),
@@ -1748,6 +1792,11 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         count_val: Optional[torch.Tensor] = None,
         structuring_labels: Optional[torch.Tensor] = None,
         structuring_count: Optional[torch.Tensor] = None,
+        structuring_relation_labels: Optional[torch.Tensor] = None,
+        structuring_relation_group_mask: Optional[torch.Tensor] = None,
+        structuring_span_idx: Optional[torch.Tensor] = None,
+        structuring_span_mask: Optional[torch.Tensor] = None,
+        structuring_span_labels: Optional[torch.Tensor] = None,
         # Embedding similarity
         embedding_labels: Optional[torch.Tensor] = None,
         embedding_pair_idx: Optional[torch.Tensor] = None,
@@ -1897,7 +1946,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
             count_targets=count_targets,
             count_val=count_val, structuring_labels=structuring_labels,
-            structuring_count=structuring_count, embedding_labels=embedding_labels,
+            structuring_count=structuring_count,
+            structuring_relation_labels=structuring_relation_labels,
+            structuring_relation_group_mask=structuring_relation_group_mask,
+            structuring_span_idx=structuring_span_idx,
+            structuring_span_mask=structuring_span_mask,
+            structuring_span_labels=structuring_span_labels,
+            embedding_labels=embedding_labels,
             embedding_pair_idx=embedding_pair_idx,
             embedding_encodings=embedding_encodings,
             embedding_encoding_mask=embedding_encoding_mask,
@@ -1961,6 +2016,11 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         count_val: Optional[torch.Tensor] = None,
         structuring_labels: Optional[torch.Tensor] = None,
         structuring_count: Optional[torch.Tensor] = None,
+        structuring_relation_labels: Optional[torch.Tensor] = None,
+        structuring_relation_group_mask: Optional[torch.Tensor] = None,
+        structuring_span_idx: Optional[torch.Tensor] = None,
+        structuring_span_mask: Optional[torch.Tensor] = None,
+        structuring_span_labels: Optional[torch.Tensor] = None,
         # Embedding similarity
         embedding_labels: Optional[torch.Tensor] = None,
         embedding_pair_idx: Optional[torch.Tensor] = None,
@@ -2078,7 +2138,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
             count_targets=count_targets,
             count_val=count_val, structuring_labels=structuring_labels,
-            structuring_count=structuring_count, embedding_labels=embedding_labels,
+            structuring_count=structuring_count,
+            structuring_relation_labels=structuring_relation_labels,
+            structuring_relation_group_mask=structuring_relation_group_mask,
+            structuring_span_idx=structuring_span_idx,
+            structuring_span_mask=structuring_span_mask,
+            structuring_span_labels=structuring_span_labels,
+            embedding_labels=embedding_labels,
             embedding_pair_idx=embedding_pair_idx,
             embedding_encodings=embedding_encodings,
             embedding_encoding_mask=embedding_encoding_mask,
@@ -2694,8 +2760,7 @@ class GLiNExTLayoutModel(_GLiNExTJointForwardModel):
             if hasattr(self, "cross_fuser"):
                 labels_embeds, words_embedding = self.cross_fuser(labels_embeds, words_embedding, labels_mask, mask)
             words_embedding, mask = self._append_layout_extra_tokens(token_embeds, input_ids, words_embedding, mask)
-            if hasattr(self, "rnn"):
-                words_embedding = self.rnn(words_embedding, mask)
+            words_embedding = self._apply_word_rnn(words_embedding, mask)
             return token_embeds, labels_embeds, labels_mask, words_embedding, mask
 
         token_embeds = self.token_rep_layer(
@@ -2710,8 +2775,7 @@ class GLiNExTLayoutModel(_GLiNExTJointForwardModel):
             )
         )
         words_embedding, mask = self._append_layout_extra_tokens(token_embeds, input_ids, words_embedding, mask)
-        if hasattr(self, "rnn"):
-            words_embedding = self.rnn(words_embedding, mask)
+        words_embedding = self._apply_word_rnn(words_embedding, mask)
         return token_embeds, prompts_embedding, prompts_embedding_mask, words_embedding, mask
 
     def encode_embedding_tokens(
@@ -2850,8 +2914,7 @@ class GLiNExTOmniModel(_GLiNExTJointForwardModel):
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
             if hasattr(self, "cross_fuser"):
                 labels_embeds, words_embedding = self.cross_fuser(labels_embeds, words_embedding, labels_mask, mask)
-            if hasattr(self, "rnn"):
-                words_embedding = self.rnn(words_embedding, mask)
+            words_embedding = self._apply_word_rnn(words_embedding, mask)
             return token_embeds, labels_embeds, labels_mask, words_embedding, mask
 
         output = self.token_rep_layer(
@@ -2878,8 +2941,7 @@ class GLiNExTOmniModel(_GLiNExTJointForwardModel):
                 text_lengths, words_mask, self.config.embed_ent_token,
             )
         )
-        if hasattr(self, "rnn"):
-            words_embedding = self.rnn(words_embedding, mask)
+        words_embedding = self._apply_word_rnn(words_embedding, mask)
         return token_embeds, prompts_embedding, prompts_embedding_mask, words_embedding, mask
 
     def encode_embedding_tokens(

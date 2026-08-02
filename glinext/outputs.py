@@ -47,17 +47,24 @@ class GLiNExTTextOutput(GLiNExTBaseOutput):
     structuring_batch_origin: Optional[torch.LongTensor] = None
     structuring_anchor_mask: Optional[torch.Tensor] = None
     structuring_objectness_logits: Optional[torch.FloatTensor] = None
+    structuring_anchor_relation_scores: Optional[torch.FloatTensor] = None
     structuring_span_logits: Optional[torch.FloatTensor] = None
     structuring_span_idx: Optional[torch.LongTensor] = None
     structuring_span_mask: Optional[torch.Tensor] = None
 
-    # Independent entity-first set structuring.  Entity BIO logits and the
-    # second-stage per-entity record/field logits are deliberately separate.
+    # Composite set structuring: classical NER token logits, NER-derived field
+    # logits for selected spans, and second-stage anchor-membership logits are
+    # deliberately separate.
     set_structuring_entity_logits: Optional[torch.FloatTensor] = None
+    set_structuring_field_logits: Optional[torch.FloatTensor] = None
     set_structuring_logits: Optional[torch.FloatTensor] = None
+    # Trainer-friendly transpose of membership logits: variable entity count
+    # occupies dimension 1, which Hugging Face evaluation can pad.
+    set_structuring_assignment_logits: Optional[torch.FloatTensor] = None
     set_structuring_batch_origin: Optional[torch.LongTensor] = None
     set_structuring_anchor_mask: Optional[torch.Tensor] = None
     set_structuring_objectness_logits: Optional[torch.FloatTensor] = None
+    set_structuring_anchor_relation_scores: Optional[torch.FloatTensor] = None
     set_structuring_span_idx: Optional[torch.LongTensor] = None
     set_structuring_span_mask: Optional[torch.Tensor] = None
 

@@ -53,6 +53,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import re
@@ -67,6 +68,35 @@ def _log(msg: str) -> None:
     """Stderr log with timestamp + immediate flush so progress is visible."""
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+
+
+def text_fingerprint(text: str) -> bytes:
+    """Return a compact stable key used to prevent duplicate passages."""
+
+    return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+def load_existing_text_fingerprints(path: Path) -> set[bytes]:
+    """Load passage keys already present in an append/resume destination."""
+
+    fingerprints: set[bytes] = set()
+    if not path.exists():
+        return fingerprints
+    with path.open("r", encoding="utf-8") as existing:
+        for line_number, line in enumerate(existing, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Cannot resume from invalid JSON on line {line_number} "
+                    f"of {path}: {exc}"
+                ) from exc
+            text = row.get("text") if isinstance(row, dict) else None
+            if isinstance(text, str):
+                fingerprints.add(text_fingerprint(text))
+    return fingerprints
 
 
 # --------------------------------------------------------------------- #
@@ -263,7 +293,7 @@ STYLE_HINTS: list[str] = [
     "a json or log-like format with repeated keys",
     "a html-like format with angle-bracket tags",
     "a mix of prose and listing elements",
-    "a structured data format with key-value pairs"
+    "a structured data format with key-value pairs",
     "a YAML-like format with indentation and dashes",
     "a CSV-style format with rows of comma-separated values",
     "a report with labeled sections and subheadings"
@@ -694,15 +724,19 @@ def validate_and_clean_extraction(
     fields: "dict[str, FieldSpec]",
     min_instances: int = 2,
     min_fields_per_item: int = 2,
+    text: Optional[str] = None,
+    max_instances: int | None = None,
 ) -> Optional[List[dict]]:
     """Coerce extraction output to ``{field: str | List[str]}`` format.
 
     The real correctness gate: stage 3 must return a list of dicts whose
-    values are scalars or string lists. The schema is advisory — when
-    ``fields`` is empty (parser fell back), per-key types are inferred from
-    the runtime value type. Items keeping at least ``min_fields_per_item``
-    fields survive; the sample is rejected when fewer than ``min_instances``
-    items survive.
+    values are scalars or string lists. Unknown schema keys and values that
+    cannot be found in ``text`` are removed before the minimum-field check;
+    otherwise invalid annotations later become false-negative span targets.
+    When ``fields`` is empty, per-key types are inferred from the runtime
+    value type. Items keeping at least ``min_fields_per_item`` fields survive;
+    the sample is rejected when fewer than ``min_instances`` items survive or
+    when it exceeds the count bucket's configured ``max_instances``.
     """
     if not isinstance(items, list):
         return None
@@ -716,6 +750,8 @@ def validate_and_clean_extraction(
             key = _normalize_identifier(str(raw_key)) if raw_key is not None else ""
             if not key:
                 continue
+            if fields and key not in fields:
+                continue
             spec = fields.get(key) if fields else None
             prefer_list: Optional[bool]
             if spec is None:
@@ -725,6 +761,16 @@ def validate_and_clean_extraction(
             coerced = _coerce_value(raw_val, prefer_list)
             if coerced is None:
                 continue
+            if text is not None:
+                if isinstance(coerced, list):
+                    coerced = [
+                        value for value in coerced
+                        if re.search(re.escape(value), text, re.IGNORECASE)
+                    ]
+                    if not coerced:
+                        continue
+                elif not re.search(re.escape(coerced), text, re.IGNORECASE):
+                    continue
             if key in cleaned:
                 continue
             cleaned[key] = coerced
@@ -733,6 +779,8 @@ def validate_and_clean_extraction(
 
     if len(cleaned_all) < min_instances:
         return None
+    if max_instances is not None and len(cleaned_all) > max_instances:
+        return None
     return cleaned_all
 
 
@@ -740,11 +788,14 @@ def validate_and_clean_extraction(
 # Tokenization                                                          #
 # --------------------------------------------------------------------- #
 
-_TOKEN_RE = re.compile(r"\w+|[^\w\s]", flags=re.UNICODE)
+# Keep this expression in lockstep with GLiNER's
+# ``WhitespaceTokenSplitter.whitespace_pattern``. The regression test covers
+# punctuation, hyphens, and numeric separators where the old pattern drifted.
+_TOKEN_RE = re.compile(r"\w+(?:[-_]\w+)*|\S", flags=re.UNICODE)
 
 
 def tokenize_text(text: str) -> List[str]:
-    """Whitespace + punctuation tokenizer matching extraction_multi.json."""
+    """Tokenize with the same word splitter used by default inference."""
     return _TOKEN_RE.findall(text)
 
 
@@ -761,6 +812,7 @@ class SamplePlan:
     max_text_tokens: int
     count_bucket: str
     n_objects: int
+    max_objects: int
     style: str
 
 
@@ -789,6 +841,7 @@ def make_plan(num_samples: int, rng: random.Random) -> List[SamplePlan]:
                     max_text_tokens=length[2],
                     count_bucket=count[0],
                     n_objects=n,
+                    max_objects=count[2],
                     style=rng.choice(STYLE_HINTS),
                 )
             )
@@ -847,6 +900,12 @@ def main() -> None:
     args = parser.parse_args()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    seen_texts = load_existing_text_fingerprints(args.output)
+    if seen_texts:
+        _log(
+            f"[resume] loaded {len(seen_texts)} existing passage fingerprints "
+            f"from {args.output}"
+        )
 
     rng = random.Random(args.seed)
     plans = make_plan(args.num_samples, rng)
@@ -859,8 +918,8 @@ def main() -> None:
          f"first batch will hit stages 1→2→3 sequentially before any rows are written")
 
     # Lazy imports so --help works without vLLM installed.
-    from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
 
     _log(f"[boot] loading tokenizer + vLLM engine for model={args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -874,6 +933,7 @@ def main() -> None:
     )
 
     written = 0
+    duplicate_text_drops = 0
     pending: list[SamplePlan] = list(plans)
     retry_round = 0
 
@@ -1050,7 +1110,11 @@ def main() -> None:
                             json_failure_samples.append(f"unparseable: {snip}")
                         continue
                     cleaned = validate_and_clean_extraction(
-                        items, fields, min_instances=args.min_instances
+                        items,
+                        fields,
+                        min_instances=args.min_instances,
+                        text=text,
+                        max_instances=plan.max_objects,
                     )
                     if cleaned is None:
                         failed.append(plan)
@@ -1061,6 +1125,16 @@ def main() -> None:
                                 f"(parsed list of {len(items)})"
                             )
                         continue
+
+                    fingerprint = text_fingerprint(text)
+                    if fingerprint in seen_texts:
+                        # Retry the plan with the next round's seed. Blindly
+                        # appending here made deterministic restarts duplicate
+                        # already-written batches.
+                        failed.append(plan)
+                        duplicate_text_drops += 1
+                        continue
+                    seen_texts.add(fingerprint)
 
                     field_descriptions = {
                         name: desc for name, (_t, _o, desc) in fields.items()
@@ -1105,8 +1179,11 @@ def main() -> None:
     finally:
         out_f.close()
 
-    _log(f"[done] wrote {written} samples to {args.output} "
-         f"(skipped {skipped} after retries)")
+    _log(
+        f"[done] wrote {written} samples to {args.output} "
+        f"(skipped {skipped} after retries, "
+        f"duplicate passages rejected={duplicate_text_drops})"
+    )
 
 
 if __name__ == "__main__":

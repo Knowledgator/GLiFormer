@@ -92,7 +92,10 @@ class GLiNExTTextDataCollator(BaseGLiNExTDataCollator):
     data_processor_type = GLiNextTextProcessor
 
     def _add_text_fields(self, model_input: Dict[str, Any], raw_batch: Dict[str, Any]) -> None:
-        model_input["text_lengths"] = raw_batch.get("seq_length")
+        # Modern text processors derive the retained source length after the
+        # combined schema-prompt/source sequence is subtokenized and truncated.
+        # Keep the raw word count only as a compatibility fallback.
+        model_input.setdefault("text_lengths", raw_batch.get("seq_length"))
 
     def __call__(self, input_x: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
         raw_batch = self.collate_batch(input_x, **kwargs)
@@ -175,4 +178,3 @@ def resolve_glinext_collator_class(config):
     if variant == "omni":
         return GLiNExTOmniDataCollator
     raise ValueError(f"Unknown GLiNExT model_variant: {variant!r}")
-

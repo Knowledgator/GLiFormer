@@ -4,11 +4,14 @@ import logging
 import warnings
 
 import torch
-from torch import nn
+from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 
 from ...layers.mlp import create_mlp
 from .. import TaskHeadOutput
 from ..anchored_extraction import AnchoredSpanExtractionHead
+from ..losses import binary_focal_or_bce
+from ..matcher import minimum_cost_assignment
+from .anchor_relations import anchor_relation_loss
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +96,6 @@ class StructuringHead(AnchoredSpanExtractionHead):
         self.bio_loss_reduction = getattr(struct_cfg, "bio_loss_reduction", "sum")
         self.negatives = getattr(struct_cfg, "negatives", 1.0)
         self.masking_mode = getattr(struct_cfg, "masking", "none")
-        self.position_bucket_matcher_cost = float(
-            getattr(struct_cfg, "position_bucket_matcher_cost", 0.0)
-        )
 
         # Diagnostic logging
         self.log_loss_stats = getattr(struct_cfg, "log_loss_stats", False)
@@ -119,6 +119,17 @@ class StructuringHead(AnchoredSpanExtractionHead):
                 output_dim=1,
                 dropout=dropout,
                 activation="gelu",
+            )
+
+        self.multi_level = bool(getattr(struct_cfg, "multi_level", False))
+        self.anchor_relations_loss_coef = getattr(
+            struct_cfg, "anchor_relations_loss_coef", 1.0,
+        )
+        if self.multi_level:
+            self.anchor_relations_rep_layer = RelationsRepLayer(
+                in_dim=hidden_size,
+                relation_mode=struct_cfg.anchor_relations_layer,
+                hidden_dim=hidden_size,
             )
 
     @classmethod
@@ -228,6 +239,13 @@ class StructuringHead(AnchoredSpanExtractionHead):
         if self.use_anchor_objectness:
             objectness_logits = self.objectness_head(anchors).squeeze(-1)  # (BN, A)
 
+        anchor_relation_scores = None
+        if self.multi_level:
+            anchor_relation_scores = self.anchor_relations_rep_layer(
+                anchors,
+                anchor_mask,
+            )
+
         # Optional span-level rescoring. It remains training-only for the
         # regular head; implementations whose primary semantic unit is an
         # extracted entity span may opt into inference via ``span_inference``.
@@ -267,6 +285,9 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
         loss = None
         loss_stats = None
+        anchor_matches = None
+        supervised_anchor_mask = anchor_mask.bool()
+        relation_loss = None
         if structuring_labels is not None and base_loss_fn is not None:
             if self.use_anchor_matching:
                 loss, anchor_matches, supervised_anchor_mask, loss_stats = self._anchor_matched_bio_loss(
@@ -291,6 +312,7 @@ class StructuringHead(AnchoredSpanExtractionHead):
                         objectness_logits=objectness_logits,
                         anchor_matches=anchor_matches,
                         supervised_anchor_mask=supervised_anchor_mask,
+                        base_loss_fn=base_loss_fn,
                     )
                     loss = loss + self.anchor_objectness_loss_coef * obj_loss
                     if loss_stats is not None:
@@ -323,13 +345,44 @@ class StructuringHead(AnchoredSpanExtractionHead):
                             anchor_matches=None,
                             supervised_anchor_mask=anchor_mask.bool(),
                             gold_mask=gold_mask,
+                            base_loss_fn=base_loss_fn,
                         )
                         loss = loss + self.anchor_objectness_loss_coef * obj_loss
                         if loss_stats is not None:
                             loss_stats["objectness_loss"] = float(obj_loss.detach().item())
 
-            if loss_stats is not None and self.log_loss_stats and self.training:
-                self._maybe_log_stats(loss_stats)
+        relation_labels = batch.get("structuring_relation_labels")
+        if (
+            anchor_relation_scores is not None
+            and relation_labels is not None
+            and base_loss_fn is not None
+        ):
+            relation_loss = anchor_relation_loss(
+                anchor_relation_scores,
+                relation_labels,
+                anchor_mask.bool(),
+                base_loss_fn=base_loss_fn,
+                relation_group_mask=batch.get(
+                    "structuring_relation_group_mask"
+                ),
+                anchor_matches=anchor_matches,
+                label_count=label_count,
+            )
+            weighted_relation_loss = (
+                self.anchor_relations_loss_coef * relation_loss
+            )
+            loss = (
+                weighted_relation_loss
+                if loss is None
+                else loss + weighted_relation_loss
+            )
+            if loss_stats is not None:
+                loss_stats["anchor_relation_loss"] = float(
+                    relation_loss.detach().item()
+                )
+
+        if loss_stats is not None and self.log_loss_stats and self.training:
+            self._maybe_log_stats(loss_stats)
 
         output_extra = {
             "groups_output": anchors,
@@ -339,6 +392,11 @@ class StructuringHead(AnchoredSpanExtractionHead):
             "span_idx": span_idx,
             "span_mask": span_mask,
             "loss_stats": loss_stats,
+            "anchor_relation_scores": anchor_relation_scores,
+            "anchor_relation_loss": (
+                relation_loss.detach() if relation_loss is not None else None
+            ),
+            "anchor_matches": anchor_matches,
         }
         output_extra.update(prediction_extra)
 
@@ -467,9 +525,8 @@ class StructuringHead(AnchoredSpanExtractionHead):
         For each sample, assigns predicted anchors to gold instances via a
         Hungarian matcher minimising the per-pair masked BIO loss. Unmatched
         predictions are supervised against an all-zero target (negative
-        anchors). When predictions exceed gold instances, the matcher only
-        claims a prediction for a gold instance if doing so beats the
-        per-prediction "train as negative" cost.
+        anchors). When predictions exceed gold instances, matching uses each
+        prediction's incremental cost relative to its all-zero target.
         """
         validate_structuring_anchor_capacity(
             labels,
@@ -591,8 +648,9 @@ class StructuringHead(AnchoredSpanExtractionHead):
     # ── Anchor objectness ────────────────────────────────────────────
 
     def _objectness_loss(self, objectness_logits, anchor_matches,
-                        supervised_anchor_mask, gold_mask=None):
-        """BCE loss for the per-anchor "is this slot used?" head.
+                        supervised_anchor_mask, gold_mask=None,
+                        base_loss_fn=None):
+        """Focal loss for the per-anchor "is this slot used?" head.
 
         When ``anchor_matches`` is provided, the target is built from the
         Hungarian assignment: matched predicted slots → 1, others → 0. When
@@ -610,8 +668,10 @@ class StructuringHead(AnchoredSpanExtractionHead):
             min_A = min(target.shape[1], gold_mask.shape[1])
             target[:, :min_A] = gold_mask[:, :min_A].to(target.dtype)
 
-        losses = nn.functional.binary_cross_entropy_with_logits(
-            objectness_logits, target, reduction="none",
+        loss_fn = base_loss_fn or binary_focal_or_bce
+        losses = loss_fn(
+            objectness_logits.float(),
+            target.float(),
         )
         mask = supervised_anchor_mask.float()
         denom = mask.sum().clamp(min=1.0)
@@ -711,9 +771,8 @@ class StructuringHead(AnchoredSpanExtractionHead):
         Returns ``matches[b]`` = list of ``(pred_anchor, label_anchor)`` pairs.
         Cost is the masked BIO loss per (pred, gold) pair. When predictions
         outnumber gold instances, ``zero_cost`` (loss vs all-zero target) is
-        subtracted per prediction so the matcher only claims predictions
-        that benefit from a real label more than from being trained as a
-        negative.
+        subtracted per prediction so assignment compares the incremental cost
+        of owning a record instead of each prediction's absolute loss scale.
         """
         B = pred.shape[0]
         matches = [[] for _ in range(B)]
@@ -739,70 +798,19 @@ class StructuringHead(AnchoredSpanExtractionHead):
                 pair_cost = (pair_losses * mask_b[None, None]).sum(dim=(-3, -2, -1))
                 # pair_cost: (n_pred, n_label)
 
-                # Express BIO matching cost per valid (token, field) cell so
-                # a normalized spatial cost has stable meaning across document
-                # lengths and schema widths. This common scalar does not alter
-                # historical assignments when the spatial coefficient is zero.
-                cost_normalizer = mask_b.sum().clamp(min=1.0)
-                pair_cost = pair_cost / cost_normalizer
-
                 if n_pred > n_label:
                     # Subtract per-prediction "train as negative" cost so the
-                    # matcher only assigns a gold instance to predictions that
-                    # gain from it. Constant per row, so safe to subtract.
+                    # matcher compares the incremental cost of assigning gold.
                     zero_losses = base_loss_fn(pred_b, torch.zeros_like(pred_b))
                     zero_cost = (zero_losses * mask_b.unsqueeze(0)).sum(dim=(-3, -2, -1))
-                    zero_cost = zero_cost / cost_normalizer
                     pair_cost = pair_cost - zero_cost[:, None]
 
-                if self.position_bucket_matcher_cost > 0:
-                    valid_tokens = word_mask_f[b].bool()
-                    valid_count = valid_tokens.sum().clamp_min(1)
-                    token_coordinates = (
-                        valid_tokens.long().cumsum(dim=0).float() - 0.5
-                    ) / valid_count
-                    token_coordinates = torch.where(
-                        valid_tokens,
-                        token_coordinates,
-                        torch.zeros_like(token_coordinates),
-                    )
-                    gold_token_mask = lbl_b.gt(0).any(dim=(-1, -2))
-                    gold_token_mask = gold_token_mask & valid_tokens.unsqueeze(0)
-                    gold_token_count = gold_token_mask.sum(dim=1)
-                    gold_centers = (
-                        gold_token_mask.to(token_coordinates.dtype)
-                        * token_coordinates.unsqueeze(0)
-                    ).sum(dim=1) / gold_token_count.clamp_min(1)
-                    prediction_centers = (
-                        pred_idx.to(dtype=token_coordinates.dtype) + 0.5
-                    ) / pred.shape[1]
-                    position_cost = (
-                        prediction_centers[:, None] - gold_centers[None]
-                    ).abs()
-                    position_cost = position_cost * (
-                        gold_token_count > 0
-                    ).to(position_cost.dtype).unsqueeze(0)
-                    pair_cost = pair_cost + (
-                        self.position_bucket_matcher_cost * position_cost
-                    )
-
-                # Hungarian implementation requires rows <= cols.
-                if n_pred <= n_label:
-                    assignment = self._hungarian_rows_to_cols(pair_cost.cpu().tolist())
-                    for pred_pos, label_pos in assignment:
-                        matches[b].append((
-                            int(pred_idx[pred_pos].item()),
-                            int(label_idx[label_pos].item()),
-                        ))
-                else:
-                    assignment = self._hungarian_rows_to_cols(
-                        pair_cost.t().contiguous().cpu().tolist()
-                    )
-                    for label_pos, pred_pos in assignment:
-                        matches[b].append((
-                            int(pred_idx[pred_pos].item()),
-                            int(label_idx[label_pos].item()),
-                        ))
+                assignment = minimum_cost_assignment(pair_cost)
+                for pred_pos, label_pos in assignment:
+                    matches[b].append((
+                        int(pred_idx[pred_pos].item()),
+                        int(label_idx[label_pos].item()),
+                    ))
 
         return matches
 
@@ -825,65 +833,3 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
         flat = labels.detach().abs().reshape(B, A, -1)
         return flat.sum(dim=-1) > 0
-
-    @staticmethod
-    def _hungarian_rows_to_cols(cost):
-        """Min-cost rows-to-distinct-cols assignment (Jonker-Volgenant).
-
-        Pure-Python so we don't pull scipy in. Requires ``n_rows <= n_cols``.
-        Returns ``[(row, col), ...]`` covering every row.
-        """
-        n_rows = len(cost)
-        n_cols = len(cost[0]) if n_rows else 0
-        if n_rows == 0 or n_cols == 0:
-            return []
-        if n_rows > n_cols:
-            raise ValueError("Hungarian assignment requires rows <= columns")
-
-        u = [0.0] * (n_rows + 1)
-        v = [0.0] * (n_cols + 1)
-        p = [0] * (n_cols + 1)
-        way = [0] * (n_cols + 1)
-
-        for i in range(1, n_rows + 1):
-            p[0] = i
-            j0 = 0
-            minv = [float("inf")] * (n_cols + 1)
-            used = [False] * (n_cols + 1)
-            while True:
-                used[j0] = True
-                i0 = p[j0]
-                delta = float("inf")
-                j1 = 0
-                for j in range(1, n_cols + 1):
-                    if used[j]:
-                        continue
-                    cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
-                    if cur < minv[j]:
-                        minv[j] = cur
-                        way[j] = j0
-                    if minv[j] < delta:
-                        delta = minv[j]
-                        j1 = j
-                for j in range(n_cols + 1):
-                    if used[j]:
-                        u[p[j]] += delta
-                        v[j] -= delta
-                    else:
-                        minv[j] -= delta
-                j0 = j1
-                if p[j0] == 0:
-                    break
-
-            while True:
-                j1 = way[j0]
-                p[j0] = p[j1]
-                j0 = j1
-                if j0 == 0:
-                    break
-
-        assignment = []
-        for j in range(1, n_cols + 1):
-            if p[j] != 0:
-                assignment.append((p[j] - 1, j - 1))
-        return assignment

@@ -11,6 +11,30 @@ from .box_ops import pairwise_generalized_box_iou
 ClassProbability = str | Callable[[torch.Tensor], torch.Tensor]
 
 
+@torch.no_grad()
+def minimum_cost_assignment(cost: torch.Tensor) -> list[tuple[int, int]]:
+    """Return a minimum-cost one-to-one assignment for a rectangular matrix.
+
+    The result contains ``min(rows, columns)`` ``(row, column)`` pairs. Cost
+    construction stays with each task, while dtype conversion and the CPU
+    linear-assignment boundary are shared here.
+    """
+
+    if cost.dim() != 2:
+        raise ValueError("Hungarian cost must be a two-dimensional matrix")
+    if cost.shape[0] == 0 or cost.shape[1] == 0:
+        return []
+
+    cost = cost.detach().float()
+    if not torch.isfinite(cost).all():
+        raise ValueError("Hungarian cost matrix must contain only finite values")
+    rows, cols = linear_sum_assignment(cost.cpu().numpy())
+    return [
+        (int(row), int(col))
+        for row, col in zip(rows, cols, strict=True)
+    ]
+
+
 class HungarianMatcher(nn.Module):
     """Match anchor-slot predictions to labeled targets with Hungarian assignment.
 
@@ -138,8 +162,8 @@ class HungarianMatcher(nn.Module):
             + self.cost_geometry * geometry_cost
             + self.cost_giou * giou_cost
         )
-        rows, cols = linear_sum_assignment(cost.detach().cpu().numpy())
+        assignment = minimum_cost_assignment(cost)
         return [
-            (int(pred_idx[int(row)].item()), int(valid_idx[int(col)].item()))
-            for row, col in zip(rows, cols, strict=True)
+            (int(pred_idx[row].item()), int(valid_idx[col].item()))
+            for row, col in assignment
         ]

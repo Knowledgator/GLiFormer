@@ -1058,9 +1058,6 @@ class StructuringHeadConfig(BaseHeadConfig):
     position_bucket_attention_bias_type: str = "none"  # "none" | "gaussian"
     position_bucket_attention_sigma: float = 0.5
     position_bucket_attention_bias_weight: float = 1.0
-    # Add normalized slot-to-record distance to the Hungarian assignment cost.
-    # This keeps positional buckets paired with records in their own region.
-    position_bucket_matcher_cost: float = 0.0
     # Optional explicit 1D coordinates for anchor refinement. Memory positions
     # identify valid word locations; query positions identify anchor slots.
     # ``none`` preserves historical checkpoints. Parameter-free choices include
@@ -1099,14 +1096,24 @@ class StructuringHeadConfig(BaseHeadConfig):
     # Anchor-objectness head: per-anchor sigmoid score "is this slot used?"
     # supervised against the Hungarian-matched mask. At inference, anchors
     # with sigmoid(logit) < threshold are filtered out before BIO decoding.
+    # ``None`` reuses the main inference threshold. A numeric value remains a
+    # fallback for direct decoder calls; public inference accepts an explicit
+    # ``objectness_threshold`` argument.
     anchor_objectness: bool = False
     anchor_objectness_loss_coef: float = 1.0
-    anchor_objectness_threshold: float = 0.5
+    anchor_objectness_threshold: Optional[float] = None
     # Diagnostic logging: when True, the head emits per-batch positive vs
     # negative loss totals split between matched and unmatched anchors. Used
     # to diagnose the imbalance behind "many fields return None".
     log_loss_stats: bool = False
     log_loss_stats_every: int = 50  # log cadence in optimiser steps
+    # Opt-in arbitrary-depth JSON structuring. Plain nested dictionaries are
+    # represented as dot-qualified fields; dictionaries contained in lists
+    # become separate record anchors linked by directed parent→child scores.
+    multi_level: bool = False
+    anchor_relations_layer: str = "mlp"
+    anchor_relations_loss_coef: float = 1.0
+    anchor_relations_threshold: float = 0.5
 
     def __post_init__(self):
         super().__post_init__()
@@ -1115,6 +1122,32 @@ class StructuringHeadConfig(BaseHeadConfig):
         if self.head_type not in {"structuring", "set_structuring"}:
             raise ValueError(
                 "head_type must be 'structuring' or 'set_structuring'"
+            )
+        self.multi_level = bool(self.multi_level)
+        self.anchor_relations_layer = str(
+            self.anchor_relations_layer
+        ).lower().replace("-", "_")
+        # Parent→child edges are directed and non-exclusive. Of GLiNER's
+        # RelationsRepLayer implementations, the ordered-pair MLP is the one
+        # that satisfies both properties.
+        if self.anchor_relations_layer != "mlp":
+            raise ValueError(
+                "anchor_relations_layer must be 'mlp' for directed "
+                "parent-child structuring"
+            )
+        if (
+            not math.isfinite(float(self.anchor_relations_loss_coef))
+            or self.anchor_relations_loss_coef < 0
+        ):
+            raise ValueError(
+                "anchor_relations_loss_coef must be finite and non-negative"
+            )
+        if (
+            not math.isfinite(float(self.anchor_relations_threshold))
+            or not 0 <= self.anchor_relations_threshold <= 1
+        ):
+            raise ValueError(
+                "anchor_relations_threshold must be finite and in [0, 1]"
             )
         self.position_bucket_normalization = str(
             self.position_bucket_normalization
@@ -1162,21 +1195,6 @@ class StructuringHeadConfig(BaseHeadConfig):
             raise ValueError(
                 "position_bucket_attention_bias_weight must be finite and "
                 "non-negative"
-            )
-        if (
-            not math.isfinite(float(self.position_bucket_matcher_cost))
-            or self.position_bucket_matcher_cost < 0
-        ):
-            raise ValueError(
-                "position_bucket_matcher_cost must be finite and non-negative"
-            )
-        if (
-            self.position_bucket_matcher_cost > 0
-            and anchor_mode != "position_buckets"
-        ):
-            raise ValueError(
-                "position_bucket_matcher_cost requires "
-                "anchor_mode='position_buckets'"
             )
         self.masking = "none" if self.masking is None else str(self.masking)
         if self.masking not in {
@@ -1308,6 +1326,9 @@ class SetStructuringHeadConfig(StructuringHeadConfig):
     anchor_mode: str = "fixed_transformer"
     anchor_modeling: str = "linear"
     represent_spans: bool = True
+    # Like joint relex, stage 2 is teacher-forced with target entity spans.
+    # Wrong record anchors already provide negative membership supervision.
+    neg_spans_ratio: float = 0.0
     entity_loss_coef: float = 1.0
 
     def __post_init__(self):
@@ -1369,6 +1390,12 @@ class GLiNextConfig(BaseGLiNERConfig):
             "embed_obj_token",
         ):
             config.pop(obsolete, None)
+
+    @staticmethod
+    def _migrate_structuring_config(config: dict) -> None:
+        """Discard retired matcher policies tied to a specific anchor strategy."""
+
+        config.pop("position_bucket_matcher_cost", None)
 
     @staticmethod
     def _migrate_detection_config(
@@ -1578,6 +1605,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         rel_token: str = "[RELATION]",
         parent_token: str = "[SCHEMA]",
         child_token: str = "[FIELD]",
+        structuring_child_token: str = "<<CHILD>>",
+        structuring_end_token: str = "<<END>>",
         obj_token: str = "[OBJECT]",
         # Descriptive aliases for the marker-token parameters above. The
         # shorter names remain the serialized/public compatibility surface.
@@ -1930,14 +1959,17 @@ class GLiNextConfig(BaseGLiNERConfig):
                 "loss_coef": structuring_loss_coef,
             }
         if isinstance(structuring_config, dict):
+            structuring_config = dict(structuring_config)
+            self._migrate_structuring_config(structuring_config)
             self.structuring_config = StructuringHeadConfig(
-                **dict(structuring_config)
+                **structuring_config
             )
         else:
             self.structuring_config = structuring_config
 
         if isinstance(set_structuring_config, dict):
             set_structuring_config = dict(set_structuring_config)
+            self._migrate_structuring_config(set_structuring_config)
             configured_type = set_structuring_config.get(
                 "head_type", "set_structuring"
             )
@@ -2158,6 +2190,8 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.parent_token_index = parent_token_index
         self.embed_parent_token = embed_parent_token
         self.child_token = child_token
+        self.structuring_child_token = structuring_child_token
+        self.structuring_end_token = structuring_end_token
         self.obj_token = obj_token
         self.obj_token_index = obj_token_index
         self.embed_obj_token = embed_obj_token
@@ -2363,6 +2397,8 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "rel_token",
         "parent_token",
         "child_token",
+        "structuring_child_token",
+        "structuring_end_token",
         "obj_token",
         "per_task_parents",
         "ner_parent_token",

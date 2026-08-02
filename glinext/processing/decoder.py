@@ -116,10 +116,25 @@ class GLiNExTDecoder:
 
     def map_results(self, decoded: Dict[str, list], **kwargs) -> Dict[str, List]:
         """Map decoded task results back through task-specific decoders."""
+        return_anchor_diagnostics = bool(
+            kwargs.pop("return_anchor_diagnostics", False)
+        )
         results = {}
         for name, task_results in decoded.items():
             decoder = self.task_decoders.get(name)
             if decoder is None:
                 continue
-            results[name] = decoder.map_results(task_results, **kwargs)
+            task_kwargs = dict(kwargs)
+            diagnostics = None
+            if return_anchor_diagnostics and name in {
+                "structuring", "set_structuring",
+            }:
+                diagnostics = []
+                task_kwargs["anchor_diagnostics_output"] = diagnostics
+            results[name] = decoder.map_results(
+                task_results,
+                **task_kwargs,
+            )
+            if diagnostics is not None:
+                results[f"{name}_anchor_diagnostics"] = diagnostics
         return results

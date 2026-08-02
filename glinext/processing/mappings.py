@@ -36,12 +36,26 @@ class StructuringItemMapping:
     field_class_to_id: BaseClassMapping  # field names → ids
     name: Optional[str] = None
     description: Optional[str] = None
+    # Internal normalized data key.  It differs from ``name`` for raw root
+    # objects/lists, whose public schema name is intentionally hidden.
+    data_key: Optional[str] = None
+    # Multi-level structuring keeps every JSON object in one schema-local
+    # anchor set. ``hierarchy`` describes the object types in that set; leaf
+    # fields are fully-qualified with dot notation so a decoder can recover an
+    # anchor's object type before applying parent→child relation scores.
+    hierarchy: List[dict] = field(default_factory=list)
+    multi_level: bool = False
 
 
 @dataclass
 class StructuringClassMapping:
     """Per-example structuring mappings: list of schemas each with field mappings."""
     items: List[StructuringItemMapping] = field(default_factory=list)
+    # ``schemas`` preserves the historical ``{schema: [records]}`` contract.
+    # Raw arbitrary JSON rows can instead be a single root object or array;
+    # those modes are unwrapped by the multi-level inference decoder.
+    output_mode: str = "schemas"
+    multi_level: bool = False
 
 
 @dataclass
