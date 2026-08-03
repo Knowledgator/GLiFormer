@@ -57,6 +57,13 @@ class GLiNExTDecoder:
             if hasattr(OpenRelexDecoder, 'from_config'):
                 self.task_decoders["open_relex"] = OpenRelexDecoder.from_config(config)
 
+        if getattr(config, "set_open_relex_config", None) is not None:
+            from ..tasks.set_open_relex.decoder import SetOpenRelexDecoder
+            if hasattr(SetOpenRelexDecoder, 'from_config'):
+                self.task_decoders["set_open_relex"] = (
+                    SetOpenRelexDecoder.from_config(config)
+                )
+
         if config.structuring_config is not None:
             from ..tasks.structuring.decoder import StructuringDecoder
             if hasattr(StructuringDecoder, 'from_config'):

@@ -34,6 +34,7 @@ from .config import (
     OpenRelexHeadConfig,
     SetOpenRelexHeadConfig,
     SetOpenRelationExtractionHeadConfig,
+    StructuringModeConfig,
     StructuringHeadConfig,
     SetStructuringHeadConfig,
     CountHeadConfig,

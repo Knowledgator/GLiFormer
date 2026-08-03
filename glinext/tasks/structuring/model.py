@@ -1,68 +1,22 @@
 """Structuring task head."""
 
 import logging
-import warnings
 
 import torch
-from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 
 from ...layers.mlp import create_mlp
+from ...layers.structuring_relations import (
+    initialize_anchor_relations,
+    maybe_anchor_relation_loss,
+    score_anchor_relations,
+    validate_structuring_anchor_capacity,
+)
 from .. import TaskHeadOutput
 from ..anchored_extraction import AnchoredSpanExtractionHead
 from ..losses import binary_focal_or_bce
 from ..matcher import minimum_cost_assignment
-from .anchor_relations import anchor_relation_loss
 
 logger = logging.getLogger(__name__)
-
-
-def validate_structuring_anchor_capacity(
-    labels,
-    label_count,
-    anchor_count,
-    *,
-    anchor_dim,
-    task_name="Structuring",
-):
-    """Warn when supervision cannot fit in the predicted record slots.
-
-    The historical losses sliced predictions and labels to their shared anchor
-    width. Keep that behavior for oversized samples, but make the loss of gold
-    records explicit. Counts produced by the processor are authoritative; the
-    positive tail check also protects direct/manual loss calls that omit them.
-    """
-
-    max_gold = None
-    if label_count is not None and label_count.numel() > 0:
-        observed = int(label_count.detach().max().item())
-        if observed > anchor_count:
-            max_gold = observed
-
-    if (
-        max_gold is None
-        and labels is not None
-        and labels.shape[anchor_dim] > anchor_count
-    ):
-        tail = labels.narrow(
-            anchor_dim,
-            anchor_count,
-            labels.shape[anchor_dim] - anchor_count,
-        )
-        if torch.count_nonzero(tail).item() > 0:
-            max_gold = labels.shape[anchor_dim]
-
-    if max_gold is not None:
-        excess = max_gold - anchor_count
-        warnings.warn(
-            f"{task_name} supervision contains {max_gold} visible records, "
-            f"but the head produced only {anchor_count} record anchors. "
-            f"The {excess} excess record(s) will not contribute to this batch's "
-            "loss. Increase anchor_layer.params.num_slots/max_count to train on "
-            "all records.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
 
 class StructuringHead(AnchoredSpanExtractionHead):
     """Structuring via anchor-based span extraction.
@@ -121,16 +75,7 @@ class StructuringHead(AnchoredSpanExtractionHead):
                 activation="gelu",
             )
 
-        self.multi_level = bool(getattr(struct_cfg, "multi_level", False))
-        self.anchor_relations_loss_coef = getattr(
-            struct_cfg, "anchor_relations_loss_coef", 1.0,
-        )
-        if self.multi_level:
-            self.anchor_relations_rep_layer = RelationsRepLayer(
-                in_dim=hidden_size,
-                relation_mode=struct_cfg.anchor_relations_layer,
-                hidden_dim=hidden_size,
-            )
+        initialize_anchor_relations(self, struct_cfg, hidden_size)
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
@@ -239,12 +184,11 @@ class StructuringHead(AnchoredSpanExtractionHead):
         if self.use_anchor_objectness:
             objectness_logits = self.objectness_head(anchors).squeeze(-1)  # (BN, A)
 
-        anchor_relation_scores = None
-        if self.multi_level:
-            anchor_relation_scores = self.anchor_relations_rep_layer(
-                anchors,
-                anchor_mask,
-            )
+        anchor_relation_scores = score_anchor_relations(
+            getattr(self, "anchor_relations_rep_layer", None),
+            anchors,
+            anchor_mask,
+        )
 
         # Optional span-level rescoring. It remains training-only for the
         # regular head; implementations whose primary semantic unit is an
@@ -351,26 +295,19 @@ class StructuringHead(AnchoredSpanExtractionHead):
                         if loss_stats is not None:
                             loss_stats["objectness_loss"] = float(obj_loss.detach().item())
 
-        relation_labels = batch.get("structuring_relation_labels")
-        if (
-            anchor_relation_scores is not None
-            and relation_labels is not None
-            and base_loss_fn is not None
-        ):
-            relation_loss = anchor_relation_loss(
-                anchor_relation_scores,
-                relation_labels,
-                anchor_mask.bool(),
-                base_loss_fn=base_loss_fn,
-                relation_group_mask=batch.get(
-                    "structuring_relation_group_mask"
-                ),
-                anchor_matches=anchor_matches,
-                label_count=label_count,
-            )
-            weighted_relation_loss = (
-                self.anchor_relations_loss_coef * relation_loss
-            )
+        relation_loss, weighted_relation_loss = maybe_anchor_relation_loss(
+            anchor_relation_scores,
+            batch.get("structuring_relation_labels"),
+            anchor_mask.bool(),
+            base_loss_fn=base_loss_fn,
+            relation_group_mask=batch.get(
+                "structuring_relation_group_mask"
+            ),
+            anchor_matches=anchor_matches,
+            label_count=label_count,
+            loss_coef=self.anchor_relations_loss_coef,
+        )
+        if weighted_relation_loss is not None:
             loss = (
                 weighted_relation_loss
                 if loss is None

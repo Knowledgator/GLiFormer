@@ -1,9 +1,12 @@
-"""Inference graph reconstruction for opt-in multi-level structuring."""
+"""Optional anchor alignment and nested formatting for structuring."""
 
 from __future__ import annotations
 
 from collections import defaultdict
-from copy import deepcopy
+from collections.abc import Callable, Mapping
+from copy import copy, deepcopy
+from dataclasses import dataclass
+from typing import Any, TypedDict
 
 import torch
 
@@ -86,8 +89,8 @@ def _paths_conflict(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     return left != right and left[:shared] == right[:shared]
 
 
-class MultiLevelStructuringDecoder:
-    """Turn qualified anchor fields plus directed edges back into nested JSON."""
+class _AnchorAlignment:
+    """Align related anchors and format qualified fields as nested JSON."""
 
     def __init__(self, relation_threshold: float = 0.5):
         self.relation_threshold = float(relation_threshold)
@@ -475,7 +478,7 @@ class MultiLevelStructuringDecoder:
 
         return order_mapping(value, schema_tree(node_path))
 
-    def reconstruct_group(
+    def align_and_format(
         self,
         payload: dict,
         start_map: list[int],
@@ -485,21 +488,25 @@ class MultiLevelStructuringDecoder:
         relation_threshold: float | None = None,
         diagnostics: dict | None = None,
     ) -> list[dict]:
-        """Reconstruct one schema group's root records."""
+        """Align and format one schema group's root records."""
 
-        old_threshold = self.relation_threshold
-        if relation_threshold is not None:
-            self.relation_threshold = float(relation_threshold)
-        try:
-            return self._reconstruct_group(
-                payload,
-                start_map,
-                end_map,
-                text,
-                diagnostics=diagnostics,
-            )
-        finally:
-            self.relation_threshold = old_threshold
+        alignment = self
+        if (
+            relation_threshold is not None
+            and float(relation_threshold) != self.relation_threshold
+        ):
+            # A call-time threshold is configuration, not mutable shared
+            # state. This keeps shared alignment helpers re-entrant and avoids
+            # cross-request leakage without changing the reconstruction path.
+            alignment = copy(self)
+            alignment.relation_threshold = float(relation_threshold)
+        return alignment._align_and_format(
+            payload,
+            start_map,
+            end_map,
+            text,
+            diagnostics=diagnostics,
+        )
 
     @staticmethod
     def _diagnostic_field(field: dict) -> dict:
@@ -509,7 +516,7 @@ class MultiLevelStructuringDecoder:
             "score": round(float(field.get("score", 0.0)), 6),
         }
 
-    def _reconstruct_group(
+    def _align_and_format(
         self,
         payload,
         start_map,
@@ -1086,9 +1093,201 @@ class MultiLevelStructuringDecoder:
         return roots
 
 
+class StructuringAnchorEntry(TypedDict):
+    """Field evidence associated with one physical prediction anchor."""
+
+    anchor_index: int
+    fields: list[dict]
+    presence_is_reliable: bool
+
+
+@dataclass(frozen=True)
+class ReconstructedStructuringGroup:
+    """Uniform result returned after optional anchor alignment."""
+
+    instances: list[dict]
+    output_mode: str | None = None
+    multi_level: bool = False
+    diagnostics: dict | None = None
+
+
+_DECODER_MODE_ALIASES = {
+    "base": "flat",
+    "single_level": "flat",
+    "singlelevel": "flat",
+    "multilevel": "multi_level",
+    "hierarchical": "multi_level",
+    "hierarchy": "multi_level",
+}
+
+
+def _component_type(
+    spec: object,
+    default: str,
+) -> tuple[str, dict[str, Any]]:
+    if spec is None:
+        return default, {}
+    if isinstance(spec, bool):
+        return ("multi_level" if spec else "flat"), {}
+    if isinstance(spec, str):
+        name, params = spec, {}
+    elif isinstance(spec, Mapping):
+        raw = dict(spec)
+        name = raw.pop("type", raw.pop("name", default))
+        configured = raw.pop("params", {})
+        if not isinstance(configured, Mapping):
+            raise TypeError(
+                "structuring decoder component params must be a mapping"
+            )
+        params = {**configured, **raw}
+    elif all(
+        hasattr(spec, attribute)
+        for attribute in (
+            "finalize_group",
+            "reconstruct_group",
+        )
+    ):
+        return "__instance__", {"instance": spec}
+    else:
+        raise TypeError(
+            "structuring decoder component must be a string, mapping, bool, "
+            "or processing component"
+        )
+    normalized = str(name).lower().replace("-", "_")
+    return _DECODER_MODE_ALIASES.get(normalized, normalized), params
+
+
+def align_structuring_anchors(
+    payload: dict,
+    start_map: list[int],
+    end_map: list[int],
+    text: str,
+    *,
+    relation_threshold: float = 0.5,
+    diagnostics: dict | None = None,
+) -> list[dict]:
+    """Apply the optional anchor-alignment and nested-formatting step."""
+
+    return _AnchorAlignment(relation_threshold).align_and_format(
+        payload,
+        start_map,
+        end_map,
+        text,
+        diagnostics=diagnostics,
+    )
+
+
+class StructuringDecoderComponent:
+    """Common formatting path with optional anchor alignment."""
+
+    def __init__(
+        self,
+        mode: str = "flat",
+        *,
+        relation_threshold: float = 0.5,
+        anchor_relations_threshold: float | None = None,
+        **_: Any,
+    ):
+        if mode not in {"flat", "multi_level"}:
+            raise ValueError(f"Unknown structuring decoder mode {mode!r}")
+        if anchor_relations_threshold is not None:
+            relation_threshold = anchor_relations_threshold
+        self.multi_level = mode == "multi_level"
+        self.relation_threshold = float(relation_threshold)
+
+    def finalize_group(
+        self,
+        entries: list[StructuringAnchorEntry],
+        *,
+        relation_scores=None,
+        mapping=None,
+        output_mode: str = "schemas",
+        preserve_empty_records: bool = False,
+    ) -> list[list[dict]] | dict:
+        align_anchors = bool(
+            getattr(mapping, "multi_level", self.multi_level)
+        )
+        if not align_anchors:
+            return [entry["fields"] for entry in entries if entry["fields"]]
+        return make_multi_level_group_result(
+            entries,
+            relation_scores,
+            mapping,
+            output_mode,
+            preserve_empty_records=preserve_empty_records,
+        )
+
+    def reconstruct_group(
+        self,
+        payload: object,
+        start_map: list[int],
+        end_map: list[int],
+        text: str,
+        *,
+        schema_fields: list[str],
+        assemble_instance: Callable,
+        fill_missing_fields: Callable,
+        diagnostics: dict | None = None,
+    ) -> ReconstructedStructuringGroup:
+        if is_multi_level_group_result(payload):
+            roots = align_structuring_anchors(
+                payload,
+                start_map,
+                end_map,
+                text,
+                relation_threshold=self.relation_threshold,
+                diagnostics=diagnostics,
+            )
+            return ReconstructedStructuringGroup(
+                instances=roots,
+                output_mode=str(payload.get("output_mode", "schemas")),
+                multi_level=True,
+                diagnostics=diagnostics,
+            )
+
+        raw_instances = payload if isinstance(payload, list) else [payload]
+        instances: list[dict] = []
+        for instance in raw_instances:
+            if isinstance(instance, list):
+                instance_dict = assemble_instance(
+                    instance,
+                    start_map,
+                    end_map,
+                    text,
+                    schema_fields,
+                )
+                if instance_dict is not None:
+                    instances.append(instance_dict)
+            elif isinstance(instance, dict):
+                instances.append(
+                    fill_missing_fields(instance, schema_fields)
+                )
+        return ReconstructedStructuringGroup(instances=instances)
+
+
+def resolve_structuring_decoder(
+    spec: object = None,
+    *,
+    multi_level: bool = False,
+    relation_threshold: float = 0.5,
+):
+    """Build shared formatting with optional anchor alignment enabled."""
+
+    default = "multi_level" if multi_level else "flat"
+    mode, params = _component_type(spec, default)
+    if mode == "__instance__":
+        return params["instance"]
+    params.setdefault("relation_threshold", relation_threshold)
+    return StructuringDecoderComponent(mode, **params)
+
+
 __all__ = [
     "MULTI_LEVEL_RESULT_KEY",
-    "MultiLevelStructuringDecoder",
+    "ReconstructedStructuringGroup",
+    "StructuringAnchorEntry",
+    "StructuringDecoderComponent",
+    "align_structuring_anchors",
     "is_multi_level_group_result",
     "make_multi_level_group_result",
+    "resolve_structuring_decoder",
 ]

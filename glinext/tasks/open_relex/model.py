@@ -52,18 +52,7 @@ class OpenRelexHead(TaskHead):
         open_rel_cfg = config.open_relex_config
         if open_rel_cfg is None:
             return None
-
-        head_type = getattr(open_rel_cfg, "head_type", "open_relex")
-        if cls is OpenRelexHead and head_type == "set_open_relex":
-            from ..set_open_relex.model import SetOpenRelexHead
-
-            return SetOpenRelexHead(
-                config,
-                hidden_size=config.hidden_size,
-                dropout=config.dropout,
-                shared_layers=shared_layers,
-            )
-        if head_type != cls.name:
+        if getattr(open_rel_cfg, "head_type", "open_relex") != cls.name:
             return None
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
                    shared_layers=shared_layers)

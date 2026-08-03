@@ -1,4 +1,4 @@
-"""Canonicalization helpers for opt-in multi-level structuring.
+"""Optional hierarchy normalization for shared structuring processing.
 
 The existing structuring head consumes ``{schema: [flat_record, ...]}``.  This
 module converts arbitrary JSON into that representation without changing the
@@ -17,11 +17,13 @@ Keeping all nodes for one JSON tree in one schema group is intentional:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from numbers import Integral
+from typing import Any
 
 MULTI_LEVEL_META_KEY = "_glinext_structuring_multi_level"
+SET_MULTI_LEVEL_META_KEY = "_glinext_set_structuring_multi_level"
 MULTI_LEVEL_ROOT_KEY = "$root"
 NODE_ID_KEY = "__glinext_multi_level_node_id__"
 NODE_KEEP_KEY = "__glinext_multi_level_keep__"
@@ -111,12 +113,25 @@ def _escaped_path_label(path: tuple[str, ...]) -> str:
     )
 
 
-class MultiLevelStructuringProcessor:
-    """Normalize training rows and nested inference templates."""
+class _HierarchyNormalizer:
+    """Optional hierarchy normalization used by structuring processing."""
 
-    def __init__(self, child_token: str, end_token: str):
+    multi_level = True
+
+    def __init__(
+        self,
+        child_token: str,
+        end_token: str,
+        *,
+        data_key: str = "structuring",
+        schema_key: str = "structuring_schema",
+        meta_key: str = MULTI_LEVEL_META_KEY,
+    ):
         self.child_token = child_token
         self.end_token = end_token
+        self.data_key = str(data_key)
+        self.schema_key = str(schema_key)
+        self.meta_key = str(meta_key)
 
     @staticmethod
     def _new_group(data_key: str, name: str) -> dict:
@@ -466,11 +481,11 @@ class MultiLevelStructuringProcessor:
     ) -> dict | None:
         """Normalize ``item['structuring']`` in-place, idempotently."""
 
-        existing = item.get(MULTI_LEVEL_META_KEY)
+        existing = item.get(self.meta_key)
         if isinstance(existing, dict):
             return existing
 
-        raw = item.get("structuring")
+        raw = item.get(self.data_key)
         if not isinstance(raw, dict | list):
             return None
 
@@ -493,7 +508,7 @@ class MultiLevelStructuringProcessor:
             raise TypeError("A raw list root must be a list")
         if forced_output_mode == "schemas" and not isinstance(raw, dict):
             raise TypeError("Named structuring schemas must be a dictionary")
-        existing_schema = deepcopy(item.get("structuring_schema") or {})
+        existing_schema = deepcopy(item.get(self.schema_key) or {})
         groups: list[dict] = []
 
         if isinstance(raw, list) and forced_output_mode != "schemas":
@@ -560,21 +575,21 @@ class MultiLevelStructuringProcessor:
             "output_mode": output_mode,
             "groups": public_groups,
         }
-        item["structuring"] = normalized
-        item["structuring_schema"] = schema
-        item[MULTI_LEVEL_META_KEY] = meta
+        item[self.data_key] = normalized
+        item[self.schema_key] = schema
+        item[self.meta_key] = meta
         return meta
 
     @staticmethod
     def _placeholder_template(value: object) -> object:
         if isinstance(value, dict):
             return {
-                str(key): MultiLevelStructuringProcessor._placeholder_template(child)
+                str(key): _HierarchyNormalizer._placeholder_template(child)
                 for key, child in value.items()
             }
         if isinstance(value, list):
             return [
-                MultiLevelStructuringProcessor._placeholder_template(child)
+                _HierarchyNormalizer._placeholder_template(child)
                 for child in value
             ]
         return ""
@@ -657,8 +672,8 @@ class MultiLevelStructuringProcessor:
                 if structures and isinstance(structures[0], dict)
                 else {}
             )
-            item["structuring"] = [template]
-            item["structuring_schema"] = {}
+            item[self.data_key] = [template]
+            item[self.schema_key] = {}
             self.normalize_item(item)
             return
 
@@ -669,8 +684,8 @@ class MultiLevelStructuringProcessor:
             root_spec = structures[MULTI_LEVEL_ROOT_KEY]
             if isinstance(root_spec, dict):
                 template, required = self._template_from_spec(root_spec)
-                item["structuring"] = template
-                item["structuring_schema"] = {
+                item[self.data_key] = template
+                item[self.schema_key] = {
                     _ROOT_SCHEMA_NAME: {"required_fields": required}
                 }
                 self.normalize_item(item, forced_output_mode="object")
@@ -681,8 +696,8 @@ class MultiLevelStructuringProcessor:
                     if root_spec and isinstance(root_spec[0], dict)
                     else {}
                 )
-                item["structuring"] = [template]
-                item["structuring_schema"] = {}
+                item[self.data_key] = [template]
+                item[self.schema_key] = {}
                 self.normalize_item(item, forced_output_mode="list")
                 return
             raise TypeError("$root structuring schema must be a dict or list")
@@ -694,8 +709,8 @@ class MultiLevelStructuringProcessor:
             template, required = self._template_from_spec(spec)
             structuring[name] = [template]
             structuring_schema[name] = {"required_fields": required}
-        item["structuring"] = structuring
-        item["structuring_schema"] = structuring_schema
+        item[self.data_key] = structuring
+        item[self.schema_key] = structuring_schema
         self.normalize_item(item)
 
     def contribute_prompt(
@@ -754,12 +769,203 @@ class MultiLevelStructuringProcessor:
         return prompt
 
 
+_PROCESSOR_MODE_ALIASES = {
+    "base": "flat",
+    "single_level": "flat",
+    "singlelevel": "flat",
+    "multilevel": "multi_level",
+    "hierarchical": "multi_level",
+    "hierarchy": "multi_level",
+}
+
+
+def _component_type(
+    spec: object,
+    default: str,
+) -> tuple[str, dict[str, Any]]:
+    if spec is None:
+        return default, {}
+    if isinstance(spec, str):
+        name, params = spec, {}
+    elif isinstance(spec, Mapping):
+        raw = dict(spec)
+        name = raw.pop("type", raw.pop("name", default))
+        configured = raw.pop("params", {})
+        if not isinstance(configured, Mapping):
+            raise TypeError(
+                "structuring processor component params must be a mapping"
+            )
+        params = {**configured, **raw}
+    elif all(
+        hasattr(spec, method)
+        for method in (
+            "normalize_item",
+            "contribute_inference_input",
+            "contribute_prompt",
+        )
+    ):
+        return "__instance__", {"instance": spec}
+    else:
+        raise TypeError(
+            "structuring processor component must be a string, mapping, "
+            "or processing component"
+        )
+    normalized = str(name).lower().replace("-", "_")
+    return _PROCESSOR_MODE_ALIASES.get(normalized, normalized), params
+
+
+class StructuringProcessorComponent:
+    """Shared input processing with optional hierarchy normalization."""
+
+    def __init__(
+        self,
+        mode: str = "flat",
+        *,
+        child_token: str,
+        end_token: str,
+        data_key: str = "structuring",
+        schema_key: str = "structuring_schema",
+        meta_key: str = MULTI_LEVEL_META_KEY,
+        **_: Any,
+    ):
+        if mode not in {"flat", "multi_level"}:
+            raise ValueError(f"Unknown structuring processor mode {mode!r}")
+        self.multi_level = mode == "multi_level"
+        self.data_key = str(data_key)
+        self.schema_key = str(schema_key)
+        self._hierarchy = (
+            _HierarchyNormalizer(
+                child_token=child_token,
+                end_token=end_token,
+                data_key=data_key,
+                schema_key=schema_key,
+                meta_key=meta_key,
+            )
+            if self.multi_level
+            else None
+        )
+
+    def normalize_item(self, item: dict, **kwargs):
+        if self._hierarchy is None:
+            return None
+        return self._hierarchy.normalize_item(item, **kwargs)
+
+    @staticmethod
+    def _structure_fields(fields):
+        if isinstance(fields, list):
+            return fields
+        if isinstance(fields, dict):
+            return fields.get("fields", [])
+        return []
+
+    def contribute_inference_input(
+        self,
+        item: dict,
+        structures: object,
+    ) -> None:
+        if self._hierarchy is not None:
+            self._hierarchy.contribute_inference_input(item, structures)
+            return
+        if isinstance(structures, list):
+            raise ValueError(
+                "Root-list or nested structuring schemas require "
+                "multi_level=True or structure_mode='multi_level'"
+            )
+        if not isinstance(structures, dict):
+            raise TypeError("structures must be a dictionary or list")
+
+        data = {}
+        schemas = {}
+        for raw_name, spec in structures.items():
+            schema_name = str(raw_name)
+            if isinstance(spec, dict) and "fields" not in spec:
+                raise ValueError(
+                    "Nested structuring schemas require "
+                    "multi_level=True or structure_mode='multi_level'"
+                )
+            fields = self._structure_fields(spec)
+            if not isinstance(fields, list) or not all(
+                isinstance(field, str) for field in fields
+            ):
+                raise TypeError(
+                    "Flat structuring schema fields must be a list of strings"
+                )
+            data[schema_name] = (
+                [dict.fromkeys(fields, "")] if fields else []
+            )
+            schemas[schema_name] = (
+                dict(spec) if isinstance(spec, dict) else list(fields)
+            )
+        item[self.data_key] = data
+        item[self.schema_key] = schemas
+
+    def contribute_prompt(
+        self,
+        struct_item,
+        *,
+        parent_token: str,
+        field_token: str,
+        sep_token: str,
+        use_labels_encoder: bool,
+    ) -> list[str]:
+        if self._hierarchy is not None:
+            return self._hierarchy.contribute_prompt(
+                struct_item,
+                parent_token=parent_token,
+                field_token=field_token,
+                sep_token=sep_token,
+                use_labels_encoder=use_labels_encoder,
+            )
+        prompt = [parent_token]
+        field_map = struct_item.field_class_to_id
+        if field_map.name:
+            prompt.append(field_map.name)
+        if field_map.description:
+            prompt.append(field_map.description)
+        if not use_labels_encoder:
+            prompt.extend(
+                f"{field_token} {field_name}"
+                for field_name in field_map.class_to_id
+            )
+        prompt.append(sep_token)
+        return prompt
+
+
+def resolve_structuring_processor(
+    spec: object = None,
+    *,
+    multi_level: bool = False,
+    child_token: str,
+    end_token: str,
+    data_key: str = "structuring",
+    schema_key: str = "structuring_schema",
+    meta_key: str,
+):
+    """Build the common structuring processor with optional hierarchy hooks."""
+
+    default = "multi_level" if multi_level else "flat"
+    mode, params = _component_type(spec, default)
+    if mode == "__instance__":
+        return params["instance"]
+    return StructuringProcessorComponent(
+        mode,
+        child_token=child_token,
+        end_token=end_token,
+        data_key=data_key,
+        schema_key=schema_key,
+        meta_key=meta_key,
+        **params,
+    )
+
+
 __all__ = [
     "INTERNAL_INSTANCE_KEYS",
     "MULTI_LEVEL_META_KEY",
+    "SET_MULTI_LEVEL_META_KEY",
     "MULTI_LEVEL_ROOT_KEY",
     "NODE_ID_KEY",
     "NODE_KEEP_KEY",
-    "MultiLevelStructuringProcessor",
+    "StructuringProcessorComponent",
     "is_internal_instance_key",
+    "resolve_structuring_processor",
 ]

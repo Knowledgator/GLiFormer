@@ -3,15 +3,15 @@
 import torch
 
 from ...processing.decoder import unflatten_by_batch_origin
+from ...processing.structuring_decoder import StructuringDecoder
 from ..span_decoder import Span
-from ..structuring.decoder import StructuringDecoder
-from ..structuring.multilevel_decoder import make_multi_level_group_result
 
 
 class SetStructuringDecoder(StructuringDecoder):
     """Join NER field decisions with second-stage anchor memberships."""
 
     config_attr = "set_structuring_config"
+    mapping_attr = "set_structuring_mapping"
     token_logits_attr = "set_structuring_entity_logits"
     field_logits_attr = "set_structuring_field_logits"
     span_logits_attr = "set_structuring_logits"
@@ -21,6 +21,27 @@ class SetStructuringDecoder(StructuringDecoder):
     relation_scores_attr = "set_structuring_anchor_relation_scores"
     span_idx_attr = "set_structuring_span_idx"
     span_mask_attr = "set_structuring_span_mask"
+
+    def map_results(
+        self,
+        task_results,
+        *args,
+        structures=None,
+        set_structures=None,
+        **kwargs,
+    ):
+        """Map with an explicit set schema, falling back to the legacy one."""
+
+        return super().map_results(
+            task_results,
+            *args,
+            structures=(
+                set_structures
+                if set_structures is not None
+                else structures
+            ),
+            **kwargs,
+        )
 
     def decode(
         self,
@@ -194,15 +215,11 @@ class SetStructuringDecoder(StructuringDecoder):
             valid_entities = torch.where(
                 span_mask[batch_idx, :entity_count].bool()
             )[0]
-            instances = []
-            nodes = []
+            anchor_entries = []
             context = (
                 multi_level_contexts[batch_idx]
                 if batch_idx < len(multi_level_contexts)
                 else None
-            )
-            is_multi_level = bool(
-                context and getattr(context["mapping"], "multi_level", False)
             )
             for anchor_idx in range(anchor_count):
                 if (
@@ -250,34 +267,27 @@ class SetStructuringDecoder(StructuringDecoder):
 
                 spans = self.greedy_search(spans, flat_ner, multi_label)
                 fields = self._spans_to_fields(spans, texts, text_idx)
-                if is_multi_level:
-                    nodes.append({
-                        "anchor_index": anchor_idx,
-                        "fields": fields,
-                        "presence_is_reliable": bool(
-                            reliable_presence_mask is not None
-                            and reliable_presence_mask[
-                                batch_idx, anchor_idx
-                            ]
-                        ),
-                    })
-                elif spans:
-                    instances.append(
-                        fields
-                    )
-            if is_multi_level:
-                flat_results.append(make_multi_level_group_result(
-                    nodes,
-                    (
+                anchor_entries.append({
+                    "anchor_index": anchor_idx,
+                    "fields": fields,
+                    "presence_is_reliable": bool(
+                        reliable_presence_mask is not None
+                        and reliable_presence_mask[
+                            batch_idx, anchor_idx
+                        ]
+                    ),
+                })
+            flat_results.append(
+                self._finalize_anchor_group(
+                    anchor_entries,
+                    relation_scores=(
                         relation_scores[batch_idx]
                         if relation_scores is not None else None
                     ),
-                    context["mapping"],
-                    context["output_mode"],
+                    context=context,
                     preserve_empty_records=preserve_empty_records,
-                ))
-            else:
-                flat_results.append(instances)
+                )
+            )
 
         return unflatten_by_batch_origin(
             flat_results,

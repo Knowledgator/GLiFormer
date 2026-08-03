@@ -37,6 +37,19 @@ class GLiNExTTextOutput(GLiNExTBaseOutput):
     open_rel_span_idx: Optional[torch.LongTensor] = None
     open_rel_span_mask: Optional[torch.Tensor] = None
 
+    # Independent entity-first set open relation extraction. Relation-role
+    # logits are (B, A, R, 2); canonical decoder assignment logits retain the
+    # selected entity axis as (B, A, R, E, 2). The trainer flattens its variable
+    # set/schema axes only at the evaluation-aggregation boundary.
+    set_open_rel_entity_logits: Optional[torch.FloatTensor] = None
+    set_open_rel_logits: Optional[torch.FloatTensor] = None
+    set_open_rel_assignment_logits: Optional[torch.FloatTensor] = None
+    set_open_rel_batch_origin: Optional[torch.LongTensor] = None
+    set_open_rel_anchor_mask: Optional[torch.Tensor] = None
+    set_open_rel_objectness_logits: Optional[torch.FloatTensor] = None
+    set_open_rel_span_idx: Optional[torch.LongTensor] = None
+    set_open_rel_span_mask: Optional[torch.Tensor] = None
+
     count_logits: Optional[torch.FloatTensor] = None
     count_batch_origin: Optional[torch.LongTensor] = None
 

@@ -1,14 +1,190 @@
-"""Directed parent-child relation utilities for structuring anchors."""
+"""Shared anchor-relation layer utilities for structuring heads."""
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 
 import torch
+from gliner.modeling.multitask.relations_layers import RelationsRepLayer
+from torch import nn
 
-from ..losses import binary_focal_or_bce
+from ..tasks.losses import binary_focal_or_bce
 
 AnchorMatches = Sequence[Sequence[tuple[int, int]]]
+
+
+def validate_structuring_anchor_capacity(
+    labels,
+    label_count,
+    anchor_count,
+    *,
+    anchor_dim,
+    task_name="Structuring",
+):
+    """Warn when supervision cannot fit in the predicted record slots."""
+
+    max_gold = None
+    if label_count is not None and label_count.numel() > 0:
+        observed = int(label_count.detach().max().item())
+        if observed > anchor_count:
+            max_gold = observed
+
+    if (
+        max_gold is None
+        and labels is not None
+        and labels.shape[anchor_dim] > anchor_count
+    ):
+        tail = labels.narrow(
+            anchor_dim,
+            anchor_count,
+            labels.shape[anchor_dim] - anchor_count,
+        )
+        if torch.count_nonzero(tail).item() > 0:
+            max_gold = labels.shape[anchor_dim]
+
+    if max_gold is not None:
+        excess = max_gold - anchor_count
+        warnings.warn(
+            f"{task_name} supervision contains {max_gold} visible records, "
+            f"but the head produced only {anchor_count} record anchors. "
+            f"The {excess} excess record(s) will not contribute to this "
+            "batch's loss. Increase anchor_layer.params.num_slots/max_count "
+            "to train on all records.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def initialize_anchor_relations(
+    owner: nn.Module,
+    task_config,
+    hidden_size: int,
+) -> None:
+    """Attach the optional hierarchy scorer without introducing a wrapper module.
+
+    Checkpoints already store the learned scorer directly below
+    ``anchor_relations_rep_layer`` on each structuring head.  Keeping this
+    helper stateless consolidates construction while preserving that exact
+    registered-module path.
+    """
+
+    owner.multi_level = bool(getattr(task_config, "multi_level", False))
+    owner.anchor_relations_loss_coef = getattr(
+        task_config,
+        "anchor_relations_loss_coef",
+        1.0,
+    )
+    if owner.multi_level:
+        owner.anchor_relations_rep_layer = RelationsRepLayer(
+            in_dim=hidden_size,
+            relation_mode=task_config.anchor_relations_layer,
+            hidden_dim=hidden_size,
+        )
+
+
+def score_anchor_relations(
+    relation_layer: nn.Module | None,
+    anchors: torch.Tensor,
+    anchor_mask: torch.Tensor,
+    *,
+    compact: bool = False,
+) -> torch.Tensor | None:
+    """Score directed anchor pairs, optionally compacting sparse slot masks.
+
+    Regular structuring retains its historical direct scorer call.  Entity-first
+    set structuring compacts active record slots first because selected token
+    anchors may be sparse, then scatters both relation axes back to their stable
+    public slot indices.
+    """
+
+    if relation_layer is None:
+        return None
+    if not compact:
+        return relation_layer(anchors, anchor_mask)
+
+    batch_size, anchor_count, hidden_size = anchors.shape
+    active_rows = torch.where(anchor_mask.bool().any(dim=1))[0]
+    if active_rows.numel() == 0:
+        return anchors.new_zeros(batch_size, anchor_count, anchor_count)
+
+    active_mask = anchor_mask[active_rows].bool()
+    compact_count = int(active_mask.sum(dim=1).max().item())
+    compact_indices = torch.zeros(
+        active_rows.numel(),
+        compact_count,
+        dtype=torch.long,
+        device=anchors.device,
+    )
+    compact_mask = torch.zeros_like(compact_indices, dtype=torch.bool)
+    for compact_batch_idx, source_batch_idx in enumerate(active_rows.tolist()):
+        indices = torch.where(anchor_mask[source_batch_idx].bool())[0]
+        compact_indices[compact_batch_idx, :indices.numel()] = indices
+        compact_mask[compact_batch_idx, :indices.numel()] = True
+
+    compact_anchors = anchors[active_rows].gather(
+        1,
+        compact_indices.unsqueeze(-1).expand(-1, -1, hidden_size),
+    )
+    compact_scores = relation_layer(compact_anchors, compact_mask)
+    compact_scores = compact_scores * (
+        compact_mask.unsqueeze(1) & compact_mask.unsqueeze(2)
+    ).to(compact_scores.dtype)
+
+    column_scattered = compact_scores.new_zeros(
+        active_rows.numel(),
+        compact_count,
+        anchor_count,
+    ).scatter_add(
+        2,
+        compact_indices.unsqueeze(1).expand(-1, compact_count, -1),
+        compact_scores,
+    )
+    active_scores = compact_scores.new_zeros(
+        active_rows.numel(),
+        anchor_count,
+        anchor_count,
+    ).scatter_add(
+        1,
+        compact_indices.unsqueeze(-1).expand(-1, -1, anchor_count),
+        column_scattered,
+    )
+    return compact_scores.new_zeros(
+        batch_size,
+        anchor_count,
+        anchor_count,
+    ).index_copy(0, active_rows, active_scores)
+
+
+def maybe_anchor_relation_loss(
+    relation_scores: torch.Tensor | None,
+    relation_labels: torch.Tensor | None,
+    anchor_mask: torch.Tensor,
+    *,
+    base_loss_fn=None,
+    relation_group_mask: torch.Tensor | None = None,
+    anchor_matches: AnchorMatches | None = None,
+    label_count: torch.Tensor | None = None,
+    loss_coef: float = 1.0,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return the raw and weighted optional hierarchy losses."""
+
+    if (
+        relation_scores is None
+        or relation_labels is None
+        or base_loss_fn is None
+    ):
+        return None, None
+    relation_loss = anchor_relation_loss(
+        relation_scores,
+        relation_labels,
+        anchor_mask,
+        base_loss_fn=base_loss_fn,
+        relation_group_mask=relation_group_mask,
+        anchor_matches=anchor_matches,
+        label_count=label_count,
+    )
+    return relation_loss, float(loss_coef) * relation_loss
 
 
 def remap_anchor_relation_targets(
@@ -197,5 +373,9 @@ def anchor_relation_loss(
 
 __all__ = [
     "anchor_relation_loss",
+    "initialize_anchor_relations",
+    "maybe_anchor_relation_loss",
     "remap_anchor_relation_targets",
+    "score_anchor_relations",
+    "validate_structuring_anchor_capacity",
 ]

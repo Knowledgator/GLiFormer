@@ -654,6 +654,12 @@ TASK_REGISTRY = TaskRegistry(
         TaskDefinition("count", "glinext.tasks.count.model", "CountHead", "text"),
         TaskDefinition("joint_relex", "glinext.tasks.joint_relex.model", "JointRelexHead", "text"),
         TaskDefinition("open_relex", "glinext.tasks.open_relex.model", "OpenRelexHead", "text"),
+        TaskDefinition(
+            "set_open_relex",
+            "glinext.tasks.set_open_relex.model",
+            "SetOpenRelexHead",
+            "text",
+        ),
         TaskDefinition("structuring", "glinext.tasks.structuring.model", "StructuringHead", "text"),
         TaskDefinition(
             "set_structuring",

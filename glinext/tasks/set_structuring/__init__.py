@@ -2,5 +2,10 @@
 
 from .model import SetStructuringHead
 from .decoder import SetStructuringDecoder
+from .processor import SetStructuringProcessor
 
-__all__ = ["SetStructuringHead", "SetStructuringDecoder"]
+__all__ = [
+    "SetStructuringHead",
+    "SetStructuringDecoder",
+    "SetStructuringProcessor",
+]

@@ -220,8 +220,11 @@ class BaseGLiNExT(BaseGLiNER):
         if self.config.classification_config is not None:
             tokens.append(self.config.cat_token)
 
-        if (self.config.joint_relex_config is not None
-                or self.config.open_relex_config is not None):
+        if (
+            self.config.joint_relex_config is not None
+            or self.config.open_relex_config is not None
+            or self.config.set_open_relex_config is not None
+        ):
             tokens.append(self.config.rel_token)
 
         if (
@@ -274,6 +277,10 @@ class BaseGLiNExT(BaseGLiNER):
             self.config.classification_config.parent_token_index = _idx(self.config.cat_parent_token)
         if self.config.open_relex_config is not None:
             self.config.open_relex_config.parent_token_index = _idx(self.config.open_rel_parent_token)
+        if self.config.set_open_relex_config is not None:
+            self.config.set_open_relex_config.parent_token_index = _idx(
+                self.config.open_rel_parent_token
+            )
         if self.config.structuring_config is not None:
             self.config.structuring_config.parent_token_index = _idx(self.config.struct_parent_token)
         if self.config.set_structuring_config is not None:
@@ -294,8 +301,11 @@ class BaseGLiNExT(BaseGLiNER):
             self.config.classification_config.cat_token_index = cat_idx
             self.config.cat_token_index = cat_idx
 
-        rel_token_added = (self.config.joint_relex_config is not None
-                           or self.config.open_relex_config is not None)
+        rel_token_added = (
+            self.config.joint_relex_config is not None
+            or self.config.open_relex_config is not None
+            or self.config.set_open_relex_config is not None
+        )
         if rel_token_added:
             rel_idx = _idx(self.config.rel_token)
             self.config.rel_token_index = rel_idx
@@ -303,6 +313,8 @@ class BaseGLiNExT(BaseGLiNER):
                 self.config.joint_relex_config.rel_token_index = rel_idx
             if self.config.open_relex_config is not None:
                 self.config.open_relex_config.rel_token_index = rel_idx
+            if self.config.set_open_relex_config is not None:
+                self.config.set_open_relex_config.rel_token_index = rel_idx
 
         if (
             self.config.structuring_config is not None
@@ -346,8 +358,10 @@ class BaseGLiNExT(BaseGLiNER):
         entities=None,
         classes=None,
         relations=None,
+        set_relations=None,
         joint_relations=None,
         structures=None,
+        set_structures=None,
     ) -> List[Dict[str, Any]]:
         """Build ``input_x`` dicts for the collator from label arguments.
 
@@ -365,8 +379,10 @@ class BaseGLiNExT(BaseGLiNER):
                     entities=entities,
                     classes=classes,
                     relations=relations,
+                    set_relations=set_relations,
                     joint_relations=joint_relations,
                     structures=structures,
+                    set_structures=set_structures,
                 )
             input_x.append(item)
         return input_x
@@ -377,8 +393,10 @@ class BaseGLiNExT(BaseGLiNER):
         entities=None,
         classes=None,
         relations=None,
+        set_relations=None,
         joint_relations=None,
         structures=None,
+        set_structures=None,
     ) -> List[Dict[str, Any]]:
         input_x = []
         task_processors = self.data_processor.task_processors.values()
@@ -392,8 +410,10 @@ class BaseGLiNExT(BaseGLiNER):
                     entities=entities,
                     classes=classes,
                     relations=relations,
+                    set_relations=set_relations,
                     joint_relations=joint_relations,
                     structures=structures,
+                    set_structures=set_structures,
                 )
             input_x.append(item)
         return input_x
@@ -518,6 +538,7 @@ class BaseGLiNExT(BaseGLiNER):
             configured = [
                 name for name in (
                     "ner", "classification", "joint_relex", "open_relex",
+                    "set_open_relex",
                     "structuring", "set_structuring", "image_classification", "object_detection",
                     "segmentation", "audio_classification", "audio_segmentation",
                     "count", "embedding",
@@ -534,15 +555,23 @@ class BaseGLiNExT(BaseGLiNER):
         entities=None,
         classes=None,
         relations=None,
+        set_relations=None,
         joint_relations=None,
         structures=None,
+        set_structures=None,
     ):
         if entities is not None:
             self._require_task_heads("ner")
         if classes is not None:
             self._require_task_heads("classification")
         if relations is not None:
-            self._require_task_heads("open_relex")
+            if (
+                self.config.open_relex_config is None
+                and self.config.set_open_relex_config is None
+            ):
+                self._require_task_heads("open_relex")
+        if set_relations is not None:
+            self._require_task_heads("set_open_relex")
         if joint_relations is not None:
             self._require_task_heads("joint_relex")
         if structures is not None:
@@ -551,6 +580,8 @@ class BaseGLiNExT(BaseGLiNER):
                 and self.config.set_structuring_config is None
             ):
                 self._require_task_heads("structuring")
+        if set_structures is not None:
+            self._require_task_heads("set_structuring")
 
     @torch.no_grad()
     def inference(
@@ -559,6 +590,9 @@ class BaseGLiNExT(BaseGLiNER):
         entities: Optional[Union[List[str], Dict[str, List[str]]]] = None,
         classes: Optional[Union[List[str], Dict[str, List[str]]]] = None,
         relations: Optional[Union[List[str], Dict[str, List[str]]]] = None,
+        set_relations: Optional[
+            Union[List[str], Dict[str, List[str]]]
+        ] = None,
         joint_relations: Optional[Dict[str, dict]] = None,
         structures: Optional[
             Union[Dict[str, Union[List[str], dict]], List[dict]]
@@ -572,6 +606,9 @@ class BaseGLiNExT(BaseGLiNER):
         objectness_threshold: Optional[float] = None,
         preserve_empty_records: bool = False,
         return_anchor_diagnostics: bool = False,
+        set_structures: Optional[
+            Union[Dict[str, Union[List[str], dict]], List[dict]]
+        ] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -585,6 +622,9 @@ class BaseGLiNExT(BaseGLiNER):
                 ``Dict[str, List[str]]`` for named groups.
             classes: Classification labels. Same format as entities.
             relations: Open relation types. Same format as entities.
+            set_relations: Entity-first set open-relation types. This explicit
+                argument is useful when regular and set open-relation heads
+                are enabled together.
             joint_relations: Joint NER + relex groups.
                 ``{parent_name: {"entities": [...], "relations": [...]}}``.
             structures: Structuring schemas. Flat schemas use
@@ -592,6 +632,9 @@ class BaseGLiNExT(BaseGLiNER):
                 nested dictionaries/lists. A list exemplar requests a raw
                 list root; wrap an object exemplar as ``{"$root": {...}}``
                 to request a raw object root rather than named schema groups.
+            set_structures: Optional schema dedicated to the independent set
+                structuring head. When omitted, that head reuses
+                ``structures`` for compatibility with earlier checkpoints.
             flat_ner: Enforce non-overlapping spans.
             threshold: Confidence threshold.
             objectness_threshold: Optional structuring-anchor objectness
@@ -613,7 +656,9 @@ class BaseGLiNExT(BaseGLiNER):
                     "ner": List[List[dict]],                    # per text, list of entities
                     "classification": List[List[dict]],         # per text, list of labels
                     "open_relex": List[List[dict]],             # per text, list of triples
+                    "set_open_relex": List[List[dict]],         # entity-first set triples
                     "structuring": List[Union[dict, list]],     # per text; preserves root shape
+                    "structuring_anchor_diagnostics": List[dict],  # opt-in
                 }
         """
         self.eval()
@@ -621,8 +666,10 @@ class BaseGLiNExT(BaseGLiNER):
             entities=entities,
             classes=classes,
             relations=relations,
+            set_relations=set_relations,
             joint_relations=joint_relations,
             structures=structures,
+            set_structures=set_structures,
         )
 
         # Normalize input
@@ -638,8 +685,10 @@ class BaseGLiNExT(BaseGLiNER):
                 entities=entities,
                 classes=classes,
                 relations=relations,
+                set_relations=set_relations,
                 joint_relations=joint_relations,
                 structures=structures,
+                set_structures=set_structures,
             )
             if return_anchor_diagnostics:
                 for task_name in ("structuring", "set_structuring"):
@@ -669,7 +718,14 @@ class BaseGLiNExT(BaseGLiNER):
 
         # Build input for collator
         input_x = self._build_inference_input(
-            all_tokens, entities, classes, relations, joint_relations, structures,
+            all_tokens,
+            entities,
+            classes,
+            relations,
+            set_relations,
+            joint_relations,
+            structures,
+            set_structures,
         )
 
         # Create collator (inference mode: no labels)
@@ -713,6 +769,7 @@ class BaseGLiNExT(BaseGLiNER):
             num_original,
             all_classes_mappings,
             structures=structures,
+            set_structures=set_structures,
             structuring_dedup=structuring_dedup,
             return_anchor_diagnostics=return_anchor_diagnostics,
         )
@@ -736,6 +793,9 @@ class BaseGLiNExT(BaseGLiNER):
         entities: Optional[Union[List[str], Dict[str, List[str]]]] = None,
         classes: Optional[Union[List[str], Dict[str, List[str]]]] = None,
         relations: Optional[Union[List[str], Dict[str, List[str]]]] = None,
+        set_relations: Optional[
+            Union[List[str], Dict[str, List[str]]]
+        ] = None,
         joint_relations: Optional[Dict[str, dict]] = None,
         structures: Optional[
             Union[Dict[str, Union[List[str], dict]], List[dict]]
@@ -748,6 +808,9 @@ class BaseGLiNExT(BaseGLiNER):
         structuring_dedup: bool = True,
         return_pages: bool = False,
         objectness_threshold: Optional[float] = None,
+        set_structures: Optional[
+            Union[Dict[str, Union[List[str], dict]], List[dict]]
+        ] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run GLiNExT layout/text inference over PDF pages.
@@ -762,8 +825,10 @@ class BaseGLiNExT(BaseGLiNER):
             entities=entities,
             classes=classes,
             relations=relations,
+            set_relations=set_relations,
             joint_relations=joint_relations,
             structures=structures,
+            set_structures=set_structures,
         )
 
         pdf_processor = GLiNextPDFProcessor()
@@ -789,8 +854,10 @@ class BaseGLiNExT(BaseGLiNER):
                 entities=entities,
                 classes=classes,
                 relations=relations,
+                set_relations=set_relations,
                 joint_relations=joint_relations,
                 structures=structures,
+                set_structures=set_structures,
             )
             if return_pages:
                 results["pages"] = []
@@ -819,15 +886,24 @@ class BaseGLiNExT(BaseGLiNER):
                 entities=entities,
                 classes=classes,
                 relations=relations,
+                set_relations=set_relations,
                 joint_relations=joint_relations,
                 structures=structures,
+                set_structures=set_structures,
             )
             if return_pages:
                 results["pages"] = [item.get("pages", item.get("page", idx)) for idx, item in enumerate(pdf_items)]
             return results
 
         input_x = self._build_pdf_inference_input(
-            valid_items, entities, classes, relations, joint_relations, structures,
+            valid_items,
+            entities,
+            classes,
+            relations,
+            set_relations,
+            joint_relations,
+            structures,
+            set_structures,
         )
 
         collator_cls = self.data_collator_class or resolve_glinext_collator_class(self.config)
@@ -867,6 +943,7 @@ class BaseGLiNExT(BaseGLiNER):
             num_pages,
             all_classes_mappings,
             structures=structures,
+            set_structures=set_structures,
             structuring_dedup=structuring_dedup,
         )
         if return_pages:
@@ -1062,6 +1139,9 @@ class BaseGLiNExT(BaseGLiNER):
         structures: Optional[
             Union[Dict[str, Union[List[str], dict]], List[dict]]
         ] = None,
+        set_structures: Optional[
+            Union[Dict[str, Union[List[str], dict]], List[dict]]
+        ] = None,
         structuring_dedup: bool = True,
         return_anchor_diagnostics: bool = False,
     ) -> Dict[str, List]:
@@ -1075,6 +1155,7 @@ class BaseGLiNExT(BaseGLiNER):
             num_original=num_original,
             all_classes_mappings=all_classes_mappings,
             structures=structures,
+            set_structures=set_structures,
             structuring_dedup=structuring_dedup,
             return_anchor_diagnostics=return_anchor_diagnostics,
         )
@@ -1141,7 +1222,38 @@ class BaseGLiNExT(BaseGLiNER):
             text_batch, relations=relations, threshold=threshold,
             flat_ner=flat_ner, **kwargs,
         )
-        task_results = results.get("open_relex", [[] for _ in text_batch])
+        task_results = results.get("open_relex")
+        if task_results is None:
+            task_results = results.get(
+                "set_open_relex",
+                [[] for _ in text_batch],
+            )
+        if self._label_group_count(relations) == 1:
+            task_results = self._collapse_single_group_results(task_results)
+        return self._single_or_batch(task_results, single)
+
+    def predict_set_relations(
+        self,
+        texts: Union[str, List[str]],
+        relations: Union[List[str], Dict[str, List[str]]],
+        threshold: float = 0.5,
+        objectness_threshold: Optional[float] = None,
+        **kwargs,
+    ) -> Union[List[Dict], List[List[Dict]]]:
+        """Run the independent entity-first set relation task."""
+
+        text_batch, single = self._normalize_texts(texts)
+        results = self.inference(
+            text_batch,
+            set_relations=relations,
+            threshold=threshold,
+            objectness_threshold=objectness_threshold,
+            **kwargs,
+        )
+        task_results = results.get(
+            "set_open_relex",
+            [[] for _ in text_batch],
+        )
         if self._label_group_count(relations) == 1:
             task_results = self._collapse_single_group_results(task_results)
         return self._single_or_batch(task_results, single)
@@ -1156,7 +1268,15 @@ class BaseGLiNExT(BaseGLiNER):
         preserve_empty_records: bool = False,
         return_anchor_diagnostics: bool = False,
         **kwargs,
-    ) -> Union[dict, list, List[Union[dict, list]]]:
+    ) -> Union[
+        dict,
+        list,
+        List[Union[dict, list]],
+        Tuple[
+            Union[dict, list, List[Union[dict, list]]],
+            Union[dict, List[dict]],
+        ],
+    ]:
         """Extract structured data from one text or a batch of texts.
 
         Returns:

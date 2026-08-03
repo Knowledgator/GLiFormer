@@ -1006,6 +1006,11 @@ class OpenRelexHeadConfig(BaseHeadConfig):
 
     Standalone head — no NER dependency. Uses configurable anchor layers
     to extract head/tail spans directly per (anchor, rel_type) pair.
+
+    ``head_type`` is retained as a serialized implementation discriminator.
+    New set-prediction configurations live in ``set_open_relex_config``;
+    ``set_open_relex`` here is accepted only so older checkpoints can be
+    migrated into that independent task field.
     """
     head_type: str = "open_relex"
     anchor_mode: str = "fixed"          # "fixed", "features", "rotary", "query_rnn", "query_transformer"
@@ -1026,15 +1031,143 @@ class OpenRelexHeadConfig(BaseHeadConfig):
 
 @dataclass
 class SetOpenRelexHeadConfig(OpenRelexHeadConfig):
-    """Pair-first set-prediction open-relation configuration."""
+    """Independent entity-first set-prediction open-relation config."""
 
     head_type: str = "set_open_relex"
     anchor_mode: str = "fixed_transformer"
-    anchor_modeling: str = "identity"
+    anchor_modeling: str = "linear"
     scorer_type: str = "dot"
+    represent_spans: bool = True
+    neg_spans_ratio: float = 0.0
+    entity_loss_coef: float = 1.0
+    assignment_loss_coef: float = 1.0
+    anchor_objectness: bool = False
+    anchor_objectness_loss_coef: float = 1.0
+    anchor_objectness_threshold: Optional[float] = None
+    # Reduction for the masked entity, role, and endpoint losses.
+    bio_loss_reduction: str = "sum"
+
+    def __post_init__(self):
+        super().__post_init__()
+        anchor_mode = self.effective_anchor_mode()
+        if anchor_mode not in {"fixed", "fixed_rnn", "fixed_transformer"}:
+            raise ValueError(
+                "set open relex requires fixed relation-query slots; "
+                "anchor_mode must be 'fixed', 'fixed_rnn', or "
+                "'fixed_transformer'"
+            )
+        for name in (
+            "entity_loss_coef",
+            "assignment_loss_coef",
+            "anchor_objectness_loss_coef",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(float(value)) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.anchor_objectness_threshold is not None:
+            threshold = float(self.anchor_objectness_threshold)
+            if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+                raise ValueError(
+                    "anchor_objectness_threshold must be finite and in [0, 1]"
+                )
+        if self.bio_loss_reduction not in {"sum", "mean"}:
+            raise ValueError("bio_loss_reduction must be 'sum' or 'mean'")
 
 
 SetOpenRelationExtractionHeadConfig = SetOpenRelexHeadConfig
+
+
+_STRUCTURING_MODE_ALIASES = {
+    "base": "flat",
+    "single_level": "flat",
+    "singlelevel": "flat",
+    "multi_level": "multi_level",
+    "multilevel": "multi_level",
+    "hierarchical": "multi_level",
+    "hierarchy": "multi_level",
+}
+
+
+@dataclass
+class StructuringModeConfig:
+    """Processing options shared by both structuring heads.
+
+    ``type`` enables optional hierarchy normalization and anchor alignment on
+    the common processing path. ``processor`` and ``decoder`` can replace the
+    corresponding shared components. Remaining ``params`` are deliberately
+    retained so adding a processing option does not require another model-
+    config migration.
+
+    Learned hierarchy settings stay on :class:`StructuringHeadConfig`.  This
+    separation is important for checkpoint compatibility: enabling a mode may
+    add ``anchor_relations_rep_layer`` to a head, but never reparents existing
+    parameters below a new module.
+    """
+
+    type: str = "flat"
+    processor: Optional[str | dict[str, Any]] = None
+    decoder: Optional[str | dict[str, Any]] = None
+    params: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self):
+        normalized = str(self.type).lower().replace("-", "_")
+        normalized = _STRUCTURING_MODE_ALIASES.get(normalized, normalized)
+        if normalized not in {"flat", "multi_level"}:
+            raise ValueError(
+                "structuring mode type must be 'flat' or 'multi_level'"
+            )
+        self.type = normalized
+        self.processor = copy.deepcopy(self.processor)
+        self.decoder = copy.deepcopy(self.decoder)
+        self.params = copy.deepcopy(dict(self.params or {}))
+
+    @property
+    def is_multi_level(self) -> bool:
+        return self.type == "multi_level"
+
+    @classmethod
+    def from_value(
+        cls,
+        value: "StructuringModeConfig | str | Mapping[str, Any] | None",
+        *,
+        legacy_multi_level: bool = False,
+    ) -> "StructuringModeConfig":
+        if isinstance(value, cls):
+            mode = copy.deepcopy(value)
+        elif value is None:
+            mode = cls(type="multi_level" if legacy_multi_level else "flat")
+        elif isinstance(value, str):
+            mode = cls(type=value)
+        elif isinstance(value, Mapping):
+            mode_type, options = _split_component_spec(
+                value,
+                default_type="multi_level" if legacy_multi_level else "flat",
+                component_name="structuring mode",
+            )
+            processor = options.pop("processor", None)
+            decoder = options.pop("decoder", None)
+            nested_params = options.pop("params", {})
+            if not isinstance(nested_params, Mapping):
+                raise TypeError("structuring mode params must be a mapping")
+            params = dict(nested_params)
+            params.update(options)
+            mode = cls(
+                type=mode_type,
+                processor=processor,
+                decoder=decoder,
+                params=params,
+            )
+        else:
+            raise TypeError(
+                "structure_mode must be a string, mapping, "
+                "StructuringModeConfig, or None"
+            )
+
+        if legacy_multi_level and not mode.is_multi_level:
+            raise ValueError(
+                "multi_level=True conflicts with a flat structure_mode"
+            )
+        return mode
 
 
 @dataclass
@@ -1107,6 +1240,11 @@ class StructuringHeadConfig(BaseHeadConfig):
     # to diagnose the imbalance behind "many fields return None".
     log_loss_stats: bool = False
     log_loss_stats_every: int = 50  # log cadence in optimiser steps
+    # Processor/decoder strategy. ``None`` derives the mode from the legacy
+    # boolean below, so old serialized configs retain exact behavior.
+    structure_mode: Optional[
+        str | dict[str, Any] | StructuringModeConfig
+    ] = None
     # Opt-in arbitrary-depth JSON structuring. Plain nested dictionaries are
     # represented as dot-qualified fields; dictionaries contained in lists
     # become separate record anchors linked by directed parent→child scores.
@@ -1124,6 +1262,12 @@ class StructuringHeadConfig(BaseHeadConfig):
                 "head_type must be 'structuring' or 'set_structuring'"
             )
         self.multi_level = bool(self.multi_level)
+        self.structure_mode = StructuringModeConfig.from_value(
+            self.structure_mode,
+            legacy_multi_level=self.multi_level,
+        )
+        # Retain the historical public/serialized flag as a derived alias.
+        self.multi_level = self.structure_mode.is_multi_level
         self.anchor_relations_layer = str(
             self.anchor_relations_layer
         ).lower().replace("-", "_")
@@ -1313,6 +1457,11 @@ class StructuringHeadConfig(BaseHeadConfig):
             query_position_type,
             query_position_kwargs,
         )
+
+    def effective_structure_mode(self) -> StructuringModeConfig:
+        """Return the normalized parameter-free structuring mode."""
+
+        return self.structure_mode
 
 
 @dataclass
@@ -1877,44 +2026,77 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Backward compat alias
         self.relations_config = self.joint_relex_config
 
-        # Open Relex. The set-prediction implementation shares the canonical
-        # processor, targets, output fields, and decoder with open_relex.
-        if open_relex_config is not None and set_open_relex_config is not None:
-            raise ValueError(
-                "open_relex_config and set_open_relex_config are mutually exclusive"
-            )
-        if set_open_relex_config is not None:
-            if isinstance(set_open_relex_config, dict):
-                set_open_relex_config = dict(set_open_relex_config)
-                configured_type = set_open_relex_config.get(
-                    "head_type", "set_open_relex"
-                )
-                if configured_type != "set_open_relex":
-                    raise ValueError(
-                        "set_open_relex_config requires "
-                        "head_type='set_open_relex'"
-                    )
-                set_open_relex_config["head_type"] = "set_open_relex"
-            elif getattr(
-                set_open_relex_config, "head_type", None
-            ) != "set_open_relex":
+        # Open-relation heads are independent tasks. For checkpoint
+        # compatibility, migrate the former discriminator-based spelling
+        # ``open_relex_config: {head_type: set_open_relex}`` into the new
+        # dedicated config field.
+        if (
+            isinstance(open_relex_config, dict)
+            and open_relex_config.get("head_type") == "set_open_relex"
+        ):
+            if set_open_relex_config is not None:
                 raise ValueError(
-                    "set_open_relex_config must be a mapping or a "
-                    "SetOpenRelexHeadConfig"
+                    "set open relex is configured in both open_relex_config "
+                    "and set_open_relex_config"
                 )
-            open_relex_config = set_open_relex_config
+            set_open_relex_config = open_relex_config
+            open_relex_config = None
+        elif (
+            open_relex_config is not None
+            and getattr(open_relex_config, "head_type", "open_relex")
+            == "set_open_relex"
+        ):
+            if set_open_relex_config is not None:
+                raise ValueError(
+                    "set open relex is configured in both open_relex_config "
+                    "and set_open_relex_config"
+                )
+            set_open_relex_config = open_relex_config
+            open_relex_config = None
 
         if isinstance(open_relex_config, dict):
-            open_relex_config = dict(open_relex_config)
-            head_type = open_relex_config.get("head_type", "open_relex")
-            config_class = (
-                SetOpenRelexHeadConfig
-                if head_type == "set_open_relex"
-                else OpenRelexHeadConfig
+            self.open_relex_config = OpenRelexHeadConfig(
+                **dict(open_relex_config)
             )
-            self.open_relex_config = config_class(**open_relex_config)
         else:
             self.open_relex_config = open_relex_config
+
+        if isinstance(set_open_relex_config, dict):
+            set_open_relex_config = dict(set_open_relex_config)
+            configured_type = set_open_relex_config.get(
+                "head_type", "set_open_relex"
+            )
+            if configured_type != "set_open_relex":
+                raise ValueError(
+                    "set_open_relex_config requires "
+                    "head_type='set_open_relex'"
+                )
+            set_open_relex_config["head_type"] = "set_open_relex"
+            self.set_open_relex_config = SetOpenRelexHeadConfig(
+                **set_open_relex_config
+            )
+        elif set_open_relex_config is None:
+            self.set_open_relex_config = None
+        elif isinstance(set_open_relex_config, SetOpenRelexHeadConfig):
+            self.set_open_relex_config = set_open_relex_config
+        elif (
+            dataclasses.is_dataclass(set_open_relex_config)
+            and getattr(set_open_relex_config, "head_type", None)
+            == "set_open_relex"
+        ):
+            # Older callers may pass an OpenRelexHeadConfig object carrying
+            # the former discriminator. Rebuild it as the dedicated config so
+            # entity/assignment/objectness fields receive their defaults.
+            migrated_config = dataclasses.asdict(set_open_relex_config)
+            migrated_config["head_type"] = "set_open_relex"
+            self.set_open_relex_config = SetOpenRelexHeadConfig(
+                **migrated_config
+            )
+        else:
+            raise ValueError(
+                "set_open_relex_config must be a mapping or a "
+                "SetOpenRelexHeadConfig"
+            )
 
         # Structuring heads are independent tasks.  For checkpoint
         # compatibility, migrate the former discriminator-based spelling
@@ -2300,19 +2482,6 @@ class GLiNextConfig(BaseGLiNERConfig):
         """True when per-task parent tokens are distinct from each other."""
         return self.per_task_parents
 
-    @property
-    def set_open_relex_config(self):
-        """Return the pair-first config when set open relex is selected."""
-
-        open_relex_config = getattr(self, "open_relex_config", None)
-        if (
-            open_relex_config is not None
-            and getattr(open_relex_config, "head_type", "open_relex")
-            == "set_open_relex"
-        ):
-            return open_relex_config
-        return None
-
     def get_task_config(self, task_name: str):
         """Return the task sub-config for a canonical task name."""
         attr_name = self.TASK_CONFIG_ATTRS.get(task_name)
@@ -2334,6 +2503,7 @@ _TEXT_CONFIG_FIELDS = (
     "classification_config",
     "joint_relex_config",
     "open_relex_config",
+    "set_open_relex_config",
     "structuring_config",
     "set_structuring_config",
     "count_config",
@@ -2423,6 +2593,7 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "joint_relex_config",
         "relations_config",
         "open_relex_config",
+        "set_open_relex_config",
         "structuring_config",
         "set_structuring_config",
         "count_config",

@@ -3,17 +3,20 @@
 from dataclasses import replace
 
 import torch
-from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import extract_spans_from_tokens
 
 from ...layers.mlp import create_mlp
+from ...layers.structuring_relations import (
+    initialize_anchor_relations,
+    maybe_anchor_relation_loss,
+    score_anchor_relations,
+    validate_structuring_anchor_capacity,
+)
 from .. import TaskHeadOutput
 from ..losses import binary_focal_or_bce
 from ..matcher import minimum_cost_assignment
 from ..ner.model import NERHead
-from ..structuring.anchor_relations import anchor_relation_loss
-from ..structuring.model import validate_structuring_anchor_capacity
 
 
 class SetStructuringHead(NERHead):
@@ -139,16 +142,7 @@ class SetStructuringHead(NERHead):
                 activation="gelu",
             )
 
-        self.multi_level = bool(getattr(set_cfg, "multi_level", False))
-        self.anchor_relations_loss_coef = getattr(
-            set_cfg, "anchor_relations_loss_coef", 1.0,
-        )
-        if self.multi_level:
-            self.anchor_relations_rep_layer = RelationsRepLayer(
-                in_dim=hidden_size,
-                relation_mode=set_cfg.anchor_relations_layer,
-                hidden_dim=hidden_size,
-            )
+        initialize_anchor_relations(self, set_cfg, hidden_size)
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
@@ -177,7 +171,9 @@ class SetStructuringHead(NERHead):
         )
         count = None
         if not self._record_uses_fixed_slots:
-            count = batch.get("structuring_count")
+            count = batch.get("set_structuring_count")
+            if count is None:
+                count = batch.get("structuring_count")
             if count is None:
                 count = batch.get("count_val")
 
@@ -390,68 +386,12 @@ class SetStructuringHead(NERHead):
     def _score_anchor_relations(self, record_anchors, anchor_mask):
         """Score only active anchors, then restore the public padded axes."""
 
-        batch_size, anchor_count, hidden_size = record_anchors.shape
-        active_rows = torch.where(anchor_mask.bool().any(dim=1))[0]
-        if active_rows.numel() == 0:
-            return record_anchors.new_zeros(
-                batch_size,
-                anchor_count,
-                anchor_count,
-            )
-
-        active_mask = anchor_mask[active_rows].bool()
-        compact_count = int(active_mask.sum(dim=1).max().item())
-        compact_indices = torch.zeros(
-            active_rows.numel(),
-            compact_count,
-            dtype=torch.long,
-            device=record_anchors.device,
+        return score_anchor_relations(
+            getattr(self, "anchor_relations_rep_layer", None),
+            record_anchors,
+            anchor_mask,
+            compact=True,
         )
-        compact_mask = torch.zeros_like(compact_indices, dtype=torch.bool)
-        for compact_batch_idx, source_batch_idx in enumerate(
-            active_rows.tolist()
-        ):
-            indices = torch.where(anchor_mask[source_batch_idx].bool())[0]
-            compact_indices[compact_batch_idx, :indices.numel()] = indices
-            compact_mask[compact_batch_idx, :indices.numel()] = True
-
-        compact_anchors = record_anchors[active_rows].gather(
-            1,
-            compact_indices.unsqueeze(-1).expand(-1, -1, hidden_size),
-        )
-        compact_scores = self.anchor_relations_rep_layer(
-            compact_anchors,
-            compact_mask,
-        )
-        compact_scores = compact_scores * (
-            compact_mask.unsqueeze(1) & compact_mask.unsqueeze(2)
-        ).to(compact_scores.dtype)
-
-        # Scatter both compact relation axes back to the stable record-slot
-        # indices expected by matching and decoding.
-        column_scattered = compact_scores.new_zeros(
-            active_rows.numel(),
-            compact_count,
-            anchor_count,
-        ).scatter_add(
-            2,
-            compact_indices.unsqueeze(1).expand(-1, compact_count, -1),
-            compact_scores,
-        )
-        active_scores = compact_scores.new_zeros(
-            active_rows.numel(),
-            anchor_count,
-            anchor_count,
-        ).scatter_add(
-            1,
-            compact_indices.unsqueeze(-1).expand(-1, -1, anchor_count),
-            column_scattered,
-        )
-        return compact_scores.new_zeros(
-            batch_size,
-            anchor_count,
-            anchor_count,
-        ).index_copy(0, active_rows, active_scores)
 
     @staticmethod
     def _gold_anchor_mask(labels, label_count):
@@ -621,10 +561,17 @@ class SetStructuringHead(NERHead):
         base_loss_fn=None,
         **batch,
     ):
-        structuring_labels = batch.get("structuring_labels")
-        structuring_span_idx = batch.get("structuring_span_idx")
-        structuring_span_mask = batch.get("structuring_span_mask")
-        structuring_span_labels = batch.get("structuring_span_labels")
+        def target(suffix):
+            value = batch.get(f"set_structuring_{suffix}")
+            if value is None:
+                value = batch.get(f"structuring_{suffix}")
+            return value
+
+        structuring_labels = target("labels")
+        structuring_count = target("count")
+        structuring_span_idx = target("span_idx")
+        structuring_span_mask = target("span_mask")
+        structuring_span_labels = target("span_labels")
 
         entity_labels = self._entity_token_labels(structuring_labels)
 
@@ -742,7 +689,7 @@ class SetStructuringHead(NERHead):
                     structuring_span_labels,
                     anchor_mask,
                     entity_mask,
-                    batch.get("structuring_count"),
+                    structuring_count,
                     base_loss_fn,
                 )
             )
@@ -766,26 +713,17 @@ class SetStructuringHead(NERHead):
                 )
                 combined_loss = combined_loss + weighted_objectness_loss
 
-        relation_labels = batch.get("structuring_relation_labels")
-        if (
-            anchor_relation_scores is not None
-            and relation_labels is not None
-            and base_loss_fn is not None
-        ):
-            relation_loss = anchor_relation_loss(
-                anchor_relation_scores,
-                relation_labels,
-                supervised_anchor_mask,
-                base_loss_fn=base_loss_fn,
-                relation_group_mask=batch.get(
-                    "structuring_relation_group_mask"
-                ),
-                anchor_matches=anchor_matches,
-                label_count=batch.get("structuring_count"),
-            )
-            weighted_relation_loss = (
-                self.anchor_relations_loss_coef * relation_loss
-            )
+        relation_loss, weighted_relation_loss = maybe_anchor_relation_loss(
+            anchor_relation_scores,
+            target("relation_labels"),
+            supervised_anchor_mask,
+            base_loss_fn=base_loss_fn,
+            relation_group_mask=target("relation_group_mask"),
+            anchor_matches=anchor_matches,
+            label_count=structuring_count,
+            loss_coef=self.anchor_relations_loss_coef,
+        )
+        if weighted_relation_loss is not None:
             combined_loss = (
                 weighted_relation_loss
                 if combined_loss is None

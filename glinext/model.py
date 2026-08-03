@@ -199,6 +199,78 @@ class BaseGLiNextModel(BaseModel):
                     continue
                 self.heads[canonical_name] = head
 
+    def _migrate_legacy_set_structuring_state_dict(
+        self,
+        state_dict,
+        prefix: str,
+    ) -> None:
+        """Move compatible legacy structuring tensors to the dedicated set head.
+
+        Early set-structuring checkpoints used the canonical ``structuring``
+        task prefix even though their config selected the set implementation.
+        Config loading now migrates that discriminator to
+        ``set_structuring_config``; migrate the corresponding weight prefix at
+        the model boundary before PyTorch descends into ``self.heads``.
+
+        The migration is deliberately conservative.  A regular structuring
+        head makes the old prefix authoritative, and implementation-specific
+        suffixes must exist in the set head with the exact same tensor shape.
+        Compatible source keys are consumed so strict loading does not report
+        them as unexpected; incompatible keys remain visible to the caller.
+        """
+
+        if (
+            "set_structuring" not in self.heads
+            or "structuring" in self.heads
+        ):
+            return
+
+        target_state = self.heads["set_structuring"].state_dict()
+        legacy_prefix = f"{prefix}heads.structuring."
+        target_prefix = f"{prefix}heads.set_structuring."
+        for legacy_key in tuple(state_dict):
+            if not legacy_key.startswith(legacy_prefix):
+                continue
+            suffix = legacy_key[len(legacy_prefix):]
+            target_value = target_state.get(suffix)
+            if target_value is None:
+                continue
+            source_value = state_dict[legacy_key]
+            try:
+                shapes_match = tuple(source_value.shape) == tuple(
+                    target_value.shape
+                )
+            except (AttributeError, RuntimeError):
+                shapes_match = False
+            if not shapes_match:
+                continue
+
+            target_key = f"{target_prefix}{suffix}"
+            if target_key not in state_dict:
+                state_dict[target_key] = source_value
+            state_dict.pop(legacy_key)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self._migrate_legacy_set_structuring_state_dict(state_dict, prefix)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def _init_token_rep_layer(self, config, from_pretrained, cache_dir):
         if config.labels_encoder is not None:
             return TextBiEncoder(config, from_pretrained, cache_dir=cache_dir)
@@ -430,6 +502,14 @@ class BaseGLiNextModel(BaseModel):
         child_labels_attention_mask: Optional[torch.Tensor] = None,
         open_rel_labels_input_ids: Optional[torch.Tensor] = None,
         open_rel_labels_attention_mask: Optional[torch.Tensor] = None,
+        set_open_rel_labels_input_ids: Optional[torch.Tensor] = None,
+        set_open_rel_labels_attention_mask: Optional[torch.Tensor] = None,
+        set_structuring_child_labels_input_ids: Optional[
+            torch.Tensor
+        ] = None,
+        set_structuring_child_labels_attention_mask: Optional[
+            torch.Tensor
+        ] = None,
     ):
         """Batch text-task label inputs into one BiEncoder pass, then split results."""
         embeddings = self._encode_label_inputs_batched(
@@ -450,6 +530,14 @@ class BaseGLiNextModel(BaseModel):
                     open_rel_labels_input_ids,
                     open_rel_labels_attention_mask,
                 ),
+                "set_open_relex": (
+                    set_open_rel_labels_input_ids,
+                    set_open_rel_labels_attention_mask,
+                ),
+                "set_structuring": (
+                    set_structuring_child_labels_input_ids,
+                    set_structuring_child_labels_attention_mask,
+                ),
             }
         )
         return (
@@ -457,6 +545,8 @@ class BaseGLiNextModel(BaseModel):
             embeddings["joint_relex"],
             embeddings["structuring"],
             embeddings["open_relex"],
+            embeddings["set_open_relex"],
+            embeddings["set_structuring"],
         )
 
     def _encode_media_labels_batched(self, kwargs: dict) -> Dict[str, torch.Tensor]:
@@ -700,6 +790,155 @@ class BaseGLiNextModel(BaseModel):
         return _FlatEmbeddingBatch(flat_embeddings, flat_mask)
 
     @staticmethod
+    def _slice_prompt_features(
+        embeddings: torch.Tensor,
+        mask: torch.Tensor,
+        starts: List[int],
+        sizes: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select one task's contiguous prompt features for every batch row."""
+
+        if embeddings.dim() != 3 or mask.shape != embeddings.shape[:2]:
+            raise ValueError(
+                "prompt embeddings and mask must have shapes (B, C, D) and (B, C)"
+            )
+        if len(starts) != embeddings.shape[0] or len(sizes) != embeddings.shape[0]:
+            raise ValueError("prompt slice bounds must have one entry per batch row")
+
+        max_size = max(sizes, default=0)
+        selected = embeddings.new_zeros(
+            embeddings.shape[0],
+            max_size,
+            embeddings.shape[-1],
+        )
+        selected_mask = mask.new_zeros(embeddings.shape[0], max_size)
+        source_width = embeddings.shape[1]
+        for batch_idx, (raw_start, raw_size) in enumerate(zip(starts, sizes)):
+            start = max(int(raw_start), 0)
+            size = max(int(raw_size), 0)
+            copy_size = min(size, max(source_width - start, 0))
+            if copy_size == 0:
+                continue
+            end = start + copy_size
+            selected[batch_idx, :copy_size] = embeddings[batch_idx, start:end]
+            selected_mask[batch_idx, :copy_size] = mask[batch_idx, start:end]
+        return selected, selected_mask
+
+    @staticmethod
+    def _relation_prompt_counts(classes_mapping, batch_size: int) -> Dict[str, List[int]]:
+        """Count relation marker features contributed by each text task."""
+
+        counts = {
+            "joint_relex": [0 for _ in range(batch_size)],
+            "open_relex": [0 for _ in range(batch_size)],
+            "set_open_relex": [0 for _ in range(batch_size)],
+        }
+        extraction_iter = getattr(classes_mapping, "flat_extraction_iter", None)
+        if extraction_iter is not None:
+            for _, batch_idx, _, item_mapping in extraction_iter():
+                relation_mapping = getattr(item_mapping, "rel_class_to_id", None)
+                class_to_id = getattr(relation_mapping, "class_to_id", None)
+                if class_to_id and batch_idx < batch_size:
+                    counts["joint_relex"][batch_idx] += len(class_to_id)
+
+        for task_name, iterator_name in (
+            ("open_relex", "flat_open_relex_iter"),
+            ("set_open_relex", "flat_set_open_relex_iter"),
+        ):
+            flat_iter = getattr(classes_mapping, iterator_name, None)
+            if flat_iter is None:
+                continue
+            for _, batch_idx, _, item_mapping in flat_iter():
+                relation_mapping = getattr(item_mapping, "rel_class_to_id", None)
+                class_to_id = getattr(relation_mapping, "class_to_id", None)
+                if class_to_id and batch_idx < batch_size:
+                    counts[task_name][batch_idx] += len(class_to_id)
+        return counts
+
+    @classmethod
+    def _slice_relation_prompt_features(
+        cls,
+        embeddings: torch.Tensor,
+        mask: torch.Tensor,
+        classes_mapping,
+        task_name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Isolate relation prompts for one task from the shared marker stream."""
+
+        task_order = ("joint_relex", "open_relex", "set_open_relex")
+        if task_name not in task_order:
+            raise ValueError(f"Unknown relation prompt task: {task_name!r}")
+        counts = cls._relation_prompt_counts(
+            classes_mapping,
+            embeddings.shape[0],
+        )
+        task_position = task_order.index(task_name)
+        starts = [
+            sum(counts[name][batch_idx] for name in task_order[:task_position])
+            for batch_idx in range(embeddings.shape[0])
+        ]
+        return cls._slice_prompt_features(
+            embeddings,
+            mask,
+            starts,
+            counts[task_name],
+        )
+
+    def _slice_structuring_prompt_features(
+        self,
+        embeddings: torch.Tensor,
+        mask: torch.Tensor,
+        classes_mapping,
+        task_name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Isolate one structuring task's field-marker stream.
+
+        Regular and set structuring intentionally reuse the same special
+        child token.  Their mappings and heads are independent, so the marker
+        occurrences contributed by each processor must be sliced before flat
+        group construction.
+        """
+
+        task_order = ("structuring", "set_structuring")
+        if task_name not in task_order:
+            raise ValueError(f"Unknown structuring prompt task: {task_name!r}")
+        batch_size = embeddings.shape[0]
+        counts = {
+            name: [0 for _ in range(batch_size)]
+            for name in task_order
+        }
+        for name in task_order:
+            if name not in self.heads:
+                continue
+            flat_iter = getattr(classes_mapping, f"flat_{name}_iter", None)
+            if flat_iter is None:
+                continue
+            for _, batch_idx, _, item_mapping in flat_iter():
+                if batch_idx >= batch_size:
+                    continue
+                field_mapping = getattr(
+                    item_mapping, "field_class_to_id", None
+                )
+                class_to_id = getattr(field_mapping, "class_to_id", None)
+                if class_to_id:
+                    counts[name][batch_idx] += len(class_to_id)
+
+        task_position = task_order.index(task_name)
+        starts = [
+            sum(
+                counts[name][batch_idx]
+                for name in task_order[:task_position]
+            )
+            for batch_idx in range(batch_size)
+        ]
+        return self._slice_prompt_features(
+            embeddings,
+            mask,
+            starts,
+            counts[task_name],
+        )
+
+    @staticmethod
     def _gather_flat_parents(
         parent_embeddings: torch.Tensor,
         layout: _FlatGroupLayout,
@@ -924,14 +1163,14 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
     )
     _flat_input_task_names = (
         "ner", "joint_relex", "classification", "structuring",
-        "set_structuring", "open_relex",
+        "set_structuring", "open_relex", "set_open_relex",
         "image_classification", "object_detection", "segmentation",
         "audio_classification", "audio_segmentation",
     )
     _flat_required_task_names = _flat_input_task_names + ("count",)
     _focal_loss_task_names = (
-        "ner", "classification", "joint_relex", "open_relex", "structuring",
-        "set_structuring",
+        "ner", "classification", "joint_relex", "open_relex",
+        "set_open_relex", "structuring", "set_structuring",
         "image_classification", "object_detection", "segmentation",
         "audio_classification", "audio_segmentation",
     )
@@ -1090,6 +1329,10 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         rel_label_embeds: Optional[torch.Tensor],
         child_label_embeds: Optional[torch.Tensor],
         open_rel_label_embeds: Optional[torch.Tensor],
+        set_open_rel_label_embeds: Optional[torch.Tensor] = None,
+        set_structuring_child_label_embeds: Optional[
+            torch.Tensor
+        ] = None,
         media_label_embeds: Optional[Dict[str, torch.Tensor]],
         vision_embedding: Optional[torch.Tensor],
         vision_mask: Optional[torch.Tensor],
@@ -1119,6 +1362,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                     "ner": self.config.ner_config,
                     "classification": self.config.classification_config,
                     "open_relex": self.config.open_relex_config,
+                    "set_open_relex": self.config.set_open_relex_config,
                     "structuring": self.config.structuring_config,
                     "set_structuring": self.config.set_structuring_config,
                 }
@@ -1132,9 +1376,36 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                             "audio_segmentation": self.config.audio_segmentation_config,
                         }
                     )
+                prompt_parent_cfgs = {
+                    "classification": self.config.classification_config,
+                    "ner": self.config.ner_config,
+                    "open_relex": self.config.open_relex_config,
+                    "set_open_relex": self.config.set_open_relex_config,
+                    "structuring": self.config.structuring_config,
+                    "set_structuring": self.config.set_structuring_config,
+                }
+                if include_media:
+                    prompt_parent_cfgs.update(
+                        {
+                            "image_classification": (
+                                self.config.image_classification_config
+                            ),
+                            "object_detection": (
+                                self.config.object_detection_config
+                            ),
+                            "segmentation": self.config.segmentation_config,
+                            "audio_classification": (
+                                self.config.audio_classification_config
+                            ),
+                            "audio_segmentation": (
+                                self.config.audio_segmentation_config
+                            ),
+                        }
+                    )
+                prompt_task_names = tuple(prompt_parent_cfgs)
                 for task_name, task_cfg in task_parent_cfgs.items():
                     if task_cfg is not None and getattr(task_cfg, "parent_token_index", -1) > 0:
-                        parent_e, _ = extract_prompt_features(
+                        parent_e, parent_m = extract_prompt_features(
                             task_cfg.parent_token_index,
                             token_embeds,
                             input_ids,
@@ -1142,6 +1413,33 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                             batch_size,
                             embed_dim,
                             getattr(task_cfg, "embed_parent_token", True),
+                        )
+                        prompt_task = task_name
+                        prompt_position = prompt_task_names.index(prompt_task)
+                        marker_index = task_cfg.parent_token_index
+                        preceding_tasks = [
+                            name
+                            for name in prompt_task_names[:prompt_position]
+                            if prompt_parent_cfgs[name] is not None
+                            and prompt_parent_cfgs[name].parent_token_index
+                            == marker_index
+                        ]
+                        starts = [
+                            sum(
+                                classes_mapping.group_count(name, batch_idx)
+                                for name in preceding_tasks
+                            )
+                            for batch_idx in range(batch_size)
+                        ]
+                        sizes = classes_mapping.group_counts(
+                            prompt_task,
+                            batch_size,
+                        )
+                        parent_e, _ = self._slice_prompt_features(
+                            parent_e,
+                            parent_m,
+                            starts,
+                            sizes,
                         )
                         per_task_parent_embeds[task_name] = parent_e
                 if "ner" in per_task_parent_embeds:
@@ -1216,6 +1514,14 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 embed_dim,
                 or_cfg.embed_rel_token,
             )
+            open_rel_child_embeds, open_rel_child_mask = (
+                self._slice_relation_prompt_features(
+                    open_rel_child_embeds,
+                    open_rel_child_mask,
+                    classes_mapping,
+                    "open_relex",
+                )
+            )
         elif open_rel_label_embeds is not None:
             open_rel_child_embeds = open_rel_label_embeds
             open_rel_child_mask = torch.ones(
@@ -1224,7 +1530,38 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 device=attention_mask.device,
             )
 
+        set_open_rel_child_embeds, set_open_rel_child_mask = None, None
+        if "set_open_relex" in self.heads and set_open_rel_label_embeds is None:
+            set_or_cfg = self.config.set_open_relex_config
+            set_open_rel_child_embeds, set_open_rel_child_mask = (
+                extract_prompt_features(
+                    set_or_cfg.rel_token_index,
+                    token_embeds,
+                    input_ids,
+                    attention_mask,
+                    batch_size,
+                    embed_dim,
+                    set_or_cfg.embed_rel_token,
+                )
+            )
+            set_open_rel_child_embeds, set_open_rel_child_mask = (
+                self._slice_relation_prompt_features(
+                    set_open_rel_child_embeds,
+                    set_open_rel_child_mask,
+                    classes_mapping,
+                    "set_open_relex",
+                )
+            )
+        elif set_open_rel_label_embeds is not None:
+            set_open_rel_child_embeds = set_open_rel_label_embeds
+            set_open_rel_child_mask = torch.ones(
+                set_open_rel_label_embeds.shape[:-1],
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+
         struct_child_embeds, struct_child_mask = None, None
+        set_struct_child_embeds, set_struct_child_mask = None, None
         if (
             "structuring" in self.heads or "set_structuring" in self.heads
         ) and child_label_embeds is None:
@@ -1232,7 +1569,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 self.config.structuring_config
                 or self.config.set_structuring_config
             )
-            struct_child_embeds, struct_child_mask = extract_prompt_features(
+            all_struct_child_embeds, all_struct_child_mask = (
+                extract_prompt_features(
                 s_cfg.child_token_index,
                 token_embeds,
                 input_ids,
@@ -1240,11 +1578,46 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 batch_size,
                 embed_dim,
                 s_cfg.embed_child_token,
+                )
             )
+            if "structuring" in self.heads:
+                struct_child_embeds, struct_child_mask = (
+                    self._slice_structuring_prompt_features(
+                        all_struct_child_embeds,
+                        all_struct_child_mask,
+                        classes_mapping,
+                        "structuring",
+                    )
+                )
+            if "set_structuring" in self.heads:
+                set_struct_child_embeds, set_struct_child_mask = (
+                    self._slice_structuring_prompt_features(
+                        all_struct_child_embeds,
+                        all_struct_child_mask,
+                        classes_mapping,
+                        "set_structuring",
+                    )
+                )
         elif child_label_embeds is not None:
-            struct_child_embeds = child_label_embeds
-            struct_child_mask = torch.ones(
+            legacy_child_mask = torch.ones(
                 child_label_embeds.shape[:-1],
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            if "structuring" in self.heads:
+                struct_child_embeds = child_label_embeds
+                struct_child_mask = legacy_child_mask
+            elif "set_structuring" in self.heads:
+                # Before set structuring became an independent task, its
+                # labels-encoder tensors used the generic ``child_labels_*``
+                # namespace. Reuse that namespace only for a set-only model;
+                # when both heads exist it belongs to regular structuring.
+                set_struct_child_embeds = child_label_embeds
+                set_struct_child_mask = legacy_child_mask
+        if set_structuring_child_label_embeds is not None:
+            set_struct_child_embeds = set_structuring_child_label_embeds
+            set_struct_child_mask = torch.ones(
+                set_structuring_child_label_embeds.shape[:-1],
                 dtype=attention_mask.dtype,
                 device=attention_mask.device,
             )
@@ -1308,12 +1681,26 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         has_parents = parent_embeds is not None or use_per_task
 
         if classes_mapping is not None and has_parents:
+            set_structuring_group_sizes = kwargs.get(
+                "set_structuring_child_labels_group_size"
+            )
+            if (
+                set_structuring_group_sizes is None
+                and "set_structuring" in self.heads
+                and "structuring" not in self.heads
+            ):
+                set_structuring_group_sizes = kwargs.get(
+                    "child_labels_group_size"
+                )
             label_group_sizes_map = {
                 "ner": kwargs.get("ner_labels_group_size"),
                 "classification": kwargs.get("cat_labels_group_size"),
                 "structuring": kwargs.get("child_labels_group_size"),
-                "set_structuring": kwargs.get("child_labels_group_size"),
+                "set_structuring": set_structuring_group_sizes,
                 "open_relex": kwargs.get("open_rel_labels_group_size"),
+                "set_open_relex": kwargs.get(
+                    "set_open_rel_labels_group_size"
+                ),
                 "image_classification": kwargs.get("image_classification_labels_group_size"),
                 "audio_classification": kwargs.get("audio_classification_labels_group_size"),
                 "object_detection": kwargs.get("object_detection_labels_group_size"),
@@ -1325,8 +1712,15 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 "joint_relex": (ner_child_embeds, ner_child_mask),
                 "classification": (cat_child_embeds, cat_child_mask),
                 "structuring": (struct_child_embeds, struct_child_mask),
-                "set_structuring": (struct_child_embeds, struct_child_mask),
+                "set_structuring": (
+                    set_struct_child_embeds,
+                    set_struct_child_mask,
+                ),
                 "open_relex": (open_rel_child_embeds, open_rel_child_mask),
+                "set_open_relex": (
+                    set_open_rel_child_embeds,
+                    set_open_rel_child_mask,
+                ),
                 "image_classification": (
                     media_label_embeds.get("image_classification"),
                     None,
@@ -1351,7 +1745,7 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
 
             task_names = (
                 "ner", "joint_relex", "classification", "structuring",
-                "set_structuring", "open_relex",
+                "set_structuring", "open_relex", "set_open_relex",
                 *media_tasks,
             )
             for task_name in task_names:
@@ -1623,6 +2017,9 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         cat_out = head_outputs.get("classification", TaskHeadOutput())
         joint_rel_out = head_outputs.get("joint_relex", TaskHeadOutput())
         open_rel_out = head_outputs.get("open_relex", TaskHeadOutput())
+        set_open_rel_out = head_outputs.get(
+            "set_open_relex", TaskHeadOutput()
+        )
         count_out = head_outputs.get("count", TaskHeadOutput())
         struct_out = head_outputs.get("structuring", TaskHeadOutput())
         set_struct_out = head_outputs.get("set_structuring", TaskHeadOutput())
@@ -1667,6 +2064,25 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             open_rel_span_logits=open_rel_out.extra.get("span_logits"),
             open_rel_span_idx=open_rel_out.extra.get("span_idx"),
             open_rel_span_mask=open_rel_out.extra.get("span_mask"),
+            set_open_rel_entity_logits=set_open_rel_out.extra.get(
+                "entity_logits"
+            ),
+            set_open_rel_logits=set_open_rel_out.logits,
+            set_open_rel_assignment_logits=set_open_rel_out.extra.get(
+                "assignment_logits"
+            ),
+            set_open_rel_batch_origin=(
+                flat_inputs_map["set_open_relex"].batch_origin
+                if "set_open_relex" in flat_inputs_map else None
+            ),
+            set_open_rel_anchor_mask=set_open_rel_out.extra.get(
+                "anchor_mask"
+            ),
+            set_open_rel_objectness_logits=set_open_rel_out.extra.get(
+                "objectness_logits"
+            ),
+            set_open_rel_span_idx=set_open_rel_out.extra.get("span_idx"),
+            set_open_rel_span_mask=set_open_rel_out.extra.get("span_mask"),
             count_logits=count_out.logits,
             count_batch_origin=flat_inputs_map["count"].batch_origin if "count" in flat_inputs_map else None,
             groups_output=struct_out.extra.get("groups_output"),
@@ -1786,6 +2202,14 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         # Open Relex
         open_rel_labels: Optional[torch.Tensor] = None,
         open_rel_count: Optional[torch.Tensor] = None,
+        # Set Open Relex
+        set_open_rel_entity_labels: Optional[torch.Tensor] = None,
+        set_open_rel_labels: Optional[torch.Tensor] = None,
+        set_open_rel_assignment_labels: Optional[torch.Tensor] = None,
+        set_open_rel_span_idx: Optional[torch.Tensor] = None,
+        set_open_rel_span_mask: Optional[torch.Tensor] = None,
+        set_open_rel_mask: Optional[torch.Tensor] = None,
+        set_open_rel_count: Optional[torch.Tensor] = None,
         # Count
         count_targets: Optional[torch.Tensor] = None,
         # Groups / Structuring
@@ -1797,6 +2221,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         structuring_span_idx: Optional[torch.Tensor] = None,
         structuring_span_mask: Optional[torch.Tensor] = None,
         structuring_span_labels: Optional[torch.Tensor] = None,
+        set_structuring_labels: Optional[torch.Tensor] = None,
+        set_structuring_count: Optional[torch.Tensor] = None,
+        set_structuring_relation_labels: Optional[torch.Tensor] = None,
+        set_structuring_relation_group_mask: Optional[torch.Tensor] = None,
+        set_structuring_span_idx: Optional[torch.Tensor] = None,
+        set_structuring_span_mask: Optional[torch.Tensor] = None,
+        set_structuring_span_labels: Optional[torch.Tensor] = None,
         # Embedding similarity
         embedding_labels: Optional[torch.Tensor] = None,
         embedding_pair_idx: Optional[torch.Tensor] = None,
@@ -1814,9 +2245,18 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         # Labels encoder — structuring/child labels
         child_labels_input_ids: Optional[torch.Tensor] = None,
         child_labels_attention_mask: Optional[torch.Tensor] = None,
+        set_structuring_child_labels_input_ids: Optional[
+            torch.Tensor
+        ] = None,
+        set_structuring_child_labels_attention_mask: Optional[
+            torch.Tensor
+        ] = None,
         # Labels encoder — open relex labels
         open_rel_labels_input_ids: Optional[torch.Tensor] = None,
         open_rel_labels_attention_mask: Optional[torch.Tensor] = None,
+        # Labels encoder — set open relex labels
+        set_open_rel_labels_input_ids: Optional[torch.Tensor] = None,
+        set_open_rel_labels_attention_mask: Optional[torch.Tensor] = None,
         # Misc
         threshold: float = 0.5,
         adjacency_threshold: float = 0.5,
@@ -1875,14 +2315,28 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         embed_dim = words_embedding.shape[-1]
 
         # ── 1b. Encode task-specific labels via labels encoder ──────────
-        cat_label_embeds, rel_label_embeds, child_label_embeds, open_rel_label_embeds = (
-            self._encode_all_labels_batched(
-                cat_labels_input_ids, cat_labels_attention_mask,
-                rel_labels_input_ids, rel_labels_attention_mask,
-                child_labels_input_ids, child_labels_attention_mask,
-                open_rel_labels_input_ids, open_rel_labels_attention_mask,
-            )
+        encoded_label_embeds = self._encode_all_labels_batched(
+            cat_labels_input_ids, cat_labels_attention_mask,
+            rel_labels_input_ids, rel_labels_attention_mask,
+            child_labels_input_ids, child_labels_attention_mask,
+            open_rel_labels_input_ids, open_rel_labels_attention_mask,
+            set_open_rel_labels_input_ids,
+            set_open_rel_labels_attention_mask,
+            set_structuring_child_labels_input_ids,
+            set_structuring_child_labels_attention_mask,
         )
+        encoded_label_embeds = tuple(encoded_label_embeds)
+        encoded_label_embeds += (None,) * max(
+            0, 6 - len(encoded_label_embeds)
+        )
+        (
+            cat_label_embeds,
+            rel_label_embeds,
+            child_label_embeds,
+            open_rel_label_embeds,
+            set_open_rel_label_embeds,
+            set_structuring_child_label_embeds,
+        ) = encoded_label_embeds[:6]
         media_label_embeds = self._encode_media_labels_batched(kwargs)
 
         # ── 1c-e. Build TaskFlatInputs per task ─────────────────────────
@@ -1902,6 +2356,10 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 rel_label_embeds=rel_label_embeds,
                 child_label_embeds=child_label_embeds,
                 open_rel_label_embeds=open_rel_label_embeds,
+                set_open_rel_label_embeds=set_open_rel_label_embeds,
+                set_structuring_child_label_embeds=(
+                    set_structuring_child_label_embeds
+                ),
                 media_label_embeds=media_label_embeds,
                 vision_embedding=vision_embedding,
                 vision_mask=vision_mask,
@@ -1944,6 +2402,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             rel_pair_mask=rel_pair_mask,
             rel_span_idx=rel_span_idx, rel_span_mask=rel_span_mask,
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
+            set_open_rel_entity_labels=set_open_rel_entity_labels,
+            set_open_rel_labels=set_open_rel_labels,
+            set_open_rel_assignment_labels=set_open_rel_assignment_labels,
+            set_open_rel_span_idx=set_open_rel_span_idx,
+            set_open_rel_span_mask=set_open_rel_span_mask,
+            set_open_rel_mask=set_open_rel_mask,
+            set_open_rel_count=set_open_rel_count,
             count_targets=count_targets,
             count_val=count_val, structuring_labels=structuring_labels,
             structuring_count=structuring_count,
@@ -1952,6 +2417,17 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             structuring_span_idx=structuring_span_idx,
             structuring_span_mask=structuring_span_mask,
             structuring_span_labels=structuring_span_labels,
+            set_structuring_labels=set_structuring_labels,
+            set_structuring_count=set_structuring_count,
+            set_structuring_relation_labels=(
+                set_structuring_relation_labels
+            ),
+            set_structuring_relation_group_mask=(
+                set_structuring_relation_group_mask
+            ),
+            set_structuring_span_idx=set_structuring_span_idx,
+            set_structuring_span_mask=set_structuring_span_mask,
+            set_structuring_span_labels=set_structuring_span_labels,
             embedding_labels=embedding_labels,
             embedding_pair_idx=embedding_pair_idx,
             embedding_encodings=embedding_encodings,
@@ -2010,6 +2486,14 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         # Open Relex
         open_rel_labels: Optional[torch.Tensor] = None,
         open_rel_count: Optional[torch.Tensor] = None,
+        # Set Open Relex
+        set_open_rel_entity_labels: Optional[torch.Tensor] = None,
+        set_open_rel_labels: Optional[torch.Tensor] = None,
+        set_open_rel_assignment_labels: Optional[torch.Tensor] = None,
+        set_open_rel_span_idx: Optional[torch.Tensor] = None,
+        set_open_rel_span_mask: Optional[torch.Tensor] = None,
+        set_open_rel_mask: Optional[torch.Tensor] = None,
+        set_open_rel_count: Optional[torch.Tensor] = None,
         # Count
         count_targets: Optional[torch.Tensor] = None,
         # Groups / Structuring
@@ -2021,6 +2505,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         structuring_span_idx: Optional[torch.Tensor] = None,
         structuring_span_mask: Optional[torch.Tensor] = None,
         structuring_span_labels: Optional[torch.Tensor] = None,
+        set_structuring_labels: Optional[torch.Tensor] = None,
+        set_structuring_count: Optional[torch.Tensor] = None,
+        set_structuring_relation_labels: Optional[torch.Tensor] = None,
+        set_structuring_relation_group_mask: Optional[torch.Tensor] = None,
+        set_structuring_span_idx: Optional[torch.Tensor] = None,
+        set_structuring_span_mask: Optional[torch.Tensor] = None,
+        set_structuring_span_labels: Optional[torch.Tensor] = None,
         # Embedding similarity
         embedding_labels: Optional[torch.Tensor] = None,
         embedding_pair_idx: Optional[torch.Tensor] = None,
@@ -2038,9 +2529,18 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         # Labels encoder — structuring/child labels
         child_labels_input_ids: Optional[torch.Tensor] = None,
         child_labels_attention_mask: Optional[torch.Tensor] = None,
+        set_structuring_child_labels_input_ids: Optional[
+            torch.Tensor
+        ] = None,
+        set_structuring_child_labels_attention_mask: Optional[
+            torch.Tensor
+        ] = None,
         # Labels encoder — open relex labels
         open_rel_labels_input_ids: Optional[torch.Tensor] = None,
         open_rel_labels_attention_mask: Optional[torch.Tensor] = None,
+        # Labels encoder — set open relex labels
+        set_open_rel_labels_input_ids: Optional[torch.Tensor] = None,
+        set_open_rel_labels_attention_mask: Optional[torch.Tensor] = None,
         # Misc
         threshold: float = 0.5,
         adjacency_threshold: float = 0.5,
@@ -2092,14 +2592,28 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
 
         batch_size = words_embedding.shape[0]
         embed_dim = words_embedding.shape[-1]
-        cat_label_embeds, rel_label_embeds, child_label_embeds, open_rel_label_embeds = (
-            self._encode_all_labels_batched(
-                cat_labels_input_ids, cat_labels_attention_mask,
-                rel_labels_input_ids, rel_labels_attention_mask,
-                child_labels_input_ids, child_labels_attention_mask,
-                open_rel_labels_input_ids, open_rel_labels_attention_mask,
-            )
+        encoded_label_embeds = self._encode_all_labels_batched(
+            cat_labels_input_ids, cat_labels_attention_mask,
+            rel_labels_input_ids, rel_labels_attention_mask,
+            child_labels_input_ids, child_labels_attention_mask,
+            open_rel_labels_input_ids, open_rel_labels_attention_mask,
+            set_open_rel_labels_input_ids,
+            set_open_rel_labels_attention_mask,
+            set_structuring_child_labels_input_ids,
+            set_structuring_child_labels_attention_mask,
         )
+        encoded_label_embeds = tuple(encoded_label_embeds)
+        encoded_label_embeds += (None,) * max(
+            0, 6 - len(encoded_label_embeds)
+        )
+        (
+            cat_label_embeds,
+            rel_label_embeds,
+            child_label_embeds,
+            open_rel_label_embeds,
+            set_open_rel_label_embeds,
+            set_structuring_child_label_embeds,
+        ) = encoded_label_embeds[:6]
         flat_inputs_map, joint_rel_flat_prompts, joint_rel_flat_mask = (
             self._build_forward_flat_inputs(
                 classes_mapping=classes_mapping,
@@ -2116,6 +2630,10 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 rel_label_embeds=rel_label_embeds,
                 child_label_embeds=child_label_embeds,
                 open_rel_label_embeds=open_rel_label_embeds,
+                set_open_rel_label_embeds=set_open_rel_label_embeds,
+                set_structuring_child_label_embeds=(
+                    set_structuring_child_label_embeds
+                ),
                 media_label_embeds=None,
                 vision_embedding=None,
                 vision_mask=None,
@@ -2136,6 +2654,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             rel_pair_mask=rel_pair_mask,
             rel_span_idx=rel_span_idx, rel_span_mask=rel_span_mask,
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
+            set_open_rel_entity_labels=set_open_rel_entity_labels,
+            set_open_rel_labels=set_open_rel_labels,
+            set_open_rel_assignment_labels=set_open_rel_assignment_labels,
+            set_open_rel_span_idx=set_open_rel_span_idx,
+            set_open_rel_span_mask=set_open_rel_span_mask,
+            set_open_rel_mask=set_open_rel_mask,
+            set_open_rel_count=set_open_rel_count,
             count_targets=count_targets,
             count_val=count_val, structuring_labels=structuring_labels,
             structuring_count=structuring_count,
@@ -2144,6 +2669,17 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             structuring_span_idx=structuring_span_idx,
             structuring_span_mask=structuring_span_mask,
             structuring_span_labels=structuring_span_labels,
+            set_structuring_labels=set_structuring_labels,
+            set_structuring_count=set_structuring_count,
+            set_structuring_relation_labels=(
+                set_structuring_relation_labels
+            ),
+            set_structuring_relation_group_mask=(
+                set_structuring_relation_group_mask
+            ),
+            set_structuring_span_idx=set_structuring_span_idx,
+            set_structuring_span_mask=set_structuring_span_mask,
+            set_structuring_span_labels=set_structuring_span_labels,
             embedding_labels=embedding_labels,
             embedding_pair_idx=embedding_pair_idx,
             embedding_encodings=embedding_encodings,
