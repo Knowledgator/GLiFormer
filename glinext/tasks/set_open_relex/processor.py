@@ -1,35 +1,42 @@
-"""Processor for independent entity-first set open relation extraction."""
+"""Processor for three-stage entity, pair, and relation set extraction."""
 
 import random
 
 import torch
 
+from ...processing.label_augmentation import AugmentableLabelGroup
 from ...processing.mappings import (
     BaseClassMapping,
     OpenRelexClassMapping,
     OpenRelexItemMapping,
 )
-from ..span_processor import SpanProcessor
+from ..ner.processor import NERProcessor
 
 
-class SetOpenRelexProcessor(SpanProcessor):
-    """Build entity, pair, and assignment targets for set open relex.
+class SetOpenRelexProcessor(NERProcessor):
+    """Build entity, directed-pair, and relation targets for set open relex.
 
     The task first recognizes relation-conditioned endpoint entities.  Its
-    second stage treats every unique directed endpoint pair as one gold set
-    element, independently of the number of predicted anchor queries.
+    second stage groups source/target entities into unique directed pairs,
+    independently of relation type and predicted anchor-query capacity.  The
+    third stage assigns every applicable relation label to each gold pair.
+
+    Training uses the same canonical ``extraction`` groups as joint NER and
+    relation extraction: ``ner`` contains the entity mentions and every
+    relation is ``[head_entity_index, relation_label, tail_entity_index]``.
+    The dedicated ``set_open_relex`` endpoint-object format remains supported
+    for inference and backward compatibility.
     """
 
     data_key = "set_open_relex"
+    extraction_data_key = "extraction"
     legacy_data_key = "open_relex"
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
-        super().__init__(
-            config,
-            tokenizer,
-            words_splitter,
-            parent_token=getattr(config, "open_rel_parent_token", None),
-            **kwargs,
+        super().__init__(config, tokenizer, words_splitter, **kwargs)
+        self.parent_token = (
+            getattr(config, "open_rel_parent_token", None)
+            or config.parent_token
         )
         self.rel_token = config.rel_token
         # Before set-open-relex became an independent task, its annotations
@@ -39,15 +46,90 @@ class SetOpenRelexProcessor(SpanProcessor):
             getattr(config, "open_relex_config", None) is None
         )
 
-    def _groups(self, item):
-        if self.data_key in item:
-            return item.get(self.data_key) or []
+    @staticmethod
+    def _is_indexed_relation(relation):
+        return (
+            isinstance(relation, (list, tuple))
+            and len(relation) >= 3
+            and isinstance(relation[0], int)
+            and isinstance(relation[2], int)
+        )
+
+    @classmethod
+    def _is_extraction_group(cls, group):
+        if not isinstance(group, dict) or "ner" not in group:
+            return False
+        return "all_rel_labels" in group or any(
+            cls._is_indexed_relation(relation)
+            for relation in group.get("relations", [])
+        )
+
+    @classmethod
+    def _extraction_groups(cls, item):
+        return [
+            group
+            for group in item.get(cls.extraction_data_key, []) or []
+            if cls._is_extraction_group(group)
+        ]
+
+    def _group_source(self, item):
+        explicit_groups = item.get(self.data_key) or []
+        if explicit_groups:
+            return self.data_key, explicit_groups
+
+        extraction_groups = self._extraction_groups(item)
+        if extraction_groups:
+            return self.extraction_data_key, extraction_groups
+
         if self.allow_legacy_data:
-            return item.get(self.legacy_data_key) or []
-        return []
+            legacy_groups = item.get(self.legacy_data_key) or []
+            if legacy_groups:
+                return self.legacy_data_key, legacy_groups
+        return None, []
+
+    def _groups(self, item):
+        return self._group_source(item)[1]
+
+    def _relation_types(self, group):
+        if self._is_extraction_group(group):
+            if "all_rel_labels" in group:
+                candidates = group["all_rel_labels"]
+            else:
+                candidates = (
+                    self._relation_name(relation)
+                    for relation in group.get("relations", [])
+                )
+        elif "all_labels" in group:
+            candidates = group["all_labels"]
+        else:
+            candidates = (
+                self._relation_name(relation)
+                for relation in group.get("relations", [])
+            )
+        return list(dict.fromkeys(
+            label for label in candidates if label
+        ))
+
+    def _mapped_groups(self, item):
+        """Return groups that occupy a flattened model/prompt slot."""
+
+        return [
+            group
+            for group in self._groups(item)
+            if self._relation_types(group)
+        ]
+
+    def has_training_annotations(self, item):
+        """Whether an item supplies a usable set-relation label space."""
+
+        return bool(self._mapped_groups(item))
 
     @staticmethod
     def _relation_name(relation):
+        if isinstance(relation, (list, tuple)):
+            return relation[1] if len(relation) >= 2 else ""
+        if not isinstance(relation, dict):
+            return ""
         return relation.get(
             "relation",
             relation.get("label", relation.get("type", "")),
@@ -56,6 +138,8 @@ class SetOpenRelexProcessor(SpanProcessor):
     @staticmethod
     def _endpoint_entry(relation, role):
         keys = ("source", "head") if role == 0 else ("target", "tail")
+        if not isinstance(relation, dict):
+            return keys[0], None
         for key in keys:
             if key in relation:
                 return key, relation.get(key)
@@ -65,17 +149,8 @@ class SetOpenRelexProcessor(SpanProcessor):
         mappings = []
         for item in batch_list:
             item_mappings = []
-            for group in self._groups(item):
-                if "all_labels" in group:
-                    relation_types = list(dict.fromkeys(group["all_labels"]))
-                else:
-                    relation_types = []
-                    seen = set()
-                    for relation in group.get("relations", []):
-                        relation_type = self._relation_name(relation)
-                        if relation_type and relation_type not in seen:
-                            relation_types.append(relation_type)
-                            seen.add(relation_type)
+            for group in self._mapped_groups(item):
+                relation_types = self._relation_types(group)
                 if shuffle_labels:
                     random.shuffle(relation_types)
                 item_mappings.append(
@@ -88,12 +163,43 @@ class SetOpenRelexProcessor(SpanProcessor):
                                 )
                             },
                             name=group.get("name"),
+                            description=group.get("description"),
                         ),
                         name=group.get("name"),
                     )
                 )
             mappings.append(OpenRelexClassMapping(items=item_mappings))
         return mappings
+
+    def get_augmentable_label_groups(self, batch_list, classes_mapping):
+        groups = []
+        for batch_idx, item_mapping in enumerate(
+            classes_mapping.set_open_relex_mapping
+        ):
+            source_groups = self._mapped_groups(batch_list[batch_idx])
+            for group_idx, relex_mapping in enumerate(item_mapping.items):
+                mapping = relex_mapping.rel_class_to_id
+                if not mapping.class_to_id:
+                    continue
+                source_group = (
+                    source_groups[group_idx]
+                    if group_idx < len(source_groups)
+                    else {}
+                )
+                positives = list(dict.fromkeys(
+                    label
+                    for relation in source_group.get("relations", [])
+                    if (label := self._relation_name(relation))
+                ))
+                groups.append(AugmentableLabelGroup(
+                    task="set_open_relex",
+                    batch_idx=batch_idx,
+                    group_idx=group_idx,
+                    mapping=mapping,
+                    positive_labels=positives,
+                    parent_name=mapping.name,
+                ))
+        return groups
 
     def contribute_prompt(
         self,
@@ -111,6 +217,8 @@ class SetOpenRelexProcessor(SpanProcessor):
             relation_mapping = item_mapping.rel_class_to_id
             if relation_mapping.name:
                 prompt.append(relation_mapping.name)
+            if relation_mapping.description:
+                prompt.append(relation_mapping.description)
             if not use_labels_encoder:
                 prompt.extend(
                     f"{self.rel_token} {relation_name}"
@@ -205,8 +313,31 @@ class SetOpenRelexProcessor(SpanProcessor):
         """Resolve source/target (or legacy head/tail) mentions to words."""
         if item.get("_glinext_set_open_relex_spans_resolved"):
             return
-        groups = self._groups(item)
+        source, groups = self._group_source(item)
         if not groups:
+            return
+
+        if source == self.extraction_data_key:
+            # Reuse the canonical joint NER/relex resolver. It converts entity
+            # character offsets to inclusive token spans, drops invalid
+            # entities, and remaps relation indices after filtering/sorting.
+            super().resolve_spans(item)
+            item["_glinext_set_open_relex_spans_resolved"] = True
+            return
+
+        if all(self._is_extraction_group(group) for group in groups):
+            # Internal collation may carry already-normalized extraction groups
+            # in the dedicated task slot. Supporting the same shape here keeps
+            # label creation independent of which namespace transported it.
+            extraction_item = {
+                "text": item.get("text", ""),
+                self.extraction_data_key: groups,
+            }
+            if "tokenized_text" in item:
+                extraction_item["tokenized_text"] = item["tokenized_text"]
+            super().resolve_spans(extraction_item)
+            item[source] = extraction_item[self.extraction_data_key]
+            item["_glinext_set_open_relex_spans_resolved"] = True
             return
 
         text = item.get("text", "")
@@ -226,8 +357,27 @@ class SetOpenRelexProcessor(SpanProcessor):
                         )
         item["_glinext_set_open_relex_spans_resolved"] = True
 
-    @staticmethod
-    def _resolved_span(relation, role):
+    @classmethod
+    def _resolved_span(cls, relation, role, group=None):
+        if cls._is_indexed_relation(relation):
+            entity_position = 0 if role == 0 else 2
+            entity_idx = relation[entity_position]
+            entities = group.get("ner", []) if isinstance(group, dict) else []
+            if entity_idx < 0 or entity_idx >= len(entities):
+                return None
+            entity = entities[entity_idx]
+            if isinstance(entity, dict):
+                start = entity.get("start", -1)
+                end = entity.get("end", -1)
+            elif isinstance(entity, (list, tuple)) and len(entity) >= 2:
+                start, end = entity[0], entity[1]
+            else:
+                return None
+            try:
+                return int(start), int(end)
+            except (TypeError, ValueError):
+                return None
+
         _, endpoint = SetOpenRelexProcessor._endpoint_entry(relation, role)
         if not isinstance(endpoint, dict):
             return None
@@ -250,8 +400,8 @@ class SetOpenRelexProcessor(SpanProcessor):
             relation_name = self._relation_name(relation)
             if relation_name not in relation_to_id:
                 continue
-            source_span = self._resolved_span(relation, 0)
-            target_span = self._resolved_span(relation, 1)
+            source_span = self._resolved_span(relation, 0, group)
+            target_span = self._resolved_span(relation, 1, group)
             if source_span is None or target_span is None:
                 continue
             source_start, source_end = source_span
@@ -283,10 +433,15 @@ class SetOpenRelexProcessor(SpanProcessor):
         return ordered_pairs, boundaries
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
-        """Create entity-first set targets without query-capacity padding.
+        """Create three-stage set targets without query-capacity padding.
 
         Shapes use ``BN`` flattened groups, ``G`` unique directed gold pairs,
         ``R`` relation classes, and ``E`` unique endpoint boundaries.
+
+        Entity targets remain relation-conditioned at ``[BN, L, R, 3]``.
+        Pair relation targets are multi-label ``[BN, G, R]`` tensors, while
+        pair endpoint assignments are relation-independent ``[BN, G, E, 2]``
+        tensors whose final axis denotes source and target respectively.
         """
         max_seq_len = int(max_seq_len)
         if max_seq_len <= 0:
@@ -305,7 +460,7 @@ class SetOpenRelexProcessor(SpanProcessor):
         for _, batch_idx, group_idx, item_mapping in (
             classes_mapping.flat_set_open_relex_iter()
         ):
-            groups = self._groups(batch_list[batch_idx])
+            groups = self._mapped_groups(batch_list[batch_idx])
             relation_to_id = (
                 item_mapping.rel_class_to_id.class_to_id
             )
@@ -343,13 +498,11 @@ class SetOpenRelexProcessor(SpanProcessor):
             total_groups,
             max_pairs,
             max_relations,
-            2,
             dtype=torch.float,
         )
         assignment_labels = torch.zeros(
             total_groups,
             max_pairs,
-            max_relations,
             max_entities,
             2,
             dtype=torch.float,
@@ -393,23 +546,21 @@ class SetOpenRelexProcessor(SpanProcessor):
                 target = (pair[2], pair[3])
                 source_entity = boundary_to_id[source]
                 target_entity = boundary_to_id[target]
+                assignment_labels[
+                    flat_idx,
+                    pair_idx,
+                    source_entity,
+                    0,
+                ] = 1.0
+                assignment_labels[
+                    flat_idx,
+                    pair_idx,
+                    target_entity,
+                    1,
+                ] = 1.0
                 for relation_id in relation_ids:
                     relation_labels[
-                        flat_idx, pair_idx, relation_id, :
-                    ] = 1.0
-                    assignment_labels[
-                        flat_idx,
-                        pair_idx,
-                        relation_id,
-                        source_entity,
-                        0,
-                    ] = 1.0
-                    assignment_labels[
-                        flat_idx,
-                        pair_idx,
-                        relation_id,
-                        target_entity,
-                        1,
+                        flat_idx, pair_idx, relation_id
                     ] = 1.0
                     for start, end in (source, target):
                         entity_labels[

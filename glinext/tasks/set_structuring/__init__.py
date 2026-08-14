@@ -1,7 +1,7 @@
 """NER-first set structuring head."""
 
-from .model import SetStructuringHead
 from .decoder import SetStructuringDecoder
+from .model import SetStructuringHead
 from .processor import SetStructuringProcessor
 
 __all__ = [

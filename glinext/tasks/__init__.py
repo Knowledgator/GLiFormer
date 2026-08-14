@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import torch
 from torch import nn
@@ -66,6 +66,49 @@ class TaskHeadOutput(ModelOutput):
         super().__post_init__()
         if self.extra is None:
             self.extra = {}
+
+
+class StructuringHeadExtra(TypedDict, total=False):
+    """Canonical extras emitted by the anchor-conditioned structuring head."""
+
+    groups_output: torch.Tensor
+    anchor_mask: torch.Tensor
+    objectness_logits: torch.Tensor | None
+    span_logits: torch.Tensor | None
+    span_idx: torch.Tensor | None
+    span_mask: torch.Tensor | None
+    loss_stats: dict[str, Any] | None
+    anchor_relation_scores: torch.Tensor | None
+    anchor_relation_loss: torch.Tensor | None
+    anchor_matches: list[list[tuple[int, int]]] | None
+
+
+class SetStructuringHeadExtra(StructuringHeadExtra, total=False):
+    """Canonical entity-first structuring tensors plus compatibility aliases."""
+
+    entity_logits: torch.Tensor
+    entity_spans: torch.Tensor
+    entity_mask: torch.Tensor
+    entity_representations: torch.Tensor
+    entity_field_logits: torch.Tensor
+    membership_logits: torch.Tensor
+    entity_assignment_logits: torch.Tensor
+    entity_anchor_logits: torch.Tensor
+    assignment_logits: torch.Tensor
+    structuring_logits: torch.Tensor
+    entity_loss: torch.Tensor | None
+    assignment_loss: torch.Tensor | None
+    objectness_loss: torch.Tensor | None
+
+
+@dataclass
+class StructuringTaskHeadOutput(TaskHeadOutput):
+    extra: StructuringHeadExtra | None = None
+
+
+@dataclass
+class SetStructuringTaskHeadOutput(TaskHeadOutput):
+    extra: SetStructuringHeadExtra | None = None
 
 
 class TaskHead(ABC, nn.Module):
@@ -570,6 +613,16 @@ class TaskProcessor(ABC):
 
     def contribute_prompt(self, classes_mapping, batch_idx, use_labels_encoder=False) -> List[str]:
         """Return prompt tokens for this task in a single batch item."""
+        return []
+
+    def get_augmentable_label_groups(self, batch_list, classes_mapping):
+        """Return label-bearing groups exposed to training-time augmentation.
+
+        Mapping-less tasks inherit the empty implementation. Concrete task
+        processors opt in by returning ``AugmentableLabelGroup`` descriptors;
+        keeping this hook non-abstract preserves compatibility with external
+        task processors.
+        """
         return []
 
     def resolve_spans(self, item):

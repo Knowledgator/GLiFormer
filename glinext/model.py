@@ -192,6 +192,15 @@ class BaseGLiNextModel(BaseModel):
                     if "object_detection" in self.heads
                     else None
                 )
+            if HeadClass.__name__ in {
+                "JointRelexHead",
+                "SetStructuringHead",
+            }:
+                head_kwargs["ner_head"] = (
+                    self.heads["ner"]
+                    if "ner" in self.heads
+                    else None
+                )
             head = HeadClass.from_config(config, **head_kwargs)
             if head is not None:
                 canonical_name = task_definition.name
@@ -250,6 +259,87 @@ class BaseGLiNextModel(BaseModel):
                 state_dict[target_key] = source_value
             state_dict.pop(legacy_key)
 
+    def _migrate_legacy_joint_relex_ner_state_dict(
+        self,
+        state_dict,
+        prefix: str,
+    ) -> None:
+        """Remove the NER copy stored by pre-reuse Joint Relex checkpoints."""
+        if "ner" not in self.heads or "joint_relex" not in self.heads:
+            return
+        joint_head = self.heads["joint_relex"]
+        if getattr(joint_head, "_owns_ner_head", True):
+            return
+
+        ner_state = self.heads["ner"].state_dict()
+        joint_state = joint_head.state_dict()
+        legacy_prefix = f"{prefix}heads.joint_relex."
+        ner_prefix = f"{prefix}heads.ner."
+        for suffix, target_value in ner_state.items():
+            # A suffix that remains in the composed Joint head is relation
+            # state, not an obsolete inherited NER tensor.
+            if suffix in joint_state:
+                continue
+            legacy_key = f"{legacy_prefix}{suffix}"
+            if legacy_key not in state_dict:
+                continue
+            source_value = state_dict[legacy_key]
+            target_key = f"{ner_prefix}{suffix}"
+            if target_key not in state_dict:
+                try:
+                    shapes_match = tuple(source_value.shape) == tuple(
+                        target_value.shape
+                    )
+                except (AttributeError, RuntimeError):
+                    shapes_match = False
+                if shapes_match:
+                    state_dict[target_key] = source_value
+            state_dict.pop(legacy_key)
+
+    def _migrate_reused_set_structuring_ner_state_dict(
+        self,
+        state_dict,
+        prefix: str,
+    ) -> None:
+        """Remove the private NER copy from pre-reuse Set Structuring state."""
+
+        if "ner" not in self.heads or "set_structuring" not in self.heads:
+            return
+        set_head = self.heads["set_structuring"]
+        if getattr(set_head, "_owns_ner_head", True):
+            return
+
+        ner_state = self.heads["ner"].state_dict()
+        set_state = set_head.state_dict()
+        legacy_prefixes = [f"{prefix}heads.set_structuring."]
+        if "structuring" not in self.heads:
+            # Older checkpoints stored the set implementation under the
+            # regular structuring task name.
+            legacy_prefixes.append(f"{prefix}heads.structuring.")
+        ner_prefix = f"{prefix}heads.ner."
+
+        for suffix, target_value in ner_state.items():
+            # Any same-named stage-2 tensor remains owned by Set Structuring.
+            if suffix in set_state:
+                continue
+            for legacy_prefix in legacy_prefixes:
+                legacy_key = f"{legacy_prefix}{suffix}"
+                if legacy_key not in state_dict:
+                    continue
+                source_value = state_dict[legacy_key]
+                target_key = f"{ner_prefix}{suffix}"
+                if target_key not in state_dict:
+                    try:
+                        shapes_match = tuple(source_value.shape) == tuple(
+                            target_value.shape
+                        )
+                    except (AttributeError, RuntimeError):
+                        shapes_match = False
+                    if shapes_match:
+                        state_dict[target_key] = source_value
+                # Canonical standalone NER state wins when both copies exist.
+                state_dict.pop(legacy_key)
+
     def _load_from_state_dict(
         self,
         state_dict,
@@ -261,6 +351,11 @@ class BaseGLiNextModel(BaseModel):
         error_msgs,
     ):
         self._migrate_legacy_set_structuring_state_dict(state_dict, prefix)
+        self._migrate_legacy_joint_relex_ner_state_dict(state_dict, prefix)
+        self._migrate_reused_set_structuring_ner_state_dict(
+            state_dict,
+            prefix,
+        )
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -1366,6 +1461,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                     "structuring": self.config.structuring_config,
                     "set_structuring": self.config.set_structuring_config,
                 }
+                if (
+                    self.config.ner_config is None
+                    and self.config.joint_relex_config is not None
+                ):
+                    task_parent_cfgs["joint_relex"] = (
+                        self.config.joint_relex_config
+                    )
                 if include_media:
                     task_parent_cfgs.update(
                         {
@@ -1384,6 +1486,13 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                     "structuring": self.config.structuring_config,
                     "set_structuring": self.config.set_structuring_config,
                 }
+                if (
+                    self.config.ner_config is None
+                    and self.config.joint_relex_config is not None
+                ):
+                    prompt_parent_cfgs["joint_relex"] = (
+                        self.config.joint_relex_config
+                    )
                 if include_media:
                     prompt_parent_cfgs.update(
                         {
@@ -1971,6 +2080,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                     "rel_label_smoothing",
                     "rel_negatives",
                     "rel_masking",
+                    "relation_flat_ner",
+                    "relation_multi_label",
                 ):
                     value = runtime_kwargs.get(runtime_name)
                     if value is not None:
@@ -2058,6 +2169,9 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             joint_rel_idx=joint_rel_out.extra.get("rel_idx"),
             joint_rel_mask=joint_rel_out.extra.get("rel_mask"),
             joint_rel_entity_spans=joint_rel_out.extra.get("rel_entity_spans"),
+            joint_rel_entity_class_idx=joint_rel_out.extra.get(
+                "rel_entity_class_idx"
+            ),
             open_rel_logits=open_rel_out.logits,
             open_rel_batch_origin=flat_inputs_map["open_relex"].batch_origin if "open_relex" in flat_inputs_map else None,
             open_rel_anchor_mask=open_rel_out.extra.get("anchor_mask"),
@@ -2102,7 +2216,8 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
                 "entity_field_logits"
             ),
             set_structuring_logits=set_struct_out.extra.get(
-                "structuring_logits"
+                "membership_logits",
+                set_struct_out.extra.get("structuring_logits"),
             ),
             set_structuring_assignment_logits=set_struct_out.extra.get(
                 "entity_assignment_logits"
@@ -2197,8 +2312,11 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         # Joint Relex
         rel_labels: Optional[torch.Tensor] = None,
         rel_pair_mask: Optional[torch.Tensor] = None,
+        rel_mask: Optional[torch.Tensor] = None,
+        rel_batch_idx: Optional[torch.Tensor] = None,
         rel_span_idx: Optional[torch.Tensor] = None,
         rel_span_mask: Optional[torch.Tensor] = None,
+        rel_span_class_idx: Optional[torch.Tensor] = None,
         # Open Relex
         open_rel_labels: Optional[torch.Tensor] = None,
         open_rel_count: Optional[torch.Tensor] = None,
@@ -2400,7 +2518,9 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             audio_segmentation_mask_labels=audio_segmentation_mask_labels,
             audio_segmentation_count=audio_segmentation_count,
             rel_pair_mask=rel_pair_mask,
+            rel_mask=rel_mask, rel_batch_idx=rel_batch_idx,
             rel_span_idx=rel_span_idx, rel_span_mask=rel_span_mask,
+            rel_span_class_idx=rel_span_class_idx,
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
             set_open_rel_entity_labels=set_open_rel_entity_labels,
             set_open_rel_labels=set_open_rel_labels,
@@ -2481,8 +2601,11 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
         # Joint Relex
         rel_labels: Optional[torch.Tensor] = None,
         rel_pair_mask: Optional[torch.Tensor] = None,
+        rel_mask: Optional[torch.Tensor] = None,
+        rel_batch_idx: Optional[torch.Tensor] = None,
         rel_span_idx: Optional[torch.Tensor] = None,
         rel_span_mask: Optional[torch.Tensor] = None,
+        rel_span_class_idx: Optional[torch.Tensor] = None,
         # Open Relex
         open_rel_labels: Optional[torch.Tensor] = None,
         open_rel_count: Optional[torch.Tensor] = None,
@@ -2652,7 +2775,9 @@ class _GLiNExTJointForwardModel(BaseGLiNextModel):
             ner_labels=ner_labels, span_idx=span_idx, span_mask=span_mask,
             span_labels=span_labels, cat_labels=cat_labels, rel_labels=rel_labels,
             rel_pair_mask=rel_pair_mask,
+            rel_mask=rel_mask, rel_batch_idx=rel_batch_idx,
             rel_span_idx=rel_span_idx, rel_span_mask=rel_span_mask,
+            rel_span_class_idx=rel_span_class_idx,
             open_rel_labels=open_rel_labels, open_rel_count=open_rel_count,
             set_open_rel_entity_labels=set_open_rel_entity_labels,
             set_open_rel_labels=set_open_rel_labels,

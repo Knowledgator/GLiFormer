@@ -1,15 +1,95 @@
 """GLiNExT trainer — extends the GLiNER Trainer for multi-task training."""
 
 import logging
+import math
+import random
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 from gliner.training.trainer import Trainer as GLiNERTrainer
 from gliner.training.trainer import TrainingArguments as TrainingArguments
 from torch import nn
+from torch.utils.data import Dataset
 from transformers.trainer_pt_utils import nested_detach
 
+from .processing.label_augmentation import (
+    LABEL_AUGMENTATION_INDEX_KEY,
+    LABEL_AUGMENTATION_MARKER_KEY,
+)
+
 logger = logging.getLogger(__name__)
+
+class TrainingLabelAugmentationDataset(Dataset):
+    """Mark records that may receive training-only label augmentation.
+
+    Hugging Face uses one data collator for both the training and evaluation
+    dataloaders.  A dataset marker lets the shared collator distinguish those
+    paths without consulting mutable model state.  The stable source index is
+    also available to the augmenter when it derives a deterministic batch
+    seed.  Source records are never modified.
+    """
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        record = self.dataset[index]
+        if not isinstance(record, Mapping):
+            return record
+
+        marked = dict(record)
+        marked[LABEL_AUGMENTATION_MARKER_KEY] = True
+        marked[LABEL_AUGMENTATION_INDEX_KEY] = int(index)
+        return marked
+
+
+class ClassificationParentNameDropoutDataset(Dataset):
+    """Expose named and unnamed singleton classification prompts in training.
+
+    The public inference API represents a single unnamed label group as a
+    list and a named group as a mapping.  Dropping the name dynamically lets
+    the model see both prompt forms without duplicating records or modifying
+    the source dataset.  Multi-group examples retain their names because the
+    groups would otherwise be ambiguous and cannot be represented as multiple
+    unnamed groups by the public API.
+    """
+
+    def __init__(self, dataset, probability: float):
+        probability = float(probability)
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError(
+                "classification_parent_name_dropout must be between 0 and 1"
+            )
+        self.dataset = dataset
+        self.probability = probability
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        record = self.dataset[index]
+        if self.probability == 0.0 or not isinstance(record, Mapping):
+            return record
+
+        groups = record.get("classification")
+        if not isinstance(groups, list | tuple) or len(groups) != 1:
+            return record
+        group = groups[0]
+        if not isinstance(group, Mapping) or not group.get("name"):
+            return record
+        if self.probability < 1.0 and random.random() >= self.probability:
+            return record
+
+        unnamed_group = dict(group)
+        unnamed_group["name"] = None
+        augmented = dict(record)
+        augmented["classification"] = [unnamed_group]
+        return augmented
+
 
 # Label keys that indicate training data is present in the batch.
 # GLiNExT does not use a single "labels" key — each task has its own.
@@ -347,13 +427,22 @@ class GLiNExTTrainer(GLiNERTrainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        # Guardrail: at least one task-specific label key must be present
+        # A malformed or unresolvable annotation must not terminate a long
+        # multi-task run.  The processors normally filter these records, but
+        # retaining this last-line guard makes training robust to new source
+        # formats and rare alignment failures.
         label_keys = _present_label_keys(inputs)
         if not label_keys:
-            raise KeyError(
-                f"Batch has no task label keys. Expected at least one of "
-                f"{sorted(_LABEL_KEYS)}. Got keys: {sorted(inputs.keys())}"
+            skipped = getattr(self, "_label_free_batches_skipped", 0) + 1
+            self._label_free_batches_skipped = skipped
+            logger.warning(
+                "Skipping label-free training batch #%d. Expected at least "
+                "one of %s; got keys: %s",
+                skipped,
+                sorted(_LABEL_KEYS),
+                sorted(inputs),
             )
+            return torch.zeros((), device=self.args.device)
 
         try:
             with self.compute_loss_context_manager():

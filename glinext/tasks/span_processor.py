@@ -117,8 +117,25 @@ class SpanProcessor(TaskProcessor):
             seen.add(char_end)
             if char_end < start:
                 continue
+
+            # Character annotations occasionally include formatting spaces at
+            # either edge (for example a sentence copied after a paragraph
+            # separator).  Whitespace has no corresponding word token, so an
+            # otherwise exact annotation cannot be mapped unless its bounds
+            # are tightened to the first and last non-whitespace character.
+            range_start = start
+            range_end = char_end
+            if text:
+                if range_start > len(text) or range_end > len(text):
+                    continue
+                while range_start < range_end and text[range_start].isspace():
+                    range_start += 1
+                while range_end > range_start and text[range_end - 1].isspace():
+                    range_end -= 1
+            if range_end <= range_start:
+                continue
             rng = cls._match_to_token_range(
-                start, char_end, tokens_with_spans, s2t, e2t,
+                range_start, range_end, tokens_with_spans, s2t, e2t,
             )
             if rng is not None:
                 return rng
@@ -217,6 +234,9 @@ class SpanProcessor(TaskProcessor):
                 resolved.extend(cls._resolve_labeled_span(text, tokens_with_spans, ent))
             else:
                 ent_text, label = ent[0], ent[-1]
+                ent_text = str(ent_text).strip()
+                if not ent_text:
+                    continue
                 # Append every occurrence so structuring can supervise all
                 # valid spans. NER/joint-relex callers pick ``resolved[0]``
                 # per entity, so their 1:1 input→output contract (and

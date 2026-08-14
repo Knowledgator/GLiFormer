@@ -1,10 +1,17 @@
 """Data collators for GLiNExT processor variants."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 import torch
 
+from .label_augmentation import (
+    LABEL_AUGMENTATION_INDEX_KEY,
+    LABEL_AUGMENTATION_MARKER_KEY,
+    BatchLabelAugmenter,
+    LabelAugmentationConfig,
+)
 from .processor import (
     BaseGLiNextProcessor,
     GLiNextAudioProcessor,
@@ -33,6 +40,7 @@ class BaseGLiNExTDataCollator(ABC):
         return_entities: bool = False,
         prepare_labels: bool = True,
         return_classes_mapping: bool = True,
+        label_augmentation=None,
     ):
         self.config = config
         self.data_processor = data_processor
@@ -41,11 +49,64 @@ class BaseGLiNExTDataCollator(ABC):
         self.return_entities = return_entities
         self.prepare_labels = prepare_labels
         self.return_classes_mapping = return_classes_mapping
+        self.label_augmentation = LabelAugmentationConfig.from_value(
+            label_augmentation
+        )
+        is_active = getattr(
+            self.label_augmentation,
+            "is_active",
+            self.label_augmentation.enabled,
+        )
+        if callable(is_active):
+            is_active = is_active()
+        self.label_augmenter = (
+            BatchLabelAugmenter(self.label_augmentation)
+            if is_active
+            else None
+        )
+
+    def _prepare_augmentation_batch(self, input_x):
+        """Strip training markers and return augmenter-specific kwargs."""
+
+        marked = [
+            isinstance(item, Mapping)
+            and item.get(LABEL_AUGMENTATION_MARKER_KEY) is True
+            for item in input_x
+        ]
+        if any(marked) and not all(marked):
+            raise ValueError(
+                "A collator batch cannot mix label-augmentation-marked "
+                "training records with unmarked evaluation records."
+            )
+        if not any(marked):
+            return input_x, {}
+
+        clean_batch = []
+        batch_ids = []
+        for position, item in enumerate(input_x):
+            clean_item = dict(item)
+            clean_item.pop(LABEL_AUGMENTATION_MARKER_KEY, None)
+            batch_ids.append(
+                clean_item.pop(LABEL_AUGMENTATION_INDEX_KEY, position)
+            )
+            clean_batch.append(clean_item)
+
+        if self.label_augmenter is None:
+            return clean_batch, {}
+        return clean_batch, {
+            "label_augmenter": self.label_augmenter,
+            "label_augmentation_batch_ids": batch_ids,
+        }
 
     def collate_batch(self, input_x: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
         if self.data_processor is None:
             raise ValueError("data_processor must be provided for GLiNExT collation.")
-        return self.data_processor.collate_raw_batch(input_x, **kwargs)
+        input_x, augmentation_kwargs = self._prepare_augmentation_batch(input_x)
+        return self.data_processor.collate_raw_batch(
+            input_x,
+            **kwargs,
+            **augmentation_kwargs,
+        )
 
     def collate_function(self, raw_batch: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         if self.data_processor is None:

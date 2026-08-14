@@ -68,7 +68,11 @@ class OpenRelexHead(TaskHead):
         anchors, anchor_mask = self._generate_anchors(
             parent_embedding,
             feature_embeddings,
-            count=open_rel_count,
+            # Gold counts do not exist at inference. Masking padded slots only
+            # during training leaves them unsupervised and then activates all
+            # of them at inference. Train and infer with the same query set;
+            # padded labels below make unused slots explicit background.
+            count=None,
             threshold=threshold,
             feature_mask=feature_mask,
         )
@@ -220,17 +224,20 @@ class OpenRelexHead(TaskHead):
             C_pred, C_label = logits.shape[2], open_rel_labels.shape[2]
             L_pred, L_label = logits.shape[3], open_rel_labels.shape[3]
 
-            min_X = min(X_pred, X_label)
             min_C = min(C_pred, C_label)
             min_L = min(L_pred, L_label)
 
-            pred = logits[:, :min_X, :min_C, :min_L, :, :]
-            labels = open_rel_labels[:, :min_X, :min_C, :min_L, :, :]
+            pred = logits[:, :, :min_C, :min_L, :, :]
+            labels = pred.new_zeros(pred.shape)
+            copy_X = min(X_pred, X_label)
+            labels[:, :copy_X] = open_rel_labels[
+                :, :copy_X, :min_C, :min_L, :, :
+            ]
 
             all_losses = base_loss_fn(pred, labels)
 
             # Build masks: anchor × rel_class × word
-            inst_mask = anchor_mask[:, :min_X].float()
+            inst_mask = anchor_mask[:, :X_pred].float()
             word_mask_f = feature_mask[:, :min_L].float()
             rel_mask_f = rel_embedding_mask[:, :min_C].float()
 
@@ -247,15 +254,20 @@ class OpenRelexHead(TaskHead):
                 # span_logits_out: (B, S, X, C, 2)
                 # span_labels:     (B, S, X, C, 2)
                 min_S = min(span_logits_out.shape[1], span_labels.shape[1])
-                min_X_s = min(span_logits_out.shape[2], span_labels.shape[2])
                 min_C_s = min(span_logits_out.shape[3], span_labels.shape[3])
 
-                span_pred = span_logits_out[:, :min_S, :min_X_s, :min_C_s, :]
-                s_labels = span_labels[:, :min_S, :min_X_s, :min_C_s, :]
+                X_span_pred = span_logits_out.shape[2]
+                X_span_label = span_labels.shape[2]
+                span_pred = span_logits_out[:, :min_S, :, :min_C_s, :]
+                s_labels = span_pred.new_zeros(span_pred.shape)
+                copy_X_s = min(X_span_pred, X_span_label)
+                s_labels[:, :, :copy_X_s] = span_labels[
+                    :, :min_S, :copy_X_s, :min_C_s, :
+                ]
 
                 span_losses = base_loss_fn(span_pred, s_labels)
                 s_span_mask = span_mask[:, :min_S].float()
-                s_inst_mask = anchor_mask[:, :min_X_s].float()
+                s_inst_mask = anchor_mask[:, :X_span_pred].float()
                 s_rel_mask = rel_embedding_mask[:, :min_C_s].float()
 
                 s_full_mask = (

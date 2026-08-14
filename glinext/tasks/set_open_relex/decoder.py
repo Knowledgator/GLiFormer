@@ -7,13 +7,12 @@ from ..span_decoder import SpanDecoder
 
 
 class SetOpenRelexDecoder(SpanDecoder):
-    """Decode relation slots by assigning one entity to each endpoint role.
+    """Decode relation-independent entity pairs into relation triples.
 
-    The public relation tensor contains per-slot, per-relation source/target
-    confidence logits with shape ``(BN, A, R, 2)``.  A separate assignment
-    tensor, ``(BN, A, R, E, 2)``, selects the concrete entity span for each
-    role.  Keeping those decisions separate lets the head train unordered
-    relation slots while the decoder still emits ordinary directed triples.
+    Relation logits have shape ``(BN, N, R)``, where every pair slot predicts
+    all relation classes.  A separate assignment tensor with shape
+    ``(BN, N, E, 2)`` selects one extracted entity for the source role and one
+    for the target role before relation labels are decoded.
     """
 
     logits_attr = "set_open_rel_logits"
@@ -49,23 +48,23 @@ class SetOpenRelexDecoder(SpanDecoder):
         objectness_logits,
         batch_origin,
     ):
-        if logits.dim() != 4 or logits.shape[-1] != 2:
-            self._shape_error(self.logits_attr, "(BN, A, R, 2)", logits)
+        if logits.dim() != 3:
+            self._shape_error(self.logits_attr, "(BN, N, R)", logits)
 
-        batch_groups, anchor_count, relation_count, _ = logits.shape
+        batch_groups, pair_count, relation_count = logits.shape
         if (
-            assignment_logits.dim() != 5
-            or assignment_logits.shape[:3]
-            != (batch_groups, anchor_count, relation_count)
+            assignment_logits.dim() != 4
+            or assignment_logits.shape[:2]
+            != (batch_groups, pair_count)
             or assignment_logits.shape[-1] != 2
         ):
             self._shape_error(
                 self.assignment_logits_attr,
-                "(BN, A, R, E, 2)",
+                "(BN, N, E, 2)",
                 assignment_logits,
             )
 
-        entity_count = assignment_logits.shape[3]
+        entity_count = assignment_logits.shape[2]
         if span_idx.shape != (batch_groups, entity_count, 2):
             self._shape_error(
                 self.span_idx_attr,
@@ -79,7 +78,7 @@ class SetOpenRelexDecoder(SpanDecoder):
                 span_mask,
             )
 
-        expected_anchor_shape = (batch_groups, anchor_count)
+        expected_anchor_shape = (batch_groups, pair_count)
         for value, name in (
             (anchor_mask, self.anchor_mask_attr),
             (objectness_logits, self.objectness_logits_attr),
@@ -87,7 +86,7 @@ class SetOpenRelexDecoder(SpanDecoder):
             if value is not None and value.shape != expected_anchor_shape:
                 self._shape_error(
                     name,
-                    f"({batch_groups}, {anchor_count})",
+                    f"({batch_groups}, {pair_count})",
                     value,
                 )
 
@@ -98,7 +97,7 @@ class SetOpenRelexDecoder(SpanDecoder):
                 batch_origin,
             )
 
-        return batch_groups, anchor_count, relation_count, entity_count
+        return batch_groups, pair_count, relation_count, entity_count
 
     @staticmethod
     def _reverse_relation_mapping(item) -> dict[int, str]:
@@ -228,7 +227,7 @@ class SetOpenRelexDecoder(SpanDecoder):
         batch_origin = getattr(model_output, self.batch_origin_attr, None)
         (
             batch_groups,
-            anchor_count,
+            pair_count,
             relation_count,
             _,
         ) = self._validate_inputs(
@@ -260,7 +259,7 @@ class SetOpenRelexDecoder(SpanDecoder):
                 if batch_origin.numel() else 0
             )
 
-        role_probs = torch.sigmoid(logits)
+        relation_probs = torch.sigmoid(logits)
         assignment_probs = torch.sigmoid(assignment_logits)
         active_anchors = self._active_anchor_mask(
             logits,
@@ -286,62 +285,63 @@ class SetOpenRelexDecoder(SpanDecoder):
             triples = {}
 
             if valid_entities.any():
-                for anchor_idx in range(anchor_count):
-                    if not bool(active_anchors[batch_idx, anchor_idx]):
+                for pair_idx in range(pair_count):
+                    if not bool(active_anchors[batch_idx, pair_idx]):
                         continue
+
+                    endpoint_ids = []
+                    endpoint_scores = []
+                    for role_idx in range(2):
+                        candidates = assignment_probs[
+                            batch_idx,
+                            pair_idx,
+                            :,
+                            role_idx,
+                        ].masked_fill(~valid_entities, float("-inf"))
+                        entity_idx = int(candidates.argmax().item())
+                        entity_score = float(candidates[entity_idx].item())
+                        if entity_score <= threshold:
+                            break
+                        endpoint_ids.append(entity_idx)
+                        endpoint_scores.append(entity_score)
+                    if len(endpoint_ids) != 2:
+                        continue
+
+                    head_idx, tail_idx = endpoint_ids
+                    head_start, head_end = (
+                        int(value)
+                        for value in span_idx[
+                            batch_idx, head_idx
+                        ].tolist()
+                    )
+                    tail_start, tail_end = (
+                        int(value)
+                        for value in span_idx[
+                            batch_idx, tail_idx
+                        ].tolist()
+                    )
+
                     for relation_idx in range(relation_count):
                         if relation_map and relation_idx not in relation_map:
                             continue
-                        public_scores = role_probs[
+                        relation_score = float(relation_probs[
                             batch_idx,
-                            anchor_idx,
+                            pair_idx,
                             relation_idx,
-                        ]
-                        if not bool((public_scores > threshold).all()):
+                        ].item())
+                        if relation_score <= threshold:
                             continue
 
-                        endpoint_ids = []
-                        endpoint_scores = []
-                        for role_idx in range(2):
-                            candidates = assignment_probs[
-                                batch_idx,
-                                anchor_idx,
-                                relation_idx,
-                                :,
-                                role_idx,
-                            ].masked_fill(~valid_entities, float("-inf"))
-                            entity_idx = int(candidates.argmax().item())
-                            entity_score = float(candidates[entity_idx].item())
-                            if entity_score <= threshold:
-                                break
-                            endpoint_ids.append(entity_idx)
-                            endpoint_scores.append(entity_score)
-                        if len(endpoint_ids) != 2:
-                            continue
-
-                        head_idx, tail_idx = endpoint_ids
-                        head_start, head_end = (
-                            int(value)
-                            for value in span_idx[
-                                batch_idx, head_idx
-                            ].tolist()
-                        )
-                        tail_start, tail_end = (
-                            int(value)
-                            for value in span_idx[
-                                batch_idx, tail_idx
-                            ].tolist()
-                        )
                         relation_name = relation_map.get(
                             relation_idx,
                             str(relation_idx),
                         )
                         source_confidence = min(
-                            float(public_scores[0].item()),
+                            relation_score,
                             endpoint_scores[0],
                         )
                         target_confidence = min(
-                            float(public_scores[1].item()),
+                            relation_score,
                             endpoint_scores[1],
                         )
                         score = (source_confidence + target_confidence) / 2.0

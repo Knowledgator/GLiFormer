@@ -1,6 +1,8 @@
 """Classification task head — anchor paradigm."""
 
 
+import torch
+
 from ...layers import Pooling
 from .. import TaskHead, TaskHeadOutput
 from ..losses import binary_focal_or_bce
@@ -28,8 +30,9 @@ class ClassificationHead(TaskHead):
 
         self._init_anchor_components(cat_cfg, config, hidden_size, dropout, shared_layers)
 
+        self.pooling_type = getattr(cat_cfg, "pooling_type", "mean")
         self.pooling = Pooling.from_config(
-            pooling_type=getattr(cat_cfg, "pooling_type", "mean"),
+            pooling_type=self.pooling_type,
             hidden_size=hidden_size,
         )
 
@@ -45,6 +48,27 @@ class ClassificationHead(TaskHead):
         return cls(config, hidden_size=config.hidden_size, dropout=config.dropout,
                    shared_layers=shared_layers)
 
+    def _pool_text(self, shared, flat_inputs):
+        """Pool one source representation for every classification group.
+
+        ``flat_inputs.words_embedding`` contains source *words* only, so its
+        first position is not the transformer CLS token.  CLS pooling must use
+        the raw encoder sequence and expand it through ``batch_origin`` for
+        items that contain multiple classification groups.  This also remains
+        defined when a long schema prompt consumes the source-word budget.
+        """
+
+        if self.pooling_type == "cls" and shared.token_embeds.shape[1] > 0:
+            batch_origin = flat_inputs.batch_origin.to(
+                device=shared.token_embeds.device,
+                dtype=torch.long,
+            )
+            return shared.token_embeds.index_select(0, batch_origin)[:, 0]
+        return self.pooling(
+            flat_inputs.words_embedding,
+            flat_inputs.mask,
+        )
+
     def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
         cat_labels = batch.get("cat_labels")
         base_loss_fn = batch.get("base_loss_fn")
@@ -53,7 +77,7 @@ class ClassificationHead(TaskHead):
         cat_embedding_mask = flat_inputs.child_mask       # (BN, max_C)
         feature_embeddings = flat_inputs.words_embedding  # (BN, W, D)
         feature_mask = flat_inputs.mask                   # (BN, W)
-        text_rep = self.pooling(feature_embeddings, feature_mask)
+        text_rep = self._pool_text(shared, flat_inputs)
         context = flat_inputs.parent_embedding            # (BN, D)
 
         # Anchor paradigm: anchor_layer → anchor_modeling → dot product

@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from .structuring_types import HierarchyNodeSpec, OutputMode
 
 
 @dataclass
@@ -43,7 +45,7 @@ class StructuringItemMapping:
     # anchor set. ``hierarchy`` describes the object types in that set; leaf
     # fields are fully-qualified with dot notation so a decoder can recover an
     # anchor's object type before applying parent→child relation scores.
-    hierarchy: List[dict] = field(default_factory=list)
+    hierarchy: list[HierarchyNodeSpec] = field(default_factory=list)
     multi_level: bool = False
 
 
@@ -54,7 +56,7 @@ class StructuringClassMapping:
     # ``schemas`` preserves the historical ``{schema: [records]}`` contract.
     # Raw arbitrary JSON rows can instead be a single root object or array;
     # hierarchy results are unwrapped by shared structuring formatting.
-    output_mode: str = "schemas"
+    output_mode: OutputMode | str = "schemas"
     multi_level: bool = False
 
 

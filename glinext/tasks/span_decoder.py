@@ -74,6 +74,7 @@ class SpanDecoder(TaskDecoder):
         scores_end: torch.Tensor,
         id_to_classes: Dict[int, str],
         threshold: float,
+        max_width: Optional[int] = None,
     ) -> List[Span]:
         """Match start/end positions and validate inside/boundary scores.
 
@@ -89,6 +90,8 @@ class SpanDecoder(TaskDecoder):
         for st, cls_st in zip(*start_idx):
             for ed, cls_ed in zip(*end_idx):
                 if ed >= st and cls_st == cls_ed:
+                    if max_width is not None and ed - st + 1 > max_width:
+                        continue
                     ins = scores_inside[st:ed + 1, cls_st]
                     if (ins < threshold).any():
                         continue
@@ -161,6 +164,7 @@ class SpanDecoder(TaskDecoder):
         threshold: float,
         flat_ner: bool = True,
         multi_label: bool = False,
+        max_width: Optional[int] = None,
     ) -> Optional[List[Span]]:
         """Decode BIO probabilities for a single class (e.g. one role in relex).
 
@@ -193,6 +197,7 @@ class SpanDecoder(TaskDecoder):
             scores_end.unsqueeze(-1),
             {0: ""},
             threshold,
+            max_width=max_width,
         )
         if not spans:
             return None

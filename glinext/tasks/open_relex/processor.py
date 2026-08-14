@@ -1,57 +1,154 @@
 """Open relex task processor."""
 
-from typing import Dict, List, Optional
+import random
 
 import torch
 
-from ..span_processor import SpanProcessor
+from ...processing.label_augmentation import AugmentableLabelGroup
 from ...processing.mappings import (
-    BaseClassMapping, OpenRelexItemMapping, OpenRelexClassMapping, BatchClassesMapping,
+    BaseClassMapping,
+    OpenRelexClassMapping,
+    OpenRelexItemMapping,
 )
+from ..ner.processor import NERProcessor
 
 
-class OpenRelexProcessor(SpanProcessor):
+class OpenRelexProcessor(NERProcessor):
     """Processor for anchor-based open relation extraction.
 
     Builds its own extraction groups with [SCHEMA] and [RELATION] tokens.
-    Input data uses the 'open_relex' key with text-based head/tail mentions.
+    Training accepts the canonical ``extraction`` representation used by the
+    relation datasets as well as the dedicated ``open_relex`` endpoint format.
     """
 
+    data_key = "open_relex"
+    extraction_data_key = "extraction"
+
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
-        super().__init__(config, tokenizer, words_splitter,
-                         parent_token=getattr(config, 'open_rel_parent_token', None), **kwargs)
+        super().__init__(config, tokenizer, words_splitter, **kwargs)
+        self.parent_token = (
+            getattr(config, "open_rel_parent_token", None)
+            or config.parent_token
+        )
         self.rel_token = config.rel_token
+
+    @staticmethod
+    def _is_indexed_relation(relation):
+        return (
+            isinstance(relation, (list, tuple))
+            and len(relation) >= 3
+            and isinstance(relation[0], int)
+            and isinstance(relation[2], int)
+        )
+
+    @classmethod
+    def _is_extraction_group(cls, group):
+        if not isinstance(group, dict) or "ner" not in group:
+            return False
+        return "all_rel_labels" in group or any(
+            cls._is_indexed_relation(relation)
+            for relation in group.get("relations", [])
+        )
+
+    @classmethod
+    def _extraction_groups(cls, item):
+        return [
+            group
+            for group in item.get(cls.extraction_data_key, []) or []
+            if cls._is_extraction_group(group)
+        ]
+
+    @classmethod
+    def _groups(cls, item):
+        explicit_groups = item.get(cls.data_key) or []
+        return explicit_groups if explicit_groups else cls._extraction_groups(item)
+
+    @staticmethod
+    def _relation_name(relation):
+        if isinstance(relation, (list, tuple)):
+            return relation[1] if len(relation) >= 2 else ""
+        if not isinstance(relation, dict):
+            return ""
+        return relation.get(
+            "relation",
+            relation.get("label", relation.get("type", "")),
+        )
+
+    @classmethod
+    def _relation_types(cls, group):
+        if cls._is_extraction_group(group) and "all_rel_labels" in group:
+            candidates = group["all_rel_labels"]
+        elif "all_labels" in group:
+            candidates = group["all_labels"]
+        else:
+            candidates = (
+                cls._relation_name(relation)
+                for relation in group.get("relations", [])
+            )
+        return list(dict.fromkeys(label for label in candidates if label))
+
+    @classmethod
+    def _mapped_groups(cls, item):
+        """Return groups that occupy a flattened model/prompt slot."""
+
+        return [
+            group for group in cls._groups(item) if cls._relation_types(group)
+        ]
+
+    def has_training_annotations(self, item):
+        """Return whether an item provides a usable relation label space."""
+
+        return any(self._relation_types(group) for group in self._groups(item))
 
     def get_classes_mapping(self, batch_list, shuffle_labels=False, **kwargs):
         open_relex_mapping = []
         for item in batch_list:
-            open_relex_data = item.get('open_relex', [])
             item_mappings = []
-            for group in open_relex_data:
-                # Use all_labels when available (inference), else extract from annotations
-                if 'all_labels' in group:
-                    rel_types = list(group['all_labels'])
-                else:
-                    rel_types = []
-                    seen = set()
-                    for rel in group.get('relations', []):
-                        rel_type = rel.get('relation', '')
-                        if rel_type and rel_type not in seen:
-                            rel_types.append(rel_type)
-                            seen.add(rel_type)
+            for group in self._mapped_groups(item):
+                rel_types = self._relation_types(group)
                 if shuffle_labels:
-                    import random
                     random.shuffle(rel_types)
                 rel_class_to_id = {rt: idx for idx, rt in enumerate(rel_types)}
                 item_mappings.append(OpenRelexItemMapping(
                     rel_class_to_id=BaseClassMapping(
                         class_to_id=rel_class_to_id,
                         name=group.get('name'),
+                        description=group.get('description'),
                     ),
                     name=group.get('name'),
                 ))
             open_relex_mapping.append(OpenRelexClassMapping(items=item_mappings))
         return open_relex_mapping
+
+    def get_augmentable_label_groups(self, batch_list, classes_mapping):
+        groups = []
+        for batch_idx, item_mapping in enumerate(
+            classes_mapping.open_relex_mapping
+        ):
+            source_groups = self._mapped_groups(batch_list[batch_idx])
+            for group_idx, relex_mapping in enumerate(item_mapping.items):
+                mapping = relex_mapping.rel_class_to_id
+                if not mapping.class_to_id:
+                    continue
+                source_group = (
+                    source_groups[group_idx]
+                    if group_idx < len(source_groups)
+                    else {}
+                )
+                positives = list(dict.fromkeys(
+                    label
+                    for relation in source_group.get("relations", [])
+                    if (label := self._relation_name(relation))
+                ))
+                groups.append(AugmentableLabelGroup(
+                    task="open_relex",
+                    batch_idx=batch_idx,
+                    group_idx=group_idx,
+                    mapping=mapping,
+                    positive_labels=positives,
+                    parent_name=mapping.name,
+                ))
+        return groups
 
     def contribute_prompt(self, classes_mapping, batch_idx, use_labels_encoder=False):
         if not hasattr(classes_mapping, 'open_relex_mapping'):
@@ -64,6 +161,8 @@ class OpenRelexProcessor(SpanProcessor):
             rel_map = relex_item.rel_class_to_id
             if rel_map.name:
                 prompt.append(rel_map.name)
+            if rel_map.description:
+                prompt.append(rel_map.description)
             if not use_labels_encoder:
                 for rel_name in rel_map.class_to_id:
                     prompt.append(f"{self.rel_token} {rel_name}")
@@ -116,7 +215,15 @@ class OpenRelexProcessor(SpanProcessor):
         """Resolve head/tail text mentions to token indices."""
         if item.get('_glinext_open_relex_spans_resolved'):
             return
-        open_relex_data = item.get('open_relex', [])
+
+        open_relex_data = item.get(self.data_key, []) or []
+        if not open_relex_data and self._extraction_groups(item):
+            # Canonical extraction relations index the group's NER array.
+            # Reuse its offset resolver so dropped/sorted entities also remap
+            # relation indices correctly.
+            super().resolve_spans(item)
+            item['_glinext_open_relex_spans_resolved'] = True
+            return
         if not open_relex_data:
             return
 
@@ -133,6 +240,32 @@ class OpenRelexProcessor(SpanProcessor):
                         continue
                     rel[role] = self._normalize_endpoint(text, tokens_with_spans, value)
         item['_glinext_open_relex_spans_resolved'] = True
+
+    @classmethod
+    def _resolved_span(cls, relation, role, group):
+        if cls._is_indexed_relation(relation):
+            entity_idx = relation[0 if role == "head" else 2]
+            entities = group.get("ner", [])
+            if entity_idx < 0 or entity_idx >= len(entities):
+                return None
+            entity = entities[entity_idx]
+            if isinstance(entity, dict):
+                start, end = entity.get("start", -1), entity.get("end", -1)
+            elif isinstance(entity, (list, tuple)) and len(entity) >= 2:
+                start, end = entity[0], entity[1]
+            else:
+                return None
+        elif isinstance(relation, dict):
+            endpoint = relation.get(role, {})
+            if not isinstance(endpoint, dict):
+                return None
+            start, end = endpoint.get("start", -1), endpoint.get("end", -1)
+        else:
+            return None
+        try:
+            return int(start), int(end)
+        except (TypeError, ValueError):
+            return None
 
     def create_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):
         """Create label tensors for open relex.
@@ -152,14 +285,13 @@ class OpenRelexProcessor(SpanProcessor):
 
         max_anchors = 0
         max_rel_classes = 0
-        has_any = False
 
         # First pass: determine dimensions
         group_relations = []
         for flat_idx, batch_idx, group_idx, relex_item in classes_mapping.flat_open_relex_iter():
-            open_relex_data = batch_list[batch_idx].get('open_relex', [])
+            open_relex_data = self._mapped_groups(batch_list[batch_idx])
             if group_idx >= len(open_relex_data):
-                group_relations.append([])
+                group_relations.append({})
                 continue
 
             group = open_relex_data[group_idx]
@@ -169,21 +301,20 @@ class OpenRelexProcessor(SpanProcessor):
             # Group relations by anchor (unique entity pairs)
             anchor_rels = {}  # anchor_key → list of (rel_class_id, head_span, tail_span)
             for rel in relations:
-                head = rel.get('head', {})
-                tail = rel.get('tail', {})
-                if isinstance(head, dict):
-                    h_start, h_end = head.get('start', -1), head.get('end', -1)
-                else:
+                head_span = self._resolved_span(rel, "head", group)
+                tail_span = self._resolved_span(rel, "tail", group)
+                if head_span is None or tail_span is None:
                     continue
-                if isinstance(tail, dict):
-                    t_start, t_end = tail.get('start', -1), tail.get('end', -1)
-                else:
-                    continue
+                h_start, h_end = head_span
+                t_start, t_end = tail_span
 
-                rel_type = rel.get('relation', '')
+                rel_type = self._relation_name(rel)
                 if rel_type not in rel_to_id:
                     continue
-                if h_start < 0 or h_end < 0 or t_start < 0 or t_end < 0:
+                if not (
+                    0 <= h_start <= h_end < max_seq_len
+                    and 0 <= t_start <= t_end < max_seq_len
+                ):
                     continue
 
                 # Each unique (head_span, tail_span) pair is an anchor
@@ -192,14 +323,15 @@ class OpenRelexProcessor(SpanProcessor):
                     anchor_rels[anchor_key] = []
                 anchor_rels[anchor_key].append(rel_to_id[rel_type])
 
-            if anchor_rels:
-                has_any = True
-                max_anchors = max(max_anchors, len(anchor_rels))
+            max_anchors = max(max_anchors, len(anchor_rels))
             max_rel_classes = max(max_rel_classes, len(rel_to_id))
             group_relations.append(anchor_rels)
 
-        if not has_any or max_anchors == 0 or max_rel_classes == 0:
+        if max_rel_classes == 0:
             return None
+        # Keep a placeholder for all-negative groups. The head pads this axis
+        # to its configured query capacity and supervises every unused slot.
+        max_anchors = max(max_anchors, 1)
 
         # Allocate label tensor: (total_groups, max_anchors, max_rel_classes, max_seq_len, 2, 3)
         open_rel_labels = torch.zeros(
@@ -213,6 +345,7 @@ class OpenRelexProcessor(SpanProcessor):
         # Second pass: fill labels
         for flat_idx, batch_idx, group_idx, relex_item in classes_mapping.flat_open_relex_iter():
             open_rel_batch_idx[flat_idx] = batch_idx
+            open_rel_mask[flat_idx] = True
             if flat_idx >= len(group_relations):
                 continue
 
@@ -220,7 +353,6 @@ class OpenRelexProcessor(SpanProcessor):
             if not anchor_rels:
                 continue
 
-            open_rel_mask[flat_idx] = True
             open_rel_count[flat_idx] = len(anchor_rels)
 
             for anchor_idx, (anchor_key, rel_class_ids) in enumerate(sorted(anchor_rels.items())):
@@ -283,7 +415,7 @@ class OpenRelexProcessor(SpanProcessor):
 
         for flat_idx, batch_idx, group_idx, relex_item in classes_mapping.flat_open_relex_iter():
             batch_indices.append(batch_idx)
-            open_relex_data = batch_list[batch_idx].get('open_relex', [])
+            open_relex_data = self._mapped_groups(batch_list[batch_idx])
             if group_idx >= len(open_relex_data):
                 all_group_data.append(({}, [], set()))
                 continue
@@ -298,13 +430,13 @@ class OpenRelexProcessor(SpanProcessor):
             positive_spans = set()
 
             for rel in relations:
-                head = rel.get('head', {})
-                tail = rel.get('tail', {})
-                if not isinstance(head, dict) or not isinstance(tail, dict):
+                head_span = self._resolved_span(rel, "head", group)
+                tail_span = self._resolved_span(rel, "tail", group)
+                if head_span is None or tail_span is None:
                     continue
-                h_start, h_end = head.get('start', -1), head.get('end', -1)
-                t_start, t_end = tail.get('start', -1), tail.get('end', -1)
-                rel_type = rel.get('relation', '')
+                h_start, h_end = head_span
+                t_start, t_end = tail_span
+                rel_type = self._relation_name(rel)
                 if rel_type not in rel_to_id or h_start < 0 or t_start < 0:
                     continue
                 if h_start >= max_seq_len or h_end >= max_seq_len:

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from copy import copy, deepcopy
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any
 
 import torch
+
+from .structuring_types import (
+    StructuringAnchorEntry,
+    StructuringDiagnostics,
+    parse_component_spec,
+)
 
 MULTI_LEVEL_RESULT_KEY = "__glinext_multi_level_result__"
 
@@ -87,6 +93,15 @@ def _paths_conflict(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
 
     shared = min(len(left), len(right))
     return left != right and left[:shared] == right[:shared]
+
+
+@dataclass(frozen=True)
+class _MaterializedNodes:
+    assigned: dict[int, tuple[str, ...]]
+    objects: dict[int, dict]
+    positions: dict[int, tuple[int, int]]
+    value_entries: dict[int, dict]
+    by_anchor: dict[int, dict]
 
 
 class _AnchorAlignment:
@@ -516,104 +531,97 @@ class _AnchorAlignment:
             "score": round(float(field.get("score", 0.0)), 6),
         }
 
-    def _align_and_format(
+    def _initialize_diagnostics(
         self,
-        payload,
-        start_map,
-        end_map,
-        text,
-        *,
-        diagnostics=None,
-    ):
-        mapping = payload.get("mapping")
-        hierarchy, by_path, field_meta = self._hierarchy(mapping)
-
-        scores = payload.get("relation_scores")
-        if scores is not None and not torch.is_tensor(scores):
-            scores = torch.as_tensor(scores)
-        physical_scores = scores
-        raw_nodes = list(payload.get("nodes") or [])
-        raw_anchors = [int(node["anchor_index"]) for node in raw_nodes]
-
-        if diagnostics is not None:
-            active_ids = sorted(set(raw_anchors))
-            diagnostics.clear()
-            diagnostics.update({
-                "relation_threshold": self.relation_threshold,
-                "physical_slot_capacity": (
-                    int(physical_scores.shape[0])
-                    if physical_scores is not None
-                    else (max(active_ids, default=-1) + 1)
-                ),
-                "active_anchor_count": len(active_ids),
-                "active_anchor_ids": active_ids,
-                "active_anchors": [
-                    {
-                        "anchor_id": int(node["anchor_index"]),
-                        "presence_is_reliable": bool(
-                            node.get("presence_is_reliable", False)
-                        ),
-                        "field_count": len(node.get("fields") or []),
-                        "fields": [
-                            self._diagnostic_field(field)
-                            for field in node.get("fields") or []
-                        ],
-                    }
-                    for node in raw_nodes
-                ],
-                "raw_relation_connections": [],
-                "top_raw_relation_candidates": [],
-                "logical_nodes": [],
-                "connections": [],
-                "merges": [],
-            })
-            raw_candidates = []
-            if physical_scores is not None:
-                for parent in active_ids:
-                    for child in active_ids:
-                        if parent == child:
-                            continue
-                        score = self._score(
-                            physical_scores, parent, child,
-                        )
-                        edge = {
-                            "parent_anchor_id": parent,
-                            "child_anchor_id": child,
-                            "score": round(score, 6),
-                        }
-                        raw_candidates.append(edge)
-                        if score >= self.relation_threshold:
-                            diagnostics[
-                                "raw_relation_connections"
-                            ].append(edge)
-            raw_candidates.sort(
-                key=lambda edge: (
-                    -edge["score"],
-                    edge["parent_anchor_id"],
-                    edge["child_anchor_id"],
-                )
-            )
-            diagnostics["top_raw_relation_candidates"] = raw_candidates[:5]
-
-        if not by_path:
-            return []
-
-        # Fully empty fixed slots are not JSON objects. A container-only slot is
-        # retained when it participates in a confident graph edge.
-        connected = set()
-        has_child_anchors = any(path for path in by_path)
-        if scores is not None and has_child_anchors:
-            for parent in raw_anchors:
-                for child in raw_anchors:
+        raw_nodes: list[dict],
+        physical_scores: torch.Tensor | None,
+        diagnostics: dict | None,
+    ) -> None:
+        if diagnostics is None:
+            return
+        active_ids = sorted(
+            {int(node["anchor_index"]) for node in raw_nodes}
+        )
+        diagnostics.clear()
+        diagnostics.update({
+            "relation_threshold": self.relation_threshold,
+            "physical_slot_capacity": (
+                int(physical_scores.shape[0])
+                if physical_scores is not None
+                else (max(active_ids, default=-1) + 1)
+            ),
+            "active_anchor_count": len(active_ids),
+            "active_anchor_ids": active_ids,
+            "active_anchors": [
+                {
+                    "anchor_id": int(node["anchor_index"]),
+                    "presence_is_reliable": bool(
+                        node.get("presence_is_reliable", False)
+                    ),
+                    "field_count": len(node.get("fields") or []),
+                    "fields": [
+                        self._diagnostic_field(field)
+                        for field in node.get("fields") or []
+                    ],
+                }
+                for node in raw_nodes
+            ],
+            "raw_relation_connections": [],
+            "top_raw_relation_candidates": [],
+            "logical_nodes": [],
+            "connections": [],
+            "merges": [],
+        })
+        raw_candidates = []
+        if physical_scores is not None:
+            for parent in active_ids:
+                for child in active_ids:
                     if parent == child:
                         continue
-                    if self._score(scores, parent, child) >= self.relation_threshold:
+                    score = self._score(physical_scores, parent, child)
+                    edge = {
+                        "parent_anchor_id": parent,
+                        "child_anchor_id": child,
+                        "score": round(score, 6),
+                    }
+                    raw_candidates.append(edge)
+                    if score >= self.relation_threshold:
+                        diagnostics["raw_relation_connections"].append(edge)
+        raw_candidates.sort(
+            key=lambda edge: (
+                -edge["score"],
+                edge["parent_anchor_id"],
+                edge["child_anchor_id"],
+            )
+        )
+        diagnostics["top_raw_relation_candidates"] = raw_candidates[:5]
+
+    def _filter_active_nodes(
+        self,
+        payload: dict,
+        raw_nodes: list[dict],
+        scores: torch.Tensor | None,
+        by_path: dict[tuple[str, ...], dict],
+    ) -> tuple[list[dict], bool]:
+        """Drop inert fixed slots while retaining connected containers."""
+
+        raw_anchors = [int(node["anchor_index"]) for node in raw_nodes]
+        connected: set[int] = set()
+        if scores is not None and any(path for path in by_path):
+            for parent in raw_anchors:
+                for child in raw_anchors:
+                    if (
+                        parent != child
+                        and self._score(scores, parent, child)
+                        >= self.relation_threshold
+                    ):
                         connected.update((parent, child))
         preserve_empty_records = bool(
             payload.get("preserve_empty_records", False)
         )
         nodes = [
-            node for node in raw_nodes
+            node
+            for node in raw_nodes
             if (
                 node.get("fields")
                 or int(node["anchor_index"]) in connected
@@ -626,24 +634,31 @@ class _AnchorAlignment:
                 )
             )
         ]
-        if not nodes:
-            return []
+        return nodes, preserve_empty_records
 
-        nodes, scores, recovered_mixed_anchors = self._expand_mixed_path_nodes(
-            nodes, scores, by_path, field_meta,
-        )
-        if not nodes:
-            return []
+    def _materialize_nodes(
+        self,
+        nodes: list[dict],
+        scores: torch.Tensor | None,
+        by_path: dict[tuple[str, ...], dict],
+        field_meta: dict,
+        start_map: list[int],
+        end_map: list[int],
+        text: str,
+    ) -> _MaterializedNodes:
+        """Assign schema paths and convert field evidence into JSON objects."""
 
         assigned = self._assign_node_paths(nodes, scores, by_path, field_meta)
-        node_objects = {}
-        node_positions = {}
-        node_value_entries = {}
-        node_by_anchor = {int(node["anchor_index"]): node for node in nodes}
+        node_objects: dict[int, dict] = {}
+        node_positions: dict[int, tuple[int, int]] = {}
+        node_value_entries: dict[int, dict] = {}
+        node_by_anchor = {
+            int(node["anchor_index"]): node for node in nodes
+        }
 
         for anchor, node in node_by_anchor.items():
             node_path = assigned[anchor]
-            obj = {}
+            obj: dict = {}
             node_schema = by_path[node_path]
             containers = sorted(
                 (
@@ -651,7 +666,9 @@ class _AnchorAlignment:
                     for container in node_schema.get("containers") or []
                     if isinstance(container, dict)
                 ),
-                key=lambda container: len(container.get("local_path") or ()),
+                key=lambda container: len(
+                    container.get("local_path") or ()
+                ),
             )
             for container in containers:
                 local_path = tuple(
@@ -665,7 +682,10 @@ class _AnchorAlignment:
                     _set_path(
                         obj,
                         local_path,
-                        _shape_array([], int(container.get("rank", 1))),
+                        _shape_array(
+                            [],
+                            int(container.get("rank", 1)),
+                        ),
                     )
 
             occurrences = defaultdict(list)
@@ -681,7 +701,10 @@ class _AnchorAlignment:
                 ))
 
             field_specs = {
-                tuple(str(x) for x in field.get("local_path") or ()): field
+                tuple(
+                    str(segment)
+                    for segment in field.get("local_path") or ()
+                ): field
                 for field in node_schema.get("fields") or []
                 if isinstance(field, dict)
             }
@@ -690,11 +713,13 @@ class _AnchorAlignment:
                 for path, values in occurrences.items()
                 if values
             }
-            selected_paths = []
+            selected_paths: list[tuple[str, ...]] = []
             for path in sorted(
                 evidence_scores,
                 key=lambda candidate: (
-                    -evidence_scores[candidate], len(candidate), candidate,
+                    -evidence_scores[candidate],
+                    len(candidate),
+                    candidate,
                 ),
             ):
                 if not any(
@@ -703,10 +728,6 @@ class _AnchorAlignment:
                 ):
                     selected_paths.append(path)
 
-            # Assemble evidence before schema defaults. This matters for union
-            # paths such as ``x`` (scalar) versus ``x.value`` (object): a
-            # missing branch must never overwrite the branch actually seen on
-            # this anchor.
             for local_path in selected_paths:
                 field = field_specs[local_path]
                 values = sorted(occurrences[local_path])
@@ -721,19 +742,12 @@ class _AnchorAlignment:
                         ),
                     )
                 else:
-                    # A scalar schema field cannot become a list merely
-                    # because several noisy candidates landed on one anchor.
-                    # Prefer the highest-confidence occurrence, breaking ties
-                    # by text order for deterministic output.
                     best = min(values, key=lambda value: (value[1], value[0]))
                     _set_path(obj, local_path, best[2])
 
-            # Preserve predictable schema defaults only on branches that do
-            # not conflict with observed evidence. Process shallow defaults
-            # first so an object-shaped descendant wins over an ambiguous
-            # missing scalar at the same prefix.
             for local_path, field in sorted(
-                field_specs.items(), key=lambda item: (len(item[0]), item[0]),
+                field_specs.items(),
+                key=lambda item: (len(item[0]), item[0]),
             ):
                 if local_path in selected_paths or any(
                     _paths_conflict(local_path, selected)
@@ -753,41 +767,57 @@ class _AnchorAlignment:
 
             node_objects[anchor] = obj
             node_value_entries[anchor] = {
-                path: [(value[0], value[2]) for value in sorted(values)]
+                path: [
+                    (value[0], value[2]) for value in sorted(values)
+                ]
                 for path, values in occurrences.items()
                 if path in selected_paths
             }
             node_positions[anchor] = self._earliest_position(node)
 
-        # Pick at most one compatible parent for every non-root node. Using the
-        # hierarchy path as a guard rejects self-edges, cycles, and cross-branch
-        # links even when their raw relation probability is high.
-        selected_parent = {}
-        selection_reason = {}
-        for child, child_path in assigned.items():
-            child_meta = by_path[child_path]
-            expected_parent_raw = child_meta.get("parent_path")
+        return _MaterializedNodes(
+            assigned=assigned,
+            objects=node_objects,
+            positions=node_positions,
+            value_entries=node_value_entries,
+            by_anchor=node_by_anchor,
+        )
+
+    def _select_parents(
+        self,
+        materialized: _MaterializedNodes,
+        by_path: dict[tuple[str, ...], dict],
+        scores: torch.Tensor | None,
+        *,
+        allow_text_fallback: bool,
+    ) -> tuple[dict[int, int], dict[int, str]]:
+        """Select one schema-compatible parent for every child node."""
+
+        selected_parent: dict[int, int] = {}
+        selection_reason: dict[int, str] = {}
+        for child, child_path in materialized.assigned.items():
+            expected_parent_raw = by_path[child_path].get("parent_path")
             if expected_parent_raw is None:
                 continue
             expected_parent = tuple(expected_parent_raw)
             candidates = []
-            for parent, parent_path in assigned.items():
+            for parent, parent_path in materialized.assigned.items():
                 if parent == child or parent_path != expected_parent:
                     continue
                 score = self._score(scores, parent, child)
                 if score >= self.relation_threshold:
                     candidates.append((score, -parent, parent))
             if candidates:
-                selected_parent[child] = max(candidates)[2]
-                parent = selected_parent[child]
+                parent = max(candidates)[2]
+                selected_parent[child] = parent
                 parent_source = int(
-                    node_by_anchor[parent].get(
-                        "source_anchor_index", parent,
+                    materialized.by_anchor[parent].get(
+                        "source_anchor_index", parent
                     )
                 )
                 child_source = int(
-                    node_by_anchor[child].get(
-                        "source_anchor_index", child,
+                    materialized.by_anchor[child].get(
+                        "source_anchor_index", child
                     )
                 )
                 selection_reason[child] = (
@@ -797,16 +827,11 @@ class _AnchorAlignment:
                 )
                 continue
 
-            # A collapsed subtree is strong evidence that this example uses
-            # parent-before-child textual order even when the learned edge for
-            # a separately anchored sibling is under-confident.  Use only the
-            # nearest compatible preceding parent; ordinary disconnected
-            # predictions retain the strict relation threshold above.
-            if recovered_mixed_anchors:
-                child_position = node_positions[child][0]
+            if allow_text_fallback:
+                child_position = materialized.positions[child][0]
                 preceding = []
-                for parent, parent_path in assigned.items():
-                    parent_position = node_positions[parent][0]
+                for parent, parent_path in materialized.assigned.items():
+                    parent_position = materialized.positions[parent][0]
                     if (
                         parent != child
                         and parent_path == expected_parent
@@ -822,132 +847,173 @@ class _AnchorAlignment:
                 if preceding:
                     selected_parent[child] = max(preceding)[3]
                     selection_reason[child] = "text_order_fallback"
+        return selected_parent, selection_reason
 
-        # A collapsed prediction can also split complementary scalar fields
-        # for one object across two physical slots (for example, a milestone
-        # name on one slot and its due date on another). Once both fragments
-        # resolve to the same parent, merge only close, non-conflicting sibling
-        # fragments. Repeated fields still delimit separate JSON objects.
-        merged_anchors = set()
-        merged_into = {}
-        if recovered_mixed_anchors:
-            siblings = defaultdict(list)
-            for child, parent in selected_parent.items():
-                child_path = assigned[child]
-                if child_path:
-                    siblings[(parent, child_path)].append(child)
+    @staticmethod
+    def _merge_sibling_fragments(
+        materialized: _MaterializedNodes,
+        selected_parent: dict[int, int],
+        selection_reason: dict[int, str],
+        *,
+        enabled: bool,
+    ) -> tuple[set[int], dict[int, int]]:
+        """Merge close complementary fields representing the same child."""
 
-            for sibling_nodes in siblings.values():
-                sibling_nodes.sort(key=lambda anchor: node_positions[anchor])
-                representative = None
-                representative_paths = set()
-                representative_sources = set()
-                previous_position = None
-                for child in sibling_nodes:
-                    evidence_paths = set(node_value_entries.get(child, {}))
-                    source_anchor = int(
-                        node_by_anchor[child].get(
-                            "source_anchor_index", child,
-                        )
-                    )
-                    child_position = node_positions[child][0]
-                    conflicts = any(
-                        left == right or _paths_conflict(left, right)
-                        for left in representative_paths
-                        for right in evidence_paths
-                    )
-                    can_merge = (
-                        representative is not None
-                        and representative_paths
-                        and evidence_paths
-                        and not conflicts
-                        and source_anchor not in representative_sources
-                        and previous_position is not None
-                        and child_position - previous_position <= 12
-                    )
-                    if not can_merge:
-                        representative = child
-                        representative_paths = evidence_paths
-                        representative_sources = {source_anchor}
-                        previous_position = child_position
-                        continue
+        merged_anchors: set[int] = set()
+        merged_into: dict[int, int] = {}
+        if not enabled:
+            return merged_anchors, merged_into
 
-                    for local_path, values in node_value_entries[child].items():
-                        _set_path(
-                            node_objects[representative],
-                            local_path,
-                            deepcopy(_get_path(node_objects[child], local_path)),
-                        )
-                        node_value_entries[representative][local_path] = list(
-                            values
-                        )
-                    representative_paths.update(evidence_paths)
-                    representative_sources.add(source_anchor)
+        siblings = defaultdict(list)
+        for child, parent in selected_parent.items():
+            child_path = materialized.assigned[child]
+            if child_path:
+                siblings[(parent, child_path)].append(child)
+
+        for sibling_nodes in siblings.values():
+            sibling_nodes.sort(
+                key=lambda anchor: materialized.positions[anchor]
+            )
+            representative = None
+            representative_paths: set[tuple[str, ...]] = set()
+            representative_sources: set[int] = set()
+            previous_position = None
+            for child in sibling_nodes:
+                evidence_paths = set(
+                    materialized.value_entries.get(child, {})
+                )
+                source_anchor = int(
+                    materialized.by_anchor[child].get(
+                        "source_anchor_index", child
+                    )
+                )
+                child_position = materialized.positions[child][0]
+                conflicts = any(
+                    left == right or _paths_conflict(left, right)
+                    for left in representative_paths
+                    for right in evidence_paths
+                )
+                can_merge = (
+                    representative is not None
+                    and bool(representative_paths)
+                    and bool(evidence_paths)
+                    and not conflicts
+                    and source_anchor not in representative_sources
+                    and previous_position is not None
+                    and child_position - previous_position <= 12
+                )
+                if not can_merge:
+                    representative = child
+                    representative_paths = evidence_paths
+                    representative_sources = {source_anchor}
                     previous_position = child_position
-                    merged_into[child] = representative
-                    merged_anchors.add(child)
+                    continue
 
-            if merged_into:
-                for child, parent in list(selected_parent.items()):
-                    original_parent = parent
-                    while parent in merged_into:
-                        parent = merged_into[parent]
-                    selected_parent[child] = parent
-                    if parent != original_parent:
-                        selection_reason[child] = (
-                            f"{selection_reason.get(child, 'model_relation')}"
-                            "_after_fragment_merge"
-                        )
-                for merged_anchor in merged_anchors:
-                    selected_parent.pop(merged_anchor, None)
-                    selection_reason.pop(merged_anchor, None)
+                for local_path, values in materialized.value_entries[
+                    child
+                ].items():
+                    _set_path(
+                        materialized.objects[representative],
+                        local_path,
+                        deepcopy(
+                            _get_path(materialized.objects[child], local_path)
+                        ),
+                    )
+                    materialized.value_entries[representative][
+                        local_path
+                    ] = list(values)
+                representative_paths.update(evidence_paths)
+                representative_sources.add(source_anchor)
+                previous_position = child_position
+                merged_into[child] = representative
+                merged_anchors.add(child)
+
+        for child, parent in list(selected_parent.items()):
+            original_parent = parent
+            while parent in merged_into:
+                parent = merged_into[parent]
+            selected_parent[child] = parent
+            if parent != original_parent:
+                selection_reason[child] = (
+                    f"{selection_reason.get(child, 'model_relation')}"
+                    "_after_fragment_merge"
+                )
+        for merged_anchor in merged_anchors:
+            selected_parent.pop(merged_anchor, None)
+            selection_reason.pop(merged_anchor, None)
+        return merged_anchors, merged_into
+
+    @staticmethod
+    def _attach_children(
+        materialized: _MaterializedNodes,
+        selected_parent: dict[int, int],
+        by_path: dict[tuple[str, ...], dict],
+    ) -> None:
+        """Install selected child objects into their parent's array paths."""
 
         children_by_parent = defaultdict(list)
         for child, parent in selected_parent.items():
             children_by_parent[parent].append(child)
         for children in children_by_parent.values():
-            children.sort(key=lambda child: node_positions[child])
+            children.sort(key=lambda child: materialized.positions[child])
 
-        # Merge primitive and object members of mixed JSON arrays by their text
-        # position. Child dictionaries are mutable references, so deeper
-        # attachments remain visible after their parent has been installed.
         attachments = defaultdict(list)
         for parent, children in children_by_parent.items():
             for child in children:
-                child_meta = by_path[assigned[child]]
+                child_meta = by_path[materialized.assigned[child]]
                 attach_path = tuple(
-                    str(x) for x in child_meta.get("parent_field_path") or ()
+                    str(segment)
+                    for segment in child_meta.get("parent_field_path") or ()
                 )
                 attachments[(parent, attach_path)].append((
-                    node_positions[child][0],
-                    node_objects[child],
+                    materialized.positions[child][0],
+                    materialized.objects[child],
                 ))
         for (parent, attach_path), child_entries in attachments.items():
             values = list(
-                node_value_entries.get(parent, {}).get(attach_path, [])
+                materialized.value_entries.get(parent, {}).get(
+                    attach_path, []
+                )
             )
             values.extend(child_entries)
             values.sort(key=lambda entry: entry[0])
             container_rank = 1
-            for container in by_path[assigned[parent]].get("containers") or []:
+            for container in by_path[
+                materialized.assigned[parent]
+            ].get("containers") or []:
                 if (
                     isinstance(container, dict)
                     and tuple(
                         str(segment)
                         for segment in container.get("local_path") or ()
-                    ) == attach_path
+                    )
+                    == attach_path
                     and container.get("kind") == "array"
                 ):
                     container_rank = int(container.get("rank", 1))
                     break
             _set_path(
-                node_objects[parent],
+                materialized.objects[parent],
                 attach_path,
                 _shape_array(
                     [value for _, value in values],
                     container_rank,
                 ),
             )
+
+    def _collect_roots(
+        self,
+        payload: dict,
+        nodes: list[dict],
+        materialized: _MaterializedNodes,
+        selected_parent: dict[int, int],
+        merged_anchors: set[int],
+        by_path: dict[tuple[str, ...], dict],
+        hierarchy: list[dict],
+        *,
+        preserve_empty_records: bool,
+    ) -> list[dict]:
+        """Collect real roots and wrap disconnected descendants safely."""
 
         structural_anchors = {
             int(node["anchor_index"])
@@ -972,20 +1038,22 @@ class _AnchorAlignment:
         structural_anchors.update(selected_parent.values())
 
         root_anchors = [
-            anchor for anchor, path in assigned.items()
+            anchor
+            for anchor, path in materialized.assigned.items()
             if (
                 anchor in structural_anchors
                 and path == ()
                 and anchor not in selected_parent
             )
         ]
-        root_anchors.sort(key=lambda anchor: node_positions[anchor])
-        roots = [node_objects[anchor] for anchor in root_anchors]
+        root_anchors.sort(
+            key=lambda anchor: materialized.positions[anchor]
+        )
+        roots = [
+            materialized.objects[anchor] for anchor in root_anchors
+        ]
 
-        # Preserve disconnected child predictions by wrapping the missing
-        # ancestors according to the schema instead of returning a malformed
-        # object at the wrong level.
-        for anchor, path in assigned.items():
+        for anchor, path in materialized.assigned.items():
             if (
                 anchor not in structural_anchors
                 or anchor in merged_anchors
@@ -993,112 +1061,199 @@ class _AnchorAlignment:
                 or anchor in selected_parent
             ):
                 continue
-            wrapped = deepcopy(node_objects[anchor])
+            wrapped = deepcopy(materialized.objects[anchor])
             current_path = path
             while current_path:
                 metadata = by_path[current_path]
-                parent_path = tuple(metadata.get("parent_path") or ())
-                parent_obj = {}
+                parent_obj: dict = {}
                 attach_path = tuple(
-                    str(x) for x in metadata.get("parent_field_path") or ()
+                    str(segment)
+                    for segment in metadata.get("parent_field_path") or ()
                 )
                 _set_path(parent_obj, attach_path, [wrapped])
                 wrapped = parent_obj
-                current_path = parent_path
+                current_path = tuple(metadata.get("parent_path") or ())
             roots.append(wrapped)
-        roots = [
+        return [
             self._order_object_by_schema(root, (), hierarchy, by_path)
             for root in roots
         ]
-        if diagnostics is not None:
-            logical_nodes = []
-            for anchor, node in node_by_anchor.items():
-                source_anchor = int(
+
+    def _finalize_diagnostics(
+        self,
+        diagnostics: dict | None,
+        materialized: _MaterializedNodes,
+        selected_parent: dict[int, int],
+        selection_reason: dict[int, str],
+        merged_anchors: set[int],
+        merged_into: dict[int, int],
+        scores: torch.Tensor | None,
+        physical_scores: torch.Tensor | None,
+    ) -> None:
+        if diagnostics is None:
+            return
+        diagnostics["logical_nodes"] = [
+            {
+                "logical_anchor_id": anchor,
+                "source_anchor_id": int(
                     node.get("source_anchor_index", anchor)
-                )
-                logical_nodes.append({
-                    "logical_anchor_id": anchor,
-                    "source_anchor_id": source_anchor,
-                    "schema_path": list(assigned[anchor]),
-                    "state": (
-                        "merged"
-                        if anchor in merged_anchors
-                        else "active"
-                    ),
-                    "merged_into_logical_anchor_id": merged_into.get(anchor),
-                    "fields": [
-                        self._diagnostic_field(field)
-                        for field in node.get("fields") or []
-                    ],
-                })
-            diagnostics["logical_nodes"] = logical_nodes
+                ),
+                "schema_path": list(materialized.assigned[anchor]),
+                "state": (
+                    "merged" if anchor in merged_anchors else "active"
+                ),
+                "merged_into_logical_anchor_id": merged_into.get(anchor),
+                "fields": [
+                    self._diagnostic_field(field)
+                    for field in node.get("fields") or []
+                ],
+            }
+            for anchor, node in materialized.by_anchor.items()
+        ]
 
-            connections = []
-            for child, parent in selected_parent.items():
-                parent_source = int(
-                    node_by_anchor[parent].get(
-                        "source_anchor_index", parent,
-                    )
+        connections = []
+        for child, parent in selected_parent.items():
+            parent_source = int(
+                materialized.by_anchor[parent].get(
+                    "source_anchor_index", parent
                 )
-                child_source = int(
-                    node_by_anchor[child].get(
-                        "source_anchor_index", child,
-                    )
+            )
+            child_source = int(
+                materialized.by_anchor[child].get(
+                    "source_anchor_index", child
                 )
-                raw_score = (
-                    None
-                    if parent_source == child_source
-                    else round(
-                        self._score(
-                            physical_scores,
-                            parent_source,
-                            child_source,
-                        ),
-                        6,
-                    )
+            )
+            raw_score = (
+                None
+                if parent_source == child_source
+                else round(
+                    self._score(
+                        physical_scores,
+                        parent_source,
+                        child_source,
+                    ),
+                    6,
                 )
-                connections.append({
-                    "parent_logical_anchor_id": parent,
-                    "child_logical_anchor_id": child,
-                    "parent_anchor_id": parent_source,
-                    "child_anchor_id": child_source,
-                    "parent_path": list(assigned[parent]),
-                    "child_path": list(assigned[child]),
-                    "selection_reason": selection_reason.get(
-                        child, "model_relation",
-                    ),
-                    "raw_score": raw_score,
-                    "effective_score": round(
-                        self._score(scores, parent, child), 6,
-                    ),
-                })
-            diagnostics["connections"] = connections
-            diagnostics["merges"] = [
-                {
-                    "merged_logical_anchor_id": merged_anchor,
-                    "target_logical_anchor_id": target_anchor,
-                    "merged_source_anchor_id": int(
-                        node_by_anchor[merged_anchor].get(
-                            "source_anchor_index", merged_anchor,
-                        )
-                    ),
-                    "target_source_anchor_id": int(
-                        node_by_anchor[target_anchor].get(
-                            "source_anchor_index", target_anchor,
-                        )
-                    ),
-                }
-                for merged_anchor, target_anchor in merged_into.items()
-            ]
+            )
+            connections.append({
+                "parent_logical_anchor_id": parent,
+                "child_logical_anchor_id": child,
+                "parent_anchor_id": parent_source,
+                "child_anchor_id": child_source,
+                "parent_path": list(materialized.assigned[parent]),
+                "child_path": list(materialized.assigned[child]),
+                "selection_reason": selection_reason.get(
+                    child, "model_relation"
+                ),
+                "raw_score": raw_score,
+                "effective_score": round(
+                    self._score(scores, parent, child), 6
+                ),
+            })
+        diagnostics["connections"] = connections
+        diagnostics["merges"] = [
+            {
+                "merged_logical_anchor_id": merged_anchor,
+                "target_logical_anchor_id": target_anchor,
+                "merged_source_anchor_id": int(
+                    materialized.by_anchor[merged_anchor].get(
+                        "source_anchor_index", merged_anchor
+                    )
+                ),
+                "target_source_anchor_id": int(
+                    materialized.by_anchor[target_anchor].get(
+                        "source_anchor_index", target_anchor
+                    )
+                ),
+            }
+            for merged_anchor, target_anchor in merged_into.items()
+        ]
+
+    def _align_and_format(
+        self,
+        payload,
+        start_map,
+        end_map,
+        text,
+        *,
+        diagnostics=None,
+    ):
+        mapping = payload.get("mapping")
+        hierarchy, by_path, field_meta = self._hierarchy(mapping)
+
+        scores = payload.get("relation_scores")
+        if scores is not None and not torch.is_tensor(scores):
+            scores = torch.as_tensor(scores)
+        physical_scores = scores
+        raw_nodes = list(payload.get("nodes") or [])
+        self._initialize_diagnostics(
+            raw_nodes,
+            physical_scores,
+            diagnostics,
+        )
+
+        if not by_path:
+            return []
+
+        nodes, preserve_empty_records = self._filter_active_nodes(
+            payload,
+            raw_nodes,
+            scores,
+            by_path,
+        )
+        if not nodes:
+            return []
+
+        nodes, scores, recovered_mixed_anchors = self._expand_mixed_path_nodes(
+            nodes, scores, by_path, field_meta,
+        )
+        if not nodes:
+            return []
+
+        materialized = self._materialize_nodes(
+            nodes,
+            scores,
+            by_path,
+            field_meta,
+            start_map,
+            end_map,
+            text,
+        )
+        selected_parent, selection_reason = self._select_parents(
+            materialized,
+            by_path,
+            scores,
+            allow_text_fallback=recovered_mixed_anchors,
+        )
+        merged_anchors, merged_into = self._merge_sibling_fragments(
+            materialized,
+            selected_parent,
+            selection_reason,
+            enabled=recovered_mixed_anchors,
+        )
+
+        self._attach_children(materialized, selected_parent, by_path)
+        roots = self._collect_roots(
+            payload,
+            nodes,
+            materialized,
+            selected_parent,
+            merged_anchors,
+            by_path,
+            hierarchy,
+            preserve_empty_records=preserve_empty_records,
+        )
+        self._finalize_diagnostics(
+            diagnostics,
+            materialized,
+            selected_parent,
+            selection_reason,
+            merged_anchors,
+            merged_into,
+            scores,
+            physical_scores,
+        )
         return roots
-
-
-class StructuringAnchorEntry(TypedDict):
-    """Field evidence associated with one physical prediction anchor."""
-
-    anchor_index: int
-    fields: list[dict]
-    presence_is_reliable: bool
 
 
 @dataclass(frozen=True)
@@ -1108,7 +1263,7 @@ class ReconstructedStructuringGroup:
     instances: list[dict]
     output_mode: str | None = None
     multi_level: bool = False
-    diagnostics: dict | None = None
+    diagnostics: StructuringDiagnostics | dict | None = None
 
 
 _DECODER_MODE_ALIASES = {
@@ -1125,36 +1280,17 @@ def _component_type(
     spec: object,
     default: str,
 ) -> tuple[str, dict[str, Any]]:
-    if spec is None:
-        return default, {}
-    if isinstance(spec, bool):
-        return ("multi_level" if spec else "flat"), {}
-    if isinstance(spec, str):
-        name, params = spec, {}
-    elif isinstance(spec, Mapping):
-        raw = dict(spec)
-        name = raw.pop("type", raw.pop("name", default))
-        configured = raw.pop("params", {})
-        if not isinstance(configured, Mapping):
-            raise TypeError(
-                "structuring decoder component params must be a mapping"
-            )
-        params = {**configured, **raw}
-    elif all(
-        hasattr(spec, attribute)
-        for attribute in (
+    return parse_component_spec(
+        spec,
+        default,
+        component_name="structuring decoder component",
+        aliases=_DECODER_MODE_ALIASES,
+        instance_attributes=(
             "finalize_group",
             "reconstruct_group",
-        )
-    ):
-        return "__instance__", {"instance": spec}
-    else:
-        raise TypeError(
-            "structuring decoder component must be a string, mapping, bool, "
-            "or processing component"
-        )
-    normalized = str(name).lower().replace("-", "_")
-    return _DECODER_MODE_ALIASES.get(normalized, normalized), params
+        ),
+        allow_bool=True,
+    )
 
 
 def align_structuring_anchors(
@@ -1186,7 +1322,6 @@ class StructuringDecoderComponent:
         *,
         relation_threshold: float = 0.5,
         anchor_relations_threshold: float | None = None,
-        **_: Any,
     ):
         if mode not in {"flat", "multi_level"}:
             raise ValueError(f"Unknown structuring decoder mode {mode!r}")

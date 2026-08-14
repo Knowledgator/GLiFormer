@@ -47,7 +47,11 @@ from .processing.collator import (
     GLiNExTVisionDataCollator,
     resolve_glinext_collator_class,
 )
-from .processing.schema import GLiNExTSchema
+from .processing.schema import (
+    GLiNExTSchema,
+    build_structuring_output_formatter,
+    normalize_structuring_schemas,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +277,13 @@ class BaseGLiNExT(BaseGLiNER):
         # Per-task parent token indices
         if self.config.ner_config is not None:
             self.config.ner_config.parent_token_index = _idx(self.config.ner_parent_token)
+        elif self.config.joint_relex_config is not None:
+            # A self-contained Joint Relex head owns the extraction NER path
+            # and therefore uses the same schema marker that standalone NER
+            # would otherwise contribute.
+            self.config.joint_relex_config.parent_token_index = _idx(
+                self.config.ner_parent_token
+            )
         if self.config.classification_config is not None:
             self.config.classification_config.parent_token_index = _idx(self.config.cat_parent_token)
         if self.config.open_relex_config is not None:
@@ -594,9 +605,7 @@ class BaseGLiNExT(BaseGLiNER):
             Union[List[str], Dict[str, List[str]]]
         ] = None,
         joint_relations: Optional[Dict[str, dict]] = None,
-        structures: Optional[
-            Union[Dict[str, Union[List[str], dict]], List[dict]]
-        ] = None,
+        structures: Optional[Any] = None,
         flat_ner: bool = True,
         threshold: float = 0.5,
         multi_label: bool = False,
@@ -606,9 +615,7 @@ class BaseGLiNExT(BaseGLiNER):
         objectness_threshold: Optional[float] = None,
         preserve_empty_records: bool = False,
         return_anchor_diagnostics: bool = False,
-        set_structures: Optional[
-            Union[Dict[str, Union[List[str], dict]], List[dict]]
-        ] = None,
+        set_structures: Optional[Any] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -662,6 +669,10 @@ class BaseGLiNExT(BaseGLiNER):
                 }
         """
         self.eval()
+        if structures is not None:
+            structures = normalize_structuring_schemas(structures)
+        if set_structures is not None:
+            set_structures = normalize_structuring_schemas(set_structures)
         self._validate_requested_inference_heads(
             entities=entities,
             classes=classes,
@@ -1026,6 +1037,10 @@ class BaseGLiNExT(BaseGLiNER):
 
             batch_size = self._infer_batch_size(batch, model_batch)
             batch_kwargs = self._batch_forward_kwargs(kwargs, offset, batch_size, total_items)
+            # Joint Relex must score the same greedily selected entity list
+            # that the NER decoder will expose to relation-index resolution.
+            batch_kwargs.setdefault("relation_flat_ner", flat_ner)
+            batch_kwargs.setdefault("relation_multi_label", multi_label)
 
             # Forward — kwargs (e.g. manual_structuring_count, multimodal tensors) flow through.
             model_output = self.model(**model_batch, threshold=threshold, **batch_kwargs)
@@ -1261,12 +1276,13 @@ class BaseGLiNExT(BaseGLiNER):
     def structure(
         self,
         texts: Union[str, List[str]],
-        structures: Union[Dict[str, Union[List[str], dict]], List[dict]],
+        structures: Any,
         threshold: float = 0.5,
         flat_ner: bool = True,
         objectness_threshold: Optional[float] = None,
         preserve_empty_records: bool = False,
         return_anchor_diagnostics: bool = False,
+        validate_output: bool = False,
         **kwargs,
     ) -> Union[
         dict,
@@ -1278,6 +1294,10 @@ class BaseGLiNExT(BaseGLiNER):
         ],
     ]:
         """Extract structured data from one text or a batch of texts.
+
+        Args:
+            validate_output: Validate direct Pydantic schemas after type
+                conversion and return their dumped dictionary/list form.
 
         Returns:
             A schema result dict for a single input, or one result per input.
@@ -1308,6 +1328,12 @@ class BaseGLiNExT(BaseGLiNER):
                 task_name,
                 [{} for _ in text_batch],
             )
+        formatter = build_structuring_output_formatter(
+            structures,
+            validate_output=validate_output,
+        )
+        if formatter is not None:
+            task_results = formatter.format_batch(task_results)
         structured_result = self._single_or_batch(task_results, single)
         if not return_anchor_diagnostics:
             return structured_result
@@ -1728,10 +1754,13 @@ class BaseGLiNExT(BaseGLiNER):
         train_dataset,
         eval_dataset=None,
         training_args=None,
+        resume_from_checkpoint: Optional[Union[str, Path, bool]] = None,
         freeze_components: Optional[List[str]] = None,
         train_head_only: bool = False,
         compile_model: bool = False,
         output_dir: Optional[Union[str, Path]] = None,
+        classification_parent_name_dropout: float = 0.0,
+        label_augmentation: Any = None,
         **training_kwargs,
     ):
         """Train the GLiNExT model.
@@ -1747,6 +1776,10 @@ class BaseGLiNExT(BaseGLiNER):
             training_args: ``TrainingArguments`` instance from
                 ``gliner.training.trainer``. Created from ``training_kwargs``
                 if not provided.
+            resume_from_checkpoint: Checkpoint path (or ``True`` for the
+                latest checkpoint in ``output_dir``) passed to the Hugging
+                Face trainer. This restores model, optimizer, scheduler, RNG,
+                and trainer progress.
             freeze_components: Components to freeze during training. Options:
                 ``"text_encoder"``, ``"labels_encoder"``, ``"rnn"``, or any
                 task head name (``"ner"``, ``"classification"``, etc.).
@@ -1755,6 +1788,12 @@ class BaseGLiNExT(BaseGLiNER):
             compile_model: Whether to compile the model with ``torch.compile``.
             output_dir: Output directory for checkpoints (required if
                 ``training_args`` is None).
+            classification_parent_name_dropout: Probability of omitting the
+                parent name from a singleton classification group each time a
+                training record is read. Validation records are not changed.
+            label_augmentation: Training-only, same-batch label augmentation
+                configuration. It may shuffle, drop, or add labels independently
+                for each supported task. Validation and inference are unchanged.
             **training_kwargs: Passed to ``create_training_args()`` when
                 ``training_args`` is not provided.
 
@@ -1782,12 +1821,35 @@ class BaseGLiNExT(BaseGLiNER):
                 others_lr=1e-4,
             )
         """
-        from .training import GLiNExTTrainer
+        from .training import (
+            ClassificationParentNameDropoutDataset,
+            GLiNExTTrainer,
+            TrainingLabelAugmentationDataset,
+        )
+        from .processing.label_augmentation import (
+            LabelAugmentationConfig,
+            SUPPORTED_LABEL_AUGMENTATION_TASKS,
+        )
 
         if training_args is None:
             if output_dir is None:
                 raise ValueError("Either training_args or output_dir must be provided")
             training_args = self.create_training_args(output_dir=output_dir, **training_kwargs)
+
+        augmentation_seed = getattr(training_args, "data_seed", None)
+        if augmentation_seed is None:
+            augmentation_seed = getattr(training_args, "seed", None)
+        label_augmentation = LabelAugmentationConfig.from_value(
+            label_augmentation,
+            default_seed=augmentation_seed,
+        )
+        augmentation_is_active = getattr(
+            label_augmentation,
+            "is_active",
+            label_augmentation.enabled,
+        )
+        if callable(augmentation_is_active):
+            augmentation_is_active = augmentation_is_active()
 
         if compile_model:
             self.compile()
@@ -1804,7 +1866,52 @@ class BaseGLiNExT(BaseGLiNER):
             for component_name in freeze_components:
                 self.freeze_component(component_name)
 
-        data_collator = self._create_data_collator()
+        if classification_parent_name_dropout:
+            train_dataset = ClassificationParentNameDropoutDataset(
+                train_dataset,
+                classification_parent_name_dropout,
+            )
+            logger.info(
+                "Classification singleton parent-name dropout enabled: %.3f",
+                float(classification_parent_name_dropout),
+            )
+
+        if augmentation_is_active:
+            train_dataset = TrainingLabelAugmentationDataset(train_dataset)
+            logger.info("Training-only same-batch label augmentation enabled")
+
+            additions_enabled = any(
+                label_augmentation.policy_for(task_name).enabled
+                and label_augmentation.policy_for(task_name).add_probability
+                > 0.0
+                and getattr(
+                    label_augmentation.policy_for(task_name),
+                    "max_added_labels",
+                    1,
+                ) > 0
+                for task_name in SUPPORTED_LABEL_AUGMENTATION_TASKS
+            )
+            microbatch_size = getattr(
+                training_args,
+                "per_device_train_batch_size",
+                None,
+            )
+            if (
+                additions_enabled
+                and microbatch_size is not None
+                and int(microbatch_size) < 2
+            ):
+                logger.warning(
+                    "Same-batch label additions are enabled with per-device "
+                    "train batch size %s. Cross-example donor pools will be "
+                    "empty; gradient accumulation and other DDP ranks do not "
+                    "enlarge the local collator batch.",
+                    microbatch_size,
+                )
+
+        data_collator = self._create_data_collator(
+            label_augmentation=label_augmentation,
+        )
 
         # Build trainer kwargs from the installed Trainer API. Development
         # builds such as ``5.0.0.dev0`` compare lower than the final 5.0.0
@@ -1825,7 +1932,7 @@ class BaseGLiNExT(BaseGLiNER):
             trainer_kwargs["tokenizer"] = self.data_processor.transformer_tokenizer
 
         trainer = GLiNExTTrainer(**trainer_kwargs)
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
         return trainer
 

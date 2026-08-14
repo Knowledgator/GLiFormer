@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from ..processing.label_augmentation import AugmentableLabelGroup
 from ..processing.mappings import (
     BaseClassMapping,
     BatchClassesMapping,
@@ -93,10 +94,14 @@ class MediaTaskProcessor(TaskProcessor):
         return unique_labels(instance.get("label") for instance in cls._instances(item))
 
     def _fallback_label_group(self, item: dict[str, Any]) -> dict[str, Any]:
-        return {
+        group = {
             "name": item.get("name", self.task_name),
             "all_labels": self.labels_from_item(item),
         }
+        true_labels = self.true_labels_from_item(item)
+        if true_labels:
+            group["true_labels"] = true_labels
+        return group
 
     def _label_groups_for_item(self, item: dict[str, Any]) -> list[dict[str, Any]]:
         groups = self._task_label_groups(item)
@@ -111,6 +116,33 @@ class MediaTaskProcessor(TaskProcessor):
         labels = group.get("all_labels") or group.get("labels") or group.get("classes")
         return unique_labels(labels or [])
 
+    def _mapping_group_entries(
+        self,
+        item: dict[str, Any],
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Return source-indexed groups that actually produce mappings.
+
+        Explicit media payloads may contain empty schema groups.  Mapping
+        creation skips those groups, so all later mapping-indexed operations
+        must use the same compacted view before looking up source annotations.
+        """
+
+        return [
+            (source_idx, group)
+            for source_idx, group in enumerate(self._mapping_groups(item))
+            if self._mapping_labels(group)
+        ]
+
+    def _mapping_group_entry(
+        self,
+        item: dict[str, Any],
+        group_idx: int,
+    ) -> tuple[int, dict[str, Any]]:
+        entries = self._mapping_group_entries(item)
+        if group_idx < len(entries):
+            return entries[group_idx]
+        return group_idx, {}
+
     def get_classes_mapping(self, batch_list, **kwargs):
         mappings = []
         for item in batch_list:
@@ -119,10 +151,8 @@ class MediaTaskProcessor(TaskProcessor):
                 continue
 
             item_mappings = []
-            for group in self._mapping_groups(item):
+            for _, group in self._mapping_group_entries(item):
                 labels = self._mapping_labels(group)
-                if not labels:
-                    continue
                 name = group.get("name", item.get("name", self.task_name))
                 item_mappings.append(
                     VisionItemMapping(
@@ -136,6 +166,48 @@ class MediaTaskProcessor(TaskProcessor):
 
             mappings.append(VisionClassMapping(items=item_mappings))
         return mappings
+
+    def get_augmentable_label_groups(self, batch_list, classes_mapping):
+        groups = []
+        mapping_list = getattr(
+            classes_mapping,
+            f"{self.task_name}_mapping",
+        )
+        classification_tasks = {
+            "image_classification",
+            "audio_classification",
+        }
+        for batch_idx, item_mapping in enumerate(mapping_list):
+            item = batch_list[batch_idx]
+            source_groups = self._mapping_group_entries(item)
+            for group_idx, mapping_item in enumerate(item_mapping.items):
+                mapping = mapping_item.class_to_id
+                if not mapping.class_to_id:
+                    continue
+                if group_idx < len(source_groups):
+                    source_idx, source_group = source_groups[group_idx]
+                else:
+                    source_idx, source_group = group_idx, {}
+
+                if self.task_name in classification_tasks:
+                    positives = self.true_labels_from_item(source_group)
+                elif hasattr(self, "_group_for_mapping"):
+                    positives = self.true_labels_from_item(
+                        self._group_for_mapping(item, source_idx)
+                    )
+                else:
+                    positives = self.true_labels_from_item(source_group)
+                positives = unique_labels(positives)
+
+                groups.append(AugmentableLabelGroup(
+                    task=self.task_name,
+                    batch_idx=batch_idx,
+                    group_idx=group_idx,
+                    mapping=mapping,
+                    positive_labels=positives,
+                    parent_name=mapping.name,
+                ))
+        return groups
 
     def contribute_prompt(
         self,
@@ -194,8 +266,12 @@ class MediaTaskProcessor(TaskProcessor):
         labels = torch.zeros(total, max_classes, dtype=torch.float)
         for flat_idx, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
             label_to_id = mapping.class_to_id.class_to_id
+            _, source_group = self._mapping_group_entry(
+                batch_list[batch_idx],
+                group_idx,
+            )
             positives = unique_labels(
-                self._classification_true_labels(batch_list[batch_idx], group_idx)
+                self.true_labels_from_item(source_group)
             )
             for label in positives:
                 if label in label_to_id:

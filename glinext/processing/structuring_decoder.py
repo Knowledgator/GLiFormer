@@ -4,6 +4,7 @@ Uses SpanDecoder for BIO span extraction and greedy overlap removal.
 Supports both token-level BIO decoding and span-level decoding (represent_spans).
 """
 
+from dataclasses import dataclass
 
 import torch
 
@@ -19,7 +20,25 @@ from ._structuring_alignment import (
     resolve_structuring_decoder,
 )
 from .decoder import unflatten_by_batch_origin
+from .structuring_compat import legacy_task_mapping
 from .structuring_processor import MULTI_LEVEL_ROOT_KEY
+from .structuring_types import is_structuring_descriptor
+
+
+@dataclass(frozen=True)
+class StructuringDecodeContext:
+    """Validated batch/mask state shared by both structuring decoders."""
+
+    threshold: float
+    objectness_threshold: float
+    raw_anchor_mask: torch.Tensor | None
+    anchor_mask: torch.Tensor | None
+    reliable_presence_mask: torch.Tensor | None
+    relation_scores: torch.Tensor | None
+    batch_origin: torch.Tensor
+    batch_size: int
+    id_to_fields: list[dict[int, str]]
+    multi_level_contexts: list[dict]
 
 
 class StructuringDecoder(SpanDecoder):
@@ -62,7 +81,11 @@ class StructuringDecoder(SpanDecoder):
             bool(mode.is_multi_level)
             if mode is not None else legacy_multi_level
         )
-        decoder_spec = getattr(mode, "decoder", None) if mode is not None else None
+        decoder_spec = (
+            mode.decoder_spec()
+            if mode is not None and hasattr(mode, "decoder_spec")
+            else getattr(mode, "decoder", None) if mode is not None else None
+        )
         self.anchor_relations_threshold = float(
             getattr(struct_cfg, "anchor_relations_threshold", 0.5)
             if struct_cfg is not None else 0.5
@@ -185,6 +208,106 @@ class StructuringDecoder(SpanDecoder):
             rescued[batch_idx] = active
         return rescued
 
+    def _prepare_decode_context(
+        self,
+        model_output,
+        classes_mapping,
+        *,
+        batch_groups: int,
+        anchor_count: int,
+        device: torch.device,
+        threshold: float | None,
+        objectness_threshold: float | None,
+    ) -> StructuringDecodeContext:
+        """Resolve thresholds and validate common anchor/batch tensors."""
+
+        if objectness_threshold is None and threshold is not None:
+            objectness_threshold = threshold
+        if objectness_threshold is None:
+            objectness_threshold = self.objectness_threshold
+        threshold = self.threshold if threshold is None else threshold
+        if objectness_threshold is None:
+            objectness_threshold = threshold
+
+        id_to_fields = self._build_field_class_maps(
+            classes_mapping,
+            batch_groups,
+        )
+        multi_level_contexts = self._build_multi_level_contexts(
+            classes_mapping,
+            batch_groups,
+        )
+        relation_scores = getattr(
+            model_output,
+            self.relation_scores_attr,
+            None,
+        )
+        if relation_scores is not None and (
+            relation_scores.dim() != 3
+            or relation_scores.shape
+            != (batch_groups, anchor_count, anchor_count)
+        ):
+            raise ValueError(
+                f"{self.relation_scores_attr} must have shape (BN, A, A), "
+                f"got {tuple(relation_scores.shape)}"
+            )
+
+        objectness_logits = getattr(
+            model_output,
+            self.objectness_logits_attr,
+            None,
+        )
+        raw_anchor_mask = getattr(
+            model_output,
+            self.anchor_mask_attr,
+            None,
+        )
+        anchor_mask = self._resolve_anchor_mask(
+            raw_anchor_mask,
+            objectness_logits,
+            float(objectness_threshold),
+            relation_scores=relation_scores,
+            expected_shape=(batch_groups, anchor_count),
+        )
+        anchor_mask = self._rescue_nested_relation_anchors(
+            anchor_mask,
+            raw_anchor_mask,
+            relation_scores,
+            multi_level_contexts,
+        )
+        reliable_presence_mask = None
+        if objectness_logits is not None:
+            reliable_presence_mask = (
+                torch.sigmoid(objectness_logits) > objectness_threshold
+            )
+            if raw_anchor_mask is not None:
+                reliable_presence_mask &= raw_anchor_mask.bool()
+
+        batch_origin = getattr(model_output, self.batch_origin_attr, None)
+        if batch_origin is None:
+            batch_origin = torch.arange(batch_groups, device=device)
+        elif batch_origin.shape != (batch_groups,):
+            raise ValueError(
+                f"{self.batch_origin_attr} must have shape (BN,), got "
+                f"{tuple(batch_origin.shape)}"
+            )
+        batch_size = getattr(model_output, "batch_size", None)
+        if batch_size is None:
+            batch_size = int(batch_origin.max().item()) + 1
+
+        return StructuringDecodeContext(
+            threshold=float(threshold),
+            objectness_threshold=float(objectness_threshold),
+            raw_anchor_mask=raw_anchor_mask,
+            anchor_mask=anchor_mask,
+            reliable_presence_mask=reliable_presence_mask,
+            relation_scores=relation_scores,
+            batch_origin=batch_origin,
+            batch_size=int(batch_size),
+            id_to_fields=id_to_fields,
+            multi_level_contexts=multi_level_contexts,
+        )
+
     def decode(
         self,
         model_output,
@@ -218,75 +341,29 @@ class StructuringDecoder(SpanDecoder):
         if token_logits is None and span_logits is None:
             return []
 
-        # A call-time objectness threshold is most specific. Otherwise reuse
-        # the call's main threshold; the configured value is retained only as
-        # a fallback for direct decoder calls that omit both.
-        if objectness_threshold is None and threshold is not None:
-            objectness_threshold = threshold
-        if objectness_threshold is None:
-            objectness_threshold = self.objectness_threshold
-        threshold = self.threshold if threshold is None else threshold
-        if objectness_threshold is None:
-            objectness_threshold = threshold
         # Determine batch size from whichever output is available
         if token_logits is not None:
             B = token_logits.shape[0]
         else:
             B = span_logits.shape[0]
 
-        id_to_fields = self._build_field_class_maps(classes_mapping, B)
-        multi_level_contexts = self._build_multi_level_contexts(
-            classes_mapping, B,
-        )
-        relation_scores = getattr(
-            model_output, self.relation_scores_attr, None,
-        )
         expected_anchor_count = (
             span_logits.shape[1]
             if span_logits is not None and span_idx is not None and span_mask is not None
             else token_logits.shape[1]
         )
-        if relation_scores is not None and (
-            relation_scores.dim() != 3
-            or relation_scores.shape != (
-                B,
-                expected_anchor_count,
-                expected_anchor_count,
-            )
-        ):
-            raise ValueError(
-                f"{self.relation_scores_attr} must have shape (BN, A, A), "
-                f"got {tuple(relation_scores.shape)}"
-            )
-        objectness_logits = getattr(
-            model_output, self.objectness_logits_attr, None,
+        context = self._prepare_decode_context(
+            model_output,
+            classes_mapping,
+            batch_groups=B,
+            anchor_count=expected_anchor_count,
+            device=(
+                token_logits.device
+                if token_logits is not None else span_logits.device
+            ),
+            threshold=threshold,
+            objectness_threshold=objectness_threshold,
         )
-        raw_anchor_mask = getattr(
-            model_output, self.anchor_mask_attr, None,
-        )
-        anchor_mask = self._resolve_anchor_mask(
-            raw_anchor_mask,
-            objectness_logits,
-            objectness_threshold,
-            relation_scores=relation_scores,
-            expected_shape=(B, expected_anchor_count),
-        )
-        anchor_mask = self._rescue_nested_relation_anchors(
-            anchor_mask,
-            raw_anchor_mask,
-            relation_scores,
-            multi_level_contexts,
-        )
-        reliable_presence_mask = None
-        if objectness_logits is not None:
-            reliable_presence_mask = (
-                torch.sigmoid(objectness_logits) > objectness_threshold
-            )
-            if raw_anchor_mask is not None:
-                reliable_presence_mask &= raw_anchor_mask.bool()
-
-        batch_origin = getattr(model_output, self.batch_origin_attr, None)
-        batch_size = model_output.batch_size
 
         # Prefer span-level decoding when available
         if span_logits is not None and span_idx is not None and span_mask is not None:
@@ -294,34 +371,34 @@ class StructuringDecoder(SpanDecoder):
                 span_logits,
                 span_idx,
                 span_mask,
-                anchor_mask,
-                id_to_fields,
-                threshold,
+                context.anchor_mask,
+                context.id_to_fields,
+                context.threshold,
                 flat_ner,
                 multi_label,
                 texts,
-                batch_origin=batch_origin,
-                batch_size=batch_size,
-                multi_level_contexts=multi_level_contexts,
-                relation_scores=relation_scores,
-                reliable_presence_mask=reliable_presence_mask,
+                batch_origin=context.batch_origin,
+                batch_size=context.batch_size,
+                multi_level_contexts=context.multi_level_contexts,
+                relation_scores=context.relation_scores,
+                reliable_presence_mask=context.reliable_presence_mask,
                 preserve_empty_records=preserve_empty_records,
             )
 
         # Fall back to token-level BIO decoding
         return self._decode_token_level(
             token_logits,
-            anchor_mask,
-            id_to_fields,
-            threshold,
+            context.anchor_mask,
+            context.id_to_fields,
+            context.threshold,
             flat_ner,
             multi_label,
             texts,
-            batch_origin=batch_origin,
-            batch_size=batch_size,
-            multi_level_contexts=multi_level_contexts,
-            relation_scores=relation_scores,
-            reliable_presence_mask=reliable_presence_mask,
+            batch_origin=context.batch_origin,
+            batch_size=context.batch_size,
+            multi_level_contexts=context.multi_level_contexts,
+            relation_scores=context.relation_scores,
+            reliable_presence_mask=context.reliable_presence_mask,
             preserve_empty_records=preserve_empty_records,
         )
 
@@ -464,23 +541,14 @@ class StructuringDecoder(SpanDecoder):
 
     @classmethod
     def _task_structuring_mappings(cls, classes_mapping):
-        if classes_mapping is None:
-            return None
-        if hasattr(classes_mapping, cls.mapping_attr):
-            # An explicitly present independent mapping is authoritative even
-            # when it is empty. ``None`` is the dataclass sentinel for mapping
-            # objects created before the independent set channel existed.
-            task_mappings = getattr(classes_mapping, cls.mapping_attr)
-            if task_mappings is not None:
-                return task_mappings
-        if (
-            cls.mapping_attr != "structuring_mapping"
-            and hasattr(classes_mapping, "structuring_mapping")
-        ):
-            # Compatibility for mapping objects serialized before set
-            # structuring gained its own task-specific channel.
-            return classes_mapping.structuring_mapping
-        return None
+        return legacy_task_mapping(
+            classes_mapping,
+            cls.mapping_attr,
+            fallback_attr=(
+                "structuring_mapping"
+                if cls.mapping_attr != "structuring_mapping" else None
+            ),
+        )
 
     def _build_field_class_maps(self, classes_mapping, batch_size: int) -> list[dict[int, str]]:
         """Build per-batch-item id->field_name mappings from BatchClassesMapping.
@@ -647,15 +715,6 @@ class StructuringDecoder(SpanDecoder):
                             )
                         ]
 
-                if (
-                    not reconstructed.multi_level
-                    and structuring_dedup
-                    and len(schema_instances) > 1
-                ):
-                    schema_instances = self._dedup_similar_instances(
-                        schema_instances, schema_field_list,
-                    )
-
                 result_dict[schema_name].extend(schema_instances)
                 if reconstructed.output_mode is not None:
                     multi_level_mode = reconstructed.output_mode
@@ -694,6 +753,8 @@ class StructuringDecoder(SpanDecoder):
                     ),
                 }
             anchor_diagnostics_output.extend(diagnostics)
+        if structuring_dedup:
+            output = [self._postprocess_structuring(item) for item in output]
         return output
 
     @classmethod
@@ -768,18 +829,7 @@ class StructuringDecoder(SpanDecoder):
 
         if not isinstance(spec, dict):
             return instance
-        descriptor_keys = {
-            "fields", "children", "required_fields", "description",
-        }
-        is_descriptor = set(spec).issubset(descriptor_keys) and (
-            isinstance(spec.get("fields"), list | dict)
-            or "required_fields" in spec
-            or (
-                "fields" in spec
-                and isinstance(spec.get("children"), dict)
-            )
-        )
-        if not is_descriptor:
+        if not is_structuring_descriptor(spec):
             return instance
 
         children = spec.get("children") or {}
@@ -855,68 +905,67 @@ class StructuringDecoder(SpanDecoder):
             return None
         return instance_dict
 
-    @staticmethod
-    def _value_dedup_key(value):
-        if value is None:
-            return None
-        raw = value if isinstance(value, list) else [value]
-        items = []
-        for v in raw:
-            if v is None:
+    @classmethod
+    def _postprocess_structuring(cls, value):
+        """Recursively remove dictionaries duplicated by a fuller peer."""
+
+        if isinstance(value, dict):
+            return {
+                key: cls._postprocess_structuring(item)
+                for key, item in value.items()
+            }
+        if not isinstance(value, list):
+            return value
+
+        items = [cls._postprocess_structuring(item) for item in value]
+        dict_indices = [
+            index for index, item in enumerate(items)
+            if isinstance(item, dict)
+        ]
+        ranked = sorted(
+            dict_indices,
+            key=lambda index: (
+                -cls._non_null_output_count(items[index]),
+                index,
+            ),
+        )
+        kept = []
+        for index in ranked:
+            candidate = items[index]
+            if any(
+                cls._contains_non_null_outputs(items[other], candidate)
+                for other in kept
+            ):
                 continue
-            if isinstance(v, dict):
-                if "text" in v:
-                    v = v["text"]
-                else:
-                    items.append((v.get("start"), v.get("end")))
-                    continue
-            if isinstance(v, str):
-                v = v.strip().lower()
-            items.append(v)
-        if not items:
-            return None
-        return frozenset(items)
+            kept.append(index)
+        kept = set(kept)
+        return [
+            item for index, item in enumerate(items)
+            if not isinstance(item, dict) or index in kept
+        ]
 
     @classmethod
-    def _dominates(
-        cls, richer: dict[str, object], poorer: dict[str, object],
-        schema_field_list: list[str],
-    ) -> bool:
-        keys = schema_field_list or list({*richer.keys(), *poorer.keys()})
-        for k in keys:
-            kp = cls._value_dedup_key(poorer.get(k))
-            if kp is None:
+    def _non_null_output_count(cls, value):
+        if value is None:
+            return 0
+        if isinstance(value, dict):
+            return sum(cls._non_null_output_count(item) for item in value.values())
+        return 1
+
+    @classmethod
+    def _contains_non_null_outputs(cls, reference: dict, candidate: dict):
+        for key, item in candidate.items():
+            if item is None:
                 continue
-            kr = cls._value_dedup_key(richer.get(k))
-            if kr is None:
-                return False
-            if not kp.issubset(kr):
+            reference_item = reference.get(key)
+            if isinstance(item, dict):
+                if not isinstance(reference_item, dict) or not cls._contains_non_null_outputs(
+                    reference_item, item,
+                ):
+                    return False
+            elif reference_item != item:
                 return False
         return True
-
-    @classmethod
-    def _dedup_similar_instances(
-        cls, instances: list[dict[str, object]], schema_field_list: list[str],
-    ) -> list[dict[str, object]]:
-        def richness(inst):
-            total = 0
-            for v in inst.values():
-                key = cls._value_dedup_key(v)
-                if key is None:
-                    continue
-                total += len(key) if isinstance(key, frozenset) else 1
-            return total
-
-        ordered = sorted(
-            enumerate(instances),
-            key=lambda iv: (-richness(iv[1]), iv[0]),
-        )
-        kept: list[dict[str, object]] = []
-        for _, inst in ordered:
-            if any(cls._dominates(k, inst, schema_field_list) for k in kept):
-                continue
-            kept.append(inst)
-        return kept
 
     @staticmethod
     def _map_field_to_value(field, start_map, end_map, text):

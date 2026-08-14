@@ -5,8 +5,9 @@ from typing import Dict, List, Optional
 
 import torch
 
+from ...processing.label_augmentation import AugmentableLabelGroup
+from ...processing.mappings import BaseClassMapping, BatchClassesMapping, CatClassMapping
 from .. import TaskProcessor
-from ...processing.mappings import BaseClassMapping, CatClassMapping, BatchClassesMapping
 
 
 class ClassificationProcessor(TaskProcessor):
@@ -49,6 +50,25 @@ class ClassificationProcessor(TaskProcessor):
                 ))
             cat_mapping.append(CatClassMapping(cat_class_to_id=class_mapping))
         return cat_mapping
+
+    def get_augmentable_label_groups(self, batch_list, classes_mapping):
+        groups = []
+        for batch_idx, item_mapping in enumerate(classes_mapping.cat_mapping):
+            examples = batch_list[batch_idx].get("classification", [])
+            for group_idx, mapping in enumerate(item_mapping.cat_class_to_id):
+                if not mapping.class_to_id:
+                    continue
+                example = examples[group_idx] if group_idx < len(examples) else {}
+                positives = list(dict.fromkeys(example.get("true_labels", [])))
+                groups.append(AugmentableLabelGroup(
+                    task="classification",
+                    batch_idx=batch_idx,
+                    group_idx=group_idx,
+                    mapping=mapping,
+                    positive_labels=positives,
+                    parent_name=mapping.name,
+                ))
+        return groups
 
     def contribute_prompt(self, classes_mapping, batch_idx, use_labels_encoder=False):
         cat_mapping = classes_mapping.cat_mapping[batch_idx]

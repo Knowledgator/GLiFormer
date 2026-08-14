@@ -69,10 +69,7 @@ class VisionProcessor(MediaTaskProcessor):
             if derived_groups:
                 return derived_groups
 
-        return [{
-            "name": item.get("name", self.task_name),
-            "all_labels": labels,
-        }]
+        return [self._fallback_label_group(item)]
 
     def create_labels(self, batch_list, classes_mapping, **kwargs):
         if self.task_name == "image_classification":
@@ -167,7 +164,14 @@ class VisionProcessor(MediaTaskProcessor):
         image_sizes = [item.get("_image_size") for item in batch_list]
         grouped_objects = []
         for _, batch_idx, group_idx, mapping in self._mapping_iter(classes_mapping):
-            group = self._group_for_mapping(batch_list[batch_idx], group_idx)
+            source_idx, _ = self._mapping_group_entry(
+                batch_list[batch_idx],
+                group_idx,
+            )
+            group = self._group_for_mapping(
+                batch_list[batch_idx],
+                source_idx,
+            )
             grouped_objects.append(self._prepare_detection_objects(
                 group.get("objects", []),
                 image_sizes[batch_idx],

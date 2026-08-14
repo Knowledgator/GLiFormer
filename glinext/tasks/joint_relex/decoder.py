@@ -53,7 +53,8 @@ class JointRelexDecoder(NERDecoder):
         if model_output.joint_rel_logits is None or model_output.joint_rel_idx is None:
             return []
 
-        threshold = threshold or self.threshold
+        if threshold is None:
+            threshold = self.threshold
 
         # 1. Decode NER entities first (returns B × groups × spans)
         ner_id_to_classes = self._get_ner_id_to_classes(classes_mapping)
@@ -72,7 +73,10 @@ class JointRelexDecoder(NERDecoder):
         # 2. Build relation class mappings
         rel_id_to_classes = self._get_rel_id_to_classes(classes_mapping)
         entity_index_maps = self._build_entity_index_maps(
-            flat_entities, getattr(model_output, "joint_rel_entity_spans", None),
+            flat_entities,
+            getattr(model_output, "joint_rel_entity_spans", None),
+            getattr(model_output, "joint_rel_entity_class_idx", None),
+            ner_id_to_classes,
         )
 
         # 3. Decode relation triples
@@ -85,6 +89,10 @@ class JointRelexDecoder(NERDecoder):
         for bn in range(BN):
             triples = []
             batch_entities = flat_entities[bn] if bn < len(flat_entities) else []
+            source_batch_idx = bn
+            batch_origin = getattr(model_output, "joint_rel_batch_origin", None)
+            if batch_origin is not None and bn < batch_origin.numel():
+                source_batch_idx = int(batch_origin[bn].item())
             rel_map = (
                 rel_id_to_classes[bn]
                 if isinstance(rel_id_to_classes, list) and bn < len(rel_id_to_classes)
@@ -111,10 +119,10 @@ class JointRelexDecoder(NERDecoder):
                             continue
 
                     head_span = self._resolve_entity(
-                        batch_entities, head_id, texts, bn,
+                        batch_entities, head_id, texts, source_batch_idx,
                     )
                     tail_span = self._resolve_entity(
-                        batch_entities, tail_id, texts, bn,
+                        batch_entities, tail_id, texts, source_batch_idx,
                     )
 
                     rel_name = rel_map.get(c, str(c))
@@ -140,7 +148,7 @@ class JointRelexDecoder(NERDecoder):
         batch_idx: int,
     ) -> dict:
         """Resolve an entity index to a span dict with text."""
-        if entity_id < len(entities):
+        if 0 <= entity_id < len(entities):
             entity = entities[entity_id]
             text = self.resolve_span_text(texts, batch_idx, entity.start, entity.end)
             return {
@@ -159,8 +167,14 @@ class JointRelexDecoder(NERDecoder):
             "entity_idx": entity_id,
         }
 
-    def _build_entity_index_maps(self, flat_entities: List[List[Span]], entity_spans) -> List[Optional[Dict[int, int]]]:
-        """Map model entity indices to decoded entity indices by span boundary."""
+    def _build_entity_index_maps(
+        self,
+        flat_entities: List[List[Span]],
+        entity_spans,
+        entity_class_idx=None,
+        ner_id_to_classes=None,
+    ) -> List[Optional[Dict[int, int]]]:
+        """Map model entity indices to decoded indices by boundary and type."""
         if entity_spans is None:
             return [None] * len(flat_entities)
 
@@ -169,15 +183,34 @@ class JointRelexDecoder(NERDecoder):
             if bn >= entity_spans.shape[0]:
                 maps.append(None)
                 continue
+            id_to_class = self._get_id_to_class(ner_id_to_classes or {}, bn)
+            typed_boundary_to_idx = {}
             boundary_to_idx = {}
             for decoded_idx, span in enumerate(entities):
                 boundary_to_idx.setdefault((span.start, span.end), decoded_idx)
+                typed_boundary_to_idx.setdefault(
+                    (span.start, span.end, span.entity_type), decoded_idx,
+                )
 
             model_to_decoded = {}
             for entity_idx in range(entity_spans.shape[1]):
                 start = int(entity_spans[bn, entity_idx, 0].item())
                 end = int(entity_spans[bn, entity_idx, 1].item())
-                decoded_idx = boundary_to_idx.get((start, end))
+                decoded_idx = None
+                if (
+                    entity_class_idx is not None
+                    and bn < entity_class_idx.shape[0]
+                    and entity_idx < entity_class_idx.shape[1]
+                ):
+                    class_idx = int(entity_class_idx[bn, entity_idx].item())
+                    entity_type = id_to_class.get(class_idx)
+                    if entity_type is not None:
+                        decoded_idx = typed_boundary_to_idx.get(
+                            (start, end, entity_type)
+                        )
+                else:
+                    # Compatibility for outputs produced by older checkpoints.
+                    decoded_idx = boundary_to_idx.get((start, end))
                 if decoded_idx is not None:
                     model_to_decoded[entity_idx] = decoded_idx
             maps.append(model_to_decoded)
@@ -185,6 +218,13 @@ class JointRelexDecoder(NERDecoder):
 
     def map_results(self, task_results: list, **kwargs):
         return OpenRelexDecoder.map_results(self, task_results, **kwargs)
+
+    @staticmethod
+    def _map_triple_chars(triple, start_map, end_map, text):
+        """Map token-indexed relation endpoints to character offsets."""
+        return OpenRelexDecoder._map_triple_chars(
+            triple, start_map, end_map, text,
+        )
 
     def _get_ner_id_to_classes(self, classes_mapping) -> Union[Dict[int, str], List[Dict[int, str]]]:
         """Extract NER id→class mappings from BatchClassesMapping.

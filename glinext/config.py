@@ -1,16 +1,27 @@
-import dataclasses
 import copy
+import dataclasses
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
-from transformers.models.auto import CONFIG_MAPPING
-
 from gliner.config import BaseGLiNERConfig
+from transformers.models.auto import CONFIG_MAPPING
 
 from . import backbones as _layout_backbones  # noqa: F401 - registers custom AutoConfig entries
 from .backbones import get_backbone, normalize_backbone_type
+
+
+_FIXED_WIDTH_ANCHOR_MODES = frozenset({
+    "fixed",
+    "fixed_rnn",
+    "fixed_transformer",
+    "position_buckets",
+    "topk_norm",
+    "topk_distinct",
+    "topk_parent",
+    "topk_density_distinct",
+})
 
 
 def _split_component_spec(
@@ -955,11 +966,21 @@ class JointRelexHeadConfig(BaseHeadConfig):
     Inherits NER scoring from NERHead and adds adjacency-based
     entity pair scoring against [RELATION] type embeddings.
     """
-    # ``dot``, ``mlp``, ``attention``/``attn``, ``bilinear``, ``gcn``, or
-    # ``gat``. ``none`` scores every directed pair without adjacency pruning.
-    layer_type: str = "none"
-    pair_rep_type: str = "concat_proj"     # pair representation type
-    triples_layer: Optional[str] = None    # optional triples scoring layer
+    # GLiNER-aligned relation settings.  A missing relations layer skips
+    # adjacency prediction and scores every directed entity pair.
+    # ``anchor_modeling`` instead predicts a bounded, unordered set of
+    # directed entity pairs before the regular MLP/triples scorer.  Joint
+    # relex uses fixed relation slots by default when that mode is selected.
+    anchor_mode: str = "fixed"
+    num_fixed_slots: int = 10
+    max_count: int = 20
+    anchor_num_heads: int = 4
+    anchor_num_layers: int = 2
+    relations_layer: Optional[str] = None
+    triples_layer: Optional[str] = None
+    relation_loss_coef: float = 1.0
+    # Reduce only over valid candidate-pair x prompted-relation cells.
+    relation_loss_reduction: str = "mean"
     embed_rel_token: bool = True
     rel_token_index: int = -1
     adjacency_loss_coef: float = 1.0
@@ -975,6 +996,34 @@ class JointRelexHeadConfig(BaseHeadConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.relations_layer is not None:
+            self.relations_layer = (
+                str(self.relations_layer).lower().replace("-", "_")
+            )
+            if self.relations_layer in {"", "none", "disabled"}:
+                self.relations_layer = None
+        if (
+            not math.isfinite(float(self.relation_loss_coef))
+            or self.relation_loss_coef < 0
+        ):
+            raise ValueError(
+                "relation_loss_coef must be finite and non-negative"
+            )
+        self.relation_loss_reduction = str(
+            self.relation_loss_reduction
+        ).lower()
+        if self.relation_loss_reduction not in {"sum", "mean"}:
+            raise ValueError(
+                "relation_loss_reduction must be 'sum' or 'mean'"
+            )
+        for name in ("num_fixed_slots", "max_count"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or int(value) != value or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.anchor_num_heads <= 0 or self.anchor_num_layers <= 0:
+            raise ValueError(
+                "anchor_num_heads and anchor_num_layers must be positive"
+            )
         for name in (
             "max_relation_span_width",
             "max_relation_entities",
@@ -993,10 +1042,11 @@ class JointRelexHeadConfig(BaseHeadConfig):
             raise ValueError("relation_neighbor_chunk_size must be a positive integer")
         if (
             self.relation_top_k_neighbors is not None
-            and str(self.layer_type).lower() != "dot"
+            and self.relations_layer != "dot"
         ):
             raise ValueError(
-                "relation_top_k_neighbors currently requires layer_type='dot'"
+                "relation_top_k_neighbors currently requires "
+                "relations_layer='dot'"
             )
 
 
@@ -1049,13 +1099,6 @@ class SetOpenRelexHeadConfig(OpenRelexHeadConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        anchor_mode = self.effective_anchor_mode()
-        if anchor_mode not in {"fixed", "fixed_rnn", "fixed_transformer"}:
-            raise ValueError(
-                "set open relex requires fixed relation-query slots; "
-                "anchor_mode must be 'fixed', 'fixed_rnn', or "
-                "'fixed_transformer'"
-            )
         for name in (
             "entity_loss_coef",
             "assignment_loss_coef",
@@ -1094,9 +1137,10 @@ class StructuringModeConfig:
 
     ``type`` enables optional hierarchy normalization and anchor alignment on
     the common processing path. ``processor`` and ``decoder`` can replace the
-    corresponding shared components. Remaining ``params`` are deliberately
-    retained so adding a processing option does not require another model-
-    config migration.
+    corresponding shared components. ``processor_options`` and
+    ``decoder_options`` configure those components explicitly. ``params`` is
+    retained as a compatibility alias for historical decoder options;
+    explicit component options take precedence.
 
     Learned hierarchy settings stay on :class:`StructuringHeadConfig`.  This
     separation is important for checkpoint compatibility: enabling a mode may
@@ -1107,6 +1151,8 @@ class StructuringModeConfig:
     type: str = "flat"
     processor: Optional[str | dict[str, Any]] = None
     decoder: Optional[str | dict[str, Any]] = None
+    processor_options: dict[str, Any] = dataclasses.field(default_factory=dict)
+    decoder_options: dict[str, Any] = dataclasses.field(default_factory=dict)
     params: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
@@ -1119,7 +1165,60 @@ class StructuringModeConfig:
         self.type = normalized
         self.processor = copy.deepcopy(self.processor)
         self.decoder = copy.deepcopy(self.decoder)
+        self.processor_options = copy.deepcopy(
+            dict(self.processor_options or {})
+        )
+        self.decoder_options = copy.deepcopy(dict(self.decoder_options or {}))
         self.params = copy.deepcopy(dict(self.params or {}))
+
+    @staticmethod
+    def _with_options(spec: object, options: Mapping[str, Any]) -> object:
+        """Merge mode-level options into a component specification."""
+
+        if not options:
+            return copy.deepcopy(spec)
+        if spec is None:
+            return {"params": copy.deepcopy(dict(options))}
+        if isinstance(spec, bool):
+            return {
+                "type": "multi_level" if spec else "flat",
+                "params": copy.deepcopy(dict(options)),
+            }
+        if isinstance(spec, str):
+            return {
+                "type": spec,
+                "params": copy.deepcopy(dict(options)),
+            }
+        if isinstance(spec, Mapping):
+            resolved = copy.deepcopy(dict(spec))
+            configured = resolved.get("params", {})
+            if not isinstance(configured, Mapping):
+                raise TypeError("structuring component params must be a mapping")
+            resolved["params"] = {
+                **copy.deepcopy(dict(options)),
+                **copy.deepcopy(dict(configured)),
+            }
+            return resolved
+        raise ValueError(
+            "Mode options cannot be applied to an initialized structuring "
+            "component instance"
+        )
+
+    def processor_spec(self) -> object:
+        """Return the processor component with all options applied."""
+
+        return self._with_options(
+            self.processor,
+            self.processor_options,
+        )
+
+    def decoder_spec(self) -> object:
+        """Return the decoder component with all options applied."""
+
+        return self._with_options(
+            self.decoder,
+            {**self.params, **self.decoder_options},
+        )
 
     @property
     def is_multi_level(self) -> bool:
@@ -1146,6 +1245,16 @@ class StructuringModeConfig:
             )
             processor = options.pop("processor", None)
             decoder = options.pop("decoder", None)
+            processor_options = options.pop("processor_options", {})
+            decoder_options = options.pop("decoder_options", {})
+            if not isinstance(processor_options, Mapping):
+                raise TypeError(
+                    "structuring mode processor_options must be a mapping"
+                )
+            if not isinstance(decoder_options, Mapping):
+                raise TypeError(
+                    "structuring mode decoder_options must be a mapping"
+                )
             nested_params = options.pop("params", {})
             if not isinstance(nested_params, Mapping):
                 raise TypeError("structuring mode params must be a mapping")
@@ -1155,6 +1264,8 @@ class StructuringModeConfig:
                 type=mode_type,
                 processor=processor,
                 decoder=decoder,
+                processor_options=dict(processor_options),
+                decoder_options=dict(decoder_options),
                 params=params,
             )
         else:
@@ -1253,13 +1364,18 @@ class StructuringHeadConfig(BaseHeadConfig):
     anchor_relations_loss_coef: float = 1.0
     anchor_relations_threshold: float = 0.5
 
+    def _expected_head_type(self) -> str:
+        return "structuring"
+
     def __post_init__(self):
         super().__post_init__()
         anchor_mode = self.effective_anchor_mode()
         refine_layers = self.effective_anchor_refine_layers()
-        if self.head_type not in {"structuring", "set_structuring"}:
+        expected_head_type = self._expected_head_type()
+        if self.head_type != expected_head_type:
             raise ValueError(
-                "head_type must be 'structuring' or 'set_structuring'"
+                f"{type(self).__name__} requires "
+                f"head_type={expected_head_type!r}"
             )
         self.multi_level = bool(self.multi_level)
         self.structure_mode = StructuringModeConfig.from_value(
@@ -1395,17 +1511,7 @@ class StructuringHeadConfig(BaseHeadConfig):
         query_strategy = PositionEmbedding.strategy_class(
             query_position_type
         )
-        fixed_width_modes = {
-            "fixed",
-            "fixed_rnn",
-            "fixed_transformer",
-            "position_buckets",
-            "topk_norm",
-            "topk_distinct",
-            "topk_parent",
-            "topk_density_distinct",
-        }
-        if anchor_mode in fixed_width_modes:
+        if anchor_mode in _FIXED_WIDTH_ANCHOR_MODES:
             # Query slots and memory tokens share one normalized document axis.
             # Using the anchor count as its sinusoidal extent maps bucket i to
             # conventional position i while keeping tokens inside that bucket
@@ -1440,7 +1546,7 @@ class StructuringHeadConfig(BaseHeadConfig):
                 "lengths"
             )
         if query_strategy.requires_num_embeddings:
-            if anchor_mode not in fixed_width_modes:
+            if anchor_mode not in _FIXED_WIDTH_ANCHOR_MODES:
                 raise ValueError(
                     "Learned index query positions require a fixed-width "
                     "structuring anchor mode"
@@ -1469,6 +1575,12 @@ class SetStructuringHeadConfig(StructuringHeadConfig):
     """Independent NER-first entity-to-record set prediction."""
 
     head_type: str = "set_structuring"
+    # Reuse the standalone NER module for field extraction instead of
+    # registering a second NER pipeline under the set-structuring head.  The
+    # shared module is still executed on structuring's own field prompts;
+    # standalone NER outputs cannot be reused because their group/class axes
+    # are independent.
+    reuse_ner_head: bool = False
     # Fixed transformer queries represent output records. Entity extraction
     # always uses a separate parent anchor, so these settings affect only the
     # second-stage record queries.
@@ -1479,15 +1591,32 @@ class SetStructuringHeadConfig(StructuringHeadConfig):
     # Wrong record anchors already provide negative membership supervision.
     neg_spans_ratio: float = 0.0
     entity_loss_coef: float = 1.0
+    # Explicit stage-2 record-membership coefficient. ``None`` migrates the
+    # historical use of ``span_loss_coef`` without changing old checkpoints.
+    assignment_loss_coef: float | None = None
+
+    def _expected_head_type(self) -> str:
+        return "set_structuring"
 
     def __post_init__(self):
         super().__post_init__()
+        if not isinstance(self.reuse_ner_head, bool):
+            raise TypeError("reuse_ner_head must be a boolean")
+        if self.assignment_loss_coef is None:
+            self.assignment_loss_coef = float(self.span_loss_coef)
         if (
             not math.isfinite(float(self.entity_loss_coef))
             or self.entity_loss_coef < 0
         ):
             raise ValueError(
                 "entity_loss_coef must be finite and non-negative"
+            )
+        if (
+            not math.isfinite(float(self.assignment_loss_coef))
+            or self.assignment_loss_coef < 0
+        ):
+            raise ValueError(
+                "assignment_loss_coef must be finite and non-negative"
             )
 
 
@@ -1782,7 +1911,6 @@ class GLiNextConfig(BaseGLiNERConfig):
         count_layer: Optional[str] = None,
         # Relations flat params
         rel_mode: str = "adjacency",
-        pair_rep_type: str = "concat_proj",
         triples_layer: Optional[str] = None,
         embed_rel_token: bool = True,
         rel_token_index: int = -1,
@@ -1797,7 +1925,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         object_detection_loss_coef: float = 1.0,
         segmentation_loss_coef: float = 1.0,
         audio_segmentation_loss_coef: float = 1.0,
-        rel_loss_coef: float = 1.0,
+        relation_loss_coef: float = 1.0,
         adjacency_loss_coef: float = 1.0,
         count_loss_coef: float = 1.0,
         groups_loss_coef: float = 1.0,
@@ -2011,12 +2139,11 @@ class GLiNextConfig(BaseGLiNERConfig):
             joint_relex_config = relations_config
         if joint_relex_config is None and relations_layer is not None:
             joint_relex_config = {
-                "layer_type": relations_layer,
-                "pair_rep_type": pair_rep_type,
+                "relations_layer": relations_layer,
                 "triples_layer": triples_layer,
                 "embed_rel_token": embed_rel_token,
                 "rel_token_index": rel_token_index,
-                "loss_coef": rel_loss_coef,
+                "relation_loss_coef": relation_loss_coef,
                 "adjacency_loss_coef": adjacency_loss_coef,
             }
         if isinstance(joint_relex_config, dict):
@@ -2175,6 +2302,21 @@ class GLiNextConfig(BaseGLiNERConfig):
                 "set_structuring_config must be a mapping or a "
                 "SetStructuringHeadConfig"
             )
+
+        if (
+            self.set_structuring_config is not None
+            and self.set_structuring_config.reuse_ner_head
+        ):
+            if self.ner_config is None:
+                raise ValueError(
+                    "set_structuring_config.reuse_ner_head=True requires "
+                    "an enabled ner_config"
+                )
+            if self.ner_config.effective_anchor_mode() != "parent":
+                raise ValueError(
+                    "set_structuring_config.reuse_ner_head=True requires "
+                    "ner_config anchor_mode='parent'"
+                )
 
         # Count
         if count_config is None and count_layer is not None:
@@ -2409,7 +2551,10 @@ class GLiNextConfig(BaseGLiNERConfig):
             self.per_task_parents = per_task_parents
 
         # ── Backward compat: keep flat attributes for code that reads them ──
-        self.relations_layer = relations_layer or (self.joint_relex_config.layer_type if self.joint_relex_config else None)
+        self.relations_layer = (
+            self.joint_relex_config.relations_layer
+            if self.joint_relex_config else relations_layer
+        )
         self.classifier_layer = classifier_layer
         effective_structuring_config = (
             self.structuring_config or self.set_structuring_config
@@ -2421,7 +2566,6 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.count_layer = count_layer or ("regression" if self.count_config else None)
 
         self.rel_mode = rel_mode
-        self.pair_rep_type = self.joint_relex_config.pair_rep_type if self.joint_relex_config else pair_rep_type
         self.triples_layer = self.joint_relex_config.triples_layer if self.joint_relex_config else triples_layer
         self.embed_rel_token = self.joint_relex_config.embed_rel_token if self.joint_relex_config else embed_rel_token
         self.rel_token_index = self.joint_relex_config.rel_token_index if self.joint_relex_config else rel_token_index
@@ -2462,7 +2606,10 @@ class GLiNextConfig(BaseGLiNERConfig):
             self.audio_segmentation_config.loss_coef
             if self.audio_segmentation_config else audio_segmentation_loss_coef
         )
-        self.rel_loss_coef = self.joint_relex_config.loss_coef if self.joint_relex_config else rel_loss_coef
+        self.relation_loss_coef = (
+            self.joint_relex_config.relation_loss_coef
+            if self.joint_relex_config else relation_loss_coef
+        )
         self.adjacency_loss_coef = self.joint_relex_config.adjacency_loss_coef if self.joint_relex_config else adjacency_loss_coef
         self.count_loss_coef = self.count_config.loss_coef if self.count_config else count_loss_coef
         self.groups_loss_coef = groups_loss_coef
@@ -2603,7 +2750,6 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "groups_layer",
         "count_layer",
         "rel_mode",
-        "pair_rep_type",
         "triples_layer",
         "embed_rel_token",
         "rel_token_index",
@@ -2611,7 +2757,7 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "embed_cat_token",
         "ner_loss_coef",
         "cat_loss_coef",
-        "rel_loss_coef",
+        "relation_loss_coef",
         "adjacency_loss_coef",
         "count_loss_coef",
         "groups_loss_coef",

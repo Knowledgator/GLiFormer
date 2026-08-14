@@ -17,10 +17,16 @@ Keeping all nodes for one JSON tree in one schema group is intentional:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from copy import deepcopy
 from numbers import Integral
 from typing import Any
+
+from .structuring_types import (
+    SchemaNode,
+    parse_component_spec,
+    schema_node_exemplar,
+)
 
 MULTI_LEVEL_META_KEY = "_glinext_structuring_multi_level"
 SET_MULTI_LEVEL_META_KEY = "_glinext_set_structuring_multi_level"
@@ -580,100 +586,29 @@ class _HierarchyNormalizer:
         item[self.meta_key] = meta
         return meta
 
-    @staticmethod
-    def _placeholder_template(value: object) -> object:
-        if isinstance(value, dict):
-            return {
-                str(key): _HierarchyNormalizer._placeholder_template(child)
-                for key, child in value.items()
-            }
-        if isinstance(value, list):
-            return [
-                _HierarchyNormalizer._placeholder_template(child)
-                for child in value
-            ]
-        return ""
-
     @classmethod
     def _template_from_spec(cls, spec: object) -> tuple[dict, list[str]]:
-        required: list[str] = []
-        if isinstance(spec, list):
-            if all(isinstance(field, str) for field in spec):
-                return dict.fromkeys(spec, ""), required
-            if spec and isinstance(spec[0], dict):
-                return cls._placeholder_template(spec[0]), required
-            if not spec:
-                return {}, required
-            raise TypeError(
-                "A structuring schema list must contain field names or a "
-                "dictionary exemplar"
-            )
+        # Local import avoids a module cycle while keeping Pydantic/annotation
+        # handling in the same compiler used by GLiNExTSchema.
+        from .schema import compile_structuring_template
 
-        if not isinstance(spec, dict):
-            return {}, required
-
-        descriptor_keys = {
-            "fields", "children", "required_fields", "description",
-        }
-        is_descriptor = set(spec).issubset(descriptor_keys) and (
-            isinstance(spec.get("fields"), list | dict)
-            or "required_fields" in spec
-            or (
-                "fields" in spec
-                and isinstance(spec.get("children"), dict)
-            )
-        )
-        if is_descriptor:
-            fields = spec.get("fields") or []
-            if isinstance(fields, dict):
-                template = {
-                    str(key): cls._placeholder_template(value)
-                    for key, value in fields.items()
-                }
-            elif isinstance(fields, list) and all(
-                isinstance(field, str) for field in fields
-            ):
-                template = dict.fromkeys(
-                    fields,
-                    "",
-                )
-            else:
-                raise TypeError(
-                    "Structuring descriptor 'fields' must be a list of "
-                    "strings or a nested dictionary"
-                )
-            raw_required = spec.get("required_fields") or []
-            if not isinstance(raw_required, list) or not all(
-                isinstance(field, str) for field in raw_required
-            ):
-                raise TypeError(
-                    "Structuring descriptor 'required_fields' must be a "
-                    "list of strings"
-                )
-            required = list(raw_required)
-            raw_children = spec.get("children") or {}
-            if not isinstance(raw_children, dict):
-                raise TypeError(
-                    "Structuring descriptor 'children' must be a dictionary"
-                )
-            for child_name, child_spec in raw_children.items():
-                child_template, _ = cls._template_from_spec(child_spec)
-                template[str(child_name)] = [child_template]
-            return template, required
-
-        return cls._placeholder_template(spec), required
+        node = compile_structuring_template(spec)
+        if node.kind == "array":
+            node = node.item or SchemaNode("object")
+        template = schema_node_exemplar(node)
+        if not isinstance(template, dict):
+            raise TypeError("A structuring schema must describe an object")
+        return template, list(node.required_fields)
 
     def contribute_inference_input(self, item: dict, structures: object) -> None:
         """Create a nested schema exemplar and run the shared normalizer."""
 
         if isinstance(structures, list):
-            template = (
-                self._placeholder_template(structures[0])
-                if structures and isinstance(structures[0], dict)
-                else {}
-            )
+            template, required = self._template_from_spec(structures)
             item[self.data_key] = [template]
-            item[self.schema_key] = {}
+            item[self.schema_key] = {
+                _ROOT_SCHEMA_NAME: {"required_fields": required}
+            }
             self.normalize_item(item)
             return
 
@@ -682,25 +617,29 @@ class _HierarchyNormalizer:
 
         if set(structures) == {MULTI_LEVEL_ROOT_KEY}:
             root_spec = structures[MULTI_LEVEL_ROOT_KEY]
-            if isinstance(root_spec, dict):
-                template, required = self._template_from_spec(root_spec)
+            from .schema import compile_structuring_template
+
+            root_node = compile_structuring_template(root_spec)
+            if root_node.kind == "object":
+                template = schema_node_exemplar(root_node)
+                required = list(root_node.required_fields)
                 item[self.data_key] = template
                 item[self.schema_key] = {
                     _ROOT_SCHEMA_NAME: {"required_fields": required}
                 }
                 self.normalize_item(item, forced_output_mode="object")
                 return
-            if isinstance(root_spec, list):
-                template = (
-                    self._placeholder_template(root_spec[0])
-                    if root_spec and isinstance(root_spec[0], dict)
-                    else {}
-                )
+            if root_node.kind == "array":
+                root_item = root_node.item or SchemaNode("object")
+                template = schema_node_exemplar(root_item)
+                required = list(root_item.required_fields)
                 item[self.data_key] = [template]
-                item[self.schema_key] = {}
+                item[self.schema_key] = {
+                    _ROOT_SCHEMA_NAME: {"required_fields": required}
+                }
                 self.normalize_item(item, forced_output_mode="list")
                 return
-            raise TypeError("$root structuring schema must be a dict or list")
+            raise TypeError("$root structuring schema must describe an object or list")
 
         structuring = {}
         structuring_schema = {}
@@ -783,35 +722,17 @@ def _component_type(
     spec: object,
     default: str,
 ) -> tuple[str, dict[str, Any]]:
-    if spec is None:
-        return default, {}
-    if isinstance(spec, str):
-        name, params = spec, {}
-    elif isinstance(spec, Mapping):
-        raw = dict(spec)
-        name = raw.pop("type", raw.pop("name", default))
-        configured = raw.pop("params", {})
-        if not isinstance(configured, Mapping):
-            raise TypeError(
-                "structuring processor component params must be a mapping"
-            )
-        params = {**configured, **raw}
-    elif all(
-        hasattr(spec, method)
-        for method in (
+    return parse_component_spec(
+        spec,
+        default,
+        component_name="structuring processor component",
+        aliases=_PROCESSOR_MODE_ALIASES,
+        instance_attributes=(
             "normalize_item",
             "contribute_inference_input",
             "contribute_prompt",
-        )
-    ):
-        return "__instance__", {"instance": spec}
-    else:
-        raise TypeError(
-            "structuring processor component must be a string, mapping, "
-            "or processing component"
-        )
-    normalized = str(name).lower().replace("-", "_")
-    return _PROCESSOR_MODE_ALIASES.get(normalized, normalized), params
+        ),
+    )
 
 
 class StructuringProcessorComponent:
@@ -826,7 +747,6 @@ class StructuringProcessorComponent:
         data_key: str = "structuring",
         schema_key: str = "structuring_schema",
         meta_key: str = MULTI_LEVEL_META_KEY,
-        **_: Any,
     ):
         if mode not in {"flat", "multi_level"}:
             raise ValueError(f"Unknown structuring processor mode {mode!r}")
@@ -850,14 +770,6 @@ class StructuringProcessorComponent:
             return None
         return self._hierarchy.normalize_item(item, **kwargs)
 
-    @staticmethod
-    def _structure_fields(fields):
-        if isinstance(fields, list):
-            return fields
-        if isinstance(fields, dict):
-            return fields.get("fields", [])
-        return []
-
     def contribute_inference_input(
         self,
         item: dict,
@@ -878,24 +790,35 @@ class StructuringProcessorComponent:
         schemas = {}
         for raw_name, spec in structures.items():
             schema_name = str(raw_name)
-            if isinstance(spec, dict) and "fields" not in spec:
+            from .schema import (
+                compile_structuring_template,
+                schema_node_requires_multi_level,
+            )
+
+            node = compile_structuring_template(spec)
+            if schema_node_requires_multi_level(node):
                 raise ValueError(
-                    "Nested structuring schemas require "
-                    "multi_level=True or structure_mode='multi_level'"
+                    "This structuring template contains nested objects or "
+                    "record arrays, but the loaded checkpoint is configured "
+                    "for flat structuring. Nested schemas require "
+                    "multi_level=True or structure_mode='multi_level' on a "
+                    "compatible checkpoint."
                 )
-            fields = self._structure_fields(spec)
-            if not isinstance(fields, list) or not all(
-                isinstance(field, str) for field in fields
-            ):
+            if node.kind != "object":
                 raise TypeError(
-                    "Flat structuring schema fields must be a list of strings"
+                    "A flat named structuring schema must describe an object"
                 )
+            fields = list(node.fields)
             data[schema_name] = (
                 [dict.fromkeys(fields, "")] if fields else []
             )
-            schemas[schema_name] = (
-                dict(spec) if isinstance(spec, dict) else list(fields)
-            )
+            schema_spec = {
+                "fields": fields,
+                "required_fields": list(node.required_fields),
+            }
+            if node.description is not None:
+                schema_spec["description"] = node.description
+            schemas[schema_name] = schema_spec
         item[self.data_key] = data
         item[self.schema_key] = schemas
 

@@ -13,9 +13,14 @@ from ...layers.structuring_relations import (
     score_anchor_relations,
     validate_structuring_anchor_capacity,
 )
-from .. import TaskHeadOutput
-from ..losses import binary_focal_or_bce
-from ..matcher import minimum_cost_assignment
+from ...processing.structuring_compat import legacy_task_value
+from .. import SetStructuringTaskHeadOutput
+from ..matcher import (
+    batched_masked_assignment,
+    gold_anchor_mask,
+    matched_anchor_targets,
+    matched_objectness_loss,
+)
 from ..ner.model import NERHead
 
 
@@ -25,7 +30,10 @@ class SetStructuringHead(NERHead):
     This follows the same composition used by :class:`JointRelexHead`: the
     inherited NER forward pass is a complete first stage, concrete entity
     spans are selected from its output, and only those pooled entities enter
-    the task-specific second stage.
+    the task-specific second stage.  When ``reuse_ner_head`` is enabled, the
+    first stage uses the standalone NER module's parameters on structuring's
+    own field prompts.  It cannot consume the standalone NER output because
+    extraction groups and structuring schemas have independent class axes.
 
     The public score tensors intentionally remain separate:
 
@@ -43,40 +51,61 @@ class SetStructuringHead(NERHead):
     name = "set_structuring"
     dependencies = []
 
-    def __init__(self, config, hidden_size, dropout, shared_layers=None):
+    def __init__(
+        self,
+        config,
+        hidden_size,
+        dropout,
+        shared_layers=None,
+        ner_head=None,
+    ):
         set_cfg = config.set_structuring_config
         shared_layers = shared_layers or {}
+        self._owns_ner_head = not set_cfg.reuse_ner_head
 
-        # NER must always have exactly one parent anchor.  Record-query
-        # settings belong exclusively to the second stage.
-        entity_cfg = replace(
-            set_cfg,
-            anchor_mode="parent",
-            anchor_layer=None,
-            anchor_normalization="none",
-            anchor_refine_layers=0,
-            anchor_refinement="none",
-            anchor_memory_position="none",
-            anchor_query_position="none",
-            anchor_self_attention_bias="none",
-            anchor_cross_attention_bias="none",
-            represent_spans=False,
-        )
-        entity_shared_layers = {
-            name: layer
-            for name, layer in shared_layers.items()
-            if name == "anchor_modeling"
-        }
-        super().__init__(
-            config,
-            hidden_size,
-            dropout,
-            shared_layers=entity_shared_layers,
-            task_config=entity_cfg,
-        )
+        if self._owns_ner_head:
+            # NER must always have exactly one parent anchor. Record-query
+            # settings belong exclusively to the second stage.
+            entity_cfg = replace(
+                set_cfg,
+                anchor_mode="parent",
+                anchor_layer=None,
+                anchor_normalization="none",
+                anchor_refine_layers=0,
+                anchor_refinement="none",
+                anchor_memory_position="none",
+                anchor_query_position="none",
+                anchor_self_attention_bias="none",
+                anchor_cross_attention_bias="none",
+                represent_spans=False,
+            )
+            entity_shared_layers = {
+                name: layer
+                for name, layer in shared_layers.items()
+                if name == "anchor_modeling"
+            }
+            super().__init__(
+                config,
+                hidden_size,
+                dropout,
+                shared_layers=entity_shared_layers,
+                task_config=entity_cfg,
+            )
+        else:
+            if ner_head is None:
+                raise ValueError(
+                    "Set Structuring NER reuse requires an initialized "
+                    "standalone NER head"
+                )
+            # Keep one registration/state-dict/optimizer owner for the shared
+            # module. The model already owns it under heads.ner.
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.loss_coef = set_cfg.loss_coef
+            self.__dict__["_reused_ner_head"] = ner_head
 
         self.entity_loss_coef = set_cfg.entity_loss_coef
-        self.assignment_loss_coef = set_cfg.span_loss_coef
+        self.assignment_loss_coef = set_cfg.assignment_loss_coef
         self.bio_loss_reduction = set_cfg.bio_loss_reduction
 
         self.record_anchor_layer = self._build_anchor_layer(
@@ -145,7 +174,13 @@ class SetStructuringHead(NERHead):
         initialize_anchor_relations(self, set_cfg, hidden_size)
 
     @classmethod
-    def from_config(cls, config, shared_layers=None, **kwargs):
+    def from_config(
+        cls,
+        config,
+        shared_layers=None,
+        ner_head=None,
+        **kwargs,
+    ):
         if config.set_structuring_config is None:
             return None
         return cls(
@@ -153,6 +188,40 @@ class SetStructuringHead(NERHead):
             hidden_size=config.hidden_size,
             dropout=config.dropout,
             shared_layers=shared_layers,
+            ner_head=ner_head,
+        )
+
+    def _forward_entity_ner(
+        self,
+        shared,
+        flat_inputs,
+        base_loss_fn,
+        entity_labels,
+        threshold,
+    ):
+        """Run the private or shared NER module on structuring field inputs."""
+
+        ner_kwargs = {
+            "flat_inputs": flat_inputs,
+            "base_loss_fn": base_loss_fn,
+            "ner_labels": entity_labels,
+            "threshold": threshold,
+        }
+        if self._owns_ner_head:
+            return NERHead.forward(
+                self,
+                shared,
+                dependency_outputs={},
+                **ner_kwargs,
+            )
+
+        reused_ner_head = self.__dict__.get("_reused_ner_head")
+        if reused_ner_head is None:
+            raise RuntimeError("the reused NER head is no longer available")
+        return reused_ner_head(
+            shared,
+            dependency_outputs={},
+            **ner_kwargs,
         )
 
     @staticmethod
@@ -171,9 +240,12 @@ class SetStructuringHead(NERHead):
         )
         count = None
         if not self._record_uses_fixed_slots:
-            count = batch.get("set_structuring_count")
-            if count is None:
-                count = batch.get("structuring_count")
+            count = legacy_task_value(
+                batch,
+                "set_structuring",
+                "count",
+                fallback_prefix="structuring",
+            )
             if count is None:
                 count = batch.get("count_val")
 
@@ -395,28 +467,7 @@ class SetStructuringHead(NERHead):
 
     @staticmethod
     def _gold_anchor_mask(labels, label_count):
-        batch_size, anchor_count = labels.shape[:2]
-        if label_count is None:
-            return labels.detach().abs().reshape(
-                batch_size,
-                anchor_count,
-                -1,
-            ).sum(dim=-1) > 0
-        if not torch.is_tensor(label_count):
-            label_count = torch.as_tensor(
-                label_count,
-                device=labels.device,
-            )
-        if label_count.dim() == 0:
-            label_count = label_count.unsqueeze(0).expand(batch_size)
-        label_count = label_count.to(labels.device).long().clamp(
-            min=0,
-            max=anchor_count,
-        )
-        return torch.arange(
-            anchor_count,
-            device=labels.device,
-        ).unsqueeze(0) < label_count.unsqueeze(1)
+        return gold_anchor_mask(labels, label_count)
 
     def _match_record_anchors(
         self,
@@ -427,52 +478,29 @@ class SetStructuringHead(NERHead):
         entity_mask,
         base_loss_fn,
     ):
-        matches = [[] for _ in range(predictions.shape[0])]
-        with torch.no_grad():
-            for batch_idx in range(predictions.shape[0]):
-                prediction_ids = torch.where(prediction_mask[batch_idx])[0]
-                gold_ids = torch.where(gold_mask[batch_idx])[0]
-                if prediction_ids.numel() == 0 or gold_ids.numel() == 0:
-                    continue
-
-                predicted = predictions[batch_idx, prediction_ids]
-                gold = labels[batch_idx, gold_ids]
-                pair_predictions = predicted[:, None].expand(
-                    -1,
-                    gold.shape[0],
-                    -1,
-                )
-                pair_gold = gold[None].expand(
-                    predicted.shape[0],
-                    -1,
-                    -1,
-                )
-                pair_losses = base_loss_fn(pair_predictions, pair_gold)
-                pair_cost = (
-                    pair_losses * entity_mask[batch_idx][None, None]
+        def pair_cost(batch_idx, prediction_ids, gold_ids):
+            predicted = predictions[batch_idx, prediction_ids]
+            gold = labels[batch_idx, gold_ids]
+            losses = base_loss_fn(
+                predicted[:, None].expand(-1, gold.shape[0], -1),
+                gold[None].expand(predicted.shape[0], -1, -1),
+            )
+            cost = (
+                losses * entity_mask[batch_idx][None, None]
+            ).sum(dim=-1)
+            if prediction_ids.numel() > gold_ids.numel():
+                zero_cost = (
+                    base_loss_fn(predicted, torch.zeros_like(predicted))
+                    * entity_mask[batch_idx].unsqueeze(0)
                 ).sum(dim=-1)
+                cost = cost - zero_cost[:, None]
+            return cost
 
-                if prediction_ids.numel() > gold_ids.numel():
-                    zero_losses = base_loss_fn(
-                        predicted,
-                        torch.zeros_like(predicted),
-                    )
-                    zero_cost = (
-                        zero_losses
-                        * entity_mask[batch_idx].unsqueeze(0)
-                    ).sum(dim=-1)
-                    pair_cost = pair_cost - zero_cost[:, None]
-
-                assignment = minimum_cost_assignment(pair_cost)
-                pairs = (
-                    (prediction_ids[pred], gold_ids[gold])
-                    for pred, gold in assignment
-                )
-                matches[batch_idx].extend(
-                    (int(pred.item()), int(gold.item()))
-                    for pred, gold in pairs
-                )
-        return matches
+        return batched_masked_assignment(
+            prediction_mask,
+            gold_mask,
+            pair_cost,
+        )
 
     def _assignment_loss(
         self,
@@ -512,14 +540,7 @@ class SetStructuringHead(NERHead):
             supervised_entity_mask,
             base_loss_fn,
         )
-        targets = torch.zeros_like(predictions)
-        for batch_idx, batch_matches in enumerate(matches):
-            for predicted_anchor, gold_anchor in batch_matches:
-                if predicted_anchor < anchor_count:
-                    targets[batch_idx, predicted_anchor] = gold[
-                        batch_idx,
-                        gold_anchor,
-                    ]
+        targets = matched_anchor_targets(predictions, gold, matches)
 
         losses = base_loss_fn(predictions, targets)
         loss_mask = (
@@ -541,17 +562,12 @@ class SetStructuringHead(NERHead):
         anchor_mask,
         base_loss_fn=None,
     ):
-        targets = torch.zeros_like(logits)
-        for batch_idx, batch_matches in enumerate(matches):
-            for predicted_anchor, _ in batch_matches:
-                targets[batch_idx, predicted_anchor] = 1.0
-        loss_fn = base_loss_fn or binary_focal_or_bce
-        losses = loss_fn(
-            logits.float(),
-            targets.float(),
+        return matched_objectness_loss(
+            logits,
+            matches,
+            anchor_mask,
+            loss_fn=base_loss_fn,
         )
-        mask = anchor_mask.to(losses.dtype)
-        return (losses * mask).sum() / mask.sum().clamp(min=1.0)
 
     def forward(
         self,
@@ -562,10 +578,12 @@ class SetStructuringHead(NERHead):
         **batch,
     ):
         def target(suffix):
-            value = batch.get(f"set_structuring_{suffix}")
-            if value is None:
-                value = batch.get(f"structuring_{suffix}")
-            return value
+            return legacy_task_value(
+                batch,
+                "set_structuring",
+                suffix,
+                fallback_prefix="structuring",
+            )
 
         structuring_labels = target("labels")
         structuring_count = target("count")
@@ -578,13 +596,12 @@ class SetStructuringHead(NERHead):
         # Stage 1: a complete classical NER forward pass. Structuring spans are
         # intentionally not passed into NER; they are teacher-forced candidates
         # for stage 2 in the same way rel_span_idx is used by joint relex.
-        entity_output = super().forward(
+        entity_output = self._forward_entity_ner(
             shared,
-            dependency_outputs,
-            flat_inputs=flat_inputs,
-            base_loss_fn=base_loss_fn,
-            ner_labels=entity_labels,
-            threshold=batch.get("threshold", 0.5),
+            flat_inputs,
+            base_loss_fn,
+            entity_labels,
+            batch.get("threshold", 0.5),
         )
 
         if entity_output.logits is None:
@@ -737,6 +754,8 @@ class SetStructuringHead(NERHead):
             "entity_mask": entity_mask,
             "entity_representations": entity_representations,
             "entity_field_logits": entity_field_logits,
+            # Canonical internal record-membership layout is (BN, A, E).
+            "membership_logits": structuring_logits,
             "entity_anchor_logits": structuring_logits.permute(0, 2, 1),
             "entity_assignment_logits": structuring_logits.permute(0, 2, 1),
             "assignment_logits": structuring_logits,
@@ -768,7 +787,7 @@ class SetStructuringHead(NERHead):
                 relation_loss.detach() if relation_loss is not None else None
             ),
         }
-        return TaskHeadOutput(
+        return SetStructuringTaskHeadOutput(
             loss=combined_loss,
             logits=entity_output.logits,
             extra=extra,

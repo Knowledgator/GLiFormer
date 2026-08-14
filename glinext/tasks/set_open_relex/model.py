@@ -1,6 +1,7 @@
 """Independent entity-first set-prediction open relation extraction."""
 
 import math
+import warnings
 from copy import copy
 
 import torch
@@ -8,31 +9,37 @@ from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import extract_spans_from_tokens
 from torch import nn
 
-from ...layers import AnchorModeling
 from ...layers.mlp import create_mlp
 from .. import TaskHeadOutput
-from ..losses import binary_focal_or_bce
-from ..matcher import minimum_cost_assignment
+from ..matcher import (
+    batched_masked_assignment,
+    gold_anchor_mask,
+    matched_anchor_targets,
+    matched_objectness_loss,
+)
 from ..ner.model import NERHead
 
 
 class SetOpenRelexHead(NERHead):
-    """Recognize entities first, then predict an unordered set of relations.
+    """Recognize entities, group directed pairs, then classify relations.
 
-    The first stage is a complete relation-aware NER pass.  Its selected spans
-    are pooled before relation-instance queries are generated, refined, and
-    modeled with the open-vocabulary relation representations.
+    The first stage is the existing NER pass. Its selected spans are pooled and
+    passed to a relation-independent set of pair anchors. Each anchor assigns a
+    source and target entity, the two soft endpoint representations are fused
+    into a directed pair representation, and that representation is compared
+    with every open-vocabulary relation embedding.
 
     Two score tensors are intentionally exposed:
 
-    * ``logits`` has shape ``(BN, A, R, 2)``.  It predicts whether each query
-      expresses each relation with a valid source and target role.
-    * ``extra["assignment_logits"]`` has shape ``(BN, A, R, E, 2)``.  The
-      additional entity axis is mathematically necessary to identify which of
-      the ``E`` recognized spans fills each role.
+    * ``logits`` has shape ``(BN, N, R)`` and classifies each pair against the
+      ``R`` requested relations.
+    * ``extra["assignment_logits"]`` has shape ``(BN, N, E, 2)`` and selects
+      the source and target from the ``E`` recognized spans independently of
+      the relation vocabulary.
 
-    ``A`` is a permutation-invariant relation-slot axis.  Hungarian matching
-    supervises both tensors jointly and provides the objectness targets.
+    ``N`` is a permutation-invariant pair-slot axis. Hungarian matching
+    supervises pair assignment and relation classification jointly and also
+    provides the objectness targets.
     """
 
     name = "set_open_relex"
@@ -69,6 +76,7 @@ class SetOpenRelexHead(NERHead):
         self.entity_loss_coef = float(set_cfg.entity_loss_coef)
         self.assignment_loss_coef = float(set_cfg.assignment_loss_coef)
         self.bio_loss_reduction = set_cfg.bio_loss_reduction
+        self._relation_capacity_warning_emitted = False
 
         self.relation_anchor_layer = self._build_anchor_layer(
             set_cfg,
@@ -83,14 +91,14 @@ class SetOpenRelexHead(NERHead):
             self.relation_anchor_layer,
             "num_slots",
         )
-        self.relation_anchor_modeling = shared_layers.get(
-            "anchor_modeling"
-        ) or AnchorModeling.from_config(
-            getattr(set_cfg, "anchor_modeling", "linear"),
-            hidden_size,
-            dropout=dropout,
+        groups_layer = getattr(self.relation_anchor_layer, "groups_layer", None)
+        self._relation_anchor_capacity = int(
+            getattr(
+                self.relation_anchor_layer,
+                "num_slots",
+                getattr(groups_layer, "max_count", set_cfg.max_count),
+            )
         )
-
         refinement = self._build_anchor_refinement(
             set_cfg,
             hidden_size,
@@ -120,9 +128,14 @@ class SetOpenRelexHead(NERHead):
             max_width=getattr(config, "max_width", 12),
             dropout=dropout,
         )
-        self.relation_role_head = nn.Linear(hidden_size, 2)
         self.endpoint_query = nn.Linear(hidden_size, hidden_size * 2)
-        self.endpoint_scale = math.sqrt(hidden_size)
+        self.pair_fusion = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_size),
+        )
+        self.logit_scale = math.sqrt(hidden_size)
 
         self.use_anchor_objectness = bool(set_cfg.anchor_objectness)
         self.anchor_objectness_loss_coef = float(
@@ -207,12 +220,12 @@ class SetOpenRelexHead(NERHead):
 
         if assignment_labels is None:
             return unique_idx, unique_mask, None
-        if assignment_labels.dim() != 5:
+        if assignment_labels.dim() != 4:
             raise ValueError(
-                "set_open_rel_assignment_labels must have shape (BN, G, R, E, 2)"
+                "set_open_rel_assignment_labels must have shape (BN, G, E, 2)"
             )
         if assignment_labels.shape[0] != span_idx.shape[0] or (
-            assignment_labels.shape[3] != span_idx.shape[1]
+            assignment_labels.shape[2] != span_idx.shape[1]
         ):
             raise ValueError(
                 "set open relation endpoint labels must share the span entity axis"
@@ -221,15 +234,14 @@ class SetOpenRelexHead(NERHead):
         merged = assignment_labels.new_zeros(
             assignment_labels.shape[0],
             assignment_labels.shape[1],
-            assignment_labels.shape[2],
             max_entities,
-            assignment_labels.shape[4],
+            assignment_labels.shape[3],
         )
         for batch_idx, groups in enumerate(source_groups):
             for output_idx, source_ids in enumerate(groups):
-                merged[batch_idx, :, :, output_idx] = assignment_labels[
-                    batch_idx, :, :, source_ids
-                ].amax(dim=2)
+                merged[batch_idx, :, output_idx] = assignment_labels[
+                    batch_idx, :, source_ids
+                ].amax(dim=1)
         return unique_idx, unique_mask, merged
 
     def _pool_entity_spans(self, words_embedding, span_idx, span_mask):
@@ -268,7 +280,14 @@ class SetOpenRelexHead(NERHead):
         )
         count = None
         if not self._relation_uses_fixed_slots:
-            count = batch.get("set_open_rel_count")
+            # Count/query-driven layers must see the same capacity in training
+            # and inference. Passing set_open_rel_count here would leak the
+            # gold number of pairs during training and disappear at inference.
+            count = flat_inputs.parent_embedding.new_full(
+                (flat_inputs.parent_embedding.shape[0],),
+                self._relation_anchor_capacity,
+                dtype=torch.long,
+            )
 
         anchors, anchor_mask = self.relation_anchor_layer(
             flat_inputs.parent_embedding,
@@ -295,7 +314,7 @@ class SetOpenRelexHead(NERHead):
             )
         return anchors, anchor_mask
 
-    def _score_relations_and_endpoints(
+    def _score_pairs_and_relations(
         self,
         anchors,
         anchor_mask,
@@ -304,50 +323,77 @@ class SetOpenRelexHead(NERHead):
         entity_representations,
         entity_mask,
     ):
-        modeled = self.relation_anchor_modeling(
-            anchors,
-            relation_embeddings,
-            anchor_mask=anchor_mask,
-            child_mask=relation_mask,
-        )
-        relation_logits = self.relation_role_head(modeled)
-        batch_size, anchor_count, relation_count, hidden_size = modeled.shape
-        endpoint_queries = self.endpoint_query(modeled).reshape(
+        batch_size, anchor_count, hidden_size = anchors.shape
+        endpoint_queries = self.endpoint_query(anchors).reshape(
             batch_size,
             anchor_count,
-            relation_count,
             2,
             hidden_size,
         )
         assignment_logits = torch.einsum(
-            "BARKD,BED->BAREK",
+            "BNKD,BED->BNEK",
             endpoint_queries,
             entity_representations,
-        ) / self.endpoint_scale
-        # The public role energy is also a prior on every entity pointer.
-        assignment_logits = assignment_logits + relation_logits.unsqueeze(3)
+        ) / self.logit_scale
 
-        public_valid = anchor_mask.bool().unsqueeze(2) & relation_mask.bool().unsqueeze(1)
-        assignment_valid = public_valid.unsqueeze(3) & entity_mask.bool()[:, None, None, :]
-        relation_logits = relation_logits * public_valid.unsqueeze(-1).to(
-            relation_logits.dtype
+        assignment_valid = (
+            anchor_mask.bool().unsqueeze(2)
+            & entity_mask.bool().unsqueeze(1)
         )
+        masked_assignment_logits = assignment_logits.masked_fill(
+            ~assignment_valid.unsqueeze(-1),
+            torch.finfo(assignment_logits.dtype).min,
+        )
+        endpoint_weights = torch.softmax(masked_assignment_logits, dim=2)
+        endpoint_weights = endpoint_weights * assignment_valid.unsqueeze(-1).to(
+            endpoint_weights.dtype
+        )
+        endpoint_weights = endpoint_weights / endpoint_weights.sum(
+            dim=2,
+            keepdim=True,
+        ).clamp(min=torch.finfo(endpoint_weights.dtype).eps)
+
+        endpoint_representations = torch.einsum(
+            "BNEK,BED->BNKD",
+            endpoint_weights,
+            entity_representations,
+        )
+        directed_endpoints = torch.cat(
+            [
+                endpoint_representations[:, :, 0],
+                endpoint_representations[:, :, 1],
+            ],
+            dim=-1,
+        )
+        pair_representations = self.pair_fusion(directed_endpoints)
+        pair_representations = pair_representations * anchor_mask.unsqueeze(-1).to(
+            pair_representations.dtype
+        )
+        relation_logits = torch.einsum(
+            "BND,BRD->BNR",
+            pair_representations,
+            relation_embeddings,
+        ) / self.logit_scale
+
+        relation_valid = (
+            anchor_mask.bool().unsqueeze(2)
+            & relation_mask.bool().unsqueeze(1)
+        )
+        relation_logits = relation_logits * relation_valid.to(relation_logits.dtype)
         assignment_logits = assignment_logits * assignment_valid.unsqueeze(-1).to(
             assignment_logits.dtype
         )
-        return relation_logits, assignment_logits, modeled
+        return (
+            relation_logits,
+            assignment_logits,
+            endpoint_weights,
+            endpoint_representations,
+            pair_representations,
+        )
 
     @staticmethod
     def _gold_anchor_mask(labels, label_count):
-        batch_size, gold_count = labels.shape[:2]
-        if label_count is None:
-            return labels.detach().abs().flatten(start_dim=2).sum(dim=-1) > 0
-        if not torch.is_tensor(label_count):
-            label_count = torch.as_tensor(label_count, device=labels.device)
-        if label_count.dim() == 0:
-            label_count = label_count.unsqueeze(0).expand(batch_size)
-        label_count = label_count.to(labels.device).long().clamp(min=0, max=gold_count)
-        return torch.arange(gold_count, device=labels.device)[None] < label_count[:, None]
+        return gold_anchor_mask(labels, label_count)
 
     def _match_anchors(
         self,
@@ -361,72 +407,54 @@ class SetOpenRelexHead(NERHead):
         entity_mask,
         base_loss_fn,
     ):
-        matches = [[] for _ in range(relation_logits.shape[0])]
-        with torch.no_grad():
-            for batch_idx in range(relation_logits.shape[0]):
-                prediction_ids = torch.where(anchor_mask[batch_idx].bool())[0]
-                gold_ids = torch.where(gold_mask[batch_idx].bool())[0]
-                if prediction_ids.numel() == 0 or gold_ids.numel() == 0:
-                    continue
+        def pair_cost(batch_idx, prediction_ids, gold_ids):
+            relation_pred = relation_logits[batch_idx, prediction_ids]
+            endpoint_pred = assignment_logits[batch_idx, prediction_ids]
+            relation_gold = relation_labels[batch_idx, gold_ids]
+            endpoint_gold = assignment_labels[batch_idx, gold_ids]
+            relation_cost_mask = relation_mask[batch_idx].to(
+                relation_pred.dtype
+            )
+            endpoint_cost_mask = entity_mask[batch_idx].to(
+                endpoint_pred.dtype
+            )[:, None]
 
-                public_pred = relation_logits[batch_idx, prediction_ids]
-                endpoint_pred = assignment_logits[batch_idx, prediction_ids]
-                public_gold = relation_labels[batch_idx, gold_ids]
-                endpoint_gold = assignment_labels[batch_idx, gold_ids]
-                public_mask = relation_mask[batch_idx].to(public_pred.dtype)[None, None, :, None]
-                endpoint_mask = (
-                    relation_mask[batch_idx].bool()[:, None]
-                    & entity_mask[batch_idx].bool()[None, :]
-                ).to(endpoint_pred.dtype)[None, None, :, :, None]
+            paired_relation_pred = relation_pred[:, None].expand(
+                -1, relation_gold.shape[0], -1
+            )
+            paired_relation_gold = relation_gold[None].expand(
+                relation_pred.shape[0], -1, -1
+            )
+            paired_endpoint_pred = endpoint_pred[:, None].expand(
+                -1, endpoint_gold.shape[0], -1, -1
+            )
+            paired_endpoint_gold = endpoint_gold[None].expand(
+                endpoint_pred.shape[0], -1, -1, -1
+            )
 
-                paired_public_pred = public_pred[:, None].expand(
-                    -1, public_gold.shape[0], -1, -1
-                )
-                paired_public_gold = public_gold[None].expand(
-                    public_pred.shape[0], -1, -1, -1
-                )
-                paired_endpoint_pred = endpoint_pred[:, None].expand(
-                    -1, endpoint_gold.shape[0], -1, -1, -1
-                )
-                paired_endpoint_gold = endpoint_gold[None].expand(
-                    endpoint_pred.shape[0], -1, -1, -1, -1
-                )
+            relation_cost = (
+                base_loss_fn(paired_relation_pred, paired_relation_gold)
+                * relation_cost_mask[None, None, :]
+            ).sum(dim=-1)
+            endpoint_cost = (
+                base_loss_fn(paired_endpoint_pred, paired_endpoint_gold)
+                * endpoint_cost_mask[None, None, :, :]
+            ).sum(dim=(-1, -2))
+            cost = relation_cost + endpoint_cost
 
-                public_cost = (
-                    base_loss_fn(
-                        paired_public_pred,
-                        paired_public_gold,
-                    )
-                    * public_mask
+            if prediction_ids.numel() > gold_ids.numel():
+                relation_zero = (
+                    base_loss_fn(relation_pred, torch.zeros_like(relation_pred))
+                    * relation_cost_mask[None, :]
+                ).sum(dim=-1)
+                endpoint_zero = (
+                    base_loss_fn(endpoint_pred, torch.zeros_like(endpoint_pred))
+                    * endpoint_cost_mask[None, :, :]
                 ).sum(dim=(-1, -2))
-                endpoint_cost = (
-                    base_loss_fn(
-                        paired_endpoint_pred,
-                        paired_endpoint_gold,
-                    )
-                    * endpoint_mask
-                ).sum(dim=(-1, -2, -3))
-                pair_cost = public_cost + endpoint_cost
+                cost = cost - (relation_zero + endpoint_zero)[:, None]
+            return cost
 
-                if prediction_ids.numel() > gold_ids.numel():
-                    public_zero = (
-                        base_loss_fn(public_pred, torch.zeros_like(public_pred))
-                        * public_mask.squeeze(0)
-                    ).sum(dim=(-1, -2))
-                    endpoint_zero = (
-                        base_loss_fn(endpoint_pred, torch.zeros_like(endpoint_pred))
-                        * endpoint_mask.squeeze(0)
-                    ).sum(dim=(-1, -2, -3))
-                    pair_cost -= (public_zero + endpoint_zero)[:, None]
-
-                for predicted_idx, gold_idx in minimum_cost_assignment(pair_cost):
-                    matches[batch_idx].append(
-                        (
-                            int(prediction_ids[predicted_idx].item()),
-                            int(gold_ids[gold_idx].item()),
-                        )
-                    )
-        return matches
+        return batched_masked_assignment(anchor_mask, gold_mask, pair_cost)
 
     def _assignment_loss(
         self,
@@ -440,28 +468,47 @@ class SetOpenRelexHead(NERHead):
         label_count,
         base_loss_fn,
     ):
-        if relation_labels.dim() != 4 or relation_labels.shape[-1] != 2:
+        if relation_labels.dim() != 3:
             raise ValueError(
-                "set_open_rel_labels must have shape (BN, G, R, 2)"
+                "set_open_rel_labels must have shape (BN, G, R)"
             )
-        if assignment_labels.dim() != 5 or assignment_labels.shape[-1] != 2:
+        if assignment_labels.dim() != 4 or assignment_labels.shape[-1] != 2:
             raise ValueError(
-                "set_open_rel_assignment_labels must have shape (BN, G, R, E, 2)"
+                "set_open_rel_assignment_labels must have shape (BN, G, E, 2)"
             )
-        if assignment_labels.shape[:3] != relation_labels.shape[:3]:
-            raise ValueError("set open relation targets must share (BN, G, R)")
-        if relation_labels.shape[1] > relation_logits.shape[1]:
-            raise ValueError(
-                "Set open relation gold count exceeds the configured relation-slot capacity"
-            )
-
+        if assignment_labels.shape[:2] != relation_labels.shape[:2]:
+            raise ValueError("set open relation targets must share (BN, G)")
+        if relation_labels.shape[0] != relation_logits.shape[0] or (
+            assignment_labels.shape[0] != assignment_logits.shape[0]
+        ):
+            raise ValueError("set open relation targets and logits must share BN")
         relation_count = min(relation_logits.shape[2], relation_labels.shape[2])
-        entity_count = min(assignment_logits.shape[3], assignment_labels.shape[3])
+        entity_count = min(assignment_logits.shape[2], assignment_labels.shape[2])
         public_pred = relation_logits[:, :, :relation_count]
-        endpoint_pred = assignment_logits[:, :, :relation_count, :entity_count]
+        endpoint_pred = assignment_logits[:, :, :entity_count]
         public_gold = relation_labels[:, :, :relation_count]
-        endpoint_gold = assignment_labels[:, :, :relation_count, :entity_count]
+        endpoint_gold = assignment_labels[:, :, :entity_count]
         gold_mask = self._gold_anchor_mask(public_gold, label_count)
+        slot_capacity = relation_logits.shape[1]
+        gold_counts = gold_mask.sum(dim=1)
+        active_slot_counts = anchor_mask[:, :slot_capacity].bool().sum(dim=1)
+        overflow = gold_counts > active_slot_counts
+        if overflow.any() and not self._relation_capacity_warning_emitted:
+            overflow_idx = (gold_counts - active_slot_counts).argmax()
+            gold_count = int(gold_counts[overflow_idx].item())
+            active_slots = int(active_slot_counts[overflow_idx].item())
+            warnings.warn(
+                "Set open relation gold count exceeds the active "
+                f"relation-slot capacity ({gold_count} gold pairs, "
+                f"{active_slots} slots active out of {slot_capacity}). "
+                "Hungarian matching will supervise at most the active slot "
+                "count per group; unmatched gold pairs are ignored. Increase "
+                "anchor_layer.params.num_slots or choose an anchor layer that "
+                "activates enough slots to cover every pair.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._relation_capacity_warning_emitted = True
 
         matches = self._match_anchors(
             public_pred,
@@ -474,26 +521,26 @@ class SetOpenRelexHead(NERHead):
             entity_mask[:, :entity_count],
             base_loss_fn,
         )
-        public_targets = torch.zeros_like(public_pred)
-        endpoint_targets = torch.zeros_like(endpoint_pred)
-        for batch_idx, batch_matches in enumerate(matches):
-            for predicted_anchor, gold_anchor in batch_matches:
-                public_targets[batch_idx, predicted_anchor] = public_gold[
-                    batch_idx, gold_anchor
-                ]
-                endpoint_targets[batch_idx, predicted_anchor] = endpoint_gold[
-                    batch_idx, gold_anchor
-                ]
+        public_targets = matched_anchor_targets(
+            public_pred,
+            public_gold,
+            matches,
+        )
+        endpoint_targets = matched_anchor_targets(
+            endpoint_pred,
+            endpoint_gold,
+            matches,
+        )
 
         public_losses = base_loss_fn(public_pred, public_targets)
         endpoint_losses = base_loss_fn(endpoint_pred, endpoint_targets)
         public_mask = (
-            anchor_mask.to(public_losses.dtype)[:, :, None, None]
-            * relation_mask[:, None, :relation_count, None].to(public_losses.dtype)
+            anchor_mask.to(public_losses.dtype)[:, :, None]
+            * relation_mask[:, None, :relation_count].to(public_losses.dtype)
         )
         endpoint_mask = (
-            public_mask.unsqueeze(3)
-            * entity_mask[:, None, None, :entity_count, None].to(endpoint_losses.dtype)
+            anchor_mask.to(endpoint_losses.dtype)[:, :, None, None]
+            * entity_mask[:, None, :entity_count, None].to(endpoint_losses.dtype)
         )
         public_total = (public_losses * public_mask).sum()
         endpoint_total = (endpoint_losses * endpoint_mask).sum()
@@ -506,14 +553,12 @@ class SetOpenRelexHead(NERHead):
 
     @staticmethod
     def _objectness_loss(logits, matches, anchor_mask, base_loss_fn=None):
-        targets = torch.zeros_like(logits)
-        for batch_idx, batch_matches in enumerate(matches):
-            for predicted_anchor, _ in batch_matches:
-                targets[batch_idx, predicted_anchor] = 1.0
-        loss_fn = base_loss_fn or binary_focal_or_bce
-        losses = loss_fn(logits.float(), targets.float())
-        mask = anchor_mask.to(losses.dtype)
-        return (losses * mask).sum() / mask.sum().clamp(min=1)
+        return matched_objectness_loss(
+            logits,
+            matches,
+            anchor_mask,
+            loss_fn=base_loss_fn,
+        )
 
     def _reduce_entity_loss(self, loss, word_mask, relation_mask):
         if loss is None or self.bio_loss_reduction == "sum":
@@ -598,8 +643,14 @@ class SetOpenRelexHead(NERHead):
             span_mask,
             batch,
         )
-        relation_logits, assignment_logits, modeled_anchors = (
-            self._score_relations_and_endpoints(
+        (
+            relation_logits,
+            assignment_logits,
+            endpoint_weights,
+            endpoint_representations,
+            pair_representations,
+        ) = (
+            self._score_pairs_and_relations(
                 anchors,
                 anchor_mask,
                 flat_inputs.child_embedding,
@@ -663,10 +714,13 @@ class SetOpenRelexHead(NERHead):
             "entity_mask": span_mask,
             "entity_representations": entity_representations,
             "anchors": anchors,
-            "modeled_anchors": modeled_anchors,
+            "modeled_anchors": pair_representations,
+            "pair_representations": pair_representations,
             "anchor_mask": anchor_mask,
             "objectness_logits": objectness_logits,
             "assignment_logits": assignment_logits,
+            "endpoint_weights": endpoint_weights,
+            "endpoint_representations": endpoint_representations,
             "span_logits": assignment_logits,
             "span_idx": span_idx,
             "span_mask": span_mask,

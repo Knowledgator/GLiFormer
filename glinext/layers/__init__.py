@@ -32,6 +32,7 @@ from .anchor_normalization import (
     NoAnchorNormalization,
     RMSNormAnchorNormalization,
 )
+from .anchor_relations import AnchorPairRelationsLayer, AnchorPairRelationsOutput
 from .anchored_scorer import AnchoredSpanScorer
 from .attention import (
     CrossAttentionBlock,
@@ -103,6 +104,7 @@ __all__ = [
     "AnchorNormalizer", "NoAnchorNormalization",
     "LayerNormAnchorNormalization", "RMSNormAnchorNormalization",
     "L2AnchorNormalization", "CenterRMSAnchorNormalization",
+    "AnchorPairRelationsLayer", "AnchorPairRelationsOutput",
     "AttentionBias", "NoAttentionBias", "GaussianDistanceAttentionBias",
     "LocalWindowAttentionBias", "CausalAttentionBias",
     "RelativeMLPAttentionBias", "CompositeAttentionBias",

@@ -17,11 +17,13 @@ from ._structuring_hierarchy import (
     is_internal_instance_key,
     resolve_structuring_processor,
 )
+from .label_augmentation import AugmentableLabelGroup
 from .mappings import (
     BaseClassMapping,
     StructuringClassMapping,
     StructuringItemMapping,
 )
+from .structuring_compat import legacy_task_mapping
 
 
 class StructuringProcessor(SpanProcessor):
@@ -72,7 +74,6 @@ class StructuringProcessor(SpanProcessor):
         # be padded to that size so Hungarian sees unmatched slots and trains
         # them as negatives. This includes learned slots and parameter-free
         # token selectors.
-        struct_configs = [self.task_config]
         mode = (
             self.task_config.effective_structure_mode()
             if hasattr(self.task_config, "effective_structure_mode")
@@ -84,7 +85,11 @@ class StructuringProcessor(SpanProcessor):
             else bool(getattr(self.task_config, "multi_level", False))
         )
         self.component = resolve_structuring_processor(
-            getattr(mode, "processor", None),
+            (
+                mode.processor_spec()
+                if mode is not None and hasattr(mode, "processor_spec")
+                else getattr(mode, "processor", None)
+            ),
             multi_level=configured_multi_level,
             child_token=config.structuring_child_token,
             end_token=config.structuring_end_token,
@@ -98,19 +103,19 @@ class StructuringProcessor(SpanProcessor):
         # Entity spans are mandatory targets for the independent second
         # stage, not an optional auxiliary representation.  Regular
         # structuring still honors its ``represent_spans`` switch.
-        self._span_config = self.task_config if self.require_span_targets else next(
-            (
-                struct_cfg
-                for struct_cfg in struct_configs
-                if getattr(struct_cfg, 'represent_spans', False)
-            ),
-            None,
+        self._span_config = (
+            self.task_config
+            if self.require_span_targets
+            or getattr(self.task_config, "represent_spans", False)
+            else None
         )
         # Only the classical structuring head consumes dense labels whose
         # record axis must match its fixed query width. Set structuring uses a
         # rectangular assignment (predicted slots versus gold records), so
         # padding its gold axis to ``num_slots`` only wastes memory.
-        fixed_slot_configs = struct_configs if self.pad_dense_fixed_slots else []
+        fixed_slot_configs = (
+            [self.task_config] if self.pad_dense_fixed_slots else []
+        )
         self._fixed_slot_pad = max(
             (
                 struct_cfg.effective_anchor_num_slots()
@@ -167,14 +172,15 @@ class StructuringProcessor(SpanProcessor):
         return item
 
     def _mapping_list(self, classes_mapping):
-        if hasattr(classes_mapping, self.mapping_attr):
-            mapping = getattr(classes_mapping, self.mapping_attr)
-            if mapping is not None:
-                return mapping
-        # Older BatchClassesMapping instances have only structuring_mapping.
-        if self.task_name == "set_structuring":
-            return getattr(classes_mapping, "structuring_mapping", [])
-        return []
+        return legacy_task_mapping(
+            classes_mapping,
+            self.mapping_attr,
+            fallback_attr=(
+                "structuring_mapping"
+                if self.task_name == "set_structuring" else None
+            ),
+            default=[],
+        )
 
     def _flat_structuring_iter(self, classes_mapping):
         flat_idx = 0
@@ -401,6 +407,134 @@ class StructuringProcessor(SpanProcessor):
                 multi_level=bool(multi_meta),
             ))
         return structuring_mapping
+
+    @staticmethod
+    def _hierarchy_field_label(field):
+        return field.get("label") if isinstance(field, dict) else field
+
+    def _apply_augmented_field_labels(self, struct_item, labels):
+        """Apply fields while preserving the inline hierarchy prompt contract."""
+
+        labels = list(dict.fromkeys(labels))
+        mapping = struct_item.field_class_to_id
+        hierarchy = list(getattr(struct_item, "hierarchy", None) or [])
+        if not struct_item.multi_level or not hierarchy:
+            mapping.class_to_id = {
+                label: index for index, label in enumerate(labels)
+            }
+            return
+
+        label_order = {label: index for index, label in enumerate(labels)}
+        represented = set()
+        root = None
+        for node in hierarchy:
+            if tuple(node.get("path") or ()) == ():
+                root = node
+            retained = []
+            for field in node.get("fields") or []:
+                label = self._hierarchy_field_label(field)
+                if label in label_order:
+                    retained.append(field)
+                    represented.add(label)
+            retained.sort(
+                key=lambda field: label_order[
+                    self._hierarchy_field_label(field)
+                ]
+            )
+            node["fields"] = retained
+
+        if root is None:
+            root = {
+                "path": [],
+                "parent_path": None,
+                "parent_field_path": [],
+                "fields": [],
+                "containers": [],
+            }
+            hierarchy.insert(0, root)
+            struct_item.hierarchy = hierarchy
+
+        for label in labels:
+            if label in represented:
+                continue
+            root["fields"].append({
+                "label": label,
+                "path": [label],
+                "local_path": [label],
+                "shape": {"kind": "scalar"},
+            })
+        root["fields"].sort(
+            key=lambda field: label_order[
+                self._hierarchy_field_label(field)
+            ]
+        )
+
+        by_path = {
+            tuple(node.get("path") or ()): node for node in hierarchy
+        }
+        children = {}
+        for node in hierarchy:
+            parent_path = node.get("parent_path")
+            if parent_path is not None:
+                children.setdefault(tuple(parent_path), []).append(node)
+
+        rendered = []
+        visited = set()
+
+        def visit(path):
+            if path in visited:
+                return
+            visited.add(path)
+            node = by_path.get(path)
+            if node is None:
+                return
+            rendered.extend(
+                self._hierarchy_field_label(field)
+                for field in node.get("fields") or []
+            )
+            for child in children.get(path, []):
+                visit(tuple(child.get("path") or ()))
+
+        visit(())
+        mapping.class_to_id = {
+            label: index
+            for index, label in enumerate(dict.fromkeys(rendered))
+        }
+
+    def get_augmentable_label_groups(self, batch_list, classes_mapping):
+        groups = []
+        for batch_idx, item_mapping in enumerate(
+            self._mapping_list(classes_mapping)
+        ):
+            structuring_data = batch_list[batch_idx].get(self.data_key, {})
+            for group_idx, struct_item in enumerate(item_mapping.items):
+                mapping = struct_item.field_class_to_id
+                if not mapping.class_to_id:
+                    continue
+                data_key = struct_item.data_key or struct_item.name
+                positives = list(dict.fromkeys(
+                    field_name
+                    for instance in structuring_data.get(data_key, [])
+                    for field_name in instance
+                    if not is_internal_instance_key(field_name)
+                ))
+
+                def apply_labels(labels, struct_item=struct_item):
+                    self._apply_augmented_field_labels(
+                        struct_item,
+                        labels,
+                    )
+
+                groups.append(AugmentableLabelGroup(
+                    task=self.task_name,
+                    batch_idx=batch_idx,
+                    group_idx=group_idx,
+                    mapping=mapping,
+                    positive_labels=positives,
+                    parent_name=mapping.name,
+                    apply_labels=apply_labels,
+                ))
+        return groups
 
     def contribute_prompt(self, classes_mapping, batch_idx, use_labels_encoder=False):
         mapping_list = self._mapping_list(classes_mapping)

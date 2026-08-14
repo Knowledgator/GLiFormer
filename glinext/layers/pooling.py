@@ -42,6 +42,15 @@ class CLSPooling(Pooling, pooling_type="cls"):
         super().__init__()
 
     def forward(self, token_embeds, attention_mask):
+        # Prompt truncation can leave a text task with no retained source
+        # words.  Task heads that have access to the encoder-level CLS token
+        # should use that directly; keep this generic fallback shape-safe for
+        # callers that only own word-level representations.
+        if token_embeds.shape[1] == 0:
+            return token_embeds.new_zeros(
+                token_embeds.shape[0],
+                token_embeds.shape[-1],
+            )
         return token_embeds[:, 0]
 
 

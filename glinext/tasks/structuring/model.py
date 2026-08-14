@@ -11,10 +11,13 @@ from ...layers.structuring_relations import (
     score_anchor_relations,
     validate_structuring_anchor_capacity,
 )
-from .. import TaskHeadOutput
+from .. import StructuringTaskHeadOutput, TaskHeadOutput
 from ..anchored_extraction import AnchoredSpanExtractionHead
-from ..losses import binary_focal_or_bce
-from ..matcher import minimum_cost_assignment
+from ..matcher import (
+    batched_masked_assignment,
+    gold_anchor_mask,
+    matched_objectness_loss,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +340,7 @@ class StructuringHead(AnchoredSpanExtractionHead):
         }
         output_extra.update(prediction_extra)
 
-        return TaskHeadOutput(
+        return StructuringTaskHeadOutput(
             loss=loss,
             logits=scores,
             extra=output_extra,
@@ -595,24 +598,13 @@ class StructuringHead(AnchoredSpanExtractionHead):
         Loss is averaged over the supervised-anchor mask so it stays
         comparable across batches with varying valid-anchor counts.
         """
-        target = torch.zeros_like(objectness_logits)
-        if anchor_matches is not None:
-            for b, batch_matches in enumerate(anchor_matches):
-                for pred_anchor, _ in batch_matches:
-                    if pred_anchor < target.shape[1]:
-                        target[b, pred_anchor] = 1.0
-        elif gold_mask is not None:
-            min_A = min(target.shape[1], gold_mask.shape[1])
-            target[:, :min_A] = gold_mask[:, :min_A].to(target.dtype)
-
-        loss_fn = base_loss_fn or binary_focal_or_bce
-        losses = loss_fn(
-            objectness_logits.float(),
-            target.float(),
+        return matched_objectness_loss(
+            objectness_logits,
+            anchor_matches,
+            supervised_anchor_mask,
+            gold_mask=gold_mask,
+            loss_fn=base_loss_fn,
         )
-        mask = supervised_anchor_mask.float()
-        denom = mask.sum().clamp(min=1.0)
-        return (losses * mask).sum() / denom
 
     # ── Diagnostic loss-stat helpers ─────────────────────────────────
 
@@ -711,45 +703,41 @@ class StructuringHead(AnchoredSpanExtractionHead):
         subtracted per prediction so assignment compares the incremental cost
         of owning a record instead of each prediction's absolute loss scale.
         """
-        B = pred.shape[0]
-        matches = [[] for _ in range(B)]
         token_child_mask = (
             word_mask_f[:, :, None] * child_mask_f[:, None, :]
         ).unsqueeze(-1)  # (B, L, C, 1)
 
-        with torch.no_grad():
-            for b in range(B):
-                pred_idx = torch.nonzero(pred_anchor_mask[b], as_tuple=False).flatten()
-                label_idx = torch.nonzero(label_anchor_mask[b], as_tuple=False).flatten()
-                n_pred, n_label = pred_idx.numel(), label_idx.numel()
-                if n_pred == 0 or n_label == 0:
-                    continue
+        def pair_cost(batch_idx, pred_idx, label_idx):
+            pred_b = pred[batch_idx, pred_idx]
+            lbl_b = lbl[batch_idx, label_idx]
+            mask_b = token_child_mask[batch_idx]
+            pair_losses = base_loss_fn(
+                pred_b[:, None].expand(
+                    -1, label_idx.numel(), -1, -1, -1
+                ),
+                lbl_b[None].expand(
+                    pred_idx.numel(), -1, -1, -1, -1
+                ),
+            )
+            cost = (pair_losses * mask_b[None, None]).sum(
+                dim=(-3, -2, -1)
+            )
+            if pred_idx.numel() > label_idx.numel():
+                zero_losses = base_loss_fn(
+                    pred_b,
+                    torch.zeros_like(pred_b),
+                )
+                zero_cost = (
+                    zero_losses * mask_b.unsqueeze(0)
+                ).sum(dim=(-3, -2, -1))
+                cost = cost - zero_cost[:, None]
+            return cost
 
-                pred_b = pred[b, pred_idx]                 # (n_pred, L, C, 3)
-                lbl_b = lbl[b, label_idx]                  # (n_label, L, C, 3)
-                mask_b = token_child_mask[b]               # (L, C, 1)
-
-                pair_pred = pred_b[:, None].expand(-1, n_label, -1, -1, -1)
-                pair_lbl = lbl_b[None].expand(n_pred, -1, -1, -1, -1)
-                pair_losses = base_loss_fn(pair_pred, pair_lbl)
-                pair_cost = (pair_losses * mask_b[None, None]).sum(dim=(-3, -2, -1))
-                # pair_cost: (n_pred, n_label)
-
-                if n_pred > n_label:
-                    # Subtract per-prediction "train as negative" cost so the
-                    # matcher compares the incremental cost of assigning gold.
-                    zero_losses = base_loss_fn(pred_b, torch.zeros_like(pred_b))
-                    zero_cost = (zero_losses * mask_b.unsqueeze(0)).sum(dim=(-3, -2, -1))
-                    pair_cost = pair_cost - zero_cost[:, None]
-
-                assignment = minimum_cost_assignment(pair_cost)
-                for pred_pos, label_pos in assignment:
-                    matches[b].append((
-                        int(pred_idx[pred_pos].item()),
-                        int(label_idx[label_pos].item()),
-                    ))
-
-        return matches
+        return batched_masked_assignment(
+            pred_anchor_mask,
+            label_anchor_mask,
+            pair_cost,
+        )
 
     @staticmethod
     def _label_anchor_mask(labels, label_count):
@@ -759,14 +747,4 @@ class StructuringHead(AnchoredSpanExtractionHead):
         provided. Falls back to "any non-zero label entry" — useful for
         direct head tests where no count is supplied.
         """
-        B, A = labels.shape[:2]
-        if label_count is not None:
-            if not torch.is_tensor(label_count):
-                label_count = torch.as_tensor(label_count, device=labels.device)
-            if label_count.dim() == 0:
-                label_count = label_count.unsqueeze(0).expand(B)
-            label_count = label_count.to(device=labels.device).long().clamp(min=0, max=A)
-            return torch.arange(A, device=labels.device).unsqueeze(0) < label_count.unsqueeze(1)
-
-        flat = labels.detach().abs().reshape(B, A, -1)
-        return flat.sum(dim=-1) > 0
+        return gold_anchor_mask(labels, label_count)

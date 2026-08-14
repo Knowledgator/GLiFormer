@@ -8,7 +8,6 @@ import enum
 import types
 from collections.abc import Callable
 from dataclasses import dataclass
-from dataclasses import field as dataclass_field
 from decimal import Decimal
 from typing import (
     Annotated,
@@ -19,15 +18,23 @@ from typing import (
     get_origin,
 )
 
-from .formatting import (
+from .formatting import StructuringOutputFormatter
+from .structuring_types import (
+    MISSING,
     FieldType,
-    StructuringOutputFormatter,
-    _RecursiveTypeSpec,
-    _UnionFieldType,
+    RecursiveTypeSpec,
+    SchemaNode,
+    UnionFieldType,
+    is_structuring_descriptor,
+    schema_node_exemplar,
+    schema_node_from_descriptor,
+    schema_node_from_spec,
 )
 
-_MISSING = object()
-_DESCRIPTOR_KEYS = {"fields", "children", "required_fields", "description"}
+_MISSING = MISSING
+_SchemaNode = SchemaNode
+_RecursiveTypeSpec = RecursiveTypeSpec
+_UnionFieldType = UnionFieldType
 _LIST_ORIGINS = {
     list,
     tuple,
@@ -46,18 +53,6 @@ _SCALAR_MAP: dict[type, str] = {
     datetime.datetime: "datetime",
 }
 _SAFE_DEFAULT_FACTORIES = {list, dict, set, tuple, frozenset}
-
-
-@dataclass
-class _SchemaNode:
-    """Recursive, dependency-free representation of a structuring schema."""
-
-    kind: str
-    type_spec: Any = None
-    fields: dict[str, _SchemaNode] = dataclass_field(default_factory=dict)
-    required_fields: list[str] = dataclass_field(default_factory=list)
-    item: _SchemaNode | None = None
-    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -365,15 +360,7 @@ def _pydantic_model_to_node(
 
 
 def _is_descriptor(spec: dict[str, Any]) -> bool:
-    fields = spec.get("fields")
-    required = spec.get("required_fields", [])
-    children = spec.get("children", {})
-    return (
-        set(spec).issubset(_DESCRIPTOR_KEYS)
-        and isinstance(fields, list | dict)
-        and isinstance(required, list)
-        and isinstance(children, dict)
-    )
+    return is_structuring_descriptor(spec)
 
 
 def _type_spec_required(type_spec: Any) -> bool:
@@ -385,89 +372,36 @@ def _type_spec_required(type_spec: Any) -> bool:
 
 
 def _node_from_mapping(spec: dict[str, Any]) -> _SchemaNode:
-    node = _SchemaNode("object")
-    for raw_name, value_spec in spec.items():
-        name = str(raw_name)
-        child = _node_from_value_spec(value_spec)
-        node.fields[name] = child
-        if child.kind == "scalar" and _type_spec_required(child.type_spec):
-            node.required_fields.append(name)
-    return node
+    return schema_node_from_spec(
+        spec,
+        _schema_scalar_node,
+        detect_descriptor=False,
+        is_required=_node_required,
+        list_factory=_schema_list_node,
+    )
 
 
 def _node_from_descriptor(spec: dict[str, Any]) -> _SchemaNode:
-    raw_fields = spec.get("fields") or []
-    if isinstance(raw_fields, list) and all(
-        isinstance(field_name, str) for field_name in raw_fields
-    ):
-        node = _SchemaNode(
-            "object",
-            fields={
-                field_name: _SchemaNode("scalar", type_spec="str") for field_name in raw_fields
-            },
-        )
-    elif isinstance(raw_fields, dict):
-        node = _node_from_mapping(raw_fields)
-    else:
-        raise TypeError("Structuring descriptor 'fields' must be a list of strings or a dictionary")
-
-    raw_children = spec.get("children") or {}
-    if not isinstance(raw_children, dict):
-        raise TypeError("Structuring descriptor 'children' must be a dictionary")
-    for raw_name, child_spec in raw_children.items():
-        if isinstance(child_spec, list) and all(
-            isinstance(field_name, str) for field_name in child_spec
-        ):
-            child_node = _SchemaNode(
-                "object",
-                fields={
-                    field_name: _SchemaNode("scalar", type_spec="str") for field_name in child_spec
-                },
-            )
-        else:
-            child_node = _node_from_value_spec(child_spec)
-        if child_node.kind == "array":
-            node.fields[str(raw_name)] = child_node
-        else:
-            node.fields[str(raw_name)] = _SchemaNode("array", item=child_node)
-
-    raw_required = spec.get("required_fields") or []
-    if not isinstance(raw_required, list) or not all(
-        isinstance(field_name, str) for field_name in raw_required
-    ):
-        raise TypeError("Structuring descriptor 'required_fields' must be a list of strings")
-    node.required_fields = list(raw_required)
-    node.description = spec.get("description")
-    return node
+    return schema_node_from_descriptor(
+        spec,
+        _schema_scalar_node,
+        is_required=_node_required,
+        list_factory=_schema_list_node,
+    )
 
 
-def _node_from_value_spec(spec: Any) -> _SchemaNode:
+def _node_required(node: _SchemaNode) -> bool:
+    return node.kind == "scalar" and _type_spec_required(node.type_spec)
+
+
+def _schema_scalar_node(spec: Any) -> _SchemaNode:
     if _is_pydantic_model_class(spec):
         return _pydantic_model_to_node(spec)
     if isinstance(spec, FieldType):
         return _SchemaNode("scalar", type_spec=spec)
-    if isinstance(spec, dict):
-        return _node_from_descriptor(spec) if _is_descriptor(spec) else _node_from_mapping(spec)
-
     origin = get_origin(spec)
     if origin is not None or _is_supported_annotation_type(spec):
         return _annotation_to_node(spec)
-
-    if isinstance(spec, list):
-        if not spec:
-            return _SchemaNode("scalar", type_spec=FieldType("list", list_item_type="str"))
-        item_node = _node_from_value_spec(spec[0])
-        if item_node.kind == "scalar":
-            item_spec = item_node.type_spec
-            item_type = item_spec.type_name if isinstance(item_spec, FieldType) else item_spec
-            if not isinstance(item_type, str) or item_type == "":
-                item_type = "str"
-            return _SchemaNode(
-                "scalar",
-                type_spec=FieldType("list", list_item_type=item_type),
-            )
-        return _SchemaNode("array", item=item_node)
-
     if isinstance(spec, str):
         return _SchemaNode("scalar", type_spec=spec or "str")
     if callable(spec):
@@ -475,6 +409,100 @@ def _node_from_value_spec(spec: Any) -> _SchemaNode:
     if spec is None:
         return _SchemaNode("scalar", type_spec="str")
     return _annotation_to_node(type(spec))
+
+
+def _schema_list_node(spec: list[Any]) -> _SchemaNode:
+    if not spec:
+        return _SchemaNode(
+            "scalar",
+            type_spec=FieldType("list", list_item_type="str"),
+        )
+    item_node = _node_from_value_spec(spec[0])
+    if item_node.kind == "scalar":
+        item_spec = item_node.type_spec
+        item_type = (
+            item_spec.type_name if isinstance(item_spec, FieldType) else item_spec
+        )
+        if not isinstance(item_type, str) or item_type == "":
+            item_type = "str"
+        return _SchemaNode(
+            "scalar",
+            type_spec=FieldType("list", list_item_type=item_type),
+        )
+    return _SchemaNode("array", item=item_node)
+
+
+def _node_from_value_spec(spec: Any) -> _SchemaNode:
+    return schema_node_from_spec(
+        spec,
+        _schema_scalar_node,
+        is_required=_node_required,
+        list_factory=_schema_list_node,
+    )
+
+
+def compile_structuring_template(spec: Any) -> _SchemaNode:
+    """Compile any public structuring template into the canonical node tree.
+
+    This is the single boundary used by schema-based inference and by direct
+    processor input. It accepts legacy field-name lists/descriptors, recursive
+    typed dictionaries, Python type annotations, and Pydantic v1/v2 models.
+    """
+
+    if _is_pydantic_model_class(spec):
+        return _pydantic_model_to_node(spec)
+    if isinstance(spec, dict):
+        # ``children`` is unambiguously part of the legacy descriptor
+        # envelope, so malformed values should produce its focused validation
+        # error. ``fields``/``required_fields`` alone can still be literal
+        # user field names and retain their historical disambiguation rules.
+        descriptor = _is_descriptor(spec) or (
+            "children" in spec and set(spec).issubset(
+                {"fields", "children", "required_fields", "description"}
+            )
+        )
+        return (
+            _node_from_descriptor(spec)
+            if descriptor
+            else _node_from_mapping(spec)
+        )
+    if isinstance(spec, list) and all(
+        isinstance(field_name, str) for field_name in spec
+    ):
+        return _SchemaNode(
+            "object",
+            fields={
+                field_name: _SchemaNode("scalar", type_spec="str")
+                for field_name in spec
+            },
+        )
+    if isinstance(spec, list):
+        if len(spec) != 1:
+            raise TypeError(
+                "A nested structuring schema list must contain one object exemplar"
+            )
+        item_node = _node_from_value_spec(spec[0])
+        if item_node.kind != "object":
+            raise TypeError(
+                "A nested structuring schema list must contain an object exemplar"
+            )
+        return _SchemaNode("array", item=item_node)
+    if get_origin(spec) is not None:
+        return _annotation_to_node(spec)
+    raise TypeError(
+        "Structuring fields must be a field-name list, typed mapping, nested "
+        "exemplar, Python type annotation, or Pydantic BaseModel class"
+    )
+
+
+def schema_node_requires_multi_level(node: _SchemaNode) -> bool:
+    """Return whether a compiled schema needs hierarchy-aware processing."""
+
+    if node.kind == "array":
+        return True
+    if node.kind != "object":
+        return False
+    return any(child.kind in {"object", "array"} for child in node.fields.values())
 
 
 def _node_to_format_spec(node: _SchemaNode) -> Any:
@@ -517,13 +545,7 @@ def _field_path_exists(node: _SchemaNode, path: str) -> bool:
 
 
 def _node_exemplar(node: _SchemaNode) -> Any:
-    if node.kind == "object":
-        return {name: _node_exemplar(child) for name, child in node.fields.items()}
-    if node.kind == "array":
-        return [_node_exemplar(node.item or _SchemaNode("scalar", type_spec="str"))]
-    if isinstance(node.type_spec, FieldType) and node.type_spec.type_name == "list":
-        return []
-    return ""
+    return schema_node_exemplar(node)
 
 
 def _descriptor_required_fields(node: _SchemaNode) -> list[str]:
@@ -578,6 +600,115 @@ def _node_to_descriptor(
         "fields": list(node.fields),
         "required_fields": required,
     }
+
+
+def _schema_node_to_wire(
+    name: str,
+    node: _SchemaNode,
+    *,
+    description: str | None = None,
+) -> Any:
+    """Serialize one canonical node to the checkpoint-compatible envelope."""
+
+    if name == "$root" and node.kind == "array":
+        item = node.item or _SchemaNode("object")
+        return [_node_exemplar(item)]
+    if name != "$root" and node.kind == "array":
+        if node.item is None or node.item.kind != "object":
+            raise TypeError(
+                "A named structuring schema must contain object instances"
+            )
+        node = node.item
+    return _node_to_descriptor(node, description=description)
+
+
+def normalize_structuring_schemas(structures: Any) -> Any:
+    """Normalize direct inference templates to the legacy wire envelope.
+
+    The normalized value is what processors and decoders exchange internally;
+    callers can use the clearer template DSL or Pydantic models without
+    knowing whether the loaded processor is flat or hierarchy-aware.
+    """
+
+    if _is_pydantic_model_class(structures):
+        node = compile_structuring_template(structures)
+        wire = _schema_node_to_wire("$root", node)
+        return wire if node.kind == "array" else {"$root": wire}
+
+    if isinstance(structures, list):
+        node = compile_structuring_template(structures)
+        if node.kind != "array":
+            return structures
+        return _schema_node_to_wire("$root", node)
+
+    if not isinstance(structures, dict):
+        raise TypeError(
+            "structures must be a named schema mapping, root exemplar, or "
+            "Pydantic BaseModel class"
+        )
+
+    normalized = {}
+    for raw_name, spec in structures.items():
+        name = str(raw_name)
+        node = compile_structuring_template(spec)
+        normalized[name] = _schema_node_to_wire(
+            name,
+            node,
+            description=node.description,
+        )
+    return normalized
+
+
+def build_structuring_output_formatter(
+    structures: Any,
+    *,
+    validate_output: bool = False,
+) -> StructuringOutputFormatter | None:
+    """Build typed output formatting directly from public inference schemas."""
+
+    schema_types: dict[str, Any] = {}
+    output_models: dict[str, type] = {}
+    whole_output_models: set[str] = set()
+
+    if _is_pydantic_model_class(structures):
+        node = compile_structuring_template(structures)
+        schema_types["$root"] = _RecursiveTypeSpec(_node_to_format_spec(node))
+        if validate_output:
+            output_models["$root"] = structures
+            whole_output_models.add("$root")
+    elif isinstance(structures, list):
+        node = compile_structuring_template(structures)
+        if node.kind != "array":
+            return None
+        schema_types["$root"] = _RecursiveTypeSpec(_node_to_format_spec(node))
+    elif isinstance(structures, dict):
+        for raw_name, spec in structures.items():
+            name = str(raw_name)
+            node = compile_structuring_template(spec)
+            formatter_node = node
+            if name != "$root" and node.kind == "array":
+                formatter_node = node.item or _SchemaNode("object")
+            schema_types[name] = _RecursiveTypeSpec(
+                _node_to_format_spec(formatter_node)
+            )
+            if validate_output and _is_pydantic_model_class(spec):
+                output_models[name] = spec
+                if name == "$root" or node.kind == "array":
+                    whole_output_models.add(name)
+    else:
+        return None
+
+    if validate_output and not output_models:
+        raise TypeError(
+            "validate_output=True requires at least one Pydantic BaseModel schema"
+        )
+    if not schema_types:
+        return None
+    return StructuringOutputFormatter(
+        schema_types,
+        output_models=output_models,
+        whole_output_models=whole_output_models,
+    )
 
 
 class GLiNExTSchema:
@@ -705,6 +836,7 @@ class GLiNExTSchema:
         fields: Any,
         description: str | None = None,
         required_fields: list[str] | None = None,
+        validate_output: bool = False,
     ) -> GLiNExTSchema:
         """Add a structuring schema for JSON extraction.
 
@@ -716,15 +848,15 @@ class GLiNExTSchema:
 
                     schema.add_structure("person", ["name", "age"])
 
-                **Typed dict** — values converted to declared types::
+                **Typed template** — values converted to declared types::
 
                     schema.add_structure("person", {
-                        "name": "str",
-                        "age": "int",
-                        "is_active": "bool",
-                        "salary": "float",
+                        "!name": "string",
+                        "age": "integer",
+                        "is_active": "boolean",
+                        "salary": "number",
                         "birth_date": "date",
-                        "skills": FieldType("list", list_item_type="str"),
+                        "skills": ["string"],
                     })
 
                     # Nested objects and lists of objects use the same shape
@@ -747,10 +879,11 @@ class GLiNExTSchema:
 
                 Both Pydantic v2 and ``pydantic.v1`` compatibility models are
                 supported, including nested models and ``list[BaseModel]``.
-                Pydantic stays optional and is imported only by user code.
 
-                Supported type names: str, int, float, bool, list, date,
-                datetime. For advanced control, use FieldType or a callable.
+                Portable type names are string, integer, number, boolean,
+                date, and datetime. The str/int/float/bool aliases remain
+                supported. For advanced control, use field metadata,
+                FieldType, or a callable.
             description: Optional description of the schema.
             required_fields: Field names that must appear in every emitted
                 instance. Acts as a post-processing filter: any instance
@@ -758,43 +891,23 @@ class GLiNExTSchema:
                 output. Decoding itself is unaffected. If ``None``, the
                 required set is auto-derived from ``FieldType.required`` or
                 from Pydantic fields without a default.
+            validate_output: For a Pydantic schema, validate converted output
+                and apply model defaults/constraints. The public result remains
+                a plain dictionary/list. Disabled by default because extraction
+                output can be partial.
         """
-        if _is_pydantic_model_class(fields):
-            node = _pydantic_model_to_node(fields)
-            has_types = True
-        elif isinstance(fields, dict):
-            node = (
-                _node_from_descriptor(fields)
-                if _is_descriptor(fields)
-                else _node_from_mapping(fields)
-            )
-            has_types = True
-        elif isinstance(fields, list) and all(isinstance(field_name, str) for field_name in fields):
-            # Historical untyped form.  Keep build_output_formatter() returning
-            # None for it, even though the recursive node knows fields are str.
-            node = _SchemaNode(
-                "object",
-                fields={
-                    field_name: _SchemaNode("scalar", type_spec="str") for field_name in fields
-                },
-            )
-            has_types = False
-        elif isinstance(fields, list):
-            if len(fields) != 1:
-                raise TypeError("A nested structuring schema list must contain one object exemplar")
-            item_node = _node_from_value_spec(fields[0])
-            if item_node.kind != "object":
-                raise TypeError("A nested structuring schema list must contain an object exemplar")
-            node = _SchemaNode("array", item=item_node)
-            has_types = True
-        elif get_origin(fields) is not None:
-            node = _annotation_to_node(fields)
-            has_types = True
-        else:
+        output_model = fields if _is_pydantic_model_class(fields) else None
+        if validate_output and output_model is None:
             raise TypeError(
-                "Structuring fields must be a field-name list, typed mapping, "
-                "nested exemplar, or Pydantic BaseModel class"
+                "validate_output=True requires a Pydantic BaseModel schema"
             )
+        # Historical field-name lists are the only untyped form. Everything
+        # else goes through the same canonical compiler and gets a formatter.
+        has_types = not (
+            isinstance(fields, list)
+            and all(isinstance(field_name, str) for field_name in fields)
+        )
+        node = compile_structuring_template(fields)
 
         if node.kind == "scalar":
             raise TypeError("A structuring schema root must be an object or list of objects")
@@ -834,8 +947,18 @@ class GLiNExTSchema:
             "required_fields": list(requirement_node.required_fields),
             "node": node,
             "inference_node": inference_node,
+            "output_model": output_model if validate_output else None,
         }
         return self
+
+    @property
+    def requires_multi_level(self) -> bool:
+        """Whether any structure needs hierarchy-aware model components."""
+
+        return any(
+            name == "$root" or schema_node_requires_multi_level(schema["node"])
+            for name, schema in self._structure_schemas.items()
+        )
 
     # ── Conversion to inference kwargs ─────────────────────────────────
 
@@ -891,13 +1014,9 @@ class GLiNExTSchema:
         if self._structure_schemas:
             structures = {}
             for name, schema in self._structure_schemas.items():
-                node = schema["node"]
-                if name == "$root" and node.kind == "array":
-                    item = node.item or _SchemaNode("object")
-                    structures[name] = [_node_exemplar(item)]
-                    continue
-                structures[name] = _node_to_descriptor(
-                    schema["inference_node"],
+                structures[name] = _schema_node_to_wire(
+                    name,
+                    schema["node"],
                     description=schema.get("description"),
                 )
             kwargs["structures"] = structures
@@ -911,13 +1030,24 @@ class GLiNExTSchema:
             A formatter if any schema has field types defined, else None.
         """
         schema_types = {}
+        output_models = {}
+        whole_output_models = set()
         for name, schema in self._structure_schemas.items():
             ft = schema.get("field_types")
             if ft is not None:
                 schema_types[name] = _RecursiveTypeSpec(ft)
+            output_model = schema.get("output_model")
+            if output_model is not None:
+                output_models[name] = output_model
+                if name == "$root" or schema["node"].kind == "array":
+                    whole_output_models.add(name)
         if not schema_types:
             return None
-        return StructuringOutputFormatter(schema_types)
+        return StructuringOutputFormatter(
+            schema_types,
+            output_models=output_models,
+            whole_output_models=whole_output_models,
+        )
 
     def __repr__(self) -> str:
         parts = []

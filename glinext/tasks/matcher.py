@@ -9,6 +9,11 @@ from torch import nn
 from .box_ops import pairwise_generalized_box_iou
 
 ClassProbability = str | Callable[[torch.Tensor], torch.Tensor]
+AnchorMatches = list[list[tuple[int, int]]]
+PairCostBuilder = Callable[
+    [int, torch.Tensor, torch.Tensor],
+    torch.Tensor,
+]
 
 
 @torch.no_grad()
@@ -33,6 +38,123 @@ def minimum_cost_assignment(cost: torch.Tensor) -> list[tuple[int, int]]:
         (int(row), int(col))
         for row, col in zip(rows, cols, strict=True)
     ]
+
+
+def gold_anchor_mask(
+    labels: torch.Tensor,
+    label_count: torch.Tensor | list[int] | int | None,
+    *,
+    anchor_dim: int = 1,
+) -> torch.Tensor:
+    """Return the valid-gold mask shared by set-prediction heads."""
+
+    labels = labels.movedim(anchor_dim, 1)
+    batch_size, anchor_count = labels.shape[:2]
+    if label_count is None:
+        return (
+            labels.detach().abs().reshape(batch_size, anchor_count, -1)
+            .sum(dim=-1)
+            > 0
+        )
+    if not torch.is_tensor(label_count):
+        label_count = torch.as_tensor(label_count, device=labels.device)
+    if label_count.dim() == 0:
+        label_count = label_count.unsqueeze(0).expand(batch_size)
+    if label_count.numel() != batch_size:
+        raise ValueError(
+            "label_count must contain one value per batch item"
+        )
+    label_count = label_count.to(device=labels.device).long().clamp(
+        min=0,
+        max=anchor_count,
+    )
+    return (
+        torch.arange(anchor_count, device=labels.device).unsqueeze(0)
+        < label_count.unsqueeze(1)
+    )
+
+
+@torch.no_grad()
+def batched_masked_assignment(
+    prediction_mask: torch.Tensor,
+    gold_mask: torch.Tensor,
+    cost_builder: PairCostBuilder,
+) -> AnchorMatches:
+    """Run rectangular matching for each batch using task-specific costs."""
+
+    if prediction_mask.dim() != 2 or gold_mask.dim() != 2:
+        raise ValueError("prediction and gold masks must have shape (B, A)")
+    if prediction_mask.shape[0] != gold_mask.shape[0]:
+        raise ValueError("prediction and gold masks must share a batch axis")
+
+    matches: AnchorMatches = [[] for _ in range(prediction_mask.shape[0])]
+    for batch_idx in range(prediction_mask.shape[0]):
+        prediction_ids = torch.where(prediction_mask[batch_idx].bool())[0]
+        gold_ids = torch.where(gold_mask[batch_idx].bool())[0]
+        if prediction_ids.numel() == 0 or gold_ids.numel() == 0:
+            continue
+        pair_cost = cost_builder(batch_idx, prediction_ids, gold_ids)
+        expected = (prediction_ids.numel(), gold_ids.numel())
+        if tuple(pair_cost.shape) != expected:
+            raise ValueError(
+                f"pair-cost builder returned {tuple(pair_cost.shape)}, "
+                f"expected {expected}"
+            )
+        matches[batch_idx] = [
+            (
+                int(prediction_ids[predicted_idx].item()),
+                int(gold_ids[gold_idx].item()),
+            )
+            for predicted_idx, gold_idx in minimum_cost_assignment(pair_cost)
+        ]
+    return matches
+
+
+def matched_anchor_targets(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    matches: AnchorMatches,
+) -> torch.Tensor:
+    """Scatter gold records onto matched prediction slots."""
+
+    targets = torch.zeros_like(predictions)
+    for batch_idx, batch_matches in enumerate(matches):
+        for predicted_anchor, gold_anchor in batch_matches:
+            targets[batch_idx, predicted_anchor] = labels[
+                batch_idx,
+                gold_anchor,
+            ]
+    return targets
+
+
+def matched_objectness_loss(
+    logits: torch.Tensor,
+    matches: AnchorMatches | None,
+    anchor_mask: torch.Tensor,
+    *,
+    gold_mask: torch.Tensor | None = None,
+    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Normalized objectness loss for matched or positional anchors."""
+
+    if loss_fn is None:
+        from .losses import binary_focal_or_bce
+
+        loss_fn = binary_focal_or_bce
+    targets = torch.zeros_like(logits)
+    if matches is not None:
+        for batch_idx, batch_matches in enumerate(matches):
+            for predicted_anchor, _ in batch_matches:
+                if predicted_anchor < targets.shape[1]:
+                    targets[batch_idx, predicted_anchor] = 1.0
+    elif gold_mask is not None:
+        anchor_count = min(targets.shape[1], gold_mask.shape[1])
+        targets[:, :anchor_count] = gold_mask[:, :anchor_count].to(
+            targets.dtype
+        )
+    losses = loss_fn(logits.float(), targets.float())
+    mask = anchor_mask.to(losses.dtype)
+    return (losses * mask).sum() / mask.sum().clamp(min=1.0)
 
 
 class HungarianMatcher(nn.Module):

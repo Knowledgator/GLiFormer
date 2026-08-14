@@ -29,6 +29,7 @@ class GLiNExTTextOutput(GLiNExTBaseOutput):
     joint_rel_idx: Optional[torch.LongTensor] = None
     joint_rel_mask: Optional[torch.Tensor] = None
     joint_rel_entity_spans: Optional[torch.LongTensor] = None
+    joint_rel_entity_class_idx: Optional[torch.LongTensor] = None
 
     open_rel_logits: Optional[torch.FloatTensor] = None
     open_rel_batch_origin: Optional[torch.LongTensor] = None

@@ -346,9 +346,10 @@ class TextProcessingMixin:
         return normalized
 
     def _preprocess_batch_text(self, batch_list, classes_mapping):
-        if "ner" in self.task_processors:
+        extraction_processor = self._extraction_task_processor()
+        if extraction_processor is not None:
             return [
-                self.task_processors["ner"].preprocess_example(
+                extraction_processor.preprocess_example(
                     item, classes_mapping.extraction_mapping[i],
                 )
                 for i, item in enumerate(batch_list)
@@ -1009,6 +1010,12 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
         if "audio_segmentation" in allowed_tasks and config.audio_segmentation_config is not None:
             self.task_processors["audio_segmentation"] = AudioProcessor(config, "audio_segmentation")
 
+    def _extraction_task_processor(self):
+        """Return the single processor responsible for joint NER prompts."""
+        return self.task_processors.get("ner") or self.task_processors.get(
+            "joint_relex"
+        )
+
     # ── Class mappings ──────────────────────────────────────────────────
 
     def batch_generate_class_mappings(self, batch_list, **kwargs):
@@ -1031,8 +1038,9 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
         else:
             cat_mapping = [CatClassMapping(cat_class_to_id=[]) for _ in batch_list]
 
-        if "ner" in self.task_processors:
-            extraction_mapping = self.task_processors["ner"].get_classes_mapping(
+        extraction_processor = self._extraction_task_processor()
+        if extraction_processor is not None:
+            extraction_mapping = extraction_processor.get_classes_mapping(
                 batch_list, **kwargs
             )
         else:
@@ -1105,7 +1113,7 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
         else:
             audio_segmentation_mapping = [VisionClassMapping() for _ in batch_list]
 
-        return BatchClassesMapping(
+        classes_mapping = BatchClassesMapping(
             cat_mapping=cat_mapping,
             extraction_mapping=extraction_mapping,
             structuring_mapping=structuring_mapping,
@@ -1118,6 +1126,27 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             segmentation_mapping=segmentation_mapping,
             audio_segmentation_mapping=audio_segmentation_mapping,
         )
+
+        # Label-schema augmentation is deliberately applied to the ephemeral
+        # mappings, not to dataset annotations.  It must happen before text
+        # preprocessing because NER preprocessing materializes class ids from
+        # these mappings for span-level supervision.
+        label_augmenter = kwargs.get("label_augmenter")
+        if label_augmenter is not None:
+            augmentable_groups = []
+            for task_processor in self.task_processors.values():
+                augmentable_groups.extend(
+                    task_processor.get_augmentable_label_groups(
+                        batch_list,
+                        classes_mapping,
+                    )
+                )
+            self.last_label_augmentation_stats = label_augmenter.augment(
+                augmentable_groups,
+                batch_ids=kwargs.get("label_augmentation_batch_ids"),
+            )
+
+        return classes_mapping
 
     # ── Prompt construction ─────────────────────────────────────────────
 
@@ -1135,8 +1164,9 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
                     classes_mapping, i, use_labels_encoder,
                 ))
 
-            if "ner" in self.task_processors:
-                prompt.extend(self.task_processors["ner"].contribute_prompt(
+            extraction_processor = self._extraction_task_processor()
+            if extraction_processor is not None:
+                prompt.extend(extraction_processor.contribute_prompt(
                     classes_mapping, i, use_labels_encoder,
                 ))
 
@@ -1213,6 +1243,18 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             proc = self.task_processors.get(name)
             if proc is None:
                 continue
+            if (
+                name == "joint_relex"
+                and "ner" not in self.task_processors
+                and hasattr(proc, "create_ner_labels")
+            ):
+                ner_result = proc.create_ner_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=max_seq_len,
+                )
+                if ner_result is not None:
+                    labels.update(ner_result)
             result = proc.create_labels(
                 batch_list,
                 classes_mapping,
@@ -1242,8 +1284,9 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
     # ── Span resolution (delegates to task processors) ──────────────────
 
     def resolve_extraction_spans(self, item):
-        if "ner" in self.task_processors:
-            self.task_processors["ner"].resolve_spans(item)
+        extraction_processor = self._extraction_task_processor()
+        if extraction_processor is not None:
+            extraction_processor.resolve_spans(item)
         return item
 
     def resolve_structuring_spans(self, item):
@@ -1285,14 +1328,12 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
                 if hasattr(proc, "resolve_spans"):
                     proc.resolve_spans(item)
 
-        all_labels = {}
-        for name, proc in self.task_processors.items():
-            result = proc.create_labels(
-                batch_list, classes_mapping, max_seq_len=max_seq_len,
-            )
-            if result is not None:
-                all_labels.update(result)
-        return all_labels
+        return self.create_task_labels(
+            batch_list,
+            classes_mapping,
+            tuple(self.task_processors),
+            max_seq_len=max_seq_len,
+        )
 
     # ── Label creation (delegates to task processors) ───────────────────
 
@@ -1306,23 +1347,53 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
     def create_ner_labels(self, batch_list, classes_mapping, max_seq_len):
         for item in batch_list:
             self.resolve_extraction_spans(item)
-        if "ner" in self.task_processors:
-            result = self.task_processors["ner"].create_labels(
-                batch_list, classes_mapping, max_seq_len=max_seq_len
-            )
+        extraction_processor = self._extraction_task_processor()
+        if extraction_processor is not None:
+            if hasattr(extraction_processor, "create_ner_labels"):
+                result = extraction_processor.create_ner_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=max_seq_len,
+                )
+            else:
+                result = extraction_processor.create_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=max_seq_len,
+                )
             if result is not None:
                 return result["ner_labels"], result["ner_batch_idx"]
         return None
 
-    def create_rel_labels(self, batch_list, classes_mapping, max_seq_len=0):
-        return self.create_joint_rel_labels(batch_list, classes_mapping, max_seq_len=max_seq_len)
+    def create_rel_labels(
+        self,
+        batch_list,
+        classes_mapping,
+        max_seq_len=0,
+        sequence_lengths=None,
+    ):
+        return self.create_joint_rel_labels(
+            batch_list,
+            classes_mapping,
+            max_seq_len=max_seq_len,
+            sequence_lengths=sequence_lengths,
+        )
 
-    def create_joint_rel_labels(self, batch_list, classes_mapping, max_seq_len=0):
+    def create_joint_rel_labels(
+        self,
+        batch_list,
+        classes_mapping,
+        max_seq_len=0,
+        sequence_lengths=None,
+    ):
         for item in batch_list:
             self.resolve_extraction_spans(item)
         if "joint_relex" in self.task_processors:
             result = self.task_processors["joint_relex"].create_labels(
-                batch_list, classes_mapping, max_seq_len=max_seq_len,
+                batch_list,
+                classes_mapping,
+                max_seq_len=max_seq_len,
+                sequence_lengths=sequence_lengths,
             )
             if result is not None:
                 return result
@@ -1417,8 +1488,9 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
     # ── Preprocessing ───────────────────────────────────────────────────
 
     def preprocess_example(self, item, extraction_mapping=None):
-        if "ner" in self.task_processors and extraction_mapping is not None:
-            return self.task_processors["ner"].preprocess_example(
+        extraction_processor = self._extraction_task_processor()
+        if extraction_processor is not None and extraction_mapping is not None:
+            return extraction_processor.preprocess_example(
                 item, extraction_mapping,
             )
         return self._preprocess_text_only(item)
@@ -1464,6 +1536,7 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             set_open_relex = [[] for _ in range(batch_size)]
 
         batch_dict = {
+            "text": batch.get("text", ["" for _ in range(batch_size)]),
             "tokens": batch["tokens"],
             "seq_length": batch["seq_length"],
             "classes_mapping": classes_mapping,
@@ -1510,10 +1583,11 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             "bbox": batch.get("bbox"),
         }
 
-        if "ner" in self.task_processors:
+        extraction_processor = self._extraction_task_processor()
+        if extraction_processor is not None:
             batch_dict["span_idx"] = batch.get("span_idx")
             batch_dict["span_label"] = batch.get("span_label")
-            batch_dict = self.task_processors["ner"].add_span_batch_fields(
+            batch_dict = extraction_processor.add_span_batch_fields(
                 batch_dict, classes_mapping,
             )
 
@@ -1577,11 +1651,18 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
         batch_list = []
         for i in range(len(batch["tokens"])):
             item = {
-            "classification": batch["classification"][i],
-            "extraction": batch["extraction"][i],
-            "embedding": batch["embedding"][i],
-            "objects": batch.get("objects", [[]])[i],
-        }
+                "text": batch["text"][i],
+                # Extraction spans were resolved before this raw batch was
+                # assembled. Preserve that coordinate system when rebuilding
+                # label items instead of interpreting token indices as character
+                # offsets a second time.
+                "tokenized_text": batch["tokens"][i],
+                "_glinext_extraction_spans_resolved": True,
+                "classification": batch["classification"][i],
+                "extraction": batch["extraction"][i],
+                "embedding": batch["embedding"][i],
+                "objects": batch.get("objects", [[]])[i],
+            }
             if "structuring" in batch and i < len(batch["structuring"]):
                 item["structuring"] = batch["structuring"][i]
             if (
@@ -1647,6 +1728,7 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
         set_processor = self.task_processors.get("set_open_relex")
 
         batch_dict = {
+            "text": [item.get("text", "") for item in batch_list],
             "tokens": texts,
             "seq_length": torch.LongTensor(seq_lengths).unsqueeze(-1),
             "classes_mapping": classes_mapping,
@@ -1718,7 +1800,12 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
             if ner_result is not None:
                 tokenized_input["ner_labels"], tokenized_input["ner_batch_idx"] = ner_result
 
-            rel_result = self.create_joint_rel_labels(batch_list, classes_mapping, max_seq_len=max_seq_len)
+            rel_result = self.create_joint_rel_labels(
+                batch_list,
+                classes_mapping,
+                max_seq_len=max_seq_len,
+                sequence_lengths=sequence_lengths,
+            )
             if rel_result is not None:
                 tokenized_input["rel_labels"] = rel_result["rel_labels"]
                 tokenized_input["rel_pair_mask"] = rel_result.get("rel_pair_mask")
@@ -1726,6 +1813,9 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
                 tokenized_input["rel_batch_idx"] = rel_result["rel_batch_idx"]
                 tokenized_input["rel_span_idx"] = rel_result["rel_span_idx"]
                 tokenized_input["rel_span_mask"] = rel_result["rel_span_mask"]
+                tokenized_input["rel_span_class_idx"] = rel_result[
+                    "rel_span_class_idx"
+                ]
 
             open_rel_result = self.create_open_rel_labels(batch_list, classes_mapping, max_seq_len)
             if open_rel_result is not None:
@@ -1761,8 +1851,12 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
                 tokenized_input["embedding_labels"] = embedding_result["embedding_labels"]
                 tokenized_input["embedding_pair_idx"] = embedding_result["embedding_pair_idx"]
 
-            if getattr(self.config, "represent_spans", False) and "ner" in self.task_processors:
-                ner_span_result = self.task_processors["ner"].create_span_labels(
+            extraction_processor = self._extraction_task_processor()
+            if (
+                getattr(self.config, "represent_spans", False)
+                and extraction_processor is not None
+            ):
+                ner_span_result = extraction_processor.create_span_labels(
                     batch, classes_mapping,
                 )
                 if ner_span_result is not None:

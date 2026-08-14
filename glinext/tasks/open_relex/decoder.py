@@ -38,7 +38,7 @@ class OpenRelexDecoder(SpanDecoder):
         if model_output.open_rel_logits is None and model_output.open_rel_span_logits is None:
             return []
 
-        threshold = threshold or self.threshold
+        threshold = self.threshold if threshold is None else threshold
         anchor_mask = model_output.open_rel_anchor_mask
         batch_origin = model_output.open_rel_batch_origin
         batch_size = model_output.batch_size
@@ -99,9 +99,11 @@ class OpenRelexDecoder(SpanDecoder):
 
                     head_spans = self.decode_bio_spans_single_class(
                         head_probs, threshold, flat_ner, multi_label,
+                        max_width=getattr(self.config, "max_width", None),
                     )
                     tail_spans = self.decode_bio_spans_single_class(
                         tail_probs, threshold, flat_ner, multi_label,
+                        max_width=getattr(self.config, "max_width", None),
                     )
 
                     if not head_spans or not tail_spans:
@@ -110,7 +112,7 @@ class OpenRelexDecoder(SpanDecoder):
                     rel_name = id_to_rel_classes[b].get(c, str(c))
                     self._add_triples(triples, head_spans, tail_spans, rel_name, texts, text_bi)
 
-            all_results.append(triples)
+            all_results.append(self._deduplicate_triples(triples))
 
         return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
 
@@ -147,6 +149,12 @@ class OpenRelexDecoder(SpanDecoder):
                         s = span_pos.item()
                         start = span_idx[b, s, 0].item()
                         end = span_idx[b, s, 1].item()
+                        max_width = getattr(self.config, "max_width", None)
+                        if (
+                            max_width is not None
+                            and end - start + 1 > max_width
+                        ):
+                            continue
 
                         head_score = span_probs[b, s, x, c, 0].item()
                         tail_score = span_probs[b, s, x, c, 1].item()
@@ -166,35 +174,57 @@ class OpenRelexDecoder(SpanDecoder):
 
                     self._add_triples(triples, head_spans, tail_spans, rel_name, texts, text_bi)
 
-            all_results.append(triples)
+            all_results.append(self._deduplicate_triples(triples))
 
         return unflatten_by_batch_origin(all_results, batch_origin, batch_size)
 
     def _add_triples(self, triples, head_spans, tail_spans, rel_name, texts, batch_idx):
-        """Build relation triple dicts from head/tail span lists."""
-        for head_span in head_spans:
-            for tail_span in tail_spans:
-                head_text = self.resolve_span_text(
-                    texts, batch_idx, head_span.start, head_span.end,
-                )
-                tail_text = self.resolve_span_text(
-                    texts, batch_idx, tail_span.start, tail_span.end,
-                )
-                score = (head_span.score + tail_span.score) / 2.0
-                triples.append({
-                    "head": {
-                        "start": head_span.start,
-                        "end": head_span.end,
-                        "text": head_text,
-                    },
-                    "tail": {
-                        "start": tail_span.start,
-                        "end": tail_span.end,
-                        "text": tail_text,
-                    },
-                    "relation": rel_name,
-                    "score": score,
-                })
+        """Build the single pair represented by one anchor/relation slot."""
+
+        # Each slot is trained against exactly one head and one tail. Returning
+        # every independently valid span and taking their Cartesian product is
+        # inconsistent with that objective and grows quadratically.
+        head_span = max(head_spans, key=lambda span: span.score)
+        tail_span = max(tail_spans, key=lambda span: span.score)
+        head_text = self.resolve_span_text(
+            texts, batch_idx, head_span.start, head_span.end,
+        )
+        tail_text = self.resolve_span_text(
+            texts, batch_idx, tail_span.start, tail_span.end,
+        )
+        score = (head_span.score + tail_span.score) / 2.0
+        triples.append({
+            "head": {
+                "start": head_span.start,
+                "end": head_span.end,
+                "text": head_text,
+            },
+            "tail": {
+                "start": tail_span.start,
+                "end": tail_span.end,
+                "text": tail_text,
+            },
+            "relation": rel_name,
+            "score": score,
+        })
+
+    @staticmethod
+    def _deduplicate_triples(triples):
+        """Keep the highest-scoring copy predicted by interchangeable slots."""
+
+        unique = {}
+        for triple in triples:
+            key = (
+                triple["head"]["start"],
+                triple["head"]["end"],
+                triple["tail"]["start"],
+                triple["tail"]["end"],
+                triple["relation"],
+            )
+            previous = unique.get(key)
+            if previous is None or triple["score"] > previous["score"]:
+                unique[key] = triple
+        return list(unique.values())
 
     def map_results(
         self,
@@ -255,11 +285,9 @@ class OpenRelexDecoder(SpanDecoder):
         if not hasattr(classes_mapping, 'open_relex_mapping'):
             return maps
 
-        for batch_idx, om in enumerate(classes_mapping.open_relex_mapping):
-            if batch_idx >= batch_size:
+        for flat_idx, _, _, item in classes_mapping.flat_open_relex_iter():
+            if flat_idx >= batch_size:
                 break
-            for item in om.items:
-                reverse = item.rel_class_to_id.get_reverse_mapping()
-                maps[batch_idx].update(reverse)
+            maps[flat_idx] = item.rel_class_to_id.get_reverse_mapping()
 
         return maps

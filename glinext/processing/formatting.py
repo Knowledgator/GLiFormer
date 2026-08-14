@@ -6,88 +6,24 @@ conversion into proper Python objects.
 """
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any
 
+from .structuring_types import (
+    MISSING,
+    FieldType,
+    RecursiveTypeSpec,
+    SchemaNode,
+    UnionFieldType,
+    schema_node_from_spec,
+)
 
-class FieldType:
-    """Descriptor for a structured field's expected type and conversion rules.
-
-    Args:
-        type_name: One of the supported type names (str, int, float, bool,
-            list, date, datetime) or a callable for custom conversion.
-        default: Default value when conversion fails. If None, the raw text
-            is kept as-is on failure.
-        list_separator: Separator pattern for list-typed fields (default: comma).
-        list_item_type: Type name for individual items within a list field.
-        date_formats: Date/datetime format strings to try in order.
-        required: Whether the field must always be present in the output.
-            Acts as a post-processing filter: any instance where this field
-            comes back as ``None`` is dropped from the output. Decoding is
-            unaffected.
-        default_factory: Zero-argument factory evaluated lazily when
-            conversion fails. Used by Pydantic default factories.
-    """
-
-    def __init__(
-        self,
-        type_name: str | Callable = "str",
-        default: Any = None,
-        list_separator: str = r"\s*,\s*",
-        list_item_type: str = "str",
-        date_formats: list[str] | None = None,
-        required: bool = False,
-        default_factory: Callable[[], Any] | None = None,
-    ):
-        self.type_name = type_name
-        self.default = default
-        self.default_factory = default_factory
-        self.list_separator = list_separator
-        self.list_item_type = list_item_type
-        self.required = required
-        self.date_formats = date_formats or [
-            "%Y-%m-%d",
-            "%d/%m/%Y",
-            "%m/%d/%Y",
-            "%B %d, %Y",
-            "%b %d, %Y",
-            "%d %B %Y",
-            "%d %b %Y",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%d %H:%M:%S",
-        ]
-
-
-class _UnionFieldType:
-    """Internal descriptor that tries scalar union variants in order."""
-
-    def __init__(self, alternatives: list[FieldType | str | Callable]):
-        self.alternatives = alternatives
-
-
-class _FormatNode:
-    """Internal recursive representation of a structuring type schema."""
-
-    def __init__(
-        self,
-        kind: str,
-        *,
-        field_type: FieldType | _UnionFieldType | None = None,
-        fields: dict[str, "_FormatNode"] | None = None,
-        item: Optional["_FormatNode"] = None,
-    ):
-        self.kind = kind
-        self.field_type = field_type
-        self.fields = fields or {}
-        self.item = item
-
-
-class _RecursiveTypeSpec:
-    """Marks an internal type tree so descriptor-like field names stay literal."""
-
-    def __init__(self, value: Any):
-        self.value = value
+# Private aliases retained for checkpoints/callers which imported the old
+# implementation details. All three now point at the canonical contracts.
+_FormatNode = SchemaNode
+_RecursiveTypeSpec = RecursiveTypeSpec
+_UnionFieldType = UnionFieldType
 
 
 # ── Built-in converters ──────────────────────────────────────────────────
@@ -172,7 +108,8 @@ class StructuringOutputFormatter:
         # raw_output is the dict returned by GLiNExT structuring inference
         typed_output = formatter.format(raw_output)
 
-    Supported type names: str, int, float, bool, list, date, datetime.
+    Supported type names: string, integer, number, boolean, date, datetime,
+    plus their str, int, float, and bool aliases.
     For advanced control, pass a FieldType instance or a callable.
     """
 
@@ -180,6 +117,8 @@ class StructuringOutputFormatter:
         self,
         schema_types: dict[str, Any],
         strict: bool = False,
+        output_models: Mapping[str, type] | None = None,
+        whole_output_models: set[str] | None = None,
     ):
         """
         Args:
@@ -190,9 +129,16 @@ class StructuringOutputFormatter:
                 be used to format an unwrapped root object or list.
             strict: If True, raise ValueError on conversion failure instead
                 of falling back to raw text.
+            output_models: Optional Pydantic model classes used to validate
+                formatted values. Validated values are dumped back to plain
+                Python dictionaries/lists.
+            whole_output_models: Schema names whose model validates the whole
+                result rather than each named record independently.
         """
         self.strict = strict
-        self._schema_nodes: dict[str, _FormatNode] = {}
+        self._output_models = dict(output_models or {})
+        self._whole_output_models = set(whole_output_models or ())
+        self._schema_nodes: dict[str, SchemaNode] = {}
         self._field_types: dict[str, dict[str, FieldType | _UnionFieldType]] = {}
         for schema_name, schema_spec in schema_types.items():
             node = self._normalize_node(schema_spec)
@@ -203,9 +149,9 @@ class StructuringOutputFormatter:
             # ``_schema_nodes`` and are intentionally omitted here.
             self._field_types[schema_name] = (
                 {
-                    field_name: field_node.field_type
+                    field_name: field_node.type_spec
                     for field_name, field_node in node.fields.items()
-                    if field_node.kind == "scalar" and field_node.field_type is not None
+                    if field_node.kind == "scalar" and field_node.type_spec is not None
                 }
                 if node.kind == "object"
                 else {}
@@ -224,101 +170,27 @@ class StructuringOutputFormatter:
             return FieldType(type_name=type_spec)
         raise TypeError(f"Unsupported type spec: {type_spec!r}")
 
-    @staticmethod
-    def _is_descriptor(spec: dict[str, Any]) -> bool:
-        """Return whether *spec* is a processor-style schema descriptor."""
-
-        descriptor_keys = {"fields", "children", "required_fields", "description"}
-        fields = spec.get("fields")
-        required = spec.get("required_fields", [])
-        children = spec.get("children", {})
-        return (
-            set(spec).issubset(descriptor_keys)
-            and isinstance(fields, list | dict)
-            and isinstance(required, list)
-            and isinstance(children, dict)
-        )
-
     @classmethod
-    def _normalize_node(cls, spec: Any) -> _FormatNode:
+    def _normalize_node(cls, spec: Any) -> SchemaNode:
         """Normalize a legacy or recursive schema specification."""
 
-        if isinstance(spec, _FormatNode):
+        if isinstance(spec, SchemaNode):
             return spec
         if isinstance(spec, _RecursiveTypeSpec):
-            return cls._normalize_type_tree(spec.value)
-
-        if isinstance(spec, dict):
-            if cls._is_descriptor(spec):
-                fields_spec = spec.get("fields") or []
-                if isinstance(fields_spec, list):
-                    fields = {
-                        str(field_name): _FormatNode("scalar", field_type=FieldType("str"))
-                        for field_name in fields_spec
-                        if isinstance(field_name, str)
-                    }
-                else:
-                    fields = {
-                        str(field_name): cls._normalize_node(type_spec)
-                        for field_name, type_spec in fields_spec.items()
-                    }
-
-                children = spec.get("children") or {}
-                if isinstance(children, dict):
-                    for child_name, child_spec in children.items():
-                        if isinstance(child_spec, list) and all(
-                            isinstance(field_name, str) for field_name in child_spec
-                        ):
-                            child_node = _FormatNode(
-                                "object",
-                                fields={
-                                    field_name: _FormatNode("scalar", field_type=FieldType("str"))
-                                    for field_name in child_spec
-                                },
-                            )
-                        else:
-                            child_node = cls._normalize_node(child_spec)
-                        if child_node.kind != "array":
-                            child_node = _FormatNode("array", item=child_node)
-                        fields[str(child_name)] = child_node
-                return _FormatNode("object", fields=fields)
-
-            return _FormatNode(
-                "object",
-                fields={
-                    str(field_name): cls._normalize_node(type_spec)
-                    for field_name, type_spec in spec.items()
-                },
+            return schema_node_from_spec(
+                spec.value,
+                cls._scalar_node,
+                detect_descriptor=False,
             )
-
-        if isinstance(spec, list):
-            item_spec = spec[0] if spec else "str"
-            return _FormatNode("array", item=cls._normalize_node(item_spec))
-
-        # Empty-string values are the canonical inference-schema placeholder.
-        # They carry string semantics rather than naming an unsupported type.
-        if spec == "":
-            spec = "str"
-        return _FormatNode("scalar", field_type=cls._normalize_type(spec))
+        return schema_node_from_spec(spec, cls._scalar_node)
 
     @classmethod
-    def _normalize_type_tree(cls, spec: Any) -> _FormatNode:
-        """Normalize an internal recursive tree without descriptor ambiguity."""
-
-        if isinstance(spec, dict):
-            return _FormatNode(
-                "object",
-                fields={
-                    str(field_name): cls._normalize_type_tree(type_spec)
-                    for field_name, type_spec in spec.items()
-                },
-            )
-        if isinstance(spec, list):
-            item_spec = spec[0] if spec else "str"
-            return _FormatNode("array", item=cls._normalize_type_tree(item_spec))
-        if spec == "":
-            spec = "str"
-        return _FormatNode("scalar", field_type=cls._normalize_type(spec))
+    def _scalar_node(cls, spec: Any) -> SchemaNode:
+        # Empty strings are inference placeholders, not unsupported type names.
+        return SchemaNode(
+            "scalar",
+            type_spec=cls._normalize_type("str" if spec == "" else spec),
+        )
 
     def format(
         self,
@@ -340,8 +212,12 @@ class StructuringOutputFormatter:
             # Also accept an explicit wrapper for callers working directly
             # with inference schemas.
             if isinstance(raw_output, dict) and set(raw_output) == {"$root"}:
-                return {"$root": self._format_node(raw_output["$root"], root_node, "$root", "")}
-            return self._format_node(raw_output, root_node, "$root", "")
+                formatted = self._format_node(
+                    raw_output["$root"], root_node, "$root", ""
+                )
+                return {"$root": self._validate_output("$root", formatted)}
+            formatted = self._format_node(raw_output, root_node, "$root", "")
+            return self._validate_output("$root", formatted)
 
         if not isinstance(raw_output, dict):
             return raw_output
@@ -354,12 +230,46 @@ class StructuringOutputFormatter:
                 result[schema_name] = instances
                 continue
             if node.kind == "object" and isinstance(instances, list):
-                result[schema_name] = [
+                formatted = [
                     self._format_node(instance, node, schema_name, "") for instance in instances
                 ]
             else:
-                result[schema_name] = self._format_node(instances, node, schema_name, "")
+                formatted = self._format_node(instances, node, schema_name, "")
+            result[schema_name] = self._validate_output(schema_name, formatted)
         return result
+
+    def _validate_output(self, schema_name: str, value: Any) -> Any:
+        """Validate with Pydantic when requested and preserve JSON-like output."""
+
+        model_cls = self._output_models.get(schema_name)
+        if model_cls is None:
+            return value
+
+        node = self._schema_nodes[schema_name]
+        validate_many = (
+            schema_name not in self._whole_output_models
+            and schema_name != "$root"
+            and node.kind == "object"
+            and isinstance(value, list)
+        )
+        if validate_many:
+            return [self._validate_pydantic_value(model_cls, item) for item in value]
+        return self._validate_pydantic_value(model_cls, value)
+
+    @staticmethod
+    def _validate_pydantic_value(model_cls: type, value: Any) -> Any:
+        model_validate = getattr(model_cls, "model_validate", None)
+        if callable(model_validate):
+            instance = model_validate(value)
+            return instance.model_dump(mode="python")
+
+        parse_obj = getattr(model_cls, "parse_obj", None)
+        if not callable(parse_obj):
+            raise TypeError(f"{model_cls!r} is not a supported Pydantic model")
+        instance = parse_obj(value)
+        if hasattr(instance, "__root__"):
+            return instance.__root__
+        return instance.dict()
 
     def format_batch(
         self,
@@ -371,7 +281,7 @@ class StructuringOutputFormatter:
     def _format_node(
         self,
         value: Any,
-        node: _FormatNode,
+        node: SchemaNode,
         schema_name: str,
         field_path: str,
     ) -> Any:
@@ -395,7 +305,9 @@ class StructuringOutputFormatter:
             return value
 
         if node.kind == "array":
-            item_node = node.item or _FormatNode("scalar", field_type=FieldType("str"))
+            item_node = node.item or SchemaNode(
+                "scalar", type_spec=FieldType("str")
+            )
             if isinstance(value, list):
                 return [
                     self._format_node(
@@ -410,14 +322,14 @@ class StructuringOutputFormatter:
                 return self._format_node(value, item_node, schema_name, field_path)
             return value
 
-        ft = node.field_type or FieldType("str")
+        ft = node.type_spec or FieldType("str")
         field_name = field_path or "$root"
         return self._convert_value(value, ft, schema_name, field_name)
 
     def _format_object(
         self,
         instance: dict[str, Any],
-        node: _FormatNode,
+        node: SchemaNode,
         schema_name: str,
         parent_path: str,
     ) -> dict[str, Any]:
@@ -440,10 +352,10 @@ class StructuringOutputFormatter:
         schema_name: str,
     ) -> dict[str, Any]:
         """Convert all field values in a single instance dict."""
-        node = _FormatNode(
+        node = SchemaNode(
             "object",
             fields={
-                field_name: _FormatNode("scalar", field_type=field_type)
+                field_name: SchemaNode("scalar", type_spec=field_type)
                 for field_name, field_type in field_types.items()
             },
         )
@@ -551,20 +463,58 @@ class StructuringOutputFormatter:
         # Callable converter
         if callable(type_name) and not isinstance(type_name, str):
             try:
-                return type_name(raw_text)
+                converted = type_name(raw_text)
             except Exception:
                 return self._handle_failure(raw_text, ft, schema_name, field_name)
+            return self._validate_choice(
+                converted,
+                raw_text,
+                ft,
+                schema_name,
+                field_name,
+            )
 
         # Built-in converters
         converted = self._apply_builtin(raw_text, type_name, ft)
         if converted is not None:
-            return converted
+            return self._validate_choice(
+                converted,
+                raw_text,
+                ft,
+                schema_name,
+                field_name,
+            )
 
         # str type always succeeds
         if type_name == "str":
-            return raw_text
+            return self._validate_choice(
+                raw_text,
+                raw_text,
+                ft,
+                schema_name,
+                field_name,
+            )
 
         return self._handle_failure(raw_text, ft, schema_name, field_name)
+
+    def _validate_choice(
+        self,
+        converted: Any,
+        raw_text: str,
+        ft: FieldType,
+        schema_name: str,
+        field_name: str,
+    ) -> Any:
+        """Apply an optional enum constraint after scalar conversion."""
+
+        if ft.choices is None or converted in ft.choices:
+            return converted
+        if self.strict:
+            raise ValueError(
+                f"Field '{field_name}' in schema '{schema_name}' must be one "
+                f"of {list(ft.choices)!r}: {converted!r}"
+            )
+        return self._fallback_value(ft, raw_text)
 
     def _apply_builtin(self, text: str, type_name: str, ft: FieldType) -> Any:
         """Apply a built-in type converter. Returns None on failure."""
@@ -619,6 +569,6 @@ class StructuringOutputFormatter:
                 return ft.default_factory()
             except Exception:
                 return raw_value
-        if ft.default is not None:
+        if ft.default is not MISSING:
             return ft.default
         return raw_value

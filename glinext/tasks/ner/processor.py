@@ -5,12 +5,13 @@ import warnings
 
 import torch
 
-from ..span_processor import SpanProcessor
+from ...processing.label_augmentation import AugmentableLabelGroup
 from ...processing.mappings import (
     BaseClassMapping,
     ExtractionClassMapping,
     ExtractionItemMapping,
 )
+from ..span_processor import SpanProcessor
 
 
 class NERProcessor(SpanProcessor):
@@ -87,6 +88,32 @@ class NERProcessor(SpanProcessor):
                 ))
             extraction_mapping.append(ExtractionClassMapping(items=item_mappings))
         return extraction_mapping
+
+    def get_augmentable_label_groups(self, batch_list, classes_mapping):
+        groups = []
+        for batch_idx, item_mapping in enumerate(
+            classes_mapping.extraction_mapping
+        ):
+            examples = batch_list[batch_idx].get("extraction", [])
+            for group_idx, extraction_mapping in enumerate(item_mapping.items):
+                mapping = extraction_mapping.ner_class_to_id
+                if mapping is None or not mapping.class_to_id:
+                    continue
+                example = examples[group_idx] if group_idx < len(examples) else {}
+                positives = list(dict.fromkeys(
+                    label
+                    for entity in example.get("ner", [])
+                    if (label := self._entity_label(entity)) is not None
+                ))
+                groups.append(AugmentableLabelGroup(
+                    task="ner",
+                    batch_idx=batch_idx,
+                    group_idx=group_idx,
+                    mapping=mapping,
+                    positive_labels=positives,
+                    parent_name=mapping.name,
+                ))
+        return groups
 
     def contribute_prompt(self, classes_mapping, batch_idx, use_labels_encoder=False):
         extraction_mapping = classes_mapping.extraction_mapping[batch_idx]

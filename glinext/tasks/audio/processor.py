@@ -122,8 +122,10 @@ class AudioProcessor(MediaTaskProcessor):
 
         group_segments = []
         for _, batch_idx, group_idx, _ in self._mapping_iter(classes_mapping):
-            groups = self._label_groups_for_item(batch_list[batch_idx])
-            group = groups[group_idx] if group_idx < len(groups) else {}
+            _, group = self._mapping_group_entry(
+                batch_list[batch_idx],
+                group_idx,
+            )
             segments = group.get("segments") or group.get("audio_segments")
             if segments is None and self._task_label_groups(batch_list[batch_idx]) is None:
                 segments = self._segments(batch_list[batch_idx])
