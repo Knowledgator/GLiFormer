@@ -45,12 +45,12 @@ model:
 
   joint_relex_config: null
   # joint_relex_config:
-  #   layer_type: "dot"           # "dot", "mlp", "attention", "bilinear", "gcn", "gat"
-  #   pair_rep_type: "concat_proj"  # "concat_proj", "bilinear", "additive", "mlp"
-  #   triples_layer: null
+  #   relations_layer: null        # optional: "dot", "mlp", "attention", "bilinear", "gcn", "gat"
+  #   triples_layer: null          # null uses GLiNER's default pair MLP
   #   embed_rel_token: true
   #   rel_token_index: -1
-  #   loss_coef: 1.0
+  #   relation_loss_coef: 1.0
+  #   relation_loss_reduction: mean  # masked mean over valid pair-label cells
   #   adjacency_loss_coef: 1.0
   #   max_relation_span_width: null  # null disables inclusive-width filtering
   #   relation_span_nms: false       # greedily keep flat, non-overlapping spans
@@ -109,7 +109,8 @@ model:
   # embedding_config:
   #   pooling_type: "mean"        # "mean", "cls", "max", "weighted"
   #   similarity_fn: "cosine"     # "cosine", "dot", "l2"
-  #   loss_fn: "mse"              # "mse", "contrastive", "triplet"
+  #   loss_fn: "mse"              # "mse", "contrastive", "cosine_margin", "rank_logsumexp", "triplet"
+  #   margin: null                # optional loss margin; cosine_margin commonly uses 0.0
   #   projection_dim: null        # optional output dimension for embedding projections
   #   loss_coef: 1.0
 
@@ -126,6 +127,21 @@ training:
   num_steps: 15000
   train_batch_size: 2
   gradient_accumulation_steps: 1
+  # Optional training-only runtime-label augmentation. Per-task policies are
+  # merged over defaults; added labels come only from other examples in the
+  # same local microbatch. See README.md for every supported task and option.
+  label_augmentation:
+    enabled: false
+    defaults:
+      enabled: true
+      shuffle_probability: 0.0
+      drop_probability: 0.0
+      add_probability: 0.0
+      preserve_positive_labels: true
+      min_labels_per_group: 1
+      max_added_labels: 16
+      pool_scope: task
+    tasks: null
   eval_every: 500
   warmup_ratio: 0.05
   scheduler_type: "cosine"        # linear, cosine, constant

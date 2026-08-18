@@ -10,31 +10,62 @@ model:
   max_types: 100
   max_len: 512
   max_neg_type_ratio: 1
+  default_ner_config: false
 
   ner_config: null
   classification_config: null
   joint_relex_config: null
   open_relex_config: null
 
-  # Pair-first set prediction: anchors extract class-independent source/tail
-  # spans, then pair/query representations are dot-scored against relations.
+  # Entity-first set prediction: relation-aware NER extracts and models spans;
+  # unordered relation queries then assign one source and target entity.
   set_open_relex_config:
+    # All anchor layers are supported. Fixed-width strategies use num_slots;
+    # rotary/query strategies use max_count, while parent/features derive their
+    # width from their source representation.
     anchor_layer:
-      type: "fixed_transformer"
+      type: "fixed_rnn"
       params:
-        num_slots: 10
-        num_heads: 4
-        num_layers: 2
+        num_slots: 30
+
     anchor_normalization: "none"
-    anchor_modeling: "identity"
-    anchor_refinement: "none"
+    anchor_modeling: "linear"
+    
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 2
+        num_heads: 8
+        norm_style: "pre_norm"
+        layer_scale_init: 0.1
+    anchor_cross_attention_bias:
+      type: "gaussian_distance"
+      params:
+        sigma: 0.5
+        weight: 1.0
+        units: "query_steps"
+    anchor_memory_position:
+      type: "fourier"
+      params: {}
+    anchor_query_position:
+      type: "fourier"
+      params: {}
+    anchor_memory_position_usage: "keys_and_values"
+
     scorer_type: "dot"
     max_count: 20
     loss_coef: 1.0
+    entity_loss_coef: 1.0
+    assignment_loss_coef: 1.0
+    anchor_objectness: true
+    anchor_objectness_loss_coef: 0.01
+    anchor_objectness_threshold: 0.5
+    bio_loss_reduction: "sum"
     focal_loss_alpha: null
     focal_loss_gamma: null
     focal_loss_prob_margin: null
-    represent_spans: false
+    represent_spans: true
+    neg_spans_ratio: 0.0
 
   structuring_config: null
   count_config: null
@@ -42,23 +73,23 @@ model:
 
 data:
   root_dir: logs/set_open_relex
-  train_data: "data/open_relex_train.json"
+  train_data: "data_prod/relex_150k.jsonl"
   val_data: "none"
 
 training:
   prev_path: null
-  num_steps: 20000
+  num_steps: 100000
   train_batch_size: 4
   gradient_accumulation_steps: 1
-  eval_every: 500
+  eval_every: 1000
   warmup_ratio: 0.05
   scheduler_type: "cosine"
   focal_loss_alpha: 0.75
   focal_loss_gamma: 0
   loss_reduction: "sum"
-  lr_encoder: 1e-5
-  lr_others: 3e-5
-  weight_decay_encoder: 0.1
+  lr_encoder: 3e-5
+  lr_others: 5e-5
+  weight_decay_encoder: 0.01
   weight_decay_other: 0.01
   max_grad_norm: 10.0
   save_total_limit: 3

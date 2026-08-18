@@ -18,27 +18,58 @@ model:
   open_relex_config: null
   structuring_config: null
 
-  # Independent NER-first set structuring: an internal NER stage explicitly
-  # extracts field entities, then every pooled entity receives record/field
-  # logits from the set-prediction stage.
+  # Composite NER-first set structuring: classical field-aware NER extracts
+  # entities, then pooled entity spans are classified into record anchors.
   set_structuring_config:
     head_type: "set_structuring"
+    # Enable for data/structuring_multi_level.jsonl. The same record anchors
+    # used by span membership are linked with directed parent-child scores.
+    # Raise num_slots for full coverage (the dataset maximum is 149 anchors).
+    multi_level: false
+    anchor_relations_layer: "mlp"
+    anchor_relations_loss_coef: 1.0
+    anchor_relations_threshold: 0.5
 
     # Stage 1: parent + field prompts drive the internal NER extractor.
     # Record-anchor components below are isolated from this internal stage.
     anchor_modeling: "linear"
     entity_loss_coef: 1.0
-    neg_spans_ratio: 1.0
+    # Stage 2 receives target entities, as in joint relation extraction;
+    # non-entity negatives are already learned by the token-level NER loss.
+    neg_spans_ratio: 0.0
 
-    # Stage 2: fixed record queries score every extracted entity.
+    # Stage 2: refined record queries score membership for every extracted
+    # entity. Field identity remains the decision of the NER stage.
     anchor_layer:
-      type: "fixed_transformer"
+      type: "position_buckets"
       params:
         num_slots: 32
-        num_heads: 4
-        num_layers: 2
+        
     anchor_normalization: "none"
-    anchor_refinement: "none"
+    # Match the regular structuring head's positional cross-attention setup.
+    # The fixed record queries remain the initial record representations; this
+    # refinement then attends them to the document with the same locality bias
+    # and position representations used by configs/structuring.yaml.
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 2
+        num_heads: 8
+        norm_style: "pre_norm"
+        layer_scale_init: 0.1
+    anchor_cross_attention_bias:
+      type: "gaussian_distance"
+      params:
+        sigma: 0.5
+        weight: 1.0
+        units: "query_steps"
+    anchor_memory_position:
+      type: "fourier"
+      params: {}
+    anchor_query_position:
+      type: "fourier"
+      params: {}
+    anchor_memory_position_usage: "keys_and_values"
     # Match the largest synthetic-data count bucket; smaller capacities would
     # leave some gold records without a record query.
     max_count: 32

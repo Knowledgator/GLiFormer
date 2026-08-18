@@ -1,0 +1,144 @@
+model:
+  model_name: microsoft/deberta-v3-small
+  name: "glinext"
+  max_width: 12
+  hidden_size: 768
+  dropout: 0.1
+  fine_tune: true
+  subtoken_pooling: first
+  span_mode: markerV0
+  # The supplied corpus reaches 127 fields in one hierarchy group.
+  max_types: 128
+  max_len: 512
+  max_neg_type_ratio: 1
+
+  ner_config: null
+  default_ner_config: false
+  classification_config: null
+  joint_relex_config: null
+  open_relex_config: null
+  structuring_config: null
+
+  # Two-stage multi-level set structuring:
+  #   1. field-aware BIO extraction proposes concrete entities;
+  #   2. fixed record queries assign entities to JSON objects and predict
+  #      directed parent -> child links between those objects.
+  set_structuring_config:
+    head_type: "set_structuring"
+    multi_level: true
+
+    # Ordered-pair MLP scores preserve parent -> child direction. The head
+    # compacts masked record slots before constructing pair features.
+    anchor_relations_layer: "mlp"
+    # Relations are already reduced over valid anchor pairs. A smaller
+    # coefficient made their gradient negligible next to summed BIO loss.
+    anchor_relations_loss_coef: 1.0
+    anchor_relations_threshold: 0.5
+
+    # Stage 1: parent + field prompts drive the internal NER extractor.
+    anchor_modeling: "linear"
+    entity_loss_coef: 1.0
+    # Include one random background span per gold span so record assignment
+    # also learns to reject false stage-1 proposals seen at inference.
+    neg_spans_ratio: 1.0
+
+    # Stage 2: fixed record slots score membership for each extracted entity.
+    # After tokenizer-visible pruning, the supplied corpus reaches 95 records
+    # in one hierarchy group; 100 slots cover it with a small margin.
+    anchor_layer:
+      type: "position_buckets"
+      params:
+        num_slots: 100
+
+    # Raw bucket means retain a large shared document component and become
+    # nearly interchangeable. Centering restores slot-local information.
+    anchor_normalization: "center_rms"
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 2
+        num_heads: 8
+        norm_style: "pre_norm"
+        layer_scale_init: 0.1
+    anchor_cross_attention_bias:
+      type: "gaussian_distance"
+      params:
+        sigma: 0.5
+        weight: 1.0
+        units: "query_steps"
+    anchor_memory_position:
+      type: "fourier"
+      params: {}
+    anchor_query_position:
+      type: "fourier"
+      params: {}
+    anchor_memory_position_usage: "keys_and_values"
+
+    max_count: 100
+    # Entity-to-record assignment loss.
+    span_loss_coef: 1.0
+    # Match the summed entity objective. Averaging assignment over all
+    # 100 x entity cells made its effective contribution nearly zero.
+    bio_loss_reduction: "sum"
+
+    loss_coef: 1.0
+    focal_loss_alpha: 0.9
+    focal_loss_gamma: 2.0
+    focal_loss_prob_margin: 0.0
+    # These negatives define unused record slots and must not be sampled away.
+    negatives: 1.0
+    masking: "none"
+
+    anchor_objectness: true
+    anchor_objectness_loss_coef: 1.0
+    anchor_objectness_threshold: 0.5
+
+  count_config: null
+  embedding_config: null
+
+data:
+  root_dir: logs/set_structuring_multi_level
+  # The first source teaches arbitrary nested JSON. The second is an explicit
+  # named-schema corpus with 2+ root records per example; without it almost
+  # every batch contains exactly one root and the model learns one-record
+  # collapse. Repeat the smaller hierarchical source so flat examples do not
+  # dominate the concatenated training set.
+  train_data:
+    - path: "data/structuring_multi_level.jsonl"
+      repeat: 8
+    - "data/structuring_synthetic.cleaned.jsonl"
+  # Replace with a held-out, length- and depth-stratified JSONL split when it
+  # is available. With "none", checkpoints are selected by step, not metrics.
+  val_data: "none"
+
+training:
+  # Start fresh: the multi-level relation layer and 100 record slots are not
+  # architecture-compatible with the existing flat set-structuring checkpoint.
+  prev_path: null
+  num_steps: 30000
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+
+  eval_every: 1000
+  warmup_ratio: 0.05
+  scheduler_type: "cosine"
+
+  focal_loss_alpha: 0.75
+  focal_loss_gamma: 2.0
+  focal_loss_prob_margin: 0.0
+  loss_reduction: "sum"
+
+  # Keep the generic runtime policy aligned with the task-specific policy.
+  # Sampling 0.5% here previously removed nearly every unused-slot target.
+  negatives: 1.0
+  masking: "none"
+
+  lr_encoder: 2.0e-5
+  lr_others: 1.0e-4
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 5.0
+
+  save_total_limit: 3
+  train_head_only: false
+  bf16: true

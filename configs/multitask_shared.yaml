@@ -44,9 +44,10 @@ model:
     focal_loss_prob_margin: null
 
   joint_relex_config:
-    layer_type: "dot"
-    pair_rep_type: "concat_proj"
-    loss_coef: 1.0
+    relations_layer: "dot"
+    triples_layer: null
+    relation_loss_coef: 1.0
+    relation_loss_reduction: mean
     adjacency_loss_coef: 1.0
     focal_loss_alpha: null
     focal_loss_gamma: null

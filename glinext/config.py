@@ -1632,8 +1632,21 @@ class EmbeddingHeadConfig:
     loss_coef: float = 1.0
     pooling_type: str = "mean"  # "mean", "cls", "max", "weighted"
     similarity_fn: str = "cosine"  # "cosine", "dot", "l2"
-    loss_fn: str = "mse"  # "mse", "contrastive", "triplet"
+    loss_fn: str = "mse"  # "mse", "contrastive", "cosine_margin", "rank_logsumexp", "triplet"
+    margin: Optional[float] = None
     projection_dim: Optional[int] = None
+
+    def __post_init__(self):
+        if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
+            raise ValueError("loss_coef must be finite and non-negative")
+        if self.margin is None:
+            return
+        if not math.isfinite(float(self.margin)):
+            raise ValueError("embedding loss margin must be finite")
+        if self.loss_fn in {"cosine", "cosine_margin"} and not (
+            -1.0 <= float(self.margin) <= 1.0
+        ):
+            raise ValueError("cosine embedding loss margin must be in [-1, 1]")
 
 
 class GLiNextConfig(BaseGLiNERConfig):

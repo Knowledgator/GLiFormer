@@ -111,6 +111,10 @@ model:
         units: "normalized"
         query_dimensions: [0, 1]
         key_dimensions: [0, 1]
+        # Optional; all three default to false, preserving a fixed bias.
+        # learnable_sigma: true
+        # learnable_weight: true
+        # per_head: true
     multi_label: true
     class_probability: "sigmoid"
     bbox_loss_coef: 5.0

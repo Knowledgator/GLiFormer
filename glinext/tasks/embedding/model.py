@@ -71,6 +71,16 @@ class CosineSimilarityLoss(EmbeddingLoss, loss_fn="cosine"):
         return (positive + negative).mean()
 
 
+class CosineMarginLoss(CosineSimilarityLoss, loss_fn="cosine_margin"):
+    """Named cosine-margin objective for embedding configurations.
+
+    This is an explicit alias of :class:`CosineSimilarityLoss`: positives are
+    pulled toward cosine 1 while negatives are penalized only when their
+    cosine exceeds ``margin``. Unlike MSE with a -1 target, it does not force
+    every negative pair to become anti-parallel.
+    """
+
+
 class RankingLogSumExpLoss(EmbeddingLoss, loss_fn="rank_logsumexp"):
     """Smooth pairwise-of-pairs ranking loss via LogSumExp.
 
@@ -139,8 +149,13 @@ class EmbeddingHead(TaskHead):
             pooling_type=getattr(emb_cfg, "pooling_type", "mean"),
             hidden_size=pooling_hidden_size,
         )
+        loss_kwargs = {}
+        margin = getattr(emb_cfg, "margin", None)
+        if margin is not None:
+            loss_kwargs["margin"] = margin
         self.loss = EmbeddingLoss.from_config(
             loss_fn=getattr(emb_cfg, "loss_fn", "mse"),
+            **loss_kwargs,
         )
 
     @classmethod

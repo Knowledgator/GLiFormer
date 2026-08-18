@@ -1,0 +1,223 @@
+model:
+  # Text-only multitask model. Layout boxes and page images in mixed source
+  # rows are ignored by the text processor.
+  model_variant: text
+  model_name: microsoft/deberta-v3-base
+  labels_encoder: null
+  name: "glinext"
+  max_width: 12
+  hidden_size: 768
+  dropout: 0.25
+  fine_tune: true
+  subtoken_pooling: first
+  span_mode: markerV0
+  max_types: 128
+  max_len: 512
+  max_neg_type_ratio: 1
+
+  ner_config:
+    loss_coef: 1.0
+    focal_loss_alpha: 0.8
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+    represent_spans: false
+
+  classification_config:
+    layer_type: "dot"
+    pooling_type: "cls"
+    loss_coef: 1.0
+    focal_loss_alpha: 0.8
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+
+  joint_relex_config:
+    # Joint Relex automatically reuses the standalone NER head and its cached
+    # output when ner_config is enabled; no separate reuse flag is required.
+    # Predict a bounded set of directed entity pairs. Anchor refinement below
+    # is only active on this anchor-modeling relation path.
+    relations_layer: anchor_modeling
+    anchor_layer:
+      type: fixed
+      params:
+        num_slots: 30
+    anchor_modeling: linear
+    # Refine relation-pair queries against the current document before source
+    # and target assignment. Pre-norm plus a small LayerScale preserves the
+    # identity of the learned fixed slots early in training.
+
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 2
+        num_heads: 8
+        norm_style: "pre_norm"
+        layer_scale_init: 0.1
+    # Give each relation slot an ordered position and favor nearby document
+    # evidence without hard-masking longer-range relations.
+    anchor_cross_attention_bias:
+      type: "gaussian_distance"
+      params:
+        sigma: 0.5
+        weight: 1.0
+        units: "query_steps"
+    anchor_memory_position:
+      type: "fourier"
+      params: {}
+    anchor_query_position:
+      type: "fourier"
+      params: {}
+    anchor_memory_position_usage: "keys_and_values"
+
+    triples_layer: null
+    relation_loss_coef: 1.0
+    # Mask-aware mean over valid directed-pair x relation-label cells.
+    relation_loss_reduction: mean
+    adjacency_loss_coef: 1.0
+    max_relation_span_width: null
+    relation_span_nms: false
+    max_relation_entities: null
+    relation_top_k_neighbors: null
+    relation_neighbor_chunk_size: 128
+    focal_loss_alpha: null
+    focal_loss_gamma: null
+    focal_loss_prob_margin: null
+
+  # The independent set head consumes both legacy `structuring` rows and
+  # explicit `set_structuring` rows. Multi-level mode supervises directed
+  # parent -> child links in nested JSON while remaining compatible with the
+  # sampled flat structuring examples.
+  set_structuring_config:
+    head_type: "set_structuring"
+    # Share the standalone NER scorer/anchor pipeline with the entity-first
+    # structuring stage. It is re-executed on structuring field prompts because
+    # those labels are independent from the ordinary NER label space.
+    reuse_ner_head: true
+    multi_level: true
+    anchor_relations_layer: "mlp"
+    anchor_relations_loss_coef: 1.0
+    anchor_relations_threshold: 0.5
+    anchor_modeling: "linear"
+    entity_loss_coef: 1.0
+    neg_spans_ratio: 1.0
+    anchor_layer:
+      type: "position_buckets"
+      params:
+        num_slots: 100
+    anchor_normalization: "center_rms"
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 2
+        num_heads: 8
+        norm_style: "pre_norm"
+        layer_scale_init: 0.1
+    anchor_cross_attention_bias:
+      type: "gaussian_distance"
+      params:
+        sigma: 0.5
+        weight: 1.0
+        units: "query_steps"
+    anchor_memory_position:
+      type: "fourier"
+      params: {}
+    anchor_query_position:
+      type: "fourier"
+      params: {}
+    anchor_memory_position_usage: "keys_and_values"
+    max_count: 100
+    span_loss_coef: 1.0
+    bio_loss_reduction: "sum"
+    loss_coef: 1.0
+    focal_loss_alpha: 0.9
+    focal_loss_gamma: 2.0
+    focal_loss_prob_margin: 0.0
+    negatives: 1.0
+    masking: "none"
+    anchor_objectness: true
+    anchor_objectness_loss_coef: 1.0
+    anchor_objectness_threshold: 0.5
+
+  embedding_config:
+    pooling_type: "cls"
+    similarity_fn: "cosine"
+    # Pull positives toward 1, but only push negatives below this margin;
+    # unlike MSE with -1 labels, negatives are not forced to be anti-parallel.
+    loss_fn: "cosine_margin"
+    margin: 0.0
+    projection_dim: 768
+    loss_coef: 1.0
+
+  open_relex_config: null
+  set_open_relex_config: null
+  structuring_config: null
+  count_config: null
+
+data:
+  root_dir: logs/multitask_text
+  # Relation-supervised extraction rows only; NER-only rows are excluded.
+  train_data: "data_prod/multitask.json"
+  val_data: "none"
+
+training:
+  # Start a text architecture from the configured DeBERTa backbone. A layout
+  # checkpoint would restore its layout architecture and defeat this config.
+  prev_path: null
+  # Set a path (or pass --resume-from-checkpoint) to restore full Trainer
+  # state after an interrupted run. `prev_path` loads model weights only.
+  resume_from_checkpoint: null
+  num_steps: 30000
+  train_batch_size: 1
+  gradient_accumulation_steps: 8
+  # Train singleton classification schemas in both supported forms. A value
+  # of 0.5 keeps the parent name on roughly half of training accesses and
+  # omits it on the other half; validation data is never augmented.
+  classification_parent_name_dropout: 0.5
+  # Training-only schema-label augmentation. The master switch is deliberately
+  # off: enabling it applies the defaults first, then the per-task overrides.
+  # Added labels are sampled only from the same task in the local collator
+  # microbatch (not gradient-accumulation steps or other DDP ranks).
+  label_augmentation:
+    enabled: false
+    seed: null
+    defaults:
+      enabled: true
+      shuffle_probability: 0.5
+      drop_probability: 0.1
+      add_probability: 0.25
+      preserve_positive_labels: false
+      min_labels_per_group: 1
+      max_added_labels: 8
+      pool_scope: task
+    tasks:
+      classification: {}
+      ner: {}
+      joint_relex:
+        add_probability: 1.0
+      set_structuring: {}
+  eval_every: 1000
+  warmup_ratio: 0.01
+  scheduler_type: "cosine"
+  focal_loss_alpha: 0.95
+  focal_loss_gamma: 2.0
+  focal_loss_prob_margin: 0.0
+  # Relation loss uses its own focal parameters; NER keeps the values above.
+  rel_focal_loss_alpha: 0.8
+  rel_focal_loss_gamma: 2.0
+  loss_reduction: "mean"
+  negatives: 1.0
+  masking: "none"
+  lr_encoder: 2.0e-5
+  lr_others: 3.0e-5
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 1.0
+  save_total_limit: 3
+  train_head_only: false
+  freeze_components: null
+    # - "text_encoder"
+    # - "ner"
+    # - "classification"
+    # - "set_structuring"
+    # - "embedding"
+  bf16: true
+  compile_model: false

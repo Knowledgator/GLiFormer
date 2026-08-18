@@ -34,8 +34,10 @@ model:
   embedding_config: null
 
 data:
-  root_dir: logs/ner_classification
-  train_data: "data/bio_post_ner_gliclass_logic.jsonl"
+  root_dir: logs/ner_classification_structuring_multitask
+  # Deterministic task-pure NER/classification views sampled from
+  # data_prod/structuring_multitask.jsonl.
+  train_data: "data_prod/structuring_ner_classification.jsonl"
   val_data: "none"
 
 training:

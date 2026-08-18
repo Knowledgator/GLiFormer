@@ -8,12 +8,20 @@ model:
   subtoken_pooling: first
   span_mode: markerV0
   max_types: 100
-  max_len: 512
+  max_len: 1024
   max_neg_type_ratio: 1
 
   ner_config: null
 
   structuring_config:
+    # Enable for data/structuring_multi_level.jsonl. Nested dictionaries are
+    # dot-qualified; dictionaries inside lists receive their own record anchor.
+    # Raise num_slots for full coverage (that dataset contains up to 149
+    # anchors in one schema; the 10-slot experiment below intentionally does not).
+    multi_level: false
+    anchor_relations_layer: "mlp"
+    anchor_relations_loss_coef: 1.0
+    anchor_relations_threshold: 0.5
     # Anchor acquisition modes:
     #   parent                  - one anchor from the parent/schema token
     #   features                - every valid word feature is an anchor
@@ -58,16 +66,17 @@ model:
         sigma: 0.5
         weight: 1.0
         units: "query_steps"
-    # Hungarian matching uses both BIO compatibility and record location, so
-    # a bucket is not trained against a record on the other side of the text.
-    position_bucket_matcher_cost: 0.1
+        # Optional; all three default to false, preserving a fixed bias.
+        # learnable_sigma: true
+        # learnable_weight: true
+        # per_head: true
     # For fixed-width anchors, fixed_sinusoidal automatically sets the shared
     # max_position to anchor_layer.params.num_slots (10 here).
     anchor_memory_position:
-      type: "fixed_sinusoidal"
+      type: "fourier"
       params: {}
     anchor_query_position:
-      type: "fixed_sinusoidal"
+      type: "fourier"
       params: {}
     # Both modes have useful parameter-free defaults. Optional kwargs:
     #   fourier: {min_frequency: 1.0, max_frequency: 64.0,
@@ -91,8 +100,8 @@ model:
     masking: "none"
     # Per-anchor "is this slot used?" head. Filters empty anchors at
     # inference and adds explicit objectness supervision during training.
-    anchor_objectness: false
-    anchor_objectness_loss_coef: 0.5
+    anchor_objectness: true
+    anchor_objectness_loss_coef: 0.001
     anchor_objectness_threshold: 0.5
     # Diagnostic: log positive vs negative loss split every N steps.
     log_loss_stats: true
@@ -114,13 +123,13 @@ training:
   # Continue from the diverse 10k-step bucket representations while replacing
   # the degenerate sparse loss and matching policy from the active YAML.
   prev_path: null
-  num_steps: 100000
+  num_steps: 12000
   train_batch_size: 1
   gradient_accumulation_steps: 4
-  eval_every: 1000
+  eval_every: 3000
   warmup_ratio: 0.01
   scheduler_type: "cosine"
-  focal_loss_alpha: 0.75
+  focal_loss_alpha: 0.9
   focal_loss_gamma: 2
   loss_reduction: "sum"
   lr_encoder: 3e-5

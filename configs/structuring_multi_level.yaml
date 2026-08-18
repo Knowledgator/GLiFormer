@@ -1,0 +1,105 @@
+model:
+  model_name: microsoft/deberta-v3-small
+  name: "glinext"
+  max_width: 12
+  hidden_size: 512
+  dropout: 0.3
+  fine_tune: true
+  subtoken_pooling: first
+  span_mode: markerV0
+  # The supplied dataset reaches 127 fields in one hierarchy group.
+  max_types: 100
+  max_len: 512
+  max_neg_type_ratio: 1
+
+  ner_config: null
+
+  structuring_config:
+    # Flatten inline dictionaries to dotted fields, give dictionaries inside
+    # lists their own anchors, and supervise directed parent -> child edges.
+    multi_level: true
+    anchor_relations_layer: "mlp"
+    anchor_relations_loss_coef: 1.0
+    anchor_relations_threshold: 0.5
+
+    # The largest hierarchy group in data/structuring_multi_level.jsonl has
+    # 148 anchors. Keep a little spare capacity so no gold node is truncated.
+    anchor_layer:
+      type: "position_buckets"
+      params:
+        num_slots: 50
+
+    anchor_normalization: "center_rms"
+    anchor_modeling: "mlp"
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 2
+        num_heads: 8
+        norm_style: "pre_norm"
+        layer_scale_init: 0.1
+    anchor_cross_attention_bias:
+      type: "gaussian_distance"
+      params:
+        sigma: 0.5
+        weight: 1.0
+        units: "query_steps"
+    anchor_memory_position:
+      type: "fourier"
+      params: {}
+    anchor_query_position:
+      type: "fourier"
+      params: {}
+    anchor_memory_position_usage: "keys_and_values"
+
+    loss_coef: 1.0
+    focal_loss_alpha: 0.75
+    focal_loss_gamma: 2.0
+    focal_loss_prob_margin: null
+    represent_spans: false
+    use_anchor_matching: true
+    bio_loss_reduction: "mean"
+    negatives: 1.0
+    masking: "none"
+
+    # Train explicit record presence because fixed-width inference always
+    # produces all 160 candidate slots before filtering.
+    anchor_objectness: true
+    anchor_objectness_loss_coef: 0.001
+    anchor_objectness_threshold: 0.5
+    log_loss_stats: true
+    log_loss_stats_every: 50
+
+  classification_config: null
+  joint_relex_config: null
+  open_relex_config: null
+  count_config: null
+  embedding_config: null
+
+data:
+  root_dir: logs/structuring_multi_level
+  train_data: "data/structuring_multi_level.jsonl"
+  val_data: "none"
+
+training:
+  # Start from the configured DeBERTa backbone. A flat-structuring checkpoint
+  # does not contain the new anchor-relation parameters and should not be used
+  # as prev_path.
+  prev_path: null
+  num_steps: 15000
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  eval_every: 1000
+  warmup_ratio: 0.01
+  scheduler_type: "cosine"
+  focal_loss_alpha: 0.75
+  focal_loss_gamma: 2
+  loss_reduction: "sum"
+  lr_encoder: 3e-5
+  lr_others: 5e-5
+  weight_decay_encoder: 0.01
+  weight_decay_other: 0.01
+  max_grad_norm: 10.0
+  save_total_limit: 3
+  train_head_only: false
+  bf16: true

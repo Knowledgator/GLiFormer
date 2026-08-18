@@ -11,25 +11,50 @@ model:
   max_len: 512
   max_neg_type_ratio: 1
 
-  # NER is built into JointRelexHead via inheritance
+  # Reuse one standalone NER head. Set this to false to let Joint Relex own
+  # its fallback NER pipeline instead.
+  default_ner_config: true
   ner_config: null
 
   joint_relex_config:
-    # null scores all directed entity pairs. Set to anchor_modeling to predict
-    # at most num_slots source/target pairs before the MLP/triples scorer.
-    relations_layer: null
+    # Predict A relation slots, then assign a source and target entity to each
+    # slot. Endpoint logits have shape (B, A, E, 2); selected pairs have shape
+    # (B, A, 2). Training uses the anchor mask and Hungarian matching.
+    relations_layer: anchor_modeling
     anchor_layer:
       type: fixed
       params:
         num_slots: 20
     anchor_modeling: linear
-    anchor_refinement: none
+    anchor_refinement:
+      type: "cross_attention"
+      params:
+        num_layers: 2
+        num_heads: 8
+        norm_style: "pre_norm"
+        layer_scale_init: 0.1
+    anchor_cross_attention_bias:
+      type: "gaussian_distance"
+      params:
+        sigma: 0.5
+        weight: 1.0
+        units: "query_steps"
+    anchor_memory_position:
+      type: "fourier"
+      params: {}
+    anchor_query_position:
+      type: "fourier"
+      params: {}
+    anchor_memory_position_usage: "keys_and_values"
+
+    # null uses the default concat(head, tail) projection MLP. It can be
+    # replaced with a supported knowledge-graph triples scorer.
     triples_layer: null
     relation_loss_coef: 1.0
     relation_loss_reduction: mean
+    # In anchor mode this weights the source/target assignment loss.
     adjacency_loss_coef: 1.0
-    # Optional relation-candidate safeguards. null/false preserves the
-    # historical dense behavior.
+
     max_relation_span_width: null
     relation_span_nms: false
     max_relation_entities: null
@@ -41,17 +66,19 @@ model:
 
   classification_config: null
   open_relex_config: null
+  set_open_relex_config: null
   structuring_config: null
+  set_structuring_config: null
   count_config: null
   embedding_config: null
 
 data:
-  root_dir: logs/joint_relex
+  root_dir: logs/joint_relex_anchor
   train_data: "data_prod/relex_150k.jsonl"
   val_data: "none"
 
 training:
-  prev_path: null                 # path to a GLiNExT checkpoint to init from (null = from scratch)
+  prev_path: null
   num_steps: 200000
   train_batch_size: 4
   gradient_accumulation_steps: 1

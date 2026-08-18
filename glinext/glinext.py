@@ -1512,15 +1512,10 @@ class BaseGLiNExT(BaseGLiNER):
         if not valid_texts:
             return torch.zeros(len(texts), self.config.hidden_size)
 
-        # Tokenize texts directly (no prompts) — matching the training path
-        # where embedding pair texts are tokenized via transformer_tokenizer
-        all_tokens, _, _ = self.prepare_inputs(valid_texts)
-
         data_loader = DataLoader(
-            all_tokens, batch_size=batch_size, shuffle=False,
+            valid_texts, batch_size=batch_size, shuffle=False,
             collate_fn=lambda batch: self.data_processor.transformer_tokenizer(
                 batch,
-                is_split_into_words=True,
                 return_tensors="pt",
                 truncation=True,
                 padding="longest",
