@@ -1363,6 +1363,12 @@ class StructuringHeadConfig(BaseHeadConfig):
     anchor_relations_layer: str = "mlp"
     anchor_relations_loss_coef: float = 1.0
     anchor_relations_threshold: float = 0.5
+    # Hierarchy adjacency has a distinct positive/negative population from
+    # entity extraction and record membership. ``None`` inherits the task or
+    # global focal policy.
+    anchor_relations_focal_loss_alpha: Optional[float] = None
+    anchor_relations_focal_loss_gamma: Optional[float] = None
+    anchor_relations_focal_loss_prob_margin: Optional[float] = None
 
     def _expected_head_type(self) -> str:
         return "structuring"
@@ -1408,6 +1414,18 @@ class StructuringHeadConfig(BaseHeadConfig):
         ):
             raise ValueError(
                 "anchor_relations_threshold must be finite and in [0, 1]"
+            )
+        for suffix in ("alpha", "gamma", "prob_margin"):
+            name = f"anchor_relations_focal_loss_{suffix}"
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite when configured")
+        if (
+            self.anchor_relations_focal_loss_alpha is not None
+            and self.anchor_relations_focal_loss_alpha > 1
+        ):
+            raise ValueError(
+                "positive anchor_relations_focal_loss_alpha must be at most 1"
             )
         self.position_bucket_normalization = str(
             self.position_bucket_normalization
@@ -1591,9 +1609,32 @@ class SetStructuringHeadConfig(StructuringHeadConfig):
     # Wrong record anchors already provide negative membership supervision.
     neg_spans_ratio: float = 0.0
     entity_loss_coef: float = 1.0
+    # Set-structuring losses are normalized by default. Explicit ``sum`` is
+    # retained for loading/training legacy configurations.
+    bio_loss_reduction: str = "mean"
     # Explicit stage-2 record-membership coefficient. ``None`` migrates the
     # historical use of ``span_loss_coef`` without changing old checkpoints.
     assignment_loss_coef: float | None = None
+    # Hungarian matching supports bounded signed membership, soft-Dice, and
+    # (when enabled) anchor-objectness costs. The two new terms default off so
+    # existing configurations retain membership-only assignment. Temperatures
+    # calibrate raw logits around the probability thresholds used by inference.
+    matcher_membership_cost: float = 1.0
+    matcher_dice_cost: float = 0.0
+    matcher_objectness_cost: float = 0.0
+    matcher_membership_temperature: float = 1.0
+    matcher_objectness_temperature: float = 1.0
+    # Each stage can tune focal balancing independently. ``None`` inherits
+    # the set-structuring task/global focal value.
+    ner_focal_loss_alpha: Optional[float] = None
+    ner_focal_loss_gamma: Optional[float] = None
+    ner_focal_loss_prob_margin: Optional[float] = None
+    matching_focal_loss_alpha: Optional[float] = None
+    matching_focal_loss_gamma: Optional[float] = None
+    matching_focal_loss_prob_margin: Optional[float] = None
+    objectness_focal_loss_alpha: Optional[float] = None
+    objectness_focal_loss_gamma: Optional[float] = None
+    objectness_focal_loss_prob_margin: Optional[float] = None
 
     def _expected_head_type(self) -> str:
         return "set_structuring"
@@ -1618,6 +1659,42 @@ class SetStructuringHeadConfig(StructuringHeadConfig):
             raise ValueError(
                 "assignment_loss_coef must be finite and non-negative"
             )
+        for name in (
+            "matcher_membership_cost",
+            "matcher_dice_cost",
+            "matcher_objectness_cost",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            setattr(self, name, value)
+        for name in (
+            "matcher_membership_temperature",
+            "matcher_objectness_temperature",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+            setattr(self, name, value)
+        for component in ("ner", "matching", "objectness"):
+            for suffix in ("alpha", "gamma", "prob_margin"):
+                name = f"{component}_focal_loss_{suffix}"
+                value = getattr(self, name)
+                if value is not None and not math.isfinite(float(value)):
+                    raise ValueError(f"{name} must be finite when configured")
+            alpha_name = f"{component}_focal_loss_alpha"
+            alpha = getattr(self, alpha_name)
+            if alpha is not None and alpha > 1:
+                raise ValueError(
+                    f"positive {alpha_name} must be at most 1"
+                )
+        if self.anchor_objectness_threshold is not None:
+            threshold = float(self.anchor_objectness_threshold)
+            if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+                raise ValueError(
+                    "anchor_objectness_threshold must be finite and in [0, 1]"
+                )
+            self.anchor_objectness_threshold = threshold
 
 
 @dataclass
@@ -1635,10 +1712,25 @@ class EmbeddingHeadConfig:
     loss_fn: str = "mse"  # "mse", "contrastive", "cosine_margin", "rank_logsumexp", "triplet"
     margin: Optional[float] = None
     projection_dim: Optional[int] = None
+    projection_dropout: float = 0.1
+    encoder_dropout: Optional[float] = None
 
     def __post_init__(self):
         if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
             raise ValueError("loss_coef must be finite and non-negative")
+        if not math.isfinite(float(self.projection_dropout)) or not (
+            0.0 <= float(self.projection_dropout) < 1.0
+        ):
+            raise ValueError(
+                "embedding projection_dropout must be finite and in [0, 1)"
+            )
+        if self.encoder_dropout is not None and (
+            not math.isfinite(float(self.encoder_dropout))
+            or not 0.0 <= float(self.encoder_dropout) < 1.0
+        ):
+            raise ValueError(
+                "embedding encoder_dropout must be finite and in [0, 1)"
+            )
         if self.margin is None:
             return
         if not math.isfinite(float(self.margin)):

@@ -309,6 +309,11 @@ class StructuringHead(AnchoredSpanExtractionHead):
             anchor_matches=anchor_matches,
             label_count=label_count,
             loss_coef=self.anchor_relations_loss_coef,
+            focal_loss_alpha=self.anchor_relations_focal_loss_alpha,
+            focal_loss_gamma=self.anchor_relations_focal_loss_gamma,
+            focal_loss_prob_margin=(
+                self.anchor_relations_focal_loss_prob_margin
+            ),
         )
         if weighted_relation_loss is not None:
             loss = (

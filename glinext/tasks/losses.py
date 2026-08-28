@@ -1,5 +1,8 @@
 """Loss primitives shared by task heads and model orchestration."""
 
+import inspect
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 
@@ -126,4 +129,65 @@ def configured_binary_loss(
     return binary_focal_or_bce(logits, targets, **loss_kwargs)
 
 
-__all__ = ["binary_focal_or_bce", "configured_binary_loss"]
+def binary_loss_with_focal_overrides(
+    loss_fn: Callable[..., torch.Tensor],
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    focal_loss_alpha: float | None = None,
+    focal_loss_gamma: float | None = None,
+    focal_loss_prob_margin: float | None = None,
+    **loss_kwargs,
+) -> torch.Tensor:
+    """Call an elementwise binary loss with optional focal overrides.
+
+    Project loss callables use the descriptive ``focal_loss_*`` names, while
+    GLiNER's public focal helper uses ``alpha``, ``gamma``, and
+    ``prob_margin``.  Supporting both signatures keeps task-level component
+    controls usable with the model's configured loss closure and with heads
+    invoked directly in downstream code.
+
+    Callables that expose neither interface are still valid custom losses;
+    they are called without focal keywords.
+    """
+
+    overrides = {
+        "focal_loss_alpha": focal_loss_alpha,
+        "focal_loss_gamma": focal_loss_gamma,
+        "focal_loss_prob_margin": focal_loss_prob_margin,
+    }
+    overrides = {
+        name: value for name, value in overrides.items() if value is not None
+    }
+    if not overrides:
+        return loss_fn(logits, targets, **loss_kwargs)
+
+    try:
+        parameters = inspect.signature(loss_fn).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+
+    accepts_arbitrary_keywords = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+    aliases = {
+        "focal_loss_alpha": "alpha",
+        "focal_loss_gamma": "gamma",
+        "focal_loss_prob_margin": "prob_margin",
+    }
+    accepted = dict(loss_kwargs)
+    for name, value in overrides.items():
+        if accepts_arbitrary_keywords or name in parameters:
+            accepted[name] = value
+        elif aliases[name] in parameters:
+            accepted[aliases[name]] = value
+    return loss_fn(logits, targets, **accepted)
+
+
+__all__ = [
+    "binary_focal_or_bce",
+    "binary_loss_with_focal_overrides",
+    "configured_binary_loss",
+]

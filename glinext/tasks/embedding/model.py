@@ -137,10 +137,20 @@ class EmbeddingHead(TaskHead):
         emb_cfg = config.embedding_config
         self.loss_coef = emb_cfg.loss_coef
         self.similarity_fn = getattr(emb_cfg, "similarity_fn", "cosine")
+        self.projection_dropout = float(
+            getattr(emb_cfg, "projection_dropout", 0.1)
+        )
+        self.encoder_dropout = getattr(emb_cfg, "encoder_dropout", None)
 
         projection_dim = getattr(emb_cfg, "projection_dim", None)
         if projection_dim is not None:
-            self.projection = create_mlp(config.hidden_size, [config.hidden_size], projection_dim)
+            self.projection = create_mlp(
+                config.hidden_size,
+                [config.hidden_size],
+                projection_dim,
+                dropout=self.projection_dropout,
+                include_dropout=True,
+            )
         else:
             self.projection = None
 

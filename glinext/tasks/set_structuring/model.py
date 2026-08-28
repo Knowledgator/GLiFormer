@@ -3,6 +3,7 @@
 from dataclasses import replace
 
 import torch
+import torch.nn.functional as F
 from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import extract_spans_from_tokens
 
@@ -15,6 +16,7 @@ from ...layers.structuring_relations import (
 )
 from ...processing.structuring_compat import legacy_task_value
 from .. import SetStructuringTaskHeadOutput
+from ..losses import binary_focal_or_bce, binary_loss_with_focal_overrides
 from ..matcher import (
     batched_masked_assignment,
     gold_anchor_mask,
@@ -107,6 +109,22 @@ class SetStructuringHead(NERHead):
         self.entity_loss_coef = set_cfg.entity_loss_coef
         self.assignment_loss_coef = set_cfg.assignment_loss_coef
         self.bio_loss_reduction = set_cfg.bio_loss_reduction
+        self.matcher_membership_cost = set_cfg.matcher_membership_cost
+        self.matcher_dice_cost = set_cfg.matcher_dice_cost
+        self.matcher_objectness_cost = set_cfg.matcher_objectness_cost
+        self.matcher_membership_temperature = (
+            set_cfg.matcher_membership_temperature
+        )
+        self.matcher_objectness_temperature = (
+            set_cfg.matcher_objectness_temperature
+        )
+        self.anchor_objectness_threshold = (
+            set_cfg.anchor_objectness_threshold
+        )
+        for component in ("ner", "matching", "objectness"):
+            for suffix in ("alpha", "gamma", "prob_margin"):
+                name = f"{component}_focal_loss_{suffix}"
+                setattr(self, name, getattr(set_cfg, name))
 
         self.record_anchor_layer = self._build_anchor_layer(
             set_cfg,
@@ -198,8 +216,19 @@ class SetStructuringHead(NERHead):
         base_loss_fn,
         entity_labels,
         threshold,
+        focal_loss_alpha=None,
+        focal_loss_gamma=None,
+        focal_loss_prob_margin=None,
     ):
         """Run the private or shared NER module on structuring field inputs."""
+
+        base_loss_fn = self._component_loss_fn(
+            base_loss_fn,
+            "ner",
+            focal_loss_alpha=focal_loss_alpha,
+            focal_loss_gamma=focal_loss_gamma,
+            focal_loss_prob_margin=focal_loss_prob_margin,
+        )
 
         ner_kwargs = {
             "flat_inputs": flat_inputs,
@@ -223,6 +252,41 @@ class SetStructuringHead(NERHead):
             dependency_outputs={},
             **ner_kwargs,
         )
+
+    def _component_loss_fn(
+        self,
+        base_loss_fn,
+        component,
+        *,
+        focal_loss_alpha=None,
+        focal_loss_gamma=None,
+        focal_loss_prob_margin=None,
+    ):
+        """Bind one set-structuring stage's focal-loss controls."""
+
+        if base_loss_fn is None:
+            return None
+        resolved = {}
+        for suffix, explicit in (
+            ("alpha", focal_loss_alpha),
+            ("gamma", focal_loss_gamma),
+            ("prob_margin", focal_loss_prob_margin),
+        ):
+            resolved[f"focal_loss_{suffix}"] = (
+                getattr(self, f"{component}_focal_loss_{suffix}")
+                if explicit is None
+                else explicit
+            )
+
+        def component_loss_fn(logits, targets):
+            return binary_loss_with_focal_overrides(
+                base_loss_fn,
+                logits,
+                targets,
+                **resolved,
+            )
+
+        return component_loss_fn
 
     @staticmethod
     def _entity_token_labels(structuring_labels):
@@ -469,6 +533,167 @@ class SetStructuringHead(NERHead):
     def _gold_anchor_mask(labels, label_count):
         return gold_anchor_mask(labels, label_count)
 
+    @staticmethod
+    def _threshold_aware_probability(
+        logits,
+        threshold,
+        temperature,
+        *,
+        eps=1e-6,
+    ):
+        """Calibrate logits so the inference threshold maps to probability .5."""
+
+        logits = logits.float()
+        threshold = torch.as_tensor(
+            threshold,
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+        threshold_logit = torch.logit(threshold, eps=eps)
+        adjusted_logits = (logits - threshold_logit) / float(temperature)
+        return adjusted_logits, adjusted_logits.sigmoid()
+
+    @staticmethod
+    def _membership_matching_cost(
+        logits,
+        labels,
+        entity_mask,
+        *,
+        threshold=0.5,
+        eps=1e-6,
+    ):
+        """Return threshold-centered signed BCE over supervised entities."""
+
+        logits = logits.float()
+        pair_logits = logits[:, None].expand(
+            -1,
+            labels.shape[0],
+            -1,
+        )
+        pair_labels = labels[None].expand(
+            logits.shape[0],
+            -1,
+            -1,
+        ).to(pair_logits.dtype)
+        bce = F.binary_cross_entropy_with_logits(
+            pair_logits,
+            pair_labels,
+            reduction="none",
+        )
+        signed_bce = 1.0 - 2.0 * torch.exp(-bce)
+        threshold = torch.as_tensor(
+            threshold,
+            dtype=signed_bce.dtype,
+            device=signed_bce.device,
+        ).clamp(min=0.0, max=1.0)
+        # The raw signed BCE is zero at probability 0.5. Re-scale each side
+        # of the configured inference boundary independently so that the
+        # boundary remains zero while the excellent/poor endpoints stay -1/1.
+        boundary = (2.0 * pair_labels - 1.0) * (1.0 - 2.0 * threshold)
+        centered_bce = signed_bce - boundary
+        signed_bce = torch.where(
+            centered_bce < 0,
+            centered_bce / (boundary + 1.0).clamp(min=eps),
+            centered_bce / (1.0 - boundary).clamp(min=eps),
+        ).clamp(min=-1.0, max=1.0)
+        mask = entity_mask.to(signed_bce.dtype)[None, None]
+        return (signed_bce * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(
+            min=1.0
+        )
+
+    @staticmethod
+    def _dice_matching_cost(
+        probabilities,
+        labels,
+        entity_mask,
+        *,
+        eps=1e-6,
+    ):
+        """Return pairwise soft-Dice cost over supervised entities only."""
+
+        mask = entity_mask.to(probabilities.dtype)
+        predicted = probabilities[:, None] * mask[None, None]
+        gold = labels[None].to(probabilities.dtype) * mask[None, None]
+        intersection = (predicted * gold).sum(dim=-1)
+        predicted_sum = predicted.sum(dim=-1)
+        gold_sum = gold.sum(dim=-1)
+        dice = (2.0 * intersection + eps) / (
+            predicted_sum + gold_sum + eps
+        )
+        return 1.0 - 2.0 * dice
+
+    @staticmethod
+    def _objectness_matching_cost(probabilities, gold_count):
+        """Broadcast bounded anchor-presence cost across gold records."""
+
+        return (1.0 - 2.0 * probabilities)[:, None].expand(-1, gold_count)
+
+    def _record_anchor_pair_cost(
+        self,
+        predicted_logits,
+        labels,
+        entity_mask,
+        *,
+        objectness_logits=None,
+        membership_threshold=0.5,
+        objectness_threshold=None,
+        eps=1e-6,
+    ):
+        """Build a bounded train/inference-aligned record matching cost."""
+
+        _, membership_probabilities = (
+            self._threshold_aware_probability(
+                predicted_logits,
+                membership_threshold,
+                self.matcher_membership_temperature,
+                eps=eps,
+            )
+        )
+        membership_cost = self._membership_matching_cost(
+            predicted_logits,
+            labels,
+            entity_mask,
+            threshold=membership_threshold,
+            eps=eps,
+        )
+        dice_cost = self._dice_matching_cost(
+            membership_probabilities,
+            labels,
+            entity_mask,
+            eps=eps,
+        )
+
+        total_cost = (
+            self.matcher_membership_cost * membership_cost
+            + self.matcher_dice_cost * dice_cost
+        )
+        total_weight = self.matcher_membership_cost + self.matcher_dice_cost
+
+        if self.use_anchor_objectness and objectness_logits is not None:
+            if objectness_threshold is None:
+                objectness_threshold = (
+                    self.anchor_objectness_threshold
+                    if self.anchor_objectness_threshold is not None
+                    else membership_threshold
+                )
+            _, objectness_probabilities = self._threshold_aware_probability(
+                objectness_logits,
+                objectness_threshold,
+                self.matcher_objectness_temperature,
+                eps=eps,
+            )
+            objectness_cost = self._objectness_matching_cost(
+                objectness_probabilities,
+                labels.shape[0],
+            )
+            total_cost = (
+                total_cost
+                + self.matcher_objectness_cost * objectness_cost
+            )
+            total_weight += self.matcher_objectness_cost
+
+        return total_cost / max(total_weight, eps)
+
     def _match_record_anchors(
         self,
         predictions,
@@ -477,24 +702,26 @@ class SetStructuringHead(NERHead):
         gold_mask,
         entity_mask,
         base_loss_fn,
+        objectness_logits=None,
+        membership_threshold=0.5,
+        objectness_threshold=None,
     ):
         def pair_cost(batch_idx, prediction_ids, gold_ids):
             predicted = predictions[batch_idx, prediction_ids]
             gold = labels[batch_idx, gold_ids]
-            losses = base_loss_fn(
-                predicted[:, None].expand(-1, gold.shape[0], -1),
-                gold[None].expand(predicted.shape[0], -1, -1),
+            predicted_objectness = (
+                objectness_logits[batch_idx, prediction_ids]
+                if objectness_logits is not None
+                else None
             )
-            cost = (
-                losses * entity_mask[batch_idx][None, None]
-            ).sum(dim=-1)
-            if prediction_ids.numel() > gold_ids.numel():
-                zero_cost = (
-                    base_loss_fn(predicted, torch.zeros_like(predicted))
-                    * entity_mask[batch_idx].unsqueeze(0)
-                ).sum(dim=-1)
-                cost = cost - zero_cost[:, None]
-            return cost
+            return self._record_anchor_pair_cost(
+                predicted,
+                gold,
+                entity_mask[batch_idx],
+                objectness_logits=predicted_objectness,
+                membership_threshold=membership_threshold,
+                objectness_threshold=objectness_threshold,
+            )
 
         return batched_masked_assignment(
             prediction_mask,
@@ -510,6 +737,12 @@ class SetStructuringHead(NERHead):
         entity_mask,
         label_count,
         base_loss_fn,
+        objectness_logits=None,
+        membership_threshold=0.5,
+        objectness_threshold=None,
+        focal_loss_alpha=None,
+        focal_loss_gamma=None,
+        focal_loss_prob_margin=None,
     ):
         # Predictions: (BN, A_pred, E). Supervision retains its processor-level
         # field axis as (BN, E, A_gold, C); field identity belongs to NER, so
@@ -531,6 +764,13 @@ class SetStructuringHead(NERHead):
         supervised_entity_mask = entity_mask[:, :entity_count].to(
             predictions.dtype
         )
+        matching_loss_fn = self._component_loss_fn(
+            base_loss_fn,
+            "matching",
+            focal_loss_alpha=focal_loss_alpha,
+            focal_loss_gamma=focal_loss_gamma,
+            focal_loss_prob_margin=focal_loss_prob_margin,
+        )
 
         matches = self._match_record_anchors(
             predictions,
@@ -538,13 +778,22 @@ class SetStructuringHead(NERHead):
             prediction_mask,
             gold_mask[:, :gold_anchor_count],
             supervised_entity_mask,
-            base_loss_fn,
+            matching_loss_fn,
+            objectness_logits=objectness_logits,
+            membership_threshold=membership_threshold,
+            objectness_threshold=objectness_threshold,
         )
         targets = matched_anchor_targets(predictions, gold, matches)
 
-        losses = base_loss_fn(predictions, targets)
+        losses = matching_loss_fn(predictions, targets)
+        # Membership is defined only for matched records. Unmatched active
+        # slots remain negative examples for the separate objectness loss.
+        matched_anchor_mask = torch.zeros_like(prediction_mask)
+        for batch_idx, batch_matches in enumerate(matches):
+            for prediction_idx, _ in batch_matches:
+                matched_anchor_mask[batch_idx, prediction_idx] = True
         loss_mask = (
-            prediction_mask.to(losses.dtype).unsqueeze(-1)
+            matched_anchor_mask.to(losses.dtype).unsqueeze(-1)
             * supervised_entity_mask.unsqueeze(1)
         )
         if self.bio_loss_reduction == "mean":
@@ -561,13 +810,32 @@ class SetStructuringHead(NERHead):
         matches,
         anchor_mask,
         base_loss_fn=None,
+        focal_loss_alpha=None,
+        focal_loss_gamma=None,
+        focal_loss_prob_margin=None,
     ):
+        objectness_loss_fn = self._component_loss_fn(
+            base_loss_fn or binary_focal_or_bce,
+            "objectness",
+            focal_loss_alpha=focal_loss_alpha,
+            focal_loss_gamma=focal_loss_gamma,
+            focal_loss_prob_margin=focal_loss_prob_margin,
+        )
         return matched_objectness_loss(
             logits,
             matches,
             anchor_mask,
-            loss_fn=base_loss_fn,
+            loss_fn=objectness_loss_fn,
         )
+
+    def _reduce_entity_loss(self, loss, entity_mask, child_mask):
+        """Normalize NER by supervised entities and active field classes."""
+
+        if loss is None or self.bio_loss_reduction == "sum":
+            return loss
+        entity_count = entity_mask.to(loss.dtype).sum(dim=1)
+        class_count = child_mask.to(loss.dtype).sum(dim=1)
+        return loss / (entity_count * class_count).sum().clamp(min=1.0)
 
     def forward(
         self,
@@ -592,6 +860,20 @@ class SetStructuringHead(NERHead):
         structuring_span_labels = target("span_labels")
 
         entity_labels = self._entity_token_labels(structuring_labels)
+        configured_membership_threshold = batch.get("threshold")
+        membership_threshold = (
+            0.5
+            if configured_membership_threshold is None
+            else configured_membership_threshold
+        )
+        objectness_threshold = batch.get("objectness_threshold")
+        if objectness_threshold is None:
+            if configured_membership_threshold is not None:
+                objectness_threshold = configured_membership_threshold
+            elif self.anchor_objectness_threshold is not None:
+                objectness_threshold = self.anchor_objectness_threshold
+            else:
+                objectness_threshold = membership_threshold
 
         # Stage 1: a complete classical NER forward pass. Structuring spans are
         # intentionally not passed into NER; they are teacher-forced candidates
@@ -601,7 +883,7 @@ class SetStructuringHead(NERHead):
             flat_inputs,
             base_loss_fn,
             entity_labels,
-            batch.get("threshold", 0.5),
+            membership_threshold,
         )
 
         if entity_output.logits is None:
@@ -696,8 +978,13 @@ class SetStructuringHead(NERHead):
         supervised_anchor_mask = anchor_mask.bool()
         relation_loss = None
         combined_loss = None
-        if entity_output.loss is not None:
-            combined_loss = self.entity_loss_coef * entity_output.loss
+        entity_loss = self._reduce_entity_loss(
+            entity_output.loss,
+            entity_mask,
+            flat_inputs.child_mask,
+        )
+        if entity_loss is not None:
+            combined_loss = self.entity_loss_coef * entity_loss
 
         if structuring_span_labels is not None and base_loss_fn is not None:
             assignment_loss, anchor_matches, supervised_anchor_mask = (
@@ -708,6 +995,9 @@ class SetStructuringHead(NERHead):
                     entity_mask,
                     structuring_count,
                     base_loss_fn,
+                    objectness_logits=objectness_logits,
+                    membership_threshold=membership_threshold,
+                    objectness_threshold=objectness_threshold,
                 )
             )
             weighted_assignment_loss = (
@@ -739,6 +1029,11 @@ class SetStructuringHead(NERHead):
             anchor_matches=anchor_matches,
             label_count=structuring_count,
             loss_coef=self.anchor_relations_loss_coef,
+            focal_loss_alpha=self.anchor_relations_focal_loss_alpha,
+            focal_loss_gamma=self.anchor_relations_focal_loss_gamma,
+            focal_loss_prob_margin=(
+                self.anchor_relations_focal_loss_prob_margin
+            ),
         )
         if weighted_relation_loss is not None:
             combined_loss = (
@@ -770,8 +1065,7 @@ class SetStructuringHead(NERHead):
             "anchor_mask": anchor_mask,
             "objectness_logits": objectness_logits,
             "entity_loss": (
-                entity_output.loss.detach()
-                if entity_output.loss is not None else None
+                entity_loss.detach() if entity_loss is not None else None
             ),
             "assignment_loss": (
                 assignment_loss.detach()

@@ -9,7 +9,10 @@ import torch
 from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from torch import nn
 
-from ..tasks.losses import binary_focal_or_bce
+from ..tasks.losses import (
+    binary_focal_or_bce,
+    binary_loss_with_focal_overrides,
+)
 
 AnchorMatches = Sequence[Sequence[tuple[int, int]]]
 
@@ -75,6 +78,9 @@ def initialize_anchor_relations(
         "anchor_relations_loss_coef",
         1.0,
     )
+    for suffix in ("alpha", "gamma", "prob_margin"):
+        name = f"anchor_relations_focal_loss_{suffix}"
+        setattr(owner, name, getattr(task_config, name, None))
     if owner.multi_level:
         owner.anchor_relations_rep_layer = RelationsRepLayer(
             in_dim=hidden_size,
@@ -166,6 +172,9 @@ def maybe_anchor_relation_loss(
     anchor_matches: AnchorMatches | None = None,
     label_count: torch.Tensor | None = None,
     loss_coef: float = 1.0,
+    focal_loss_alpha: float | None = None,
+    focal_loss_gamma: float | None = None,
+    focal_loss_prob_margin: float | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Return the raw and weighted optional hierarchy losses."""
 
@@ -183,6 +192,9 @@ def maybe_anchor_relation_loss(
         relation_group_mask=relation_group_mask,
         anchor_matches=anchor_matches,
         label_count=label_count,
+        focal_loss_alpha=focal_loss_alpha,
+        focal_loss_gamma=focal_loss_gamma,
+        focal_loss_prob_margin=focal_loss_prob_margin,
     )
     return relation_loss, float(loss_coef) * relation_loss
 
@@ -342,8 +354,16 @@ def anchor_relation_loss(
     relation_group_mask: torch.Tensor | None = None,
     anchor_matches: AnchorMatches | None = None,
     label_count: torch.Tensor | None = None,
+    focal_loss_alpha: float | None = None,
+    focal_loss_gamma: float | None = None,
+    focal_loss_prob_margin: float | None = None,
 ) -> torch.Tensor:
-    """Return mean elementwise loss for directed anchor adjacency probabilities."""
+    """Return mean loss over valid directed, non-self anchor pairs.
+
+    For ``n`` eligible anchors the denominator is ``n * (n - 1)``. It is not
+    merely ``n`` because every ordered source/target decision is independently
+    supervised, and it is not ``n**2`` because self-relations are masked out.
+    """
 
     targets, pair_mask = remap_anchor_relation_targets(
         relation_scores,
@@ -357,9 +377,13 @@ def anchor_relation_loss(
     # GLiNER's relation layer already applies sigmoid.  Require the loss
     # callable to acknowledge that contract explicitly instead of silently
     # retrying after any TypeError (which could hide an error inside the loss).
-    losses = loss_fn(
+    losses = binary_loss_with_focal_overrides(
+        loss_fn,
         relation_scores.float(),
         targets.float(),
+        focal_loss_alpha=focal_loss_alpha,
+        focal_loss_gamma=focal_loss_gamma,
+        focal_loss_prob_margin=focal_loss_prob_margin,
         normalize_prob=False,
     )
     if losses.shape != relation_scores.shape:

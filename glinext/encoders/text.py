@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -8,6 +9,35 @@ from gliner.modeling.encoder import BiEncoder as GLiNERBiEncoder
 from gliner.modeling.encoder import Encoder as GLiNEREncoder
 
 from .base import Transformer, hidden_size
+
+
+def set_text_encoder_dropout(encoder: nn.Module, value: float) -> int:
+    """Set text-backbone dropout without changing checkpoint topology."""
+    dropout = float(value)
+    if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
+        raise ValueError("text encoder dropout must be finite and in [0, 1)")
+
+    bert_layer = getattr(encoder, "bert_layer", None)
+    backbone = getattr(bert_layer, "model", None)
+    if backbone is None:
+        return 0
+
+    updated = 0
+    for module in backbone.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = dropout
+            updated += 1
+
+    backbone_config = getattr(backbone, "config", None)
+    if backbone_config is not None:
+        for name in (
+            "hidden_dropout_prob",
+            "attention_probs_dropout_prob",
+            "pooler_dropout",
+        ):
+            if hasattr(backbone_config, name):
+                setattr(backbone_config, name, dropout)
+    return updated
 
 
 class InputsEmbedsEncoderMixin:
@@ -56,6 +86,10 @@ class TextEncoder(InputsEmbedsEncoderMixin, GLiNEREncoder):
     ) -> None:
         nn.Module.__init__(self)
         self.bert_layer = TextTransformer(config.model_name, config, from_pretrained, cache_dir=cache_dir)
+        embedding_config = getattr(config, "embedding_config", None)
+        encoder_dropout = getattr(embedding_config, "encoder_dropout", None)
+        if encoder_dropout is not None:
+            set_text_encoder_dropout(self, encoder_dropout)
         bert_hidden_size = hidden_size(self.bert_layer.model.config)
         if config.hidden_size != bert_hidden_size:
             self.projection = nn.Linear(bert_hidden_size, config.hidden_size)

@@ -5,7 +5,15 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 
-def create_mlp(input_dim, intermediate_dims, output_dim, dropout=0.1, activation="gelu", add_layer_norm=False):
+def create_mlp(
+    input_dim,
+    intermediate_dims,
+    output_dim,
+    dropout=0.1,
+    activation="gelu",
+    add_layer_norm=False,
+    include_dropout=False,
+):
     """
     Creates a multi-layer perceptron (MLP) with specified dimensions and activation functions.
     """
@@ -23,7 +31,7 @@ def create_mlp(input_dim, intermediate_dims, output_dim, dropout=0.1, activation
         if add_layer_norm:
             layers.append(nn.LayerNorm(dim))
         layers.append(activation_mapping[activation]())
-        if dropout > 0:
+        if dropout > 0 or include_dropout:
             layers.append(nn.Dropout(dropout))
         in_dim = dim
     layers.append(nn.Linear(in_dim, output_dim))

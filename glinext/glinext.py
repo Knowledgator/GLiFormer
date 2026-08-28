@@ -95,6 +95,75 @@ class BaseGLiNExT(BaseGLiNER):
     data_collator_class = GLiNExTDataCollator
     decoder_class = GLiNExTDecoder
 
+    def _gradient_checkpointing_backbones(self):
+        """Yield the outermost checkpoint-capable modules in each model branch."""
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+
+        pending = list(model.children())
+        while pending:
+            module = pending.pop()
+            enable = getattr(module, "gradient_checkpointing_enable", None)
+            supports = getattr(module, "supports_gradient_checkpointing", None)
+            if callable(enable) and supports is not False:
+                yield module
+                # Enabling an outer Transformers/PEFT model also configures its
+                # checkpoint-capable descendants, so do not invoke them twice.
+                continue
+            pending.extend(module.children())
+
+    @property
+    def supports_gradient_checkpointing(self) -> bool:
+        """Whether at least one wrapped backbone supports checkpointing."""
+        return next(self._gradient_checkpointing_backbones(), None) is not None
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        """Whether gradient checkpointing is active on a wrapped backbone."""
+        return any(
+            bool(getattr(module, "is_gradient_checkpointing", False))
+            for module in self._gradient_checkpointing_backbones()
+        )
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable checkpointing on the transformer backbones wrapped by GLiNExT.
+
+        Hugging Face's Trainer calls this method on its top-level model. GLiNExT
+        is a composition wrapper rather than a ``PreTrainedModel``, so forward
+        the request to the actual text/label/media transformer models.
+        """
+        backbones = list(self._gradient_checkpointing_backbones())
+        if not backbones:
+            raise ValueError(
+                f"{type(self).__name__} has no backbone that supports "
+                "gradient checkpointing."
+            )
+
+        for backbone in backbones:
+            enable = backbone.gradient_checkpointing_enable
+            parameters = inspect.signature(enable).parameters
+            accepts_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if gradient_checkpointing_kwargs is not None and (
+                "gradient_checkpointing_kwargs" in parameters or accepts_kwargs
+            ):
+                enable(
+                    gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+                )
+            else:
+                # Older Transformers releases expose a no-argument method.
+                enable()
+
+    def gradient_checkpointing_disable(self):
+        """Disable checkpointing on all wrapped transformer backbones."""
+        for backbone in self._gradient_checkpointing_backbones():
+            disable = getattr(backbone, "gradient_checkpointing_disable", None)
+            if callable(disable):
+                disable()
+
     @classmethod
     def create_training_args(cls, *args, **kwargs):
         """Preserve explicit zero values for non-encoder optimizer settings.
