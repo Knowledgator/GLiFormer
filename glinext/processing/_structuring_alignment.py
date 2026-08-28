@@ -88,6 +88,38 @@ def _shape_array(values: list[object], rank: int = 1) -> list:
     return shaped
 
 
+def _has_json_content(value: object) -> bool:
+    """Return whether a JSON value contains evidence beyond empty placeholders."""
+
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return any(_has_json_content(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_json_content(item) for item in value)
+    return True
+
+
+def _filter_empty_records(value: object) -> object:
+    """Recursively remove null/empty-only records from nested JSON arrays."""
+
+    if isinstance(value, dict):
+        return {
+            key: _filter_empty_records(item)
+            for key, item in value.items()
+        }
+    if not isinstance(value, list):
+        return value
+
+    filtered = []
+    for item in value:
+        item = _filter_empty_records(item)
+        if isinstance(item, dict) and not _has_json_content(item):
+            continue
+        filtered.append(item)
+    return filtered
+
+
 def _paths_conflict(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     """Return whether one JSON leaf path is a prefix of the other."""
 
@@ -1253,7 +1285,9 @@ class _AnchorAlignment:
             scores,
             physical_scores,
         )
-        return roots
+        if preserve_empty_records:
+            return roots
+        return _filter_empty_records(roots)
 
 
 @dataclass(frozen=True)
