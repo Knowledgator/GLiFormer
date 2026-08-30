@@ -98,8 +98,18 @@ class AnchoredSpanExtractionHead(TaskHead):
         scores = scores_flat.reshape(B, A, C, L, 3).permute(0, 1, 3, 2, 4)
         return scores, anchors, anchor_mask, fused_flat, (B, A, C, L)
 
-    def _bio_loss(self, scores, labels, anchor_mask, word_mask, child_mask, base_loss_fn):
-        """Masked BIO loss over (BN, A, L, C, 3) predictions and labels."""
+    def _bio_loss(
+        self,
+        scores,
+        labels,
+        anchor_mask,
+        word_mask,
+        child_mask,
+        base_loss_fn,
+        *,
+        normalize=False,
+    ):
+        """Masked BIO loss over ``(BN, A, L, C, 3)`` predictions."""
         min_A = min(scores.shape[1], labels.shape[1])
         min_L = min(scores.shape[2], labels.shape[2])
         min_C = min(scores.shape[3], labels.shape[3])
@@ -114,7 +124,12 @@ class AnchoredSpanExtractionHead(TaskHead):
             * word_mask[:, :min_L].float()[:, None, :, None, None]
             * child_mask[:, :min_C].float()[:, None, None, :, None]
         )
-        return (losses * full_mask).sum()
+        loss = (losses * full_mask).sum()
+        if normalize:
+            # BIO is one structured prediction per anchor/token/class cell;
+            # its three channels do not add a factor to the denominator.
+            loss = loss / full_mask.sum().clamp(min=1.0)
+        return loss
 
     def _span_loss(self, span_logits, span_labels, anchor_mask, span_mask,
                    child_mask, base_loss_fn):

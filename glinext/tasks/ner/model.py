@@ -4,6 +4,7 @@ import torch
 
 from .. import TaskHeadOutput
 from ..anchored_extraction import AnchoredSpanExtractionHead
+from ..losses import configured_binary_loss
 
 
 class NERHead(AnchoredSpanExtractionHead):
@@ -36,6 +37,7 @@ class NERHead(AnchoredSpanExtractionHead):
             dropout,
             shared_layers,
         )
+        self.head_config = task_config
 
     @classmethod
     def from_config(cls, config, shared_layers=None, **kwargs):
@@ -64,6 +66,27 @@ class NERHead(AnchoredSpanExtractionHead):
         elif mask_length > target_length:
             mask = mask[:, :target_length]
         return tensor, mask
+
+    def _bio_loss(
+        self,
+        scores,
+        labels,
+        anchor_mask,
+        word_mask,
+        child_mask,
+        base_loss_fn,
+    ):
+        """Normalize NER over active ``BN x L x C`` cells."""
+
+        return super()._bio_loss(
+            scores,
+            labels,
+            anchor_mask,
+            word_mask,
+            child_mask,
+            base_loss_fn,
+            normalize=True,
+        )
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, base_loss_fn=None, **batch):
         ner_labels = batch.get("ner_labels")
@@ -110,15 +133,22 @@ class NERHead(AnchoredSpanExtractionHead):
             span_logits_out = torch.einsum("BND,BCD->BNC", span_rep, flat_inputs.child_embedding)
 
         loss = None
-        if ner_labels is not None and base_loss_fn is not None:
+        if ner_labels is not None:
+            loss_fn = base_loss_fn or (
+                lambda logits, targets: configured_binary_loss(
+                    self.head_config,
+                    logits,
+                    targets,
+                )
+            )
             # NER has A=1 with all-ones anchor_mask → equivalent to word × child masking.
             loss = self._bio_loss(
                 scores=scores, labels=ner_labels.unsqueeze(1),
                 anchor_mask=anchor_mask, word_mask=word_mask, child_mask=child_mask,
-                base_loss_fn=base_loss_fn,
+                base_loss_fn=loss_fn,
             )
             if span_labels is not None and span_logits_out is not None:
-                span_losses = base_loss_fn(span_logits_out, span_labels)
+                span_losses = loss_fn(span_logits_out, span_labels)
                 span_loss_mask = span_mask.unsqueeze(-1) * child_mask.unsqueeze(1)
                 if span_losses.dim() == 4:
                     span_loss_mask = span_loss_mask.unsqueeze(-1)

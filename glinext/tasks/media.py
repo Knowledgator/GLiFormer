@@ -528,7 +528,9 @@ class MediaClassificationHead(TaskHead):
             class_count = min(logits.shape[1], labels.shape[1])
             losses = loss_fn(logits[:, :class_count], labels[:, :class_count])
             valid_classes = flat_inputs.child_mask[:, :class_count].to(losses.dtype)
-            loss = (losses * valid_classes).sum()
+            loss = (losses * valid_classes).sum() / valid_classes.sum().clamp(
+                min=1.0
+            )
         return TaskHeadOutput(loss=loss, logits=logits)
 
 

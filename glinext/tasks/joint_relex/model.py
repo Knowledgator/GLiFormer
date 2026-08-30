@@ -82,6 +82,11 @@ class JointRelexHead(NERHead):
         self.ner_loss_coef = getattr(ner_cfg, "loss_coef", 1.0)
         self.relation_loss_coef = rel_cfg.relation_loss_coef
         self.relation_loss_reduction = rel_cfg.relation_loss_reduction
+        self.relation_focal_loss_alpha = rel_cfg.relation_focal_loss_alpha
+        self.relation_focal_loss_gamma = rel_cfg.relation_focal_loss_gamma
+        self.relation_focal_loss_prob_margin = (
+            rel_cfg.relation_focal_loss_prob_margin
+        )
         self.adjacency_loss_coef = rel_cfg.adjacency_loss_coef
         self.rel_token_index = rel_cfg.rel_token_index
         self.embed_rel_token = rel_cfg.embed_rel_token
@@ -1112,7 +1117,18 @@ class JointRelexHead(NERHead):
             valid_relation_cells = combined.to(rel_losses.dtype)
             rel_loss = (rel_losses * valid_relation_cells).sum()
             if self.relation_loss_reduction == "mean":
-                rel_loss = rel_loss / valid_relation_cells.sum().clamp(min=1.0)
+                # Normalize against every possible directed pair of active
+                # entities and every active relation class. For group b this
+                # contributes e_b * (e_b - 1) * C_b; summing groups is the
+                # mask-aware form of BN * e * (e - 1) * C.
+                entity_counts = target_span_mask.to(rel_losses.dtype).sum(dim=1)
+                relation_counts = rel_prompts_mask.to(rel_losses.dtype).sum(dim=1)
+                relation_normalizer = (
+                    entity_counts
+                    * (entity_counts - 1.0).clamp(min=0.0)
+                    * relation_counts
+                ).sum()
+                rel_loss = rel_loss / relation_normalizer.clamp(min=1.0)
 
             if use_anchor_pairs:
                 loss = (
@@ -1158,23 +1174,36 @@ class JointRelexHead(NERHead):
             extra=extra,
         )
 
-    @staticmethod
-    def _relation_loss_kwargs(batch):
-        """Mirror GLiNER-relex relation-loss kwargs, including rel_* overrides."""
+    def _relation_loss_kwargs(self, batch):
+        """Resolve relation-specific focal controls and runtime fallbacks."""
         kwargs = {}
-        for out_key, sources in (
+        for out_key, config_name, sources in (
             (
                 "focal_loss_alpha",
+                "relation_focal_loss_alpha",
                 ("rel_focal_loss_alpha", "focal_loss_alpha"),
             ),
             (
                 "focal_loss_gamma",
+                "relation_focal_loss_gamma",
                 ("rel_focal_loss_gamma", "focal_loss_gamma"),
             ),
             (
                 "focal_loss_prob_margin",
+                "relation_focal_loss_prob_margin",
                 ("rel_focal_loss_prob_margin", "focal_loss_prob_margin"),
             ),
+        ):
+            configured_value = getattr(self, config_name)
+            if configured_value is not None:
+                kwargs[out_key] = configured_value
+                continue
+            for source in sources:
+                value = batch.get(source)
+                if value is not None:
+                    kwargs[out_key] = value
+                    break
+        for out_key, sources in (
             ("label_smoothing", ("rel_label_smoothing", "label_smoothing")),
             ("negatives", ("rel_negatives", "negatives")),
             ("masking", ("rel_masking", "masking")),

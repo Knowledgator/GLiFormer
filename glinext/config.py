@@ -979,8 +979,15 @@ class JointRelexHeadConfig(BaseHeadConfig):
     relations_layer: Optional[str] = None
     triples_layer: Optional[str] = None
     relation_loss_coef: float = 1.0
-    # Reduce only over valid candidate-pair x prompted-relation cells.
+    # ``mean`` divides by all active directed entity-pair x relation-class
+    # cells, including pairs omitted by optional negative sampling.
     relation_loss_reduction: str = "mean"
+    # Relation classification can use a focal policy independent from the NER
+    # stage owned or reused by this composite head. ``None`` preserves the
+    # runtime rel_* and generic focal fallbacks, in that order.
+    relation_focal_loss_alpha: Optional[float] = None
+    relation_focal_loss_gamma: Optional[float] = None
+    relation_focal_loss_prob_margin: Optional[float] = None
     embed_rel_token: bool = True
     rel_token_index: int = -1
     adjacency_loss_coef: float = 1.0
@@ -1015,6 +1022,21 @@ class JointRelexHeadConfig(BaseHeadConfig):
         if self.relation_loss_reduction not in {"sum", "mean"}:
             raise ValueError(
                 "relation_loss_reduction must be 'sum' or 'mean'"
+            )
+        for name in (
+            "relation_focal_loss_alpha",
+            "relation_focal_loss_gamma",
+            "relation_focal_loss_prob_margin",
+        ):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite when configured")
+        if (
+            self.relation_focal_loss_alpha is not None
+            and self.relation_focal_loss_alpha > 1
+        ):
+            raise ValueError(
+                "positive relation_focal_loss_alpha must be at most 1"
             )
         for name in ("num_fixed_slots", "max_count"):
             value = getattr(self, name)

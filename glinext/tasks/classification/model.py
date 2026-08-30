@@ -5,7 +5,7 @@ import torch
 
 from ...layers import Pooling
 from .. import TaskHead, TaskHeadOutput
-from ..losses import binary_focal_or_bce
+from ..losses import configured_binary_loss
 from .scorer import ClassificationScorer
 
 
@@ -22,6 +22,7 @@ class ClassificationHead(TaskHead):
     def __init__(self, config, hidden_size, dropout, shared_layers=None):
         super().__init__()
         cat_cfg = config.classification_config
+        self.head_config = cat_cfg
         self.loss_coef = cat_cfg.loss_coef
         self.cat_token_index = cat_cfg.cat_token_index
         self.embed_cat_token = cat_cfg.embed_cat_token
@@ -105,10 +106,18 @@ class ClassificationHead(TaskHead):
 
         loss = None
         if cat_labels is not None:
-            loss_fn = base_loss_fn or binary_focal_or_bce
+            loss_fn = base_loss_fn or (
+                lambda logits, targets: configured_binary_loss(
+                    self.head_config,
+                    logits,
+                    targets,
+                )
+            )
             all_losses = loss_fn(scores, cat_labels)
-            valid_mask = cat_embedding_mask
+            valid_mask = cat_embedding_mask.to(dtype=all_losses.dtype)
             all_losses = all_losses * valid_mask
-            loss = all_losses.sum()
+            # Normalize by the active BN x C classification cells. Prompt
+            # padding must affect neither the numerator nor denominator.
+            loss = all_losses.sum() / valid_mask.sum().clamp(min=1.0)
 
         return TaskHeadOutput(loss=loss, logits=scores)
