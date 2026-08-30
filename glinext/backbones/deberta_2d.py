@@ -19,6 +19,24 @@ from transformers.models.deberta_v2.modeling_deberta_v2 import (
 from ..layers.positional_layer import SpatialEmbeddings
 
 
+def _prepare_layout_input_mask(
+    layout_input_mask: Optional[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Normalize the per-example flag controlling 2D layout features."""
+    if layout_input_mask is None:
+        return None
+    if not isinstance(layout_input_mask, torch.Tensor):
+        layout_input_mask = torch.as_tensor(layout_input_mask)
+    if layout_input_mask.shape != (batch_size,):
+        raise ValueError(
+            "layout_input_mask must have shape (batch,), "
+            f"got {tuple(layout_input_mask.shape)} for batch size {batch_size}"
+        )
+    return layout_input_mask.to(device=device, dtype=torch.bool)
+
+
 def _relative_position_bucket(
     relative_position: torch.Tensor,
     num_buckets: int = 32,
@@ -154,6 +172,7 @@ class LayoutDebertaEmbeddings(nn.Module):
         token_type_ids=None,
         position_ids=None,
         bbox=None,
+        layout_input_mask=None,
         page_token_ids=None,
         mask=None,
         inputs_embeds=None,
@@ -187,7 +206,17 @@ class LayoutDebertaEmbeddings(nn.Module):
             page_token_ids = torch.clamp(page_token_ids, 0, self.page_embeddings.num_embeddings - 1)
             embeddings = embeddings + self.page_embeddings(page_token_ids)
         if self.spatial_embeddings is not None and bbox is not None:
-            embeddings = embeddings + self.spatial_embeddings(bbox)
+            spatial_embeddings = self.spatial_embeddings(bbox)
+            prepared_layout_mask = _prepare_layout_input_mask(
+                layout_input_mask,
+                input_shape[0],
+                spatial_embeddings.device,
+            )
+            if prepared_layout_mask is not None:
+                spatial_embeddings = spatial_embeddings * prepared_layout_mask[:, None, None].to(
+                    dtype=spatial_embeddings.dtype
+                )
+            embeddings = embeddings + spatial_embeddings
 
         if self.embed_proj is not None:
             embeddings = self.embed_proj(embeddings)
@@ -346,7 +375,11 @@ class LayoutDebertaEncoder(DebertaV2Encoder):
             self.layout_relative_x_bias = nn.Embedding(self.layout_position_buckets, config.num_attention_heads)
             self.layout_relative_y_bias = nn.Embedding(self.layout_position_buckets, config.num_attention_heads)
 
-    def get_layout_attention_bias(self, bbox: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def get_layout_attention_bias(
+        self,
+        bbox: Optional[torch.Tensor],
+        layout_input_mask: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         if not self.layout_relative_attention or bbox is None:
             return None
         buckets = build_layout_relative_position(
@@ -357,7 +390,15 @@ class LayoutDebertaEncoder(DebertaV2Encoder):
         x_bias = self.layout_relative_x_bias(buckets[..., 0])
         y_bias = self.layout_relative_y_bias(buckets[..., 1])
         bias = x_bias + y_bias
-        return bias.permute(0, 3, 1, 2).contiguous()
+        bias = bias.permute(0, 3, 1, 2).contiguous()
+        prepared_layout_mask = _prepare_layout_input_mask(
+            layout_input_mask,
+            bbox.shape[0],
+            bias.device,
+        )
+        if prepared_layout_mask is not None:
+            bias = bias * prepared_layout_mask[:, None, None, None].to(dtype=bias.dtype)
+        return bias
 
     def _layout_bias_for_layer(self, layout_attention_bias, layer_idx: int):
         if layout_attention_bias is None:
@@ -378,6 +419,7 @@ class LayoutDebertaEncoder(DebertaV2Encoder):
         relative_pos=None,
         return_dict=True,
         bbox: Optional[torch.Tensor] = None,
+        layout_input_mask: Optional[torch.Tensor] = None,
         layout_attention_bias: Optional[torch.Tensor] = None,
     ):
         if attention_mask.dim() <= 2:
@@ -387,7 +429,7 @@ class LayoutDebertaEncoder(DebertaV2Encoder):
         attention_mask = self.get_attention_mask(attention_mask)
         relative_pos = self.get_rel_pos(hidden_states, query_states, relative_pos)
         if layout_attention_bias is None:
-            layout_attention_bias = self.get_layout_attention_bias(bbox)
+            layout_attention_bias = self.get_layout_attention_bias(bbox, layout_input_mask)
 
         all_hidden_states: Optional[Tuple[torch.Tensor, ...]] = (hidden_states,) if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -450,6 +492,8 @@ class LayoutDebertaPreTrainedModel(PreTrainedModel):
 
 
 class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
+    supports_layout_input_mask = True
+
     def __init__(self, config):
         super().__init__(config)
         self.embeddings = LayoutDebertaEmbeddings(config)
@@ -474,6 +518,7 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         bbox: Optional[torch.Tensor] = None,
+        layout_input_mask: Optional[torch.Tensor] = None,
         page_token_ids: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
@@ -505,6 +550,9 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
         if bbox is not None and bbox.shape[:2] != input_shape:
             raise ValueError(f"bbox must have shape (batch, seq_len, 4), got {tuple(bbox.shape)} for input {tuple(input_shape)}")
+        if layout_input_mask is not None and bbox is None:
+            raise ValueError("layout_input_mask requires bbox")
+        layout_input_mask = _prepare_layout_input_mask(layout_input_mask, input_shape[0], device)
         if page_token_ids is not None and page_token_ids.shape != input_shape:
             raise ValueError(
                 f"page_token_ids must have shape {tuple(input_shape)}, got {tuple(page_token_ids.shape)}"
@@ -515,11 +563,12 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             bbox=bbox,
+            layout_input_mask=layout_input_mask,
             page_token_ids=page_token_ids,
             mask=attention_mask,
             inputs_embeds=inputs_embeds,
         )
-        layout_attention_bias = self.encoder.get_layout_attention_bias(bbox)
+        layout_attention_bias = self.encoder.get_layout_attention_bias(bbox, layout_input_mask)
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask,
@@ -527,6 +576,7 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
             output_attentions=output_attentions,
             return_dict=return_dict,
             bbox=bbox,
+            layout_input_mask=layout_input_mask,
             layout_attention_bias=layout_attention_bias,
         )
         encoded_layers = encoder_outputs[1] if not return_dict else encoder_outputs.hidden_states

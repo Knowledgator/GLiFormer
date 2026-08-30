@@ -3352,6 +3352,7 @@ class GLiNExTLayoutModel(_GLiNExTJointForwardModel):
             "output_hidden_states",
             "return_dict",
             "bbox",
+            "layout_input_mask",
             "page_token_ids",
             "pixel_values",
             "vision_attention_mask",
@@ -3526,7 +3527,7 @@ class GLiNExTOmniModel(_GLiNExTJointForwardModel):
         allowed = {
             "packing_config", "pair_attention_mask", "pixel_values",
             "vision_attention_mask", "audio_values", "audio_attention_mask",
-            "vision_input_mask", "audio_input_mask", "bbox",
+            "vision_input_mask", "audio_input_mask", "bbox", "layout_input_mask",
             "vision_encoder_kwargs", "interpolate_pos_encoding", "pixel_mask",
         }
         cls._reject_unsupported_input_names(kwargs)

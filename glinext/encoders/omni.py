@@ -55,6 +55,7 @@ _TRANSFORMER_KWARGS = {
     "return_dict",
     "packing_config",
     "token_lengths",
+    "layout_input_mask",
 }
 
 

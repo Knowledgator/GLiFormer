@@ -161,6 +161,8 @@ class Transformer(nn.Module):
         self.config = config
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if not getattr(self.model, "supports_layout_input_mask", False):
+            kwargs.pop("layout_input_mask", None)
         pair_attention_mask = kwargs.pop("pair_attention_mask", None)
         base_attention_mask = kwargs.pop("attention_mask", None)
         args = list(args)
@@ -287,6 +289,7 @@ class Transformer(nn.Module):
         token_type_ids = model_kwargs.pop("token_type_ids", None)
         position_ids = model_kwargs.pop("position_ids", None)
         bbox = model_kwargs.pop("bbox", None)
+        layout_input_mask = model_kwargs.pop("layout_input_mask", None)
         page_token_ids = model_kwargs.pop("page_token_ids", None)
         output_attentions = model_kwargs.pop("output_attentions")
         produce_hidden = model_kwargs.pop("output_hidden_states")
@@ -311,6 +314,8 @@ class Transformer(nn.Module):
         }
         if bbox is not None:
             embedding_kwargs["bbox"] = bbox
+            if layout_input_mask is not None:
+                embedding_kwargs["layout_input_mask"] = layout_input_mask
         if page_token_ids is not None:
             embedding_kwargs["page_token_ids"] = page_token_ids
         embedding_output = self.model.embeddings(**embedding_kwargs)
@@ -322,6 +327,8 @@ class Transformer(nn.Module):
         }
         if bbox is not None:
             encoder_kwargs["bbox"] = bbox
+            if layout_input_mask is not None:
+                encoder_kwargs["layout_input_mask"] = layout_input_mask
         encoder_outputs = self.model.encoder(
             embedding_output,
             mask_info["block_mask"],
@@ -338,7 +345,10 @@ class Transformer(nn.Module):
             rel_pos = self.model.encoder.get_rel_pos(embedding_output)
             layout_attention_bias = None
             if bbox is not None and hasattr(self.model.encoder, "get_layout_attention_bias"):
-                layout_attention_bias = self.model.encoder.get_layout_attention_bias(bbox)
+                layout_attention_bias = self.model.encoder.get_layout_attention_bias(
+                    bbox,
+                    layout_input_mask,
+                )
             for layer in layers[1:]:
                 layer_kwargs = {
                     "output_attentions": False,
