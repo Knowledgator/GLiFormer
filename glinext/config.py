@@ -2509,6 +2509,10 @@ class GLiNextConfig(BaseGLiNERConfig):
         self.media_parent_embedding_source = media_parent_embedding_source
         self.use_layout = use_layout
         self.layout_image_tokens = layout_image_tokens
+        if isinstance(max_page_embeddings, bool) or not isinstance(max_page_embeddings, int):
+            raise ValueError("max_page_embeddings must be a non-negative integer")
+        if max_page_embeddings < 0:
+            raise ValueError("max_page_embeddings must be a non-negative integer")
         self.max_page_embeddings = max_page_embeddings
 
         # Multimodal encoder config

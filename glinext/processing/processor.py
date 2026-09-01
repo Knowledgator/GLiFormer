@@ -876,6 +876,7 @@ class LayoutProcessingMixin:
         word_bboxes = []
         word_page_ids = []
         layout_input_mask = []
+        page_input_mask = []
         has_layout = False
         has_page_ids = False
         for item in batch_list:
@@ -884,6 +885,7 @@ class LayoutProcessingMixin:
                 word_bboxes.append(None)
                 word_page_ids.append(None)
                 layout_input_mask.append(False)
+                page_input_mask.append(False)
                 continue
             if len(words) != len(bboxes):
                 raise ValueError(
@@ -898,6 +900,7 @@ class LayoutProcessingMixin:
             word_bboxes.append(bboxes)
             word_page_ids.append(page_ids)
             layout_input_mask.append(True)
+            page_input_mask.append(page_ids is not None)
             has_layout = True
             has_page_ids = has_page_ids or page_ids is not None
         fields = (
@@ -910,6 +913,7 @@ class LayoutProcessingMixin:
         )
         if has_page_ids:
             fields["word_page_ids"] = word_page_ids
+            fields["page_input_mask"] = torch.tensor(page_input_mask, dtype=torch.bool)
         return fields
 
     def _augment_label_item(self, item, batch, batch_idx):
@@ -927,6 +931,7 @@ class LayoutProcessingMixin:
         word_bboxes = kwargs.get("word_bboxes")
         word_page_ids = kwargs.get("word_page_ids")
         layout_input_mask = kwargs.get("layout_input_mask")
+        page_input_mask = kwargs.get("page_input_mask")
         prompt_lengths = kwargs.get("prompt_lengths")
         if word_bboxes is None and word_page_ids is None:
             return tokenized_inputs
@@ -968,6 +973,15 @@ class LayoutProcessingMixin:
             tokenized_inputs["layout_input_mask"] = layout_input_mask
         if page_token_ids is not None:
             tokenized_inputs["page_token_ids"] = page_token_ids
+            if page_input_mask is None:
+                page_input_mask = [page_ids is not None for page_ids in word_page_ids]
+            page_input_mask = torch.as_tensor(page_input_mask, dtype=torch.bool)
+            if page_input_mask.shape != (input_ids.shape[0],):
+                raise ValueError(
+                    "page_input_mask must have shape (batch,), "
+                    f"got {tuple(page_input_mask.shape)} for batch size {input_ids.shape[0]}"
+                )
+            tokenized_inputs["page_input_mask"] = page_input_mask
         return tokenized_inputs
 
 
@@ -1592,6 +1606,7 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             "word_bboxes": batch.get("word_bboxes"),
             "word_page_ids": batch.get("word_page_ids"),
             "layout_input_mask": batch.get("layout_input_mask"),
+            "page_input_mask": batch.get("page_input_mask"),
             "pixel_values": batch.get("pixel_values"),
             "vision_attention_mask": batch.get("vision_attention_mask"),
             "vision_input_mask": batch.get("vision_input_mask"),
@@ -1803,6 +1818,8 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
             tokenize_kwargs["word_page_ids"] = batch["word_page_ids"]
         if batch.get("layout_input_mask") is not None:
             tokenize_kwargs["layout_input_mask"] = batch["layout_input_mask"]
+        if batch.get("page_input_mask") is not None:
+            tokenize_kwargs["page_input_mask"] = batch["page_input_mask"]
         tokenized_input = self.tokenize_inputs(batch["tokens"], classes_mapping, **tokenize_kwargs)
         tokenized_input["classes_mapping"] = classes_mapping
 

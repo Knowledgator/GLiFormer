@@ -56,6 +56,7 @@ _TRANSFORMER_KWARGS = {
     "packing_config",
     "token_lengths",
     "layout_input_mask",
+    "page_input_mask",
 }
 
 
@@ -132,7 +133,11 @@ class LayoutEncoder(TextEncoder):
 
     def _supports_page_token_ids(self) -> bool:
         embeddings = getattr(getattr(self.bert_layer, "model", None), "embeddings", None)
-        return hasattr(embeddings, "page_embeddings")
+        return getattr(embeddings, "page_embeddings", None) is not None
+
+    def _supports_page_input_mask(self) -> bool:
+        model = getattr(self.bert_layer, "model", None)
+        return bool(getattr(model, "supports_page_input_mask", False))
 
     def _text_input_embeddings(
         self,
@@ -307,6 +312,7 @@ class LayoutEncoder(TextEncoder):
         attention_mask: Optional[torch.Tensor] = None,
         bbox: Optional[torch.Tensor] = None,
         page_token_ids: Optional[torch.Tensor] = None,
+        page_input_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         vision_attention_mask: Optional[torch.Tensor] = None,
         image_batch_idx: Optional[torch.Tensor] = None,
@@ -317,6 +323,7 @@ class LayoutEncoder(TextEncoder):
         bbox = LayoutEncoder._pop_bbox(kwargs, bbox)
         model_kwargs = dict(kwargs)
         page_token_ids = model_kwargs.pop("page_token_ids", page_token_ids)
+        page_input_mask = model_kwargs.pop("page_input_mask", page_input_mask)
         vision_attention_mask = model_kwargs.pop("vision_attention_mask", vision_attention_mask)
         image_batch_idx = model_kwargs.pop("image_batch_idx", image_batch_idx)
         image_page_ids = model_kwargs.pop("image_page_ids", image_page_ids)
@@ -349,6 +356,18 @@ class LayoutEncoder(TextEncoder):
             if ref is not None:
                 page_token_ids = torch.zeros(ref.shape[:2], dtype=torch.long, device=ref.device)
 
+        if page_token_ids is not None and self._supports_page_input_mask():
+            if page_input_mask is None:
+                page_input_mask = torch.ones(
+                    page_token_ids.shape[0],
+                    dtype=torch.bool,
+                    device=page_token_ids.device,
+                )
+            elif not isinstance(page_input_mask, torch.Tensor):
+                page_input_mask = torch.as_tensor(page_input_mask)
+            page_input_mask = page_input_mask.to(device=page_token_ids.device, dtype=torch.bool)
+            model_kwargs["page_input_mask"] = page_input_mask
+
         if pixel_values is not None and hasattr(self, "vision_encoder"):
             text_inputs_embeds = self._text_input_embeddings(input_ids, inputs_embeds)
             combined = self._combine_text_and_image_inputs(
@@ -371,8 +390,11 @@ class LayoutEncoder(TextEncoder):
                 model_kwargs.pop("bbox", None)
             if page_token_ids is not None and self._supports_page_token_ids():
                 model_kwargs["page_token_ids"] = page_token_ids
+                if page_input_mask is not None and self._supports_page_input_mask():
+                    model_kwargs["page_input_mask"] = page_input_mask
             elif "page_token_ids" in model_kwargs:
                 model_kwargs.pop("page_token_ids", None)
+                model_kwargs.pop("page_input_mask", None)
         elif attention_mask is not None:
             model_kwargs["attention_mask"] = attention_mask
 
@@ -402,6 +424,7 @@ class LayoutEncoder(TextEncoder):
         attention_mask: Optional[torch.Tensor] = None,
         bbox: Optional[torch.Tensor] = None,
         page_token_ids: Optional[torch.Tensor] = None,
+        page_input_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
@@ -410,6 +433,7 @@ class LayoutEncoder(TextEncoder):
             attention_mask=attention_mask,
             bbox=bbox,
             page_token_ids=page_token_ids,
+            page_input_mask=page_input_mask,
             pixel_values=pixel_values,
             **kwargs,
         )
@@ -463,6 +487,7 @@ class LayoutBiEncoder(TextBiEncoder):
         labels_attention_mask: Optional[torch.Tensor] = None,
         bbox: Optional[torch.Tensor] = None,
         page_token_ids: Optional[torch.Tensor] = None,
+        page_input_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -472,6 +497,7 @@ class LayoutBiEncoder(TextBiEncoder):
             attention_mask=attention_mask,
             bbox=bbox,
             page_token_ids=page_token_ids,
+            page_input_mask=page_input_mask,
             pixel_values=pixel_values,
             **kwargs,
         )

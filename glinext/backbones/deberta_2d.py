@@ -37,6 +37,24 @@ def _prepare_layout_input_mask(
     return layout_input_mask.to(device=device, dtype=torch.bool)
 
 
+def _prepare_page_input_mask(
+    page_input_mask: Optional[torch.Tensor],
+    batch_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Normalize the per-example flag controlling page embeddings."""
+    if page_input_mask is None:
+        return None
+    if not isinstance(page_input_mask, torch.Tensor):
+        page_input_mask = torch.as_tensor(page_input_mask)
+    if page_input_mask.shape != (batch_size,):
+        raise ValueError(
+            "page_input_mask must have shape (batch,), "
+            f"got {tuple(page_input_mask.shape)} for batch size {batch_size}"
+        )
+    return page_input_mask.to(device=device, dtype=torch.bool)
+
+
 def _relative_position_bucket(
     relative_position: torch.Tensor,
     num_buckets: int = 32,
@@ -174,6 +192,7 @@ class LayoutDebertaEmbeddings(nn.Module):
         bbox=None,
         layout_input_mask=None,
         page_token_ids=None,
+        page_input_mask=None,
         mask=None,
         inputs_embeds=None,
     ):
@@ -195,16 +214,24 @@ class LayoutDebertaEmbeddings(nn.Module):
             embeddings = embeddings + self.position_embeddings(position_ids.long())
         if self.token_type_embeddings is not None:
             embeddings = embeddings + self.token_type_embeddings(token_type_ids)
-        if self.page_embeddings is not None:
-            if page_token_ids is None:
-                page_token_ids = torch.zeros(input_shape, dtype=torch.long, device=embeddings.device)
+        if self.page_embeddings is not None and page_token_ids is not None:
             if page_token_ids.shape != input_shape:
                 raise ValueError(
                     f"page_token_ids must have shape {tuple(input_shape)}, got {tuple(page_token_ids.shape)}"
                 )
             page_token_ids = page_token_ids.to(device=embeddings.device, dtype=torch.long)
             page_token_ids = torch.clamp(page_token_ids, 0, self.page_embeddings.num_embeddings - 1)
-            embeddings = embeddings + self.page_embeddings(page_token_ids)
+            page_embeddings = self.page_embeddings(page_token_ids)
+            prepared_page_mask = _prepare_page_input_mask(
+                page_input_mask,
+                input_shape[0],
+                page_embeddings.device,
+            )
+            if prepared_page_mask is not None:
+                page_embeddings = page_embeddings * prepared_page_mask[:, None, None].to(
+                    dtype=page_embeddings.dtype
+                )
+            embeddings = embeddings + page_embeddings
         if self.spatial_embeddings is not None and bbox is not None:
             spatial_embeddings = self.spatial_embeddings(bbox)
             prepared_layout_mask = _prepare_layout_input_mask(
@@ -493,6 +520,7 @@ class LayoutDebertaPreTrainedModel(PreTrainedModel):
 
 class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
     supports_layout_input_mask = True
+    supports_page_input_mask = True
 
     def __init__(self, config):
         super().__init__(config)
@@ -520,6 +548,7 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
         bbox: Optional[torch.Tensor] = None,
         layout_input_mask: Optional[torch.Tensor] = None,
         page_token_ids: Optional[torch.Tensor] = None,
+        page_input_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -557,6 +586,9 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
             raise ValueError(
                 f"page_token_ids must have shape {tuple(input_shape)}, got {tuple(page_token_ids.shape)}"
             )
+        if page_input_mask is not None and page_token_ids is None:
+            raise ValueError("page_input_mask requires page_token_ids")
+        page_input_mask = _prepare_page_input_mask(page_input_mask, input_shape[0], device)
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
@@ -565,6 +597,7 @@ class LayoutDebertaModel(LayoutDebertaPreTrainedModel):
             bbox=bbox,
             layout_input_mask=layout_input_mask,
             page_token_ids=page_token_ids,
+            page_input_mask=page_input_mask,
             mask=attention_mask,
             inputs_embeds=inputs_embeds,
         )

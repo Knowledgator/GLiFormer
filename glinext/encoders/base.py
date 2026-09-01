@@ -91,6 +91,8 @@ class Transformer(nn.Module):
             if config.vocab_size != -1 and not labels_encoder:
                 encoder_config.vocab_size = config.vocab_size
         encoder_config = _coerce_backbone_config(encoder_config, backbone)
+        if backbone is not None and backbone.name == "deberta_2d":
+            encoder_config.max_page_embeddings = int(config.max_page_embeddings)
 
         if config._attn_implementation is not None and not labels_encoder:
             encoder_config._attn_implementation = config._attn_implementation
@@ -163,6 +165,8 @@ class Transformer(nn.Module):
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         if not getattr(self.model, "supports_layout_input_mask", False):
             kwargs.pop("layout_input_mask", None)
+        if not getattr(self.model, "supports_page_input_mask", False):
+            kwargs.pop("page_input_mask", None)
         pair_attention_mask = kwargs.pop("pair_attention_mask", None)
         base_attention_mask = kwargs.pop("attention_mask", None)
         args = list(args)
@@ -291,6 +295,7 @@ class Transformer(nn.Module):
         bbox = model_kwargs.pop("bbox", None)
         layout_input_mask = model_kwargs.pop("layout_input_mask", None)
         page_token_ids = model_kwargs.pop("page_token_ids", None)
+        page_input_mask = model_kwargs.pop("page_input_mask", None)
         output_attentions = model_kwargs.pop("output_attentions")
         produce_hidden = model_kwargs.pop("output_hidden_states")
         return_dict = model_kwargs.pop("return_dict")
@@ -318,6 +323,8 @@ class Transformer(nn.Module):
                 embedding_kwargs["layout_input_mask"] = layout_input_mask
         if page_token_ids is not None:
             embedding_kwargs["page_token_ids"] = page_token_ids
+            if page_input_mask is not None:
+                embedding_kwargs["page_input_mask"] = page_input_mask
         embedding_output = self.model.embeddings(**embedding_kwargs)
 
         encoder_kwargs = {

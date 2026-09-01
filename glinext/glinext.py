@@ -1051,7 +1051,7 @@ class BaseGLiNExT(BaseGLiNER):
         for key in (
             "pixel_values", "vision_attention_mask", "vision_input_mask",
             "audio_values", "audio_attention_mask", "audio_input_mask", "bbox",
-            "page_token_ids",
+            "layout_input_mask", "page_token_ids", "page_input_mask",
         ):
             value = result.get(key)
             if isinstance(value, torch.Tensor) and value.shape[0] == num_original:
