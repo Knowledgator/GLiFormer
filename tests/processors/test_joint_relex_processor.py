@@ -33,6 +33,54 @@ class TestInheritance:
         assert relex_proc.contribute_prompt(None, 0) == []
 
 
+class TestAugmentableLabelGroups:
+    def test_standalone_joint_relex_exposes_entities_and_relations(
+        self,
+        joint_relex_item,
+    ):
+        config = make_config(
+            default_ner_config=False,
+            joint_relex_config={},
+        )
+        processor = JointRelexProcessor(
+            config,
+            words_splitter=FakeWordsSplitter(),
+        )
+        mapping = processor.get_classes_mapping([joint_relex_item])
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=mapping,
+        )
+
+        groups = processor.get_augmentable_label_groups(
+            [joint_relex_item], classes_mapping,
+        )
+
+        assert [group.task for group in groups] == ["ner", "joint_relex"]
+        assert set(groups[0].positive_labels) == {"person", "location"}
+        assert groups[1].positive_labels == frozenset({"lives_in"})
+        groups[1].replace_labels(["works_at", "lives_in"])
+        assert list(
+            mapping[0].items[0].rel_class_to_id.class_to_id
+        ) == ["works_at", "lives_in"]
+
+    def test_shared_ner_configuration_exposes_only_relation_groups(
+        self,
+        relex_proc,
+        ner_proc,
+        joint_relex_item,
+    ):
+        mapping = ner_proc.get_classes_mapping([joint_relex_item])
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=mapping,
+        )
+
+        groups = relex_proc.get_augmentable_label_groups(
+            [joint_relex_item], classes_mapping,
+        )
+
+        assert [group.task for group in groups] == ["joint_relex"]
+
+
 class TestCreateLabels:
     def test_basic(self, relex_proc, ner_proc):
         """Test with manually constructed mapping to avoid NER's rel[-1] format issue."""
@@ -67,6 +115,7 @@ class TestCreateLabels:
         assert "rel_pair_mask" in result
         assert "rel_mask" in result
         assert "rel_batch_idx" in result
+        assert "rel_span_class_idx" in result
 
         labels = result["rel_labels"]
         # Shape: (total_groups, max_entities, max_entities, max_rel_classes)
@@ -77,6 +126,7 @@ class TestCreateLabels:
         assert labels[0, 0, 1, 0] == 1.0  # head=0, tail=1, rel_class=0
         assert result["rel_pair_mask"][0, 0, 1] == 1.0
         assert result["rel_mask"][0] == True
+        assert result["rel_span_class_idx"][0, :2].tolist() == [0, 1]
 
     def test_samples_no_relation_pairs_like_gliner_relex(self, relex_proc):
         from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
@@ -136,6 +186,66 @@ class TestCreateLabels:
         classes_mapping = make_batch_classes_mapping(extraction_mappings=ext_mapping, batch_size=2)
         result = relex_proc.create_labels([item, item], classes_mapping)
         assert result["rel_batch_idx"].tolist() == [0, 1]
+
+    def test_self_relation_is_not_left_as_an_unscorable_label(
+        self, relex_proc,
+    ):
+        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+
+        item = {
+            "text": "A",
+            "extraction": [{
+                "ner": [[0, 0, "X"]],
+                "relations": [[0, "r", 0]],
+            }],
+        }
+        ext_mapping = [ExtractionClassMapping(items=[
+            ExtractionItemMapping(
+                ner_class_to_id=BaseClassMapping(class_to_id={"X": 0}),
+                rel_class_to_id=BaseClassMapping(class_to_id={"r": 0}),
+            )
+        ])]
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=ext_mapping,
+        )
+
+        with pytest.warns(UserWarning, match="self-relations"):
+            result = relex_proc.create_labels([item], classes_mapping)
+
+        assert not result["rel_labels"].any()
+        assert not result["rel_pair_mask"].any()
+
+    def test_entity_without_a_prompted_ner_class_is_not_a_relation_endpoint(
+        self, relex_proc,
+    ):
+        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+
+        item = {
+            "text": "A B C",
+            "extraction": [{
+                "ner": [[0, 0, "kept"], [1, 1, "dropped"], [2, 2, "kept"]],
+                "relations": [[0, "r", 2], [0, "r", 1]],
+            }],
+        }
+        ext_mapping = [ExtractionClassMapping(items=[
+            ExtractionItemMapping(
+                ner_class_to_id=BaseClassMapping(class_to_id={"kept": 0}),
+                rel_class_to_id=BaseClassMapping(class_to_id={"r": 0}),
+            )
+        ])]
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=ext_mapping,
+        )
+
+        result = relex_proc.create_labels(
+            [item], classes_mapping, add_random_negatives=False,
+        )
+
+        assert result["rel_span_mask"].tolist() == [[True, True, False]]
+        assert result["rel_span_idx"][0, :2].tolist() == [[0, 0], [2, 2]]
+        assert result["rel_span_class_idx"].tolist() == [[0, 0, -1]]
+        assert result["rel_labels"][0, 0, 1, 0].item() == 1.0
+        assert result["rel_labels"].sum().item() == 1.0
 
 
 class TestBugRegressions:
@@ -231,3 +341,147 @@ class TestBugRegressions:
         rel_labels = result["rel_labels"][0]  # (E, E, C_rel)
         assert rel_labels[0, 1].sum().item() == 1.0  # exactly one relation set
         assert rel_labels[0, 2].sum().item() == 0.0  # old (0,2) must be empty
+
+    def test_post_tokenization_lengths_filter_each_batch_item(
+        self,
+        relex_proc,
+        ner_proc,
+    ):
+        items = [
+            {
+                "text": "a b c d",
+                "extraction": [{
+                    "ner": [[0, 0, "T"], [2, 2, "T"]],
+                    "relations": [[0, "r", 1]],
+                }],
+            },
+            {
+                "text": "e f g h",
+                "extraction": [{
+                    "ner": [[0, 0, "T"], [2, 2, "T"]],
+                    "relations": [[0, "r", 1]],
+                }],
+            },
+        ]
+        mappings = ner_proc.get_classes_mapping(items)
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=mappings,
+            batch_size=2,
+        )
+
+        result = relex_proc.create_labels(
+            items,
+            classes_mapping,
+            max_seq_len=4,
+            sequence_lengths=torch.tensor([[2], [3]]),
+            add_random_negatives=False,
+        )
+
+        assert result["rel_span_mask"].tolist() == [
+            [True, False],
+            [True, True],
+        ]
+        assert result["rel_labels"][0].sum().item() == 0.0
+        assert result["rel_labels"][1, 0, 1, 0].item() == 1.0
+
+    def test_zero_retained_source_length_filters_every_entity(
+        self,
+        relex_proc,
+        ner_proc,
+    ):
+        item = {
+            "text": "a b",
+            "extraction": [{
+                "ner": [[0, 0, "T"], [1, 1, "T"]],
+                "relations": [[0, "r", 1]],
+            }],
+        }
+        mappings = ner_proc.get_classes_mapping([item])
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=mappings,
+        )
+
+        result = relex_proc.create_labels(
+            [item],
+            classes_mapping,
+            max_seq_len=2,
+            sequence_lengths=torch.tensor([[0]]),
+            add_random_negatives=False,
+        )
+
+        assert not result["rel_span_mask"].any()
+        assert not result["rel_pair_mask"].any()
+        assert not result["rel_labels"].any()
+
+    def test_retained_length_uses_batch_index_not_flat_group_index(
+        self,
+        relex_proc,
+        ner_proc,
+    ):
+        items = [
+            {"text": "unrelated batch item"},
+            {
+                "text": "a b",
+                "extraction": [{
+                    "ner": [[0, 0, "T"], [1, 1, "T"]],
+                    "relations": [[0, "r", 1]],
+                }],
+            },
+        ]
+        mappings = ner_proc.get_classes_mapping(items)
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=mappings,
+            batch_size=2,
+        )
+
+        result = relex_proc.create_labels(
+            items,
+            classes_mapping,
+            max_seq_len=3,
+            sequence_lengths=torch.tensor([[3], [1]]),
+            add_random_negatives=False,
+        )
+
+        assert result["rel_batch_idx"].tolist() == [1]
+        assert result["rel_span_mask"].tolist() == [[True, False]]
+        assert not result["rel_pair_mask"].any()
+        assert not result["rel_labels"].any()
+
+    def test_retained_length_is_shared_by_groups_from_the_same_item(
+        self,
+        relex_proc,
+        ner_proc,
+    ):
+        item = {
+            "text": "a b",
+            "extraction": [
+                {
+                    "ner": [[0, 0, "T"], [1, 1, "T"]],
+                    "relations": [[0, "r1", 1]],
+                },
+                {
+                    "ner": [[0, 0, "T"], [1, 1, "T"]],
+                    "relations": [[0, "r2", 1]],
+                },
+            ],
+        }
+        mappings = ner_proc.get_classes_mapping([item])
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=mappings,
+        )
+
+        result = relex_proc.create_labels(
+            [item],
+            classes_mapping,
+            max_seq_len=2,
+            sequence_lengths=torch.tensor([[1]]),
+            add_random_negatives=False,
+        )
+
+        assert result["rel_batch_idx"].tolist() == [0, 0]
+        assert result["rel_span_mask"].tolist() == [
+            [True, False],
+            [True, False],
+        ]
+        assert not result["rel_pair_mask"].any()
+        assert not result["rel_labels"].any()

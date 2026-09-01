@@ -21,6 +21,11 @@ class TestGetClassesMapping:
     def test_returns_none(self, count_proc):
         assert count_proc.get_classes_mapping([{}]) is None
 
+    def test_mappingless_task_has_no_augmentable_groups(self, count_proc):
+        assert count_proc.get_augmentable_label_groups(
+            [{}], make_batch_classes_mapping(),
+        ) == []
+
 
 class TestCreateLabels:
     def test_cat_only(self, count_proc):

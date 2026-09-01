@@ -98,10 +98,9 @@ def score_anchor_relations(
 ) -> torch.Tensor | None:
     """Score directed anchor pairs, optionally compacting sparse slot masks.
 
-    Regular structuring retains its historical direct scorer call.  Entity-first
-    set structuring compacts active record slots first because selected token
-    anchors may be sparse, then scatters both relation axes back to their stable
-    public slot indices.
+    Entity-first structuring compacts active record slots because selected
+    token anchors may be sparse, then scatters both relation axes back to their
+    stable public slot indices.
     """
 
     if relation_layer is None:

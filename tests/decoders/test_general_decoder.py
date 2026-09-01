@@ -1,9 +1,8 @@
 """Tests for GLiNExTDecoder — the general decoder factory and unflatten utility."""
 
-import pytest
 import torch
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import asdict, dataclass
+from typing import Optional
 
 from glinext.processing.decoder import GLiNExTDecoder, unflatten_by_batch_origin
 from glinext.config import (
@@ -226,3 +225,43 @@ class TestGLiNExTDecoderDecode:
         # With high threshold, the borderline detection at sigmoid(0)≈0.5 is filtered
         # but the strong one at sigmoid(5)≈0.99 may still pass
         assert "ner" in results
+
+
+def test_map_results_routes_opt_in_anchor_diagnostics_separately():
+    task_name = "structuring"
+    config = make_config(
+        ner_config=None,
+        structuring_config=None,
+    )
+    decoder = GLiNExTDecoder(config)
+
+    class ProbeDecoder:
+        def map_results(
+            self,
+            task_results,
+            *,
+            anchor_diagnostics_output=None,
+            **kwargs,
+        ):
+            assert task_results == ["decoded"]
+            assert anchor_diagnostics_output is not None
+            anchor_diagnostics_output.append({
+                "summary": {"activated_anchor_count": 3},
+                "groups": [],
+            })
+            return ["mapped"]
+
+    decoder.task_decoders = {task_name: ProbeDecoder()}
+
+    result = decoder.map_results(
+        {task_name: ["decoded"]},
+        return_anchor_diagnostics=True,
+    )
+
+    assert result == {
+        task_name: ["mapped"],
+        f"{task_name}_anchor_diagnostics": [{
+            "summary": {"activated_anchor_count": 3},
+            "groups": [],
+        }],
+    }

@@ -32,11 +32,8 @@ from .config import (
     AudioSegmentationHeadConfig,
     JointRelexHeadConfig,
     OpenRelexHeadConfig,
-    SetOpenRelexHeadConfig,
-    SetOpenRelationExtractionHeadConfig,
     StructuringModeConfig,
     StructuringHeadConfig,
-    SetStructuringHeadConfig,
     CountHeadConfig,
     EmbeddingHeadConfig,
 )

@@ -12,7 +12,6 @@ from glinext.processing.formatting import (
     _convert_int,
 )
 
-
 # ── Low-level converter tests ────────────────────────────────────────────
 
 class TestConvertBool:
@@ -159,6 +158,23 @@ class TestStructuringOutputFormatter:
         })
         result = fmt.format({"data": [{"num": "bad"}]})
         assert result == {"data": [{"num": 0}]}
+
+    def test_explicit_none_default_differs_from_omitted_default(self):
+        fmt = StructuringOutputFormatter(
+            {
+                "data": {
+                    "raw": FieldType("int"),
+                    "nullable": FieldType("int", default=None),
+                }
+            }
+        )
+
+        result = fmt.format(
+            {"data": [{"raw": "invalid", "nullable": "invalid"}]}
+        )
+        assert result == {
+            "data": [{"raw": "invalid", "nullable": None}]
+        }
 
     def test_format_batch(self):
         fmt = StructuringOutputFormatter({"person": {"age": "int"}})

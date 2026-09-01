@@ -61,6 +61,24 @@ class TestResolveTextSpan:
                   ("New", 14, 17), ("York", 18, 22)]
         assert SpanProcessor._resolve_text_span(text, tokens, "john") == (0, 0)
 
+    def test_character_offsets_trim_formatting_whitespace(self):
+        text = "Intro   Burton argued.  "
+        tokens = [
+            ("Intro", 0, 5),
+            ("Burton", 8, 14),
+            ("argued", 15, 21),
+            (".", 21, 22),
+        ]
+        mention = "  Burton argued.  "
+
+        assert SpanProcessor._char_span_to_token_range(
+            text,
+            tokens,
+            6,
+            24,
+            mention,
+        ) == (1, 3)
+
 
 class TestResolveEntitySpans:
     def test_text_based(self):

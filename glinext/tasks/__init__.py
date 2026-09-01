@@ -69,7 +69,7 @@ class TaskHeadOutput(ModelOutput):
 
 
 class StructuringHeadExtra(TypedDict, total=False):
-    """Canonical extras emitted by the anchor-conditioned structuring head."""
+    """Entity-first structuring tensors and record-assignment metadata."""
 
     groups_output: torch.Tensor
     anchor_mask: torch.Tensor
@@ -81,11 +81,6 @@ class StructuringHeadExtra(TypedDict, total=False):
     anchor_relation_scores: torch.Tensor | None
     anchor_relation_loss: torch.Tensor | None
     anchor_matches: list[list[tuple[int, int]]] | None
-
-
-class SetStructuringHeadExtra(StructuringHeadExtra, total=False):
-    """Canonical entity-first structuring tensors plus compatibility aliases."""
-
     entity_logits: torch.Tensor
     entity_spans: torch.Tensor
     entity_mask: torch.Tensor
@@ -104,11 +99,6 @@ class SetStructuringHeadExtra(StructuringHeadExtra, total=False):
 @dataclass
 class StructuringTaskHeadOutput(TaskHeadOutput):
     extra: StructuringHeadExtra | None = None
-
-
-@dataclass
-class SetStructuringTaskHeadOutput(TaskHeadOutput):
-    extra: SetStructuringHeadExtra | None = None
 
 
 class TaskHead(ABC, nn.Module):
@@ -707,19 +697,7 @@ TASK_REGISTRY = TaskRegistry(
         TaskDefinition("count", "glinext.tasks.count.model", "CountHead", "text"),
         TaskDefinition("joint_relex", "glinext.tasks.joint_relex.model", "JointRelexHead", "text"),
         TaskDefinition("open_relex", "glinext.tasks.open_relex.model", "OpenRelexHead", "text"),
-        TaskDefinition(
-            "set_open_relex",
-            "glinext.tasks.set_open_relex.model",
-            "SetOpenRelexHead",
-            "text",
-        ),
         TaskDefinition("structuring", "glinext.tasks.structuring.model", "StructuringHead", "text"),
-        TaskDefinition(
-            "set_structuring",
-            "glinext.tasks.set_structuring.model",
-            "SetStructuringHead",
-            "text",
-        ),
         TaskDefinition("image_classification", "glinext.tasks.vision.model", "ImageClassificationHead", "vision"),
         TaskDefinition("object_detection", "glinext.tasks.vision.model", "ObjectDetectionHead", "vision"),
         TaskDefinition("segmentation", "glinext.tasks.vision.model", "SegmentationHead", "vision"),

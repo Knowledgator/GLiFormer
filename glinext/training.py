@@ -100,20 +100,14 @@ _LABEL_KEYS = frozenset(
         "span_labels",
         "cat_labels",
         "rel_labels",
+        "open_rel_entity_labels",
         "open_rel_labels",
-        "open_rel_span_labels",
-        "set_open_rel_entity_labels",
-        "set_open_rel_labels",
-        "set_open_rel_assignment_labels",
-        "set_open_rel_count",
+        "open_rel_assignment_labels",
+        "open_rel_count",
         "structuring_labels",
         "structuring_span_labels",
         "structuring_count",
         "structuring_relation_labels",
-        "set_structuring_labels",
-        "set_structuring_span_labels",
-        "set_structuring_count",
-        "set_structuring_relation_labels",
         "embedding_labels",
         "count_targets",
         # Vision tasks
@@ -145,59 +139,38 @@ _PREDICTION_FIELDS_BY_LABEL = {
     "span_labels": ("span_logits",),
     "cat_labels": ("cat_logits",),
     "rel_labels": ("joint_rel_logits",),
-    "open_rel_labels": ("open_rel_logits",),
-    "open_rel_span_labels": ("open_rel_span_logits",),
-    "set_open_rel_entity_labels": ("set_open_rel_entity_logits",),
-    "set_open_rel_labels": (
-        "set_open_rel_logits",
-        "set_open_rel_objectness_logits",
-        "set_open_rel_anchor_mask",
+    "open_rel_entity_labels": ("open_rel_entity_logits",),
+    "open_rel_labels": (
+        "open_rel_logits",
+        "open_rel_objectness_logits",
+        "open_rel_anchor_mask",
     ),
-    "set_open_rel_assignment_labels": (
-        "set_open_rel_assignment_logits",
-        "set_open_rel_span_idx",
-        "set_open_rel_span_mask",
+    "open_rel_assignment_labels": (
+        "open_rel_assignment_logits",
+        "open_rel_span_idx",
+        "open_rel_span_mask",
     ),
-    "set_open_rel_count": (
-        "set_open_rel_objectness_logits",
-        "set_open_rel_anchor_mask",
+    "open_rel_count": (
+        "open_rel_objectness_logits",
+        "open_rel_anchor_mask",
     ),
     "structuring_labels": (
-        "structuring_logits",
-        "structuring_objectness_logits",
-        "set_structuring_entity_logits",
+        "structuring_entity_logits",
+        "structuring_field_logits",
     ),
     "structuring_span_labels": (
-        "structuring_span_logits",
-        "set_structuring_field_logits",
-        "set_structuring_assignment_logits",
-        "set_structuring_span_idx",
-        "set_structuring_span_mask",
-        "set_structuring_objectness_logits",
-        "set_structuring_anchor_mask",
+        "structuring_assignment_logits",
+        "structuring_span_idx",
+        "structuring_span_mask",
+        "structuring_objectness_logits",
+        "structuring_anchor_mask",
     ),
-    "structuring_count": ("count_logits",),
+    "structuring_count": (
+        "structuring_objectness_logits",
+        "structuring_anchor_mask",
+    ),
     "structuring_relation_labels": (
         "structuring_anchor_relation_scores",
-        "set_structuring_anchor_relation_scores",
-    ),
-    "set_structuring_labels": (
-        "set_structuring_entity_logits",
-        "set_structuring_field_logits",
-    ),
-    "set_structuring_span_labels": (
-        "set_structuring_assignment_logits",
-        "set_structuring_span_idx",
-        "set_structuring_span_mask",
-        "set_structuring_objectness_logits",
-        "set_structuring_anchor_mask",
-    ),
-    "set_structuring_count": (
-        "set_structuring_objectness_logits",
-        "set_structuring_anchor_mask",
-    ),
-    "set_structuring_relation_labels": (
-        "set_structuring_anchor_relation_scores",
     ),
     "embedding_labels": ("embedding_logits",),
     "count_targets": ("count_logits",),
@@ -284,14 +257,11 @@ _PREDICTION_FIELDS_BY_LABEL = {
 }
 
 _STRUCTURING_RELATION_PREDICTION_FIELDS = frozenset(
-    {
-        "structuring_anchor_relation_scores",
-        "set_structuring_anchor_relation_scores",
-    }
+    {"structuring_anchor_relation_scores"}
 )
 
-_SET_OPEN_ASSIGNMENT_PREDICTION_FIELDS = frozenset(
-    {"set_open_rel_assignment_logits"}
+_OPEN_REL_ASSIGNMENT_PREDICTION_FIELDS = frozenset(
+    {"open_rel_assignment_logits"}
 )
 
 
@@ -337,14 +307,14 @@ def _prediction_values(
             # it does not attempt to apply training-time anchor matching.
             value = value.flatten(start_dim=1)
         elif (
-            field_name in _SET_OPEN_ASSIGNMENT_PREDICTION_FIELDS
+            field_name in _OPEN_REL_ASSIGNMENT_PREDICTION_FIELDS
             and isinstance(value, torch.Tensor)
-            and value.ndim == 5
+            and value.ndim == 4
         ):
-            # Assignment logits are canonically (BN, A, R, E, 2), where the
-            # recognized-entity count E varies by batch. Hugging Face pads
-            # only dimension 1 during evaluation, so flatten every variable
-            # set/schema axis there while retaining the two endpoint roles.
+            # Assignment logits are canonically (BN, A, E, 2), where both
+            # anchor count A and recognized-entity count E can vary by batch.
+            # Hugging Face pads only dimension 1 during evaluation, so flatten
+            # both variable axes there while retaining the endpoint roles.
             value = value.flatten(start_dim=1, end_dim=-2)
         values.append(value)
     if not values:
@@ -522,13 +492,13 @@ class GLiNExTTrainer(GLiNERTrainer):
         logits = nested_detach(logits) if logits is not None else None
 
         labels = {key: nested_detach(inputs[key]) for key in label_keys}
-        assignment_labels = labels.get("set_open_rel_assignment_labels")
+        assignment_labels = labels.get("open_rel_assignment_labels")
         if (
             isinstance(assignment_labels, torch.Tensor)
-            and assignment_labels.ndim == 5
+            and assignment_labels.ndim == 4
         ):
-            # Gold targets are (BN, G, R, E, 2); both G and E may vary.
-            labels["set_open_rel_assignment_labels"] = (
+            # Gold targets are (BN, G, E, 2); both G and E may vary.
+            labels["open_rel_assignment_labels"] = (
                 assignment_labels.flatten(start_dim=1, end_dim=-2)
             )
         relation_labels = labels.get("structuring_relation_labels")

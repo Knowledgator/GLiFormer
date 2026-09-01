@@ -1,14 +1,10 @@
-"""Shared decoder for base and set structuring tasks.
-
-Uses SpanDecoder for BIO span extraction and greedy overlap removal.
-Supports both token-level BIO decoding and span-level decoding (represent_spans).
-"""
+"""Shared hierarchy, mapping, and formatting support for structuring."""
 
 from dataclasses import dataclass
 
 import torch
 
-from ..tasks.span_decoder import Span, SpanDecoder
+from ..tasks.span_decoder import SpanDecoder
 from ._structuring_alignment import (
     MULTI_LEVEL_RESULT_KEY,
     ReconstructedStructuringGroup,
@@ -19,8 +15,6 @@ from ._structuring_alignment import (
     make_multi_level_group_result,
     resolve_structuring_decoder,
 )
-from .decoder import unflatten_by_batch_origin
-from .structuring_compat import legacy_task_mapping
 from .structuring_processor import MULTI_LEVEL_ROOT_KEY
 from .structuring_types import is_structuring_descriptor
 
@@ -42,17 +36,16 @@ class StructuringDecodeContext:
 
 
 class StructuringDecoder(SpanDecoder):
-    """Decodes structuring logits into field-value assignments per instance.
+    """Shared support for the canonical entity-first task decoder.
 
-    Two decoding modes:
-    1. Token-level BIO: structuring_logits (B, X, L, C, 3)
-    2. Span-level: structuring_span_logits (B, X, S, C) + span_idx/span_mask
+    Concrete task decoding lives in :mod:`glinext.tasks.structuring.decoder`.
+    This class owns common threshold/mask validation plus hierarchy mapping and
+    result formatting; it deliberately does not accept the retired 5-D
+    anchor-BIO output contract.
     """
 
     config_attr = "structuring_config"
     mapping_attr = "structuring_mapping"
-    token_logits_attr = "structuring_logits"
-    span_logits_attr = "structuring_span_logits"
     batch_origin_attr = "structuring_batch_origin"
     anchor_mask_attr = "structuring_anchor_mask"
     objectness_logits_attr = "structuring_objectness_logits"
@@ -308,223 +301,6 @@ class StructuringDecoder(SpanDecoder):
             multi_level_contexts=multi_level_contexts,
         )
 
-    def decode(
-        self,
-        model_output,
-        classes_mapping=None,
-        threshold=None,
-        flat_ner=True,
-        multi_label=False,
-        texts=None,
-        objectness_threshold=None,
-        preserve_empty_records=False,
-        **kwargs,
-    ) -> list[list[dict]]:
-        """Decode structuring predictions.
-
-        Automatically selects span-level decoding when span_logits are available,
-        otherwise falls back to token-level BIO decoding. ``required_fields``
-        are not consulted here — they only affect post-processing, where
-        instances missing a required field are dropped.
-
-        When the model has an anchor-objectness head, anchors below
-        ``objectness_threshold`` are filtered before BIO decoding so that
-        empty slots do not leak into the output. When it is omitted, the main
-        ``threshold`` is reused for objectness. Objectness-selected records
-        without field evidence are dropped unless ``preserve_empty_records``
-        is explicitly enabled.
-        """
-        token_logits = getattr(model_output, self.token_logits_attr, None)
-        span_logits = getattr(model_output, self.span_logits_attr, None)
-        span_idx = getattr(model_output, self.span_idx_attr, None)
-        span_mask = getattr(model_output, self.span_mask_attr, None)
-        if token_logits is None and span_logits is None:
-            return []
-
-        # Determine batch size from whichever output is available
-        if token_logits is not None:
-            B = token_logits.shape[0]
-        else:
-            B = span_logits.shape[0]
-
-        expected_anchor_count = (
-            span_logits.shape[1]
-            if span_logits is not None and span_idx is not None and span_mask is not None
-            else token_logits.shape[1]
-        )
-        context = self._prepare_decode_context(
-            model_output,
-            classes_mapping,
-            batch_groups=B,
-            anchor_count=expected_anchor_count,
-            device=(
-                token_logits.device
-                if token_logits is not None else span_logits.device
-            ),
-            threshold=threshold,
-            objectness_threshold=objectness_threshold,
-        )
-
-        # Prefer span-level decoding when available
-        if span_logits is not None and span_idx is not None and span_mask is not None:
-            return self._decode_from_spans(
-                span_logits,
-                span_idx,
-                span_mask,
-                context.anchor_mask,
-                context.id_to_fields,
-                context.threshold,
-                flat_ner,
-                multi_label,
-                texts,
-                batch_origin=context.batch_origin,
-                batch_size=context.batch_size,
-                multi_level_contexts=context.multi_level_contexts,
-                relation_scores=context.relation_scores,
-                reliable_presence_mask=context.reliable_presence_mask,
-                preserve_empty_records=preserve_empty_records,
-            )
-
-        # Fall back to token-level BIO decoding
-        return self._decode_token_level(
-            token_logits,
-            context.anchor_mask,
-            context.id_to_fields,
-            context.threshold,
-            flat_ner,
-            multi_label,
-            texts,
-            batch_origin=context.batch_origin,
-            batch_size=context.batch_size,
-            multi_level_contexts=context.multi_level_contexts,
-            relation_scores=context.relation_scores,
-            reliable_presence_mask=context.reliable_presence_mask,
-            preserve_empty_records=preserve_empty_records,
-        )
-
-    def _decode_token_level(self, logits, anchor_mask, id_to_fields, threshold,
-                            flat_ner, multi_label, texts, batch_origin=None,
-                            batch_size=None, multi_level_contexts=None,
-                            relation_scores=None,
-                            reliable_presence_mask=None,
-                            preserve_empty_records=False):
-        """Decode from token-level BIO logits (BN, X, L, C, 3)."""
-        BN, X, L, C, _ = logits.shape
-        flat_results = []
-
-        for b in range(BN):
-            text_bi = batch_origin[b].item()
-            anchor_entries = []
-            context = (
-                multi_level_contexts[b]
-                if multi_level_contexts and b < len(multi_level_contexts)
-                else None
-            )
-            field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
-                i: str(i) for i in range(C)
-            }
-            for x in range(X):
-                if anchor_mask is not None and not anchor_mask[b, x]:
-                    continue
-
-                instance_logits = logits[b, x]  # (L, C, 3)
-                spans = self.decode_bio_spans(
-                    instance_logits, field_id_to_class, threshold, flat_ner, multi_label,
-                )
-
-                fields = self._spans_to_fields(spans, texts, text_bi)
-                anchor_entries.append({
-                    "anchor_index": x,
-                    "fields": fields,
-                    "presence_is_reliable": bool(
-                        reliable_presence_mask is not None
-                        and reliable_presence_mask[b, x]
-                    ),
-                })
-            flat_results.append(
-                self._finalize_anchor_group(
-                    anchor_entries,
-                    relation_scores=(
-                        relation_scores[b]
-                        if relation_scores is not None else None
-                    ),
-                    context=context,
-                    preserve_empty_records=preserve_empty_records,
-                )
-            )
-
-        return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
-
-    def _decode_from_spans(self, span_logits, span_idx, span_mask, anchor_mask,
-                           id_to_fields, threshold, flat_ner, multi_label, texts,
-                           batch_origin=None, batch_size=None,
-                           multi_level_contexts=None, relation_scores=None,
-                           reliable_presence_mask=None,
-                           preserve_empty_records=False):
-        """Decode from span-level predictions (BN, X, S, C)."""
-        BN, X, S, C = span_logits.shape
-        span_probs = torch.sigmoid(span_logits)
-        flat_results = []
-
-        for b in range(BN):
-            text_bi = batch_origin[b].item()
-            anchor_entries = []
-            context = (
-                multi_level_contexts[b]
-                if multi_level_contexts and b < len(multi_level_contexts)
-                else None
-            )
-            field_id_to_class = id_to_fields[b] if b < len(id_to_fields) and id_to_fields[b] else {
-                i: str(i) for i in range(C)
-            }
-            valid_indices = torch.where(span_mask[b])[0]
-            for x in range(X):
-                if anchor_mask is not None and not anchor_mask[b, x]:
-                    continue
-
-                spans = []
-
-                for span_pos in valid_indices:
-                    span_start = span_idx[b, span_pos, 0].item()
-                    span_end = span_idx[b, span_pos, 1].item()
-                    probs = span_probs[b, x, span_pos]
-                    class_indices = torch.where(probs > threshold)[0]
-
-                    for class_idx in class_indices:
-                        class_id = class_idx.item()
-                        if class_id in field_id_to_class:
-                            spans.append(Span(
-                                start=span_start,
-                                end=span_end,
-                                entity_type=field_id_to_class[class_id],
-                                score=probs[class_idx].item(),
-                            ))
-
-                spans = self.greedy_search(spans, flat_ner, multi_label)
-
-                fields = self._spans_to_fields(spans, texts, text_bi)
-                anchor_entries.append({
-                    "anchor_index": x,
-                    "fields": fields,
-                    "presence_is_reliable": bool(
-                        reliable_presence_mask is not None
-                        and reliable_presence_mask[b, x]
-                    ),
-                })
-            flat_results.append(
-                self._finalize_anchor_group(
-                    anchor_entries,
-                    relation_scores=(
-                        relation_scores[b]
-                        if relation_scores is not None else None
-                    ),
-                    context=context,
-                    preserve_empty_records=preserve_empty_records,
-                )
-            )
-
-        return unflatten_by_batch_origin(flat_results, batch_origin, batch_size)
-
     def _spans_to_fields(self, spans, texts, batch_idx):
         """Convert Span objects to field dicts with text."""
         fields = []
@@ -541,14 +317,9 @@ class StructuringDecoder(SpanDecoder):
 
     @classmethod
     def _task_structuring_mappings(cls, classes_mapping):
-        return legacy_task_mapping(
-            classes_mapping,
-            cls.mapping_attr,
-            fallback_attr=(
-                "structuring_mapping"
-                if cls.mapping_attr != "structuring_mapping" else None
-            ),
-        )
+        if classes_mapping is None:
+            return None
+        return getattr(classes_mapping, cls.mapping_attr, None)
 
     def _build_field_class_maps(self, classes_mapping, batch_size: int) -> list[dict[int, str]]:
         """Build per-batch-item id->field_name mappings from BatchClassesMapping.

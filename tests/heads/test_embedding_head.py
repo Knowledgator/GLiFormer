@@ -1,13 +1,21 @@
 """Tests for EmbeddingHead and EmbeddingLoss."""
 
-import pytest
-import torch
+from dataclasses import asdict
 from types import SimpleNamespace
 
-from glinext.tasks.embedding.model import EmbeddingHead, EmbeddingLoss, MSELoss, ContrastiveLoss, TripletLoss
-from tests.heads.conftest import make_config, D, B, W, C
-from dataclasses import asdict
+import pytest
+import torch
+
 from glinext.config import EmbeddingHeadConfig
+from glinext.tasks.embedding.model import (
+    ContrastiveLoss,
+    CosineMarginLoss,
+    EmbeddingHead,
+    EmbeddingLoss,
+    MSELoss,
+    TripletLoss,
+)
+from tests.heads.conftest import B, D, W, make_config
 
 
 # ── EmbeddingLoss registry ───────────────────────────────────────────────
@@ -24,6 +32,11 @@ class TestEmbeddingLossRegistry:
     def test_triplet(self):
         loss = EmbeddingLoss.from_config("triplet")
         assert isinstance(loss, TripletLoss)
+
+    def test_cosine_margin(self):
+        loss = EmbeddingLoss.from_config("cosine_margin", margin=0.2)
+        assert isinstance(loss, CosineMarginLoss)
+        assert loss.margin == pytest.approx(0.2)
 
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown loss function"):
@@ -49,6 +62,13 @@ class TestEmbeddingLossForward:
         labels = torch.tensor([1.0, 0.0])
         val = loss(sims, labels)
         assert val.item() >= 0
+
+    def test_cosine_margin_only_penalizes_negatives_above_margin(self):
+        loss = CosineMarginLoss(margin=0.2)
+        sims = torch.tensor([0.9, 0.4, 0.1, -0.2])
+        labels = torch.tensor([1.0, -1.0, 0.0, -1.0])
+
+        assert loss(sims, labels).item() == pytest.approx(0.075)
 
 
 # ── EmbeddingHead construction ───────────────────────────────────────────
@@ -87,6 +107,64 @@ class TestEmbeddingHeadConstruction:
         )
         out = head(shared, {}, embedding_pair_idx=pair_idx)
         assert out.logits.shape == (1,)
+
+    def test_projection_dropout_can_be_disabled_without_changing_topology(self):
+        config = make_config(
+            embedding_config=asdict(
+                EmbeddingHeadConfig(
+                    projection_dim=32,
+                    projection_dropout=0.0,
+                )
+            )
+        )
+
+        head = EmbeddingHead.from_config(config)
+        dropout_layers = [
+            module
+            for module in head.projection.modules()
+            if isinstance(module, torch.nn.Dropout)
+        ]
+
+        assert head.projection_dropout == 0.0
+        assert len(dropout_layers) == 1
+        assert dropout_layers[0].p == 0.0
+        assert isinstance(head.projection[3], torch.nn.Linear)
+
+    def test_zero_projection_dropout_loads_legacy_projection_state_strictly(self):
+        legacy = EmbeddingHead.from_config(
+            make_config(
+                embedding_config=asdict(
+                    EmbeddingHeadConfig(
+                        projection_dim=32,
+                        projection_dropout=0.1,
+                    )
+                )
+            )
+        )
+        deterministic = EmbeddingHead.from_config(
+            make_config(
+                embedding_config=asdict(
+                    EmbeddingHeadConfig(
+                        projection_dim=32,
+                        projection_dropout=0.0,
+                    )
+                )
+            )
+        )
+
+        deterministic.load_state_dict(legacy.state_dict(), strict=True)
+
+    def test_cosine_margin_config_reaches_loss(self):
+        config = make_config(
+            embedding_config=asdict(
+                EmbeddingHeadConfig(loss_fn="cosine_margin", margin=0.3)
+            )
+        )
+
+        head = EmbeddingHead.from_config(config)
+
+        assert isinstance(head.loss, CosineMarginLoss)
+        assert head.loss.margin == pytest.approx(0.3)
 
 
 # ── EmbeddingHead forward ───────────────────────────────────────────────

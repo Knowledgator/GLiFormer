@@ -1074,40 +1074,17 @@ class JointRelexHeadConfig(BaseHeadConfig):
 
 @dataclass
 class OpenRelexHeadConfig(BaseHeadConfig):
-    """Config for anchor-based relation extraction (GLiNER2 style).
+    """Entity-first set-prediction configuration for open relations."""
 
-    Standalone head — no NER dependency. Uses configurable anchor layers
-    to extract head/tail spans directly per (anchor, rel_type) pair.
-
-    ``head_type`` is retained as a serialized implementation discriminator.
-    New set-prediction configurations live in ``set_open_relex_config``;
-    ``set_open_relex`` here is accepted only so older checkpoints can be
-    migrated into that independent task field.
-    """
     head_type: str = "open_relex"
-    anchor_mode: str = "fixed"          # "fixed", "features", "rotary", "query_rnn", "query_transformer"
+    anchor_mode: str = "fixed_transformer"
+    anchor_modeling: str = "linear"
     num_fixed_slots: int = 10
     max_count: int = 20
     anchor_num_heads: int = 4
     anchor_num_layers: int = 2
     rel_token_index: int = -1
     embed_rel_token: bool = True
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.head_type not in {"open_relex", "set_open_relex"}:
-            raise ValueError(
-                "head_type must be 'open_relex' or 'set_open_relex'"
-            )
-
-
-@dataclass
-class SetOpenRelexHeadConfig(OpenRelexHeadConfig):
-    """Independent entity-first set-prediction open-relation config."""
-
-    head_type: str = "set_open_relex"
-    anchor_mode: str = "fixed_transformer"
-    anchor_modeling: str = "linear"
     scorer_type: str = "dot"
     represent_spans: bool = True
     neg_spans_ratio: float = 0.0
@@ -1120,6 +1097,12 @@ class SetOpenRelexHeadConfig(OpenRelexHeadConfig):
     bio_loss_reduction: str = "sum"
 
     def __post_init__(self):
+        if self.head_type == "set_open_relex":
+            # Load-only compatibility for entity-first configs serialized
+            # before this became the sole open-relation implementation.
+            self.head_type = "open_relex"
+        elif self.head_type != "open_relex":
+            raise ValueError("head_type must be 'open_relex'")
         super().__post_init__()
         for name in (
             "entity_loss_coef",
@@ -1139,9 +1122,6 @@ class SetOpenRelexHeadConfig(OpenRelexHeadConfig):
             raise ValueError("bio_loss_reduction must be 'sum' or 'mean'")
 
 
-SetOpenRelationExtractionHeadConfig = SetOpenRelexHeadConfig
-
-
 _STRUCTURING_MODE_ALIASES = {
     "base": "flat",
     "single_level": "flat",
@@ -1155,7 +1135,7 @@ _STRUCTURING_MODE_ALIASES = {
 
 @dataclass
 class StructuringModeConfig:
-    """Processing options shared by both structuring heads.
+    """Processing options for the structuring head.
 
     ``type`` enables optional hierarchy normalization and anchor alignment on
     the common processing path. ``processor`` and ``decoder`` can replace the
@@ -1304,11 +1284,9 @@ class StructuringModeConfig:
 
 
 @dataclass
-class StructuringHeadConfig(BaseHeadConfig):
-    # Serialized implementation discriminator.  New configurations should use
-    # ``set_structuring_config`` for the independent entity-first head.  The
-    # alternate value is retained solely to migrate older checkpoints which
-    # stored that head inside ``structuring_config``.
+class _StructuringHeadConfigBase(BaseHeadConfig):
+    """Shared fields and validation for the entity-first structuring config."""
+
     head_type: str = "structuring"
     anchor_mode: str = "rnn"  # "rnn", "features", "query_rnn", "query_transformer", "fixed"
     anchor_num_heads: int = 4
@@ -1401,6 +1379,10 @@ class StructuringHeadConfig(BaseHeadConfig):
         return "structuring"
 
     def __post_init__(self):
+        if self.head_type == "set_structuring":
+            # Load-only compatibility for entity-first configs serialized
+            # before this became the sole structuring implementation.
+            self.head_type = "structuring"
         super().__post_init__()
         anchor_mode = self.effective_anchor_mode()
         refine_layers = self.effective_anchor_refine_layers()
@@ -1619,12 +1601,12 @@ class StructuringHeadConfig(BaseHeadConfig):
 
 
 @dataclass
-class SetStructuringHeadConfig(StructuringHeadConfig):
-    """Independent NER-first entity-to-record set prediction."""
+class StructuringHeadConfig(_StructuringHeadConfigBase):
+    """NER-first entity-to-record set-prediction configuration."""
 
-    head_type: str = "set_structuring"
+    head_type: str = "structuring"
     # Reuse the standalone NER module for field extraction instead of
-    # registering a second NER pipeline under the set-structuring head.  The
+    # registering a second NER pipeline under the structuring head.  The
     # shared module is still executed on structuring's own field prompts;
     # standalone NER outputs cannot be reused because their group/class axes
     # are independent.
@@ -1639,7 +1621,7 @@ class SetStructuringHeadConfig(StructuringHeadConfig):
     # Wrong record anchors already provide negative membership supervision.
     neg_spans_ratio: float = 0.0
     entity_loss_coef: float = 1.0
-    # Set-structuring losses are normalized by default. Explicit ``sum`` is
+    # Entity-first structuring losses are normalized by default. Explicit ``sum`` is
     # retained for loading/training legacy configurations.
     bio_loss_reduction: str = "mean"
     # Explicit stage-2 record-membership coefficient. ``None`` migrates the
@@ -1655,7 +1637,7 @@ class SetStructuringHeadConfig(StructuringHeadConfig):
     matcher_membership_temperature: float = 1.0
     matcher_objectness_temperature: float = 1.0
     # Each stage can tune focal balancing independently. ``None`` inherits
-    # the set-structuring task/global focal value.
+    # the structuring task/global focal value.
     ner_focal_loss_alpha: Optional[float] = None
     ner_focal_loss_gamma: Optional[float] = None
     ner_focal_loss_prob_margin: Optional[float] = None
@@ -1665,9 +1647,6 @@ class SetStructuringHeadConfig(StructuringHeadConfig):
     objectness_focal_loss_alpha: Optional[float] = None
     objectness_focal_loss_gamma: Optional[float] = None
     objectness_focal_loss_prob_margin: Optional[float] = None
-
-    def _expected_head_type(self) -> str:
-        return "set_structuring"
 
     def __post_init__(self):
         super().__post_init__()
@@ -1784,9 +1763,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         "audio_segmentation": "audio_segmentation_config",
         "joint_relex": "joint_relex_config",
         "open_relex": "open_relex_config",
-        "set_open_relex": "set_open_relex_config",
         "structuring": "structuring_config",
-        "set_structuring": "set_structuring_config",
         "count": "count_config",
         "embedding": "embedding_config",
     }
@@ -1809,6 +1786,24 @@ class GLiNextConfig(BaseGLiNERConfig):
         """Discard retired matcher policies tied to a specific anchor strategy."""
 
         config.pop("position_bucket_matcher_cost", None)
+
+    @staticmethod
+    def _canonicalize_head_type(
+        config: dict,
+        *,
+        canonical: str,
+        legacy: str,
+    ) -> None:
+        """Normalize a load-only legacy head discriminator in-place."""
+
+        configured_type = config.get("head_type", canonical)
+        if configured_type == legacy:
+            configured_type = canonical
+        if configured_type != canonical:
+            raise ValueError(
+                f"{canonical}_config requires head_type={canonical!r}"
+            )
+        config["head_type"] = canonical
 
     @staticmethod
     def _migrate_detection_config(
@@ -1956,9 +1951,7 @@ class GLiNextConfig(BaseGLiNERConfig):
         relations_config: Optional[dict] = None,  # backward compat alias for joint_relex_config
         joint_relex_config: Optional[dict] = None,
         open_relex_config: Optional[dict] = None,
-        set_open_relex_config: Optional[dict] = None,
         structuring_config: Optional[dict] = None,
-        set_structuring_config: Optional[dict] = None,
         count_config: Optional[dict] = None,
         embedding_config: Optional[dict] = None,
         # Shared layers across tasks (None = each task creates its own)
@@ -2093,6 +2086,28 @@ class GLiNextConfig(BaseGLiNERConfig):
         vision_image_std: Optional[list[float]] = None,
         **kwargs,
     ):
+        # Load-only aliases for checkpoints written while the entity-first
+        # implementations used separate ``set_*`` task names. Pop these before
+        # ``PretrainedConfig`` sees kwargs so no deprecated public attributes
+        # survive on the initialized config.
+        legacy_open_relex_config = kwargs.pop("set_open_relex_config", None)
+        if legacy_open_relex_config is not None:
+            if open_relex_config is not None:
+                raise ValueError(
+                    "open relex is configured in both open_relex_config and "
+                    "legacy set_open_relex_config"
+                )
+            open_relex_config = legacy_open_relex_config
+
+        legacy_structuring_config = kwargs.pop("set_structuring_config", None)
+        if legacy_structuring_config is not None:
+            if structuring_config is not None:
+                raise ValueError(
+                    "structuring is configured in both structuring_config and "
+                    "legacy set_structuring_config"
+                )
+            structuring_config = legacy_structuring_config
+
         deprecated_processor_fields = {
             "image_processor_name",
             "audio_feature_type",
@@ -2288,109 +2303,42 @@ class GLiNextConfig(BaseGLiNERConfig):
         # Backward compat alias
         self.relations_config = self.joint_relex_config
 
-        # Open-relation heads are independent tasks. For checkpoint
-        # compatibility, migrate the former discriminator-based spelling
-        # ``open_relex_config: {head_type: set_open_relex}`` into the new
-        # dedicated config field.
-        if (
-            isinstance(open_relex_config, dict)
-            and open_relex_config.get("head_type") == "set_open_relex"
-        ):
-            if set_open_relex_config is not None:
-                raise ValueError(
-                    "set open relex is configured in both open_relex_config "
-                    "and set_open_relex_config"
-                )
-            set_open_relex_config = open_relex_config
-            open_relex_config = None
-        elif (
-            open_relex_config is not None
-            and getattr(open_relex_config, "head_type", "open_relex")
-            == "set_open_relex"
-        ):
-            if set_open_relex_config is not None:
-                raise ValueError(
-                    "set open relex is configured in both open_relex_config "
-                    "and set_open_relex_config"
-                )
-            set_open_relex_config = open_relex_config
-            open_relex_config = None
-
         if isinstance(open_relex_config, dict):
+            open_relex_config = dict(open_relex_config)
+            self._canonicalize_head_type(
+                open_relex_config,
+                canonical="open_relex",
+                legacy="set_open_relex",
+            )
             self.open_relex_config = OpenRelexHeadConfig(
-                **dict(open_relex_config)
+                **open_relex_config
             )
-        else:
+        elif open_relex_config is None:
+            self.open_relex_config = None
+        elif isinstance(open_relex_config, OpenRelexHeadConfig):
             self.open_relex_config = open_relex_config
-
-        if isinstance(set_open_relex_config, dict):
-            set_open_relex_config = dict(set_open_relex_config)
-            configured_type = set_open_relex_config.get(
-                "head_type", "set_open_relex"
-            )
-            if configured_type != "set_open_relex":
-                raise ValueError(
-                    "set_open_relex_config requires "
-                    "head_type='set_open_relex'"
-                )
-            set_open_relex_config["head_type"] = "set_open_relex"
-            self.set_open_relex_config = SetOpenRelexHeadConfig(
-                **set_open_relex_config
-            )
-        elif set_open_relex_config is None:
-            self.set_open_relex_config = None
-        elif isinstance(set_open_relex_config, SetOpenRelexHeadConfig):
-            self.set_open_relex_config = set_open_relex_config
         elif (
-            dataclasses.is_dataclass(set_open_relex_config)
-            and getattr(set_open_relex_config, "head_type", None)
-            == "set_open_relex"
+            dataclasses.is_dataclass(open_relex_config)
+            and getattr(open_relex_config, "head_type", None)
+            in {"open_relex", "set_open_relex"}
         ):
-            # Older callers may pass an OpenRelexHeadConfig object carrying
-            # the former discriminator. Rebuild it as the dedicated config so
-            # entity/assignment/objectness fields receive their defaults.
-            migrated_config = dataclasses.asdict(set_open_relex_config)
-            migrated_config["head_type"] = "set_open_relex"
-            self.set_open_relex_config = SetOpenRelexHeadConfig(
+            migrated_config = dataclasses.asdict(open_relex_config)
+            self._canonicalize_head_type(
+                migrated_config,
+                canonical="open_relex",
+                legacy="set_open_relex",
+            )
+            self.open_relex_config = OpenRelexHeadConfig(
                 **migrated_config
             )
         else:
             raise ValueError(
-                "set_open_relex_config must be a mapping or a "
-                "SetOpenRelexHeadConfig"
+                "open_relex_config must be a mapping or an "
+                "OpenRelexHeadConfig"
             )
-
-        # Structuring heads are independent tasks.  For checkpoint
-        # compatibility, migrate the former discriminator-based spelling
-        # ``structuring_config: {head_type: set_structuring}`` into the new
-        # dedicated config field.
-        if (
-            isinstance(structuring_config, dict)
-            and structuring_config.get("head_type") == "set_structuring"
-        ):
-            if set_structuring_config is not None:
-                raise ValueError(
-                    "set structuring is configured in both structuring_config "
-                    "and set_structuring_config"
-                )
-            set_structuring_config = structuring_config
-            structuring_config = None
-        elif (
-            structuring_config is not None
-            and getattr(structuring_config, "head_type", "structuring")
-            == "set_structuring"
-        ):
-            if set_structuring_config is not None:
-                raise ValueError(
-                    "set structuring is configured in both structuring_config "
-                    "and set_structuring_config"
-                )
-            set_structuring_config = structuring_config
-            structuring_config = None
 
         if (
             structuring_config is None
-            and set_structuring_config is None
             and groups_layer is not None
         ):
             structuring_config = {
@@ -2405,51 +2353,51 @@ class GLiNextConfig(BaseGLiNERConfig):
         if isinstance(structuring_config, dict):
             structuring_config = dict(structuring_config)
             self._migrate_structuring_config(structuring_config)
+            self._canonicalize_head_type(
+                structuring_config,
+                canonical="structuring",
+                legacy="set_structuring",
+            )
             self.structuring_config = StructuringHeadConfig(
                 **structuring_config
             )
-        else:
+        elif structuring_config is None:
+            self.structuring_config = None
+        elif isinstance(structuring_config, StructuringHeadConfig):
             self.structuring_config = structuring_config
-
-        if isinstance(set_structuring_config, dict):
-            set_structuring_config = dict(set_structuring_config)
-            self._migrate_structuring_config(set_structuring_config)
-            configured_type = set_structuring_config.get(
-                "head_type", "set_structuring"
+        elif (
+            dataclasses.is_dataclass(structuring_config)
+            and getattr(structuring_config, "head_type", None)
+            in {"structuring", "set_structuring"}
+        ):
+            migrated_config = dataclasses.asdict(structuring_config)
+            self._migrate_structuring_config(migrated_config)
+            self._canonicalize_head_type(
+                migrated_config,
+                canonical="structuring",
+                legacy="set_structuring",
             )
-            if configured_type != "set_structuring":
-                raise ValueError(
-                    "set_structuring_config requires "
-                    "head_type='set_structuring'"
-                )
-            set_structuring_config["head_type"] = "set_structuring"
-            self.set_structuring_config = SetStructuringHeadConfig(
-                **set_structuring_config
+            self.structuring_config = StructuringHeadConfig(
+                **migrated_config
             )
-        elif set_structuring_config is None:
-            self.set_structuring_config = None
-        elif getattr(
-            set_structuring_config, "head_type", None
-        ) == "set_structuring":
-            self.set_structuring_config = set_structuring_config
         else:
             raise ValueError(
-                "set_structuring_config must be a mapping or a "
-                "SetStructuringHeadConfig"
+                "structuring_config must be a mapping or a "
+                "StructuringHeadConfig"
             )
 
         if (
-            self.set_structuring_config is not None
-            and self.set_structuring_config.reuse_ner_head
+            self.structuring_config is not None
+            and self.structuring_config.reuse_ner_head
         ):
             if self.ner_config is None:
                 raise ValueError(
-                    "set_structuring_config.reuse_ner_head=True requires "
+                    "structuring_config.reuse_ner_head=True requires "
                     "an enabled ner_config"
                 )
             if self.ner_config.effective_anchor_mode() != "parent":
                 raise ValueError(
-                    "set_structuring_config.reuse_ner_head=True requires "
+                    "structuring_config.reuse_ner_head=True requires "
                     "ner_config anchor_mode='parent'"
                 )
 
@@ -2695,9 +2643,7 @@ class GLiNextConfig(BaseGLiNERConfig):
             if self.joint_relex_config else relations_layer
         )
         self.classifier_layer = classifier_layer
-        effective_structuring_config = (
-            self.structuring_config or self.set_structuring_config
-        )
+        effective_structuring_config = self.structuring_config
         self.groups_layer = groups_layer or (
             effective_structuring_config.effective_anchor_mode()
             if effective_structuring_config else None
@@ -2789,9 +2735,7 @@ _TEXT_CONFIG_FIELDS = (
     "classification_config",
     "joint_relex_config",
     "open_relex_config",
-    "set_open_relex_config",
     "structuring_config",
-    "set_structuring_config",
     "count_config",
     "embedding_config",
 )
@@ -2879,9 +2823,7 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "joint_relex_config",
         "relations_config",
         "open_relex_config",
-        "set_open_relex_config",
         "structuring_config",
-        "set_structuring_config",
         "count_config",
         "embedding_config",
         "relations_layer",

@@ -1,161 +1,265 @@
-"""Tests for Open Relex decoder."""
+"""Focused tests for entity-first open-relex decoding."""
 
-import pytest
+from types import SimpleNamespace
+
 import torch
-from dataclasses import dataclass
-from typing import Optional
 
-from glinext.tasks.open_relex.decoder import OpenRelexDecoder
 from glinext.processing.mappings import (
-    BaseClassMapping, OpenRelexItemMapping, OpenRelexClassMapping,
-    BatchClassesMapping, CatClassMapping, ExtractionClassMapping, StructuringClassMapping,
+    BaseClassMapping,
+    BatchClassesMapping,
+    CatClassMapping,
+    ExtractionClassMapping,
+    OpenRelexClassMapping,
+    OpenRelexItemMapping,
 )
+from glinext.tasks.open_relex.decoder import OpenRelexDecoder
 from tests.conftest import make_config
 
 
-@dataclass
-class FakeModelOutput:
-    open_rel_logits: Optional[torch.Tensor] = None
-    open_rel_batch_origin: Optional[torch.Tensor] = None
-    open_rel_anchor_mask: Optional[torch.Tensor] = None
-    open_rel_span_logits: Optional[torch.Tensor] = None
-    open_rel_span_idx: Optional[torch.Tensor] = None
-    open_rel_span_mask: Optional[torch.Tensor] = None
-    batch_size: Optional[int] = None
-
-    def __post_init__(self):
-        if self.open_rel_batch_origin is None and self.batch_size is None:
-            logits = self.open_rel_logits if self.open_rel_logits is not None else self.open_rel_span_logits
-            if logits is not None:
-                BN = logits.shape[0]
-                self.open_rel_batch_origin = torch.arange(BN)
-                self.batch_size = BN
-
-
-@pytest.fixture
-def decoder():
-    config = make_config()
+def _decoder():
+    config = make_config(
+        default_ner_config=False,
+        open_relex_config={"num_fixed_slots": 2},
+    )
     return OpenRelexDecoder.from_config(config)
 
 
-def _make_mapping(rel_labels, batch_size=1):
-    rel_map = BaseClassMapping(class_to_id={l: i for i, l in enumerate(rel_labels)})
-    item = OpenRelexItemMapping(rel_class_to_id=rel_map)
-    return BatchClassesMapping(
-        cat_mapping=[CatClassMapping(cat_class_to_id=[]) for _ in range(batch_size)],
-        extraction_mapping=[ExtractionClassMapping() for _ in range(batch_size)],
-        structuring_mapping=[StructuringClassMapping() for _ in range(batch_size)],
-        open_relex_mapping=[OpenRelexClassMapping(items=[item]) for _ in range(batch_size)],
+def _item_mapping(*labels):
+    return OpenRelexItemMapping(
+        rel_class_to_id=BaseClassMapping(
+            {label: index for index, label in enumerate(labels)}
+        )
     )
 
 
-class TestOpenRelexTokenLevel:
-    def test_empty(self, decoder):
-        out = FakeModelOutput()
-        assert decoder.decode(out) == []
-
-    def test_single_triple(self, decoder):
-        # (BN=1, X=1, C=1, L=5, 2=head/tail, 3=BIO)
-        logits = torch.full((1, 1, 1, 5, 2, 3), -10.0)
-        # head span at pos 0
-        logits[0, 0, 0, 0, 0, :] = 5.0  # head: start+end+inside all strong at pos 0
-        # tail span at pos 3-4
-        logits[0, 0, 0, 3, 1, 0] = 5.0  # tail start
-        logits[0, 0, 0, 4, 1, 1] = 5.0  # tail end
-        for t in range(3, 5):
-            logits[0, 0, 0, t, 1, 2] = 5.0  # tail inside
-
-        out = FakeModelOutput(open_rel_logits=logits)
-        mapping = _make_mapping(["lives_in"])
-        result = decoder.decode(out, classes_mapping=mapping, texts=[["John", "lives", "in", "New", "York"]])
-        assert len(result) == 1  # 1 batch item
-        assert len(result[0]) == 1  # 1 group
-        assert len(result[0][0]) >= 1
-        triple = result[0][0][0]
-        assert triple["relation"] == "lives_in"
-        assert triple["head"]["start"] == 0
-        assert triple["tail"]["start"] == 3
-
-    def test_anchor_mask(self, decoder):
-        logits = torch.full((1, 2, 1, 5, 2, 3), 5.0)  # all strong
-        anchor_mask = torch.tensor([[True, False]])  # second anchor masked
-        out = FakeModelOutput(open_rel_logits=logits, open_rel_anchor_mask=anchor_mask)
-        result = decoder.decode(out)
-        # Only triples from anchor 0 should appear
-        for triple in result[0][0]:
-            # All triples should come from the unmasked anchor
-            pass
-        # With anchor_mask[1]=False, triples from anchor 1 are excluded
-        result_no_mask = decoder.decode(FakeModelOutput(open_rel_logits=logits))
-        assert len(result[0][0]) <= len(result_no_mask[0][0])
-
-    def test_no_spans_found(self, decoder):
-        logits = torch.full((1, 1, 1, 5, 2, 3), -10.0)
-        out = FakeModelOutput(open_rel_logits=logits)
-        result = decoder.decode(out)
-        assert result[0][0] == []
+def _mapping(*open_groups):
+    return BatchClassesMapping(
+        cat_mapping=[CatClassMapping([])],
+        extraction_mapping=[ExtractionClassMapping()],
+        open_relex_mapping=[
+            OpenRelexClassMapping(items=list(open_groups))
+        ],
+    )
 
 
-class TestOpenRelexSpanLevel:
-    def test_span_level_preferred(self, decoder):
-        BN, S, X, C = 1, 3, 1, 1
-        # (BN, S, X, C, 2) — per span, per anchor, per rel class, head/tail
-        span_logits = torch.full((BN, S, X, C, 2), -10.0)
-        span_logits[0, 0, 0, 0, 0] = 5.0  # span 0 is head
-        span_logits[0, 2, 0, 0, 1] = 5.0  # span 2 is tail
-
-        span_idx = torch.tensor([[[0, 0], [1, 2], [3, 4]]])
-        span_mask = torch.ones(BN, S, dtype=torch.bool)
-
-        out = FakeModelOutput(
-            open_rel_span_logits=span_logits,
-            open_rel_span_idx=span_idx,
-            open_rel_span_mask=span_mask,
+def _output(
+    logits,
+    assignments,
+    spans,
+    *,
+    span_mask=None,
+    anchor_mask=None,
+    objectness=None,
+    batch_origin=None,
+    batch_size=None,
+):
+    if span_mask is None:
+        span_mask = torch.ones(spans.shape[:2], dtype=torch.bool)
+    if batch_origin is None:
+        batch_origin = torch.arange(logits.shape[0])
+    if batch_size is None:
+        batch_size = (
+            int(batch_origin.max().item()) + 1
+            if batch_origin.numel()
+            else 0
         )
-        mapping = _make_mapping(["rel_a"])
-        result = decoder.decode(out, classes_mapping=mapping)
-        assert len(result) == 1  # 1 batch item
-        assert len(result[0]) == 1  # 1 group
-        assert len(result[0][0]) == 1  # 1 triple
-        assert result[0][0][0]["head"]["start"] == 0
-        assert result[0][0][0]["tail"]["start"] == 3
+    return SimpleNamespace(
+        open_rel_logits=logits,
+        open_rel_assignment_logits=assignments,
+        open_rel_span_idx=spans,
+        open_rel_span_mask=span_mask,
+        open_rel_anchor_mask=anchor_mask,
+        open_rel_objectness_logits=objectness,
+        open_rel_batch_origin=batch_origin,
+        batch_size=batch_size,
+    )
 
-    def test_span_level_masked_spans(self, decoder):
-        BN, S, X, C = 1, 3, 1, 1
-        span_logits = torch.full((BN, S, X, C, 2), 5.0)  # all strong
-        span_idx = torch.tensor([[[0, 0], [1, 1], [2, 2]]])
-        span_mask = torch.tensor([[True, False, True]])
 
-        out = FakeModelOutput(
-            open_rel_span_logits=span_logits,
-            open_rel_span_idx=span_idx,
-            open_rel_span_mask=span_mask,
-        )
-        result = decoder.decode(out)
-        # span 1 is masked out, so triples should only use spans 0 and 2
-        for triple in result[0][0]:
-            assert triple["head"]["start"] != 1
-            assert triple["tail"]["start"] != 1
+def test_decoder_returns_empty_when_logits_are_absent():
+    decoder = _decoder()
 
-    def test_with_batch_origin(self, decoder):
-        BN, S, X, C = 2, 2, 1, 1
-        span_logits = torch.full((BN, S, X, C, 2), -10.0)
-        span_logits[0, 0, 0, 0, 0] = 5.0
-        span_logits[0, 1, 0, 0, 1] = 5.0
-        span_logits[1, 0, 0, 0, 0] = 5.0
-        span_logits[1, 1, 0, 0, 1] = 5.0
+    assert decoder.decode(SimpleNamespace(open_rel_logits=None)) == []
 
-        span_idx = torch.tensor([[[0, 0], [2, 3]], [[0, 0], [1, 1]]])
-        span_mask = torch.ones(BN, S, dtype=torch.bool)
 
-        out = FakeModelOutput(
-            open_rel_span_logits=span_logits,
-            open_rel_span_idx=span_idx,
-            open_rel_span_mask=span_mask,
-            open_rel_batch_origin=torch.tensor([0, 0]),
-            batch_size=1,
-        )
-        mapping = _make_mapping(["r"], batch_size=BN)
-        result = decoder.decode(out, classes_mapping=mapping)
-        assert len(result) == 1  # 1 batch item
-        assert len(result[0]) == 2  # 2 groups
+def test_decoder_selects_exactly_one_argmax_entity_per_role():
+    decoder = _decoder()
+    logits = torch.full((1, 1, 1), 8.0)
+    assignments = torch.full((1, 1, 4, 2), -8.0)
+    # Multiple valid entities clear the threshold for each role. Only the
+    # role-wise argmax must be emitted, and a masked higher score is ignored.
+    assignments[0, 0, 0, 0] = 9.0
+    assignments[0, 0, 1, 0] = 7.0
+    assignments[0, 0, 2, 1] = 9.0
+    assignments[0, 0, 1, 1] = 7.0
+    assignments[0, 0, 3, :] = 20.0
+    spans = torch.tensor([[[0, 0], [1, 1], [2, 2], [3, 3]]])
+    output = _output(
+        logits,
+        assignments,
+        spans,
+        span_mask=torch.tensor([[True, True, True, False]]),
+    )
+
+    decoded = decoder.decode(
+        output,
+        classes_mapping=_mapping(_item_mapping("works_at")),
+        texts=[["Alice", "near", "Acme", "masked"]],
+    )
+
+    assert len(decoded[0][0]) == 1
+    triple = decoded[0][0][0]
+    assert triple["relation"] == "works_at"
+    assert triple["head"] == {
+        "start": 0,
+        "end": 0,
+        "text": "Alice",
+    }
+    assert triple["tail"] == {
+        "start": 2,
+        "end": 2,
+        "text": "Acme",
+    }
+
+
+def test_decoder_preserves_relation_direction_across_slots():
+    decoder = _decoder()
+    logits = torch.full((1, 2, 1), 8.0)
+    assignments = torch.full((1, 2, 2, 2), -8.0)
+    assignments[0, 0, 0, 0] = 9.0
+    assignments[0, 0, 1, 1] = 9.0
+    assignments[0, 1, 1, 0] = 9.0
+    assignments[0, 1, 0, 1] = 9.0
+    spans = torch.tensor([[[0, 0], [1, 1]]])
+
+    decoded = decoder.decode(
+        _output(logits, assignments, spans),
+        classes_mapping=_mapping(_item_mapping("related_to")),
+        texts=[["Alice", "Acme"]],
+    )
+
+    directions = [
+        (triple["head"]["text"], triple["tail"]["text"])
+        for triple in decoded[0][0]
+    ]
+    assert directions == [("Alice", "Acme"), ("Acme", "Alice")]
+
+
+def test_duplicate_slots_collapse_to_one_public_triple():
+    decoder = _decoder()
+    logits = torch.full((1, 2, 1), 8.0)
+    assignments = torch.full((1, 2, 2, 2), -8.0)
+    assignments[:, :, 0, 0] = 9.0
+    assignments[:, :, 1, 1] = 9.0
+    spans = torch.tensor([[[0, 0], [1, 1]]])
+
+    decoded = decoder.decode(
+        _output(logits, assignments, spans),
+        classes_mapping=_mapping(_item_mapping("related_to")),
+        texts=[["Alice", "Acme"]],
+    )
+
+    assert len(decoded[0][0]) == 1
+    assert decoded[0][0][0]["head"]["text"] == "Alice"
+    assert decoded[0][0][0]["tail"]["text"] == "Acme"
+
+
+def test_objectness_gates_relation_slots_before_endpoint_decoding():
+    decoder = _decoder()
+    logits = torch.full((1, 2, 1), 8.0)
+    assignments = torch.full((1, 2, 2, 2), -8.0)
+    assignments[0, 0, 0, 0] = 9.0
+    assignments[0, 0, 1, 1] = 9.0
+    assignments[0, 1, 1, 0] = 9.0
+    assignments[0, 1, 0, 1] = 9.0
+    spans = torch.tensor([[[0, 0], [1, 1]]])
+    output = _output(
+        logits,
+        assignments,
+        spans,
+        anchor_mask=torch.ones(1, 2, dtype=torch.bool),
+        objectness=torch.tensor([[-8.0, 8.0]]),
+    )
+
+    decoded = decoder.decode(
+        output,
+        classes_mapping=_mapping(_item_mapping("related_to")),
+        texts=[["Alice", "Acme"]],
+        objectness_threshold=0.5,
+    )
+
+    assert len(decoded[0][0]) == 1
+    assert decoded[0][0][0]["head"]["text"] == "Acme"
+    assert decoded[0][0][0]["tail"]["text"] == "Alice"
+
+
+def test_flat_groups_use_canonical_open_relation_mapping():
+    decoder = _decoder()
+    logits = torch.full((2, 1, 1), 8.0)
+    assignments = torch.full((2, 1, 2, 2), -8.0)
+    assignments[:, 0, 0, 0] = 9.0
+    assignments[:, 0, 1, 1] = 9.0
+    spans = torch.tensor(
+        [
+            [[0, 0], [1, 1]],
+            [[2, 2], [3, 3]],
+        ]
+    )
+    output = _output(
+        logits,
+        assignments,
+        spans,
+        batch_origin=torch.tensor([0, 0]),
+        batch_size=1,
+    )
+    classes_mapping = _mapping(
+        _item_mapping("first_relation"),
+        _item_mapping("second_relation"),
+    )
+
+    decoded = decoder.decode(
+        output,
+        classes_mapping=classes_mapping,
+        texts=[["A", "B", "C", "D"]],
+    )
+
+    assert len(decoded) == 1
+    assert len(decoded[0]) == 2
+    assert decoded[0][0][0]["relation"] == "first_relation"
+    assert decoded[0][1][0]["relation"] == "second_relation"
+    assert decoded[0][0][0]["head"]["text"] == "A"
+    assert decoded[0][1][0]["head"]["text"] == "C"
+
+
+def test_map_results_converts_each_directed_endpoint_to_character_offsets():
+    decoder = _decoder()
+    token_results = [
+        [
+            [
+                {
+                    "head": {"start": 0, "end": 0, "text": "Alice"},
+                    "tail": {"start": 2, "end": 2, "text": "Bob"},
+                    "relation": "knows",
+                    "score": 0.9,
+                }
+            ]
+        ]
+    ]
+
+    mapped = decoder.map_results(
+        token_results,
+        valid_to_orig_idx=[1],
+        all_start_maps=[[0, 6, 10]],
+        all_end_maps=[[5, 9, 13]],
+        valid_texts=["Alice met Bob"],
+        num_original=2,
+    )
+
+    assert mapped[0] == []
+    assert mapped[1] == [
+        {
+            "head": {"start": 0, "end": 5, "text": "Alice"},
+            "tail": {"start": 10, "end": 13, "text": "Bob"},
+            "relation": "knows",
+            "score": 0.9,
+        }
+    ]

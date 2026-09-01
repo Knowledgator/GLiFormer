@@ -5,8 +5,8 @@ import torch
 
 from glinext.layers.anchor_layer import (
     AnchorLayer, ParentAnchorLayer, FixedAnchorLayer,
-    FixedLSTMAnchorLayer, FixedTransformerAnchorLayer,
-    RotaryAnchorLayer, QueryLSTMAnchorLayer, QueryTransformerAnchorLayer,
+    FixedRNNAnchorLayer, FixedTransformerAnchorLayer,
+    RotaryAnchorLayer, QueryRNNAnchorLayer, QueryTransformerAnchorLayer,
 )
 
 D = 16
@@ -14,18 +14,18 @@ D = 16
 
 class TestAnchorLayerRegistry:
     def test_registry_has_all_modes(self):
-        for mode in ["parent", "fixed", "fixed_lstm", "fixed_transformer",
-                      "rotary", "lstm", "query_lstm", "query_transformer"]:
+        for mode in ["parent", "fixed", "fixed_rnn", "fixed_transformer",
+                      "rotary", "rnn", "query_rnn", "query_transformer"]:
             assert mode in AnchorLayer._registry
 
     def test_registry_types(self):
         assert AnchorLayer._registry["parent"] is ParentAnchorLayer
         assert AnchorLayer._registry["fixed"] is FixedAnchorLayer
-        assert AnchorLayer._registry["fixed_lstm"] is FixedLSTMAnchorLayer
+        assert AnchorLayer._registry["fixed_rnn"] is FixedRNNAnchorLayer
         assert AnchorLayer._registry["fixed_transformer"] is FixedTransformerAnchorLayer
         assert AnchorLayer._registry["rotary"] is RotaryAnchorLayer
-        assert AnchorLayer._registry["lstm"] is RotaryAnchorLayer
-        assert AnchorLayer._registry["query_lstm"] is QueryLSTMAnchorLayer
+        assert AnchorLayer._registry["rnn"] is RotaryAnchorLayer
+        assert AnchorLayer._registry["query_rnn"] is QueryRNNAnchorLayer
         assert AnchorLayer._registry["query_transformer"] is QueryTransformerAnchorLayer
 
 
@@ -39,9 +39,9 @@ class TestAnchorLayerFactory:
         assert isinstance(layer, FixedAnchorLayer)
         assert layer.num_slots == 5
 
-    def test_fixed_lstm(self):
-        layer = AnchorLayer.from_config("fixed_lstm", D, num_slots=5)
-        assert isinstance(layer, FixedLSTMAnchorLayer)
+    def test_fixed_rnn(self):
+        layer = AnchorLayer.from_config("fixed_rnn", D, num_slots=5)
+        assert isinstance(layer, FixedRNNAnchorLayer)
         assert layer.num_slots == 5
 
     def test_fixed_transformer(self):
@@ -53,13 +53,13 @@ class TestAnchorLayerFactory:
         layer = AnchorLayer.from_config("rotary", D, max_count=10)
         assert isinstance(layer, RotaryAnchorLayer)
 
-    def test_lstm_alias(self):
-        layer = AnchorLayer.from_config("lstm", D)
+    def test_rnn_alias(self):
+        layer = AnchorLayer.from_config("rnn", D)
         assert isinstance(layer, RotaryAnchorLayer)
 
-    def test_query_lstm(self):
-        layer = AnchorLayer.from_config("query_lstm", D)
-        assert isinstance(layer, QueryLSTMAnchorLayer)
+    def test_query_rnn(self):
+        layer = AnchorLayer.from_config("query_rnn", D)
+        assert isinstance(layer, QueryRNNAnchorLayer)
 
     def test_query_transformer(self):
         layer = AnchorLayer.from_config("query_transformer", D, num_heads=2, num_layers=1)
@@ -88,6 +88,44 @@ class TestParentAnchorLayer:
 
 
 class TestFixedAnchorLayer:
+    def test_context_gate_preserves_historical_defaults(self):
+        layer = FixedAnchorLayer(D, num_slots=3)
+
+        assert layer.context_gate.item() == pytest.approx(0.1)
+        assert layer.context_gate.requires_grad
+
+    def test_context_gate_can_be_initialized_and_frozen(self):
+        layer = FixedAnchorLayer(
+            D,
+            num_slots=3,
+            context_gate_init=0.0,
+            context_gate_trainable=False,
+        )
+        first, _ = layer(torch.randn(1, D))
+        second, _ = layer(torch.randn(1, D))
+
+        assert layer.context_gate.item() == 0.0
+        assert not layer.context_gate.requires_grad
+        assert torch.equal(first, second)
+        assert "context_gate" in layer.state_dict()
+
+    def test_frozen_context_gate_loads_historical_parameter_state(self):
+        historical = FixedAnchorLayer(D, num_slots=3)
+        historical.context_gate.data.fill_(0.25)
+        frozen = FixedAnchorLayer(
+            D,
+            num_slots=3,
+            context_gate_init=0.0,
+            context_gate_trainable=False,
+        )
+
+        result = frozen.load_state_dict(historical.state_dict(), strict=True)
+
+        assert not result.missing_keys
+        assert not result.unexpected_keys
+        assert frozen.context_gate.item() == pytest.approx(0.25)
+        assert not frozen.context_gate.requires_grad
+
     def test_output_shape(self):
         layer = FixedAnchorLayer(D, num_slots=5)
         ctx = torch.randn(2, D)
@@ -127,9 +165,9 @@ class TestFixedAnchorLayer:
         assert mask[1, :3].all() and not mask[1, 3:].any()
 
 
-class TestFixedLSTMAnchorLayer:
+class TestFixedRNNAnchorLayer:
     def test_output_shape(self):
-        layer = FixedLSTMAnchorLayer(D, num_slots=5)
+        layer = FixedRNNAnchorLayer(D, num_slots=5)
         ctx = torch.randn(2, D)
         anchors, mask = layer(ctx)
         assert anchors.shape == (2, 5, D)
@@ -137,7 +175,7 @@ class TestFixedLSTMAnchorLayer:
         assert mask.all()
 
     def test_with_count(self):
-        layer = FixedLSTMAnchorLayer(D, num_slots=5)
+        layer = FixedRNNAnchorLayer(D, num_slots=5)
         ctx = torch.randn(2, D)
         count = torch.tensor([3, 2])
         anchors, mask = layer(ctx, count=count)
@@ -146,7 +184,7 @@ class TestFixedLSTMAnchorLayer:
         assert mask[1, :2].all() and not mask[1, 2:].any()
 
     def test_context_conditioning(self):
-        layer = FixedLSTMAnchorLayer(D, num_slots=3)
+        layer = FixedRNNAnchorLayer(D, num_slots=3)
         ctx1 = torch.randn(1, D)
         ctx2 = torch.randn(1, D)
         anchors1, _ = layer(ctx1)
@@ -154,7 +192,7 @@ class TestFixedLSTMAnchorLayer:
         assert not torch.equal(anchors1, anchors2)
 
     def test_gradient_flows(self):
-        layer = FixedLSTMAnchorLayer(D, num_slots=3)
+        layer = FixedRNNAnchorLayer(D, num_slots=3)
         ctx = torch.randn(1, D, requires_grad=True)
         anchors, _ = layer(ctx)
         anchors.sum().backward()
@@ -174,7 +212,7 @@ class TestFixedTransformerAnchorLayer:
         layer = FixedTransformerAnchorLayer(D, num_slots=5, num_heads=4, num_layers=1)
         ctx = torch.randn(2, D)
         words = torch.randn(2, 10, D)
-        anchors, mask = layer(ctx, word_embeddings=words)
+        anchors, mask = layer(ctx, feature_embeddings=words)
         assert anchors.shape == (2, 5, D)
 
     def test_with_count(self):
@@ -197,7 +235,7 @@ class TestFixedTransformerAnchorLayer:
         layer = FixedTransformerAnchorLayer(D, num_slots=3, num_heads=4, num_layers=1)
         ctx = torch.randn(1, D, requires_grad=True)
         words = torch.randn(1, 5, D, requires_grad=True)
-        anchors, _ = layer(ctx, word_embeddings=words)
+        anchors, _ = layer(ctx, feature_embeddings=words)
         anchors.sum().backward()
         assert ctx.grad is not None
         assert words.grad is not None
@@ -224,20 +262,20 @@ class TestRotaryAnchorLayer:
         assert mask[1, :3].all()
 
 
-class TestQueryLSTMAnchorLayer:
+class TestQueryRNNAnchorLayer:
     def test_no_word_embeddings(self):
-        layer = QueryLSTMAnchorLayer(D)
+        layer = QueryRNNAnchorLayer(D)
         ctx = torch.randn(2, D)
-        anchors, mask = layer(ctx, word_embeddings=None)
+        anchors, mask = layer(ctx, feature_embeddings=None)
         assert anchors.shape == (2, 0, D)
         assert mask.shape == (2, 0)
 
     def test_with_word_embeddings(self):
-        layer = QueryLSTMAnchorLayer(D, max_count=5)
+        layer = QueryRNNAnchorLayer(D, max_count=5)
         ctx = torch.randn(2, D)
         words = torch.randn(2, 10, D)
         count = torch.tensor([2, 3])
-        anchors, mask = layer(ctx, word_embeddings=words, count=count)
+        anchors, mask = layer(ctx, feature_embeddings=words, count=count)
         assert anchors.dim() == 3
         assert mask.dim() == 2
 
@@ -246,7 +284,7 @@ class TestQueryTransformerAnchorLayer:
     def test_no_word_embeddings(self):
         layer = QueryTransformerAnchorLayer(D, num_heads=2, num_layers=1)
         ctx = torch.randn(2, D)
-        anchors, mask = layer(ctx, word_embeddings=None)
+        anchors, mask = layer(ctx, feature_embeddings=None)
         assert anchors.shape == (2, 0, D)
         assert mask.shape == (2, 0)
 
@@ -255,6 +293,6 @@ class TestQueryTransformerAnchorLayer:
         ctx = torch.randn(2, D)
         words = torch.randn(2, 10, D)
         count = torch.tensor([2, 3])
-        anchors, mask = layer(ctx, word_embeddings=words, count=count)
+        anchors, mask = layer(ctx, feature_embeddings=words, count=count)
         assert anchors.dim() == 3
         assert mask.dim() == 2

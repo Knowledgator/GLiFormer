@@ -25,8 +25,7 @@ from ..tasks.embedding.processor import EmbeddingProcessor
 from ..tasks.joint_relex.processor import JointRelexProcessor
 from ..tasks.ner.processor import NERProcessor
 from ..tasks.open_relex.processor import OpenRelexProcessor
-from ..tasks.set_open_relex.processor import SetOpenRelexProcessor
-from ..tasks.set_structuring.processor import SetStructuringProcessor
+from ..tasks.structuring.processor import StructuringProcessor
 from ..tasks.vision.processor import VisionProcessor
 from ..utils import pair_2d
 from .mappings import (
@@ -39,8 +38,6 @@ from .mappings import (
 )
 from .structuring_processor import (
     MULTI_LEVEL_META_KEY,
-    SET_MULTI_LEVEL_META_KEY,
-    StructuringProcessor,
 )
 
 _VISION_TASKS = ("image_classification", "object_detection", "segmentation")
@@ -50,10 +47,8 @@ _TEXT_TASKS = (
     "classification",
     "joint_relex",
     "open_relex",
-    "set_open_relex",
     "count",
     "structuring",
-    "set_structuring",
     "embedding",
 )
 _ALL_TASKS = (*_TEXT_TASKS, *_VISION_TASKS, *_AUDIO_TASKS)
@@ -1013,24 +1008,10 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             self.task_processors["joint_relex"] = JointRelexProcessor(config, tokenizer, words_splitter)
         if "open_relex" in allowed_tasks and config.open_relex_config is not None:
             self.task_processors["open_relex"] = OpenRelexProcessor(config, tokenizer, words_splitter)
-        if (
-            "set_open_relex" in allowed_tasks
-            and getattr(config, "set_open_relex_config", None) is not None
-        ):
-            self.task_processors["set_open_relex"] = SetOpenRelexProcessor(
-                config, tokenizer, words_splitter,
-            )
         if "count" in allowed_tasks and config.count_config is not None:
             self.task_processors["count"] = CountProcessor(config)
         if "structuring" in allowed_tasks and config.structuring_config is not None:
             self.task_processors["structuring"] = StructuringProcessor(config, tokenizer, words_splitter)
-        if (
-            "set_structuring" in allowed_tasks
-            and config.set_structuring_config is not None
-        ):
-            self.task_processors["set_structuring"] = SetStructuringProcessor(
-                config, tokenizer, words_splitter,
-            )
         if "embedding" in allowed_tasks and config.embedding_config is not None:
             self.task_processors["embedding"] = EmbeddingProcessor(config)
         if "image_classification" in allowed_tasks and config.image_classification_config is not None:
@@ -1056,9 +1037,7 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
         cat_mapping = []
         extraction_mapping = []
         structuring_mapping = []
-        set_structuring_mapping = []
         open_relex_mapping = []
-        set_open_relex_mapping = []
         image_classification_mapping = []
         audio_classification_mapping = []
         object_detection_mapping = []
@@ -1087,30 +1066,12 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
         else:
             structuring_mapping = [StructuringClassMapping() for _ in batch_list]
 
-        if "set_structuring" in self.task_processors:
-            set_structuring_mapping = self.task_processors[
-                "set_structuring"
-            ].get_classes_mapping(batch_list, **kwargs)
-        else:
-            set_structuring_mapping = [
-                StructuringClassMapping() for _ in batch_list
-            ]
-
         if "open_relex" in self.task_processors:
             open_relex_mapping = self.task_processors["open_relex"].get_classes_mapping(
                 batch_list, **kwargs
             )
         else:
             open_relex_mapping = [OpenRelexClassMapping() for _ in batch_list]
-
-        if "set_open_relex" in self.task_processors:
-            set_open_relex_mapping = self.task_processors[
-                "set_open_relex"
-            ].get_classes_mapping(batch_list, **kwargs)
-        else:
-            set_open_relex_mapping = [
-                OpenRelexClassMapping() for _ in batch_list
-            ]
 
         if "image_classification" in self.task_processors:
             image_classification_mapping = self.task_processors["image_classification"].get_classes_mapping(
@@ -1151,9 +1112,7 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             cat_mapping=cat_mapping,
             extraction_mapping=extraction_mapping,
             structuring_mapping=structuring_mapping,
-            set_structuring_mapping=set_structuring_mapping,
             open_relex_mapping=open_relex_mapping,
-            set_open_relex_mapping=set_open_relex_mapping,
             image_classification_mapping=image_classification_mapping,
             audio_classification_mapping=audio_classification_mapping,
             object_detection_mapping=object_detection_mapping,
@@ -1209,22 +1168,8 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
                     classes_mapping, i, use_labels_encoder,
                 ))
 
-            if "set_open_relex" in self.task_processors:
-                prompt.extend(self.task_processors[
-                    "set_open_relex"
-                ].contribute_prompt(
-                    classes_mapping, i, use_labels_encoder,
-                ))
-
             if "structuring" in self.task_processors:
                 prompt.extend(self.task_processors["structuring"].contribute_prompt(
-                    classes_mapping, i, use_labels_encoder,
-                ))
-
-            if "set_structuring" in self.task_processors:
-                prompt.extend(self.task_processors[
-                    "set_structuring"
-                ].contribute_prompt(
                     classes_mapping, i, use_labels_encoder,
                 ))
 
@@ -1328,19 +1273,9 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             self.task_processors["structuring"].resolve_spans(item)
         return item
 
-    def resolve_set_structuring_spans(self, item):
-        if "set_structuring" in self.task_processors:
-            self.task_processors["set_structuring"].resolve_spans(item)
-        return item
-
     def resolve_open_relex_spans(self, item):
         if "open_relex" in self.task_processors:
             self.task_processors["open_relex"].resolve_spans(item)
-        return item
-
-    def resolve_set_open_relex_spans(self, item):
-        if "set_open_relex" in self.task_processors:
-            self.task_processors["set_open_relex"].resolve_spans(item)
         return item
 
     # ── Generic label creation ────────────────────────────────────────────
@@ -1442,22 +1377,6 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             )
         return None
 
-    def create_set_open_rel_labels(
-        self,
-        batch_list,
-        classes_mapping,
-        max_seq_len,
-    ):
-        for item in batch_list:
-            self.resolve_set_open_relex_spans(item)
-        if "set_open_relex" in self.task_processors:
-            return self.task_processors["set_open_relex"].create_labels(
-                batch_list,
-                classes_mapping,
-                max_seq_len=max_seq_len,
-            )
-        return None
-
     def create_count_labels(self, batch_list, classes_mapping):
         if "count" in self.task_processors:
             result = self.task_processors["count"].create_labels(batch_list, classes_mapping)
@@ -1496,28 +1415,6 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
                 return (result["structuring_labels"], result["structuring_mask"],
                         result["structuring_batch_idx"], result["structuring_count"])
         return None
-
-    def create_set_structuring_labels(
-        self,
-        batch_list,
-        classes_mapping,
-        max_seq_len,
-        *,
-        sequence_lengths=None,
-        source_sequence_lengths=None,
-    ):
-        for item in batch_list:
-            self.resolve_set_structuring_spans(item)
-        processor = self.task_processors.get("set_structuring")
-        if processor is None:
-            return None
-        return processor.create_labels(
-            batch_list,
-            classes_mapping,
-            max_seq_len=max_seq_len,
-            sequence_lengths=sequence_lengths,
-            source_sequence_lengths=source_sequence_lengths,
-        )
 
     # ── Preprocessing ───────────────────────────────────────────────────
 
@@ -1558,17 +1455,6 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
 
     def create_batch_dict(self, batch, classes_mapping):
         batch_size = len(batch["tokens"])
-        set_open_relex = batch.get("set_open_relex")
-        if set_open_relex is None:
-            set_processor = self.task_processors.get("set_open_relex")
-            if (
-                set_processor is not None
-                and set_processor.allow_legacy_data
-            ):
-                set_open_relex = batch.get("open_relex")
-        if set_open_relex is None:
-            set_open_relex = [[] for _ in range(batch_size)]
-
         batch_dict = {
             "text": batch.get("text", ["" for _ in range(batch_size)]),
             "tokens": batch["tokens"],
@@ -1584,18 +1470,7 @@ class BaseGLiNextProcessor(TextProcessingMixin, BaseProcessor):
             MULTI_LEVEL_META_KEY: batch.get(
                 MULTI_LEVEL_META_KEY, [None for _ in range(batch_size)]
             ),
-            "set_structuring": batch.get(
-                "set_structuring", [{} for _ in range(batch_size)]
-            ),
-            "set_structuring_schema": batch.get(
-                "set_structuring_schema", [{} for _ in range(batch_size)]
-            ),
-            SET_MULTI_LEVEL_META_KEY: batch.get(
-                SET_MULTI_LEVEL_META_KEY,
-                [None for _ in range(batch_size)],
-            ),
             "open_relex": batch.get("open_relex", [[] for _ in range(batch_size)]),
-            "set_open_relex": set_open_relex,
             "image_classification": batch.get("image_classification", [None for _ in range(batch_size)]),
             "object_detection": batch.get("object_detection", [None for _ in range(batch_size)]),
             "segmentation": batch.get("segmentation", [None for _ in range(batch_size)]),
@@ -1650,14 +1525,12 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
         resolved annotations and layout/PDF inputs keep their supplied word
         grid because their integer spans or boxes depend on it.
         """
-        if not (
-            item.get("structuring") or item.get("set_structuring")
-        ) or not item.get("text"):
+        if not item.get("structuring") or not item.get("text"):
             return
         active_processors = [
             processor
             for task_name, processor in self.task_processors.items()
-            if task_name in {"structuring", "set_structuring"}
+            if task_name == "structuring"
         ]
         if active_processors and all(
             item.get(processor.resolved_flag)
@@ -1713,32 +1586,8 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
                 and multi_level_meta[i] is not None
             ):
                 item[MULTI_LEVEL_META_KEY] = multi_level_meta[i]
-            if (
-                "set_structuring" in batch
-                and i < len(batch["set_structuring"])
-            ):
-                item["set_structuring"] = batch["set_structuring"][i]
-            if (
-                "set_structuring_schema" in batch
-                and i < len(batch["set_structuring_schema"])
-            ):
-                item["set_structuring_schema"] = (
-                    batch["set_structuring_schema"][i]
-                )
-            set_multi_level_meta = batch.get(SET_MULTI_LEVEL_META_KEY)
-            if (
-                set_multi_level_meta is not None
-                and i < len(set_multi_level_meta)
-                and set_multi_level_meta[i] is not None
-            ):
-                item[SET_MULTI_LEVEL_META_KEY] = set_multi_level_meta[i]
             if "open_relex" in batch and i < len(batch["open_relex"]):
                 item["open_relex"] = batch["open_relex"][i]
-            if (
-                "set_open_relex" in batch
-                and i < len(batch["set_open_relex"])
-            ):
-                item["set_open_relex"] = batch["set_open_relex"][i]
             for field in (
                 "image_classification", "object_detection", "segmentation",
                 "audio_classification", "audio_segmentation",
@@ -1761,8 +1610,6 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
 
         texts = [item["tokens"] for item in preprocessed]
         seq_lengths = [len(t) for t in texts]
-        set_processor = self.task_processors.get("set_open_relex")
-
         batch_dict = {
             "text": [item.get("text", "") for item in batch_list],
             "tokens": texts,
@@ -1778,25 +1625,7 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
             MULTI_LEVEL_META_KEY: [
                 item.get(MULTI_LEVEL_META_KEY) for item in batch_list
             ],
-            "set_structuring": [
-                item.get("set_structuring", {}) for item in batch_list
-            ],
-            "set_structuring_schema": [
-                item.get("set_structuring_schema", {})
-                for item in batch_list
-            ],
-            SET_MULTI_LEVEL_META_KEY: [
-                item.get(SET_MULTI_LEVEL_META_KEY) for item in batch_list
-            ],
             "open_relex": [item.get("open_relex", []) for item in batch_list],
-            "set_open_relex": [
-                (
-                    set_processor._groups(item)
-                    if set_processor is not None
-                    else item.get("set_open_relex", [])
-                )
-                for item in batch_list
-            ],
             "image_classification": [item.get("image_classification") for item in batch_list],
             "object_detection": [item.get("object_detection") for item in batch_list],
             "segmentation": [item.get("segmentation") for item in batch_list],
@@ -1859,18 +1688,7 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
 
             open_rel_result = self.create_open_rel_labels(batch_list, classes_mapping, max_seq_len)
             if open_rel_result is not None:
-                tokenized_input["open_rel_labels"] = open_rel_result["open_rel_labels"]
-                tokenized_input["open_rel_mask"] = open_rel_result["open_rel_mask"]
-                tokenized_input["open_rel_batch_idx"] = open_rel_result["open_rel_batch_idx"]
-                tokenized_input["open_rel_count"] = open_rel_result["open_rel_count"]
-
-            set_open_rel_result = self.create_set_open_rel_labels(
-                batch_list,
-                classes_mapping,
-                max_seq_len,
-            )
-            if set_open_rel_result is not None:
-                tokenized_input.update(set_open_rel_result)
+                tokenized_input.update(open_rel_result)
 
             count_result = self.create_count_labels(batch_list, classes_mapping)
             if count_result is not None:
@@ -1913,19 +1731,6 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
                 if struct_span_result is not None:
                     tokenized_input.update(struct_span_result)
 
-            if "set_structuring" in self.task_processors:
-                set_struct_span_result = self.task_processors[
-                    "set_structuring"
-                ].create_span_labels(
-                    batch_list,
-                    classes_mapping,
-                    max_seq_len=structuring_max_seq_len,
-                    sequence_lengths=sequence_lengths,
-                    source_sequence_lengths=batch["seq_length"],
-                )
-                if set_struct_span_result is not None:
-                    tokenized_input.update(set_struct_span_result)
-
             if "open_relex" in self.task_processors:
                 open_rel_span_result = self.task_processors["open_relex"].create_span_labels(
                     batch_list, classes_mapping, max_seq_len=max_seq_len,
@@ -1943,16 +1748,6 @@ class GLiNextTextProcessor(BaseGLiNextProcessor):
             )
             if structuring_result is not None:
                 tokenized_input.update(structuring_result)
-
-            set_structuring_result = self.create_set_structuring_labels(
-                batch_list,
-                classes_mapping,
-                structuring_max_seq_len,
-                sequence_lengths=sequence_lengths,
-                source_sequence_lengths=batch["seq_length"],
-            )
-            if set_structuring_result is not None:
-                tokenized_input.update(set_structuring_result)
 
         if batch.get("bbox") is not None and "bbox" not in tokenized_input:
             tokenized_input["bbox"] = batch["bbox"]

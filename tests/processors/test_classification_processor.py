@@ -52,6 +52,23 @@ class TestGetClassesMapping:
         # Should have original 3 + up to 1 negative
         assert len(cat_map.class_to_id) >= 3
 
+    def test_exposes_augmentable_groups(self, cls_proc, classification_item):
+        mapping = cls_proc.get_classes_mapping([classification_item])
+        classes_mapping = make_batch_classes_mapping(cat_mappings=mapping)
+
+        groups = cls_proc.get_augmentable_label_groups(
+            [classification_item], classes_mapping,
+        )
+
+        assert len(groups) == 1
+        assert groups[0].task == "classification"
+        assert groups[0].positive_labels == frozenset({"positive"})
+        assert groups[0].parent_name == "sentiment"
+        groups[0].replace_labels(["neutral", "extra", "positive"])
+        assert list(mapping[0].cat_class_to_id[0].class_to_id) == [
+            "neutral", "extra", "positive",
+        ]
+
 
 class TestContributePrompt:
     def test_basic(self, cls_proc, classification_item):

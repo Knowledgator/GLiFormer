@@ -5,6 +5,7 @@ import torch
 
 from glinext.tasks.ner.model import NERHead
 from glinext.tasks import TaskHeadOutput
+from glinext.tasks.losses import binary_focal_or_bce
 from tests.heads.conftest import make_config, D, B, W, C
 from dataclasses import asdict
 from glinext.config import NERHeadConfig
@@ -73,6 +74,54 @@ class TestNERHeadForward:
         out = head(shared, {}, flat_inputs=flat_inputs, ner_labels=ner_labels, base_loss_fn=focal_loss_with_logits)
         assert out.loss is not None
         assert out.loss.item() >= 0
+
+    def test_loss_is_normalized_by_active_bn_token_class_cells(self):
+        head = _make_head()
+        scores = torch.zeros(2, 1, 3, 2, 3)
+        labels = torch.zeros_like(scores)
+        anchor_mask = torch.ones(2, 1)
+        word_mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
+        child_mask = torch.tensor([[1, 1], [1, 0]])
+
+        loss = head._bio_loss(
+            scores,
+            labels,
+            anchor_mask,
+            word_mask,
+            child_mask,
+            base_loss_fn=lambda logits, targets: torch.ones_like(logits),
+        )
+
+        # Active L*C cells: 2*2 + 1*1 = 5. Each cell has three BIO terms.
+        assert loss.item() == pytest.approx(3.0)
+
+    def test_direct_head_uses_configured_focal_parameters(
+        self,
+        shared,
+        flat_inputs,
+    ):
+        head = _make_head(
+            focal_loss_alpha=0.4,
+            focal_loss_gamma=1.5,
+            focal_loss_prob_margin=0.1,
+        )
+        labels = torch.zeros(B, W, C, 3)
+
+        output = head(
+            shared,
+            {},
+            flat_inputs=flat_inputs,
+            ner_labels=labels,
+        )
+
+        expected = binary_focal_or_bce(
+            output.logits,
+            labels,
+            focal_loss_alpha=0.4,
+            focal_loss_gamma=1.5,
+            focal_loss_prob_margin=0.1,
+        ).sum() / (B * W * C)
+        torch.testing.assert_close(output.loss, expected)
 
     def test_output_extra_contains_embeddings(self, shared, flat_inputs):
         head = _make_head()

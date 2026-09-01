@@ -1,4 +1,4 @@
-"""Shared tensor processor for base and set structuring tasks."""
+"""Shared tensor machinery for entity-first structuring."""
 
 import random
 from copy import deepcopy
@@ -12,7 +12,6 @@ from ._structuring_hierarchy import (
     MULTI_LEVEL_ROOT_KEY,
     NODE_ID_KEY,
     NODE_KEEP_KEY,
-    SET_MULTI_LEVEL_META_KEY,
     StructuringProcessorComponent,
     is_internal_instance_key,
     resolve_structuring_processor,
@@ -23,7 +22,6 @@ from .mappings import (
     StructuringClassMapping,
     StructuringItemMapping,
 )
-from .structuring_compat import legacy_task_mapping
 
 
 class StructuringProcessor(SpanProcessor):
@@ -36,44 +34,23 @@ class StructuringProcessor(SpanProcessor):
     schema_key = "structuring_schema"
     meta_key = MULTI_LEVEL_META_KEY
     tensor_prefix = "structuring"
-    fallback_data_key = None
-    fallback_schema_key = None
     resolved_flag = "_glinext_structuring_spans_resolved"
-    pad_dense_fixed_slots = True
-    require_span_targets = False
-    _raw_data_backup_key = "_glinext_raw_structuring"
-    _raw_schema_backup_key = "_glinext_raw_structuring_schema"
+    # Entity-first structuring matches predicted record slots against the
+    # compact gold-record axis and always needs explicit entity-span targets.
+    pad_dense_fixed_slots = False
+    require_span_targets = True
 
     def __init__(self, config, tokenizer=None, words_splitter=None, **kwargs):
         super().__init__(config, tokenizer, words_splitter,
                          parent_token=getattr(config, 'struct_parent_token', None), **kwargs)
         self.child_token = config.child_token
-        if (
-            self.__class__ is StructuringProcessor
-            and getattr(config, "structuring_config", None) is None
-            and getattr(config, "set_structuring_config", None) is not None
-        ):
-            # Compatibility for callers that instantiated the historical
-            # shared processor directly for a set-only checkpoint.  The
-            # orchestrator uses SetStructuringProcessor and therefore gets
-            # the fully independent namespace; this shim retains the former
-            # tensor/data contract only at that old construction boundary.
-            self.task_name = "set_structuring"
-            self.config_attr = "set_structuring_config"
-            self.require_span_targets = True
-            self.pad_dense_fixed_slots = False
-        # Preserve the original legacy payload before hierarchy normalization
-        # canonicalizes it in place. A second task-specific processor can then
-        # consume the same user input without inheriting the first task's
-        # internal sidecar representation.
         self.task_config = getattr(config, self.config_attr, None)
         if self.task_config is None:
             raise ValueError(f"{self.config_attr} is required for {self.task_name}")
 
-        # Fixed-width anchors always emit ``num_slots`` anchors; labels must
-        # be padded to that size so Hungarian sees unmatched slots and trains
-        # them as negatives. This includes learned slots and parameter-free
-        # token selectors.
+        # Resolve the processing strategy independently of the prediction
+        # slot width. Gold records remain a compact rectangular target axis;
+        # Hungarian matching accounts for unmatched prediction slots.
         mode = (
             self.task_config.effective_structure_mode()
             if hasattr(self.task_config, "effective_structure_mode")
@@ -100,19 +77,17 @@ class StructuringProcessor(SpanProcessor):
         self.multi_level = bool(
             getattr(self.component, "multi_level", configured_multi_level)
         )
-        # Entity spans are mandatory targets for the independent second
-        # stage, not an optional auxiliary representation.  Regular
-        # structuring still honors its ``represent_spans`` switch.
+        # Entity spans are mandatory targets for the second stage rather than
+        # an optional auxiliary representation.
         self._span_config = (
             self.task_config
             if self.require_span_targets
             or getattr(self.task_config, "represent_spans", False)
             else None
         )
-        # Only the classical structuring head consumes dense labels whose
-        # record axis must match its fixed query width. Set structuring uses a
-        # rectangular assignment (predicted slots versus gold records), so
-        # padding its gold axis to ``num_slots`` only wastes memory.
+        # Entity-first structuring uses a rectangular assignment (predicted
+        # slots versus gold records), so its gold axis must not be padded to
+        # the fixed prediction width.
         fixed_slot_configs = (
             [self.task_config] if self.pad_dense_fixed_slots else []
         )
@@ -136,51 +111,11 @@ class StructuringProcessor(SpanProcessor):
         ) if fixed_slot_configs else 0
 
     def _ensure_task_payload(self, item):
-        """Materialize this task's view while preserving legacy input keys."""
-
-        if (
-            self._raw_data_backup_key not in item
-            and "structuring" in item
-        ):
-            item[self._raw_data_backup_key] = deepcopy(item["structuring"])
-        if (
-            self._raw_schema_backup_key not in item
-            and "structuring_schema" in item
-        ):
-            item[self._raw_schema_backup_key] = deepcopy(
-                item["structuring_schema"]
-            )
-
-        used_fallback_data = False
-        if self.data_key not in item and self.fallback_data_key is not None:
-            source = item.get(self._raw_data_backup_key)
-            if source is None:
-                source = item.get(self.fallback_data_key)
-            if source is not None:
-                item[self.data_key] = deepcopy(source)
-                used_fallback_data = True
-        if (
-            used_fallback_data
-            and self.schema_key not in item
-            and self.fallback_schema_key is not None
-        ):
-            source = item.get(self._raw_schema_backup_key)
-            if source is None:
-                source = item.get(self.fallback_schema_key)
-            if source is not None:
-                item[self.schema_key] = deepcopy(source)
+        """Return the canonical structuring payload unchanged."""
         return item
 
     def _mapping_list(self, classes_mapping):
-        return legacy_task_mapping(
-            classes_mapping,
-            self.mapping_attr,
-            fallback_attr=(
-                "structuring_mapping"
-                if self.task_name == "set_structuring" else None
-            ),
-            default=[],
-        )
+        return getattr(classes_mapping, self.mapping_attr, [])
 
     def _flat_structuring_iter(self, classes_mapping):
         flat_idx = 0
@@ -1036,11 +971,7 @@ class StructuringProcessor(SpanProcessor):
             all_label_strings, return_tensors="pt", truncation=True,
             padding="longest", add_special_tokens=True
         )
-        label_prefix = (
-            "child_labels"
-            if self.task_name == "structuring"
-            else f"{self.task_name}_child_labels"
-        )
+        label_prefix = "child_labels"
         return {
             f"{label_prefix}_input_ids": tokenized["input_ids"],
             f"{label_prefix}_attention_mask": tokenized["attention_mask"],
@@ -1054,7 +985,6 @@ __all__ = [
     "MULTI_LEVEL_ROOT_KEY",
     "NODE_ID_KEY",
     "NODE_KEEP_KEY",
-    "SET_MULTI_LEVEL_META_KEY",
     "StructuringProcessor",
     "StructuringProcessorComponent",
     "is_internal_instance_key",

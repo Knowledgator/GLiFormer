@@ -25,6 +25,8 @@ class FakeModelOutput:
     joint_rel_idx: Optional[torch.Tensor] = None
     joint_rel_mask: Optional[torch.Tensor] = None
     joint_rel_batch_origin: Optional[torch.Tensor] = None
+    joint_rel_entity_spans: Optional[torch.Tensor] = None
+    joint_rel_entity_class_idx: Optional[torch.Tensor] = None
     batch_size: Optional[int] = None
 
     def __post_init__(self):
@@ -149,6 +151,73 @@ class TestJointRelexDecoder:
         assert len(result[0][0]) == 1
         assert result[0][0][0]["tail"]["start"] == -1  # fallback
 
+    def test_negative_entity_index_does_not_select_last_entity(self, decoder):
+        ner_logits = _bio_logits(1, 3, 1, [(0, 0, 0, 0), (0, 2, 2, 0)])
+        out = FakeModelOutput(
+            ner_logits=ner_logits,
+            joint_rel_logits=torch.tensor([[[5.0]]]),
+            joint_rel_idx=torch.tensor([[[-1, 0]]]),
+            joint_rel_mask=torch.ones(1, 1, dtype=torch.bool),
+        )
+
+        result = decoder.decode(out, classes_mapping={0: "A"})
+
+        assert result[0][0][0]["head"]["start"] == -1
+
+    def test_equal_boundaries_are_mapped_by_entity_class(self, decoder):
+        # Multi-label decoding orders the stronger location first. The model
+        # entity axis deliberately orders person first, so boundary-only
+        # matching would collapse both endpoints onto location.
+        ner_logits = _bio_logits(
+            1, 2, 2,
+            [(0, 0, 0, 0), (0, 0, 0, 1)],
+        )
+        ner_logits[0, 0, 1] = 7.0
+        out = FakeModelOutput(
+            ner_logits=ner_logits,
+            joint_rel_logits=torch.tensor([[[5.0]]]),
+            joint_rel_idx=torch.tensor([[[0, 1]]]),
+            joint_rel_mask=torch.ones(1, 1, dtype=torch.bool),
+            joint_rel_entity_spans=torch.tensor([[[0, 0], [0, 0]]]),
+            joint_rel_entity_class_idx=torch.tensor([[0, 1]]),
+        )
+
+        result = decoder.decode(
+            out,
+            classes_mapping=_make_classes_mapping(),
+            multi_label=True,
+        )
+
+        triple = result[0][0][0]
+        assert triple["head"]["type"] == "person"
+        assert triple["tail"]["type"] == "location"
+        assert triple["head"]["entity_idx"] != triple["tail"]["entity_idx"]
+
+    def test_group_text_resolution_uses_batch_origin(self, decoder):
+        ner_logits = _bio_logits(
+            2, 3, 1,
+            [(0, 0, 0, 0), (0, 2, 2, 0), (1, 0, 0, 0), (1, 2, 2, 0)],
+        )
+        out = FakeModelOutput(
+            ner_logits=ner_logits,
+            ner_batch_origin=torch.tensor([0, 0]),
+            joint_rel_logits=torch.tensor([[[-10.0]], [[5.0]]]),
+            joint_rel_idx=torch.tensor([[[0, 1]], [[0, 1]]]),
+            joint_rel_mask=torch.ones(2, 1, dtype=torch.bool),
+            joint_rel_batch_origin=torch.tensor([0, 0]),
+            batch_size=1,
+        )
+
+        result = decoder.decode(
+            out,
+            classes_mapping=[{0: "entity"}, {0: "entity"}],
+            texts=[["first", "gap", "second"]],
+        )
+
+        triple = result[0][1][0]
+        assert triple["head"]["text"] == "first"
+        assert triple["tail"]["text"] == "second"
+
     def test_with_batch_classes_mapping(self, decoder):
         ner_logits = _bio_logits(1, 5, 2, [(0, 0, 0, 0), (0, 3, 4, 1)])
         rel_logits = torch.tensor([[[5.0]]])
@@ -167,3 +236,29 @@ class TestJointRelexDecoder:
         assert len(result[0]) == 1  # 1 group
         triple = result[0][0][0]
         assert triple["relation"] == "lives_in"
+
+    def test_map_results_converts_triple_spans_to_character_offsets(
+        self, decoder,
+    ):
+        task_results = [[[{
+            "head": {"start": 0, "end": 0, "text": "John"},
+            "tail": {"start": 1, "end": 1, "text": "London"},
+            "relation": "lives_in",
+            "score": 0.9,
+        }]]]
+
+        result = decoder.map_results(
+            task_results,
+            valid_to_orig_idx=[0],
+            all_start_maps=[[0, 5]],
+            all_end_maps=[[4, 11]],
+            valid_texts=["John London"],
+            num_original=1,
+        )
+
+        assert result[0][0]["head"] == {
+            "start": 0, "end": 4, "text": "John",
+        }
+        assert result[0][0]["tail"] == {
+            "start": 5, "end": 11, "text": "London",
+        }

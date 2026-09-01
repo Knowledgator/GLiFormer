@@ -89,8 +89,7 @@ class VisionClassMapping:
 @dataclass
 class BatchClassesMapping:
     PROMPT_TASK_ORDER = (
-        "classification", "ner", "open_relex", "set_open_relex",
-        "structuring", "set_structuring",
+        "classification", "ner", "open_relex", "structuring",
         "image_classification", "object_detection", "segmentation",
         "audio_classification", "audio_segmentation",
     )
@@ -98,12 +97,7 @@ class BatchClassesMapping:
     cat_mapping: List[CatClassMapping]
     extraction_mapping: List[ExtractionClassMapping]
     structuring_mapping: List[StructuringClassMapping] = field(default_factory=list)
-    # ``None`` means a legacy mapping object that predates the independent
-    # set task and should therefore reuse ``structuring_mapping``.  An
-    # explicit empty list means the independent task has no groups.
-    set_structuring_mapping: Optional[List[StructuringClassMapping]] = None
     open_relex_mapping: List[OpenRelexClassMapping] = field(default_factory=list)
-    set_open_relex_mapping: List[OpenRelexClassMapping] = field(default_factory=list)
     image_classification_mapping: List[VisionClassMapping] = field(default_factory=list)
     audio_classification_mapping: List[VisionClassMapping] = field(default_factory=list)
     object_detection_mapping: List[VisionClassMapping] = field(default_factory=list)
@@ -124,16 +118,6 @@ class BatchClassesMapping:
     def total_structuring_groups(self) -> int:
         """Total number of structuring groups (schemas) across the batch."""
         return sum(len(sm.items) for sm in self.structuring_mapping)
-
-    def _set_structuring_mappings(self) -> List[StructuringClassMapping]:
-        """Return independent mappings, falling back for legacy callers."""
-
-        if self.set_structuring_mapping is None:
-            return self.structuring_mapping
-        return self.set_structuring_mapping
-
-    def total_set_structuring_groups(self) -> int:
-        return sum(len(sm.items) for sm in self._set_structuring_mappings())
 
     def flat_cat_iter(self):
         """Iterate (flat_idx, batch_idx, group_idx, mapping) over all cat groups."""
@@ -163,31 +147,10 @@ class BatchClassesMapping:
                 yield flat_idx, batch_idx, group_idx, item_mapping
                 flat_idx += 1
 
-    def total_set_open_relex_groups(self) -> int:
-        """Total number of set_open_relex groups across the batch."""
-        return sum(len(om.items) for om in self.set_open_relex_mapping)
-
-    def flat_set_open_relex_iter(self):
-        """Iterate over the independent set-open-relex groups."""
-        flat_idx = 0
-        for batch_idx, om in enumerate(self.set_open_relex_mapping):
-            for group_idx, item_mapping in enumerate(om.items):
-                yield flat_idx, batch_idx, group_idx, item_mapping
-                flat_idx += 1
-
     def flat_structuring_iter(self):
         """Iterate (flat_idx, batch_idx, group_idx, item_mapping) over all structuring groups."""
         flat_idx = 0
         for batch_idx, sm in enumerate(self.structuring_mapping):
-            for group_idx, item_mapping in enumerate(sm.items):
-                yield flat_idx, batch_idx, group_idx, item_mapping
-                flat_idx += 1
-
-    def flat_set_structuring_iter(self):
-        """Iterate independent set-structuring schema groups."""
-
-        flat_idx = 0
-        for batch_idx, sm in enumerate(self._set_structuring_mappings()):
             for group_idx, item_mapping in enumerate(sm.items):
                 yield flat_idx, batch_idx, group_idx, item_mapping
                 flat_idx += 1
@@ -237,11 +200,6 @@ class BatchClassesMapping:
         if task_name in ("ner", "joint_relex"):
             return len(self.extraction_mapping[batch_idx].items)
 
-        if task_name == "set_structuring":
-            mapping_list = self._set_structuring_mappings()
-            if batch_idx >= len(mapping_list):
-                return 0
-            return len(mapping_list[batch_idx].items)
         mapping_attr = f"{task_name}_mapping"
         mapping_list = getattr(self, mapping_attr, None)
         if mapping_list is None or batch_idx >= len(mapping_list):
@@ -295,12 +253,8 @@ class BatchClassesMapping:
             return len(self.cat_mapping[batch_idx].cat_class_to_id[group_idx].class_to_id)
         if task_name == "structuring":
             return len(self.structuring_mapping[batch_idx].items[group_idx].field_class_to_id.class_to_id)
-        if task_name == "set_structuring":
-            return len(self._set_structuring_mappings()[batch_idx].items[group_idx].field_class_to_id.class_to_id)
         if task_name == "open_relex":
             return len(self.open_relex_mapping[batch_idx].items[group_idx].rel_class_to_id.class_to_id)
-        if task_name == "set_open_relex":
-            return len(self.set_open_relex_mapping[batch_idx].items[group_idx].rel_class_to_id.class_to_id)
         if task_name in (
             "image_classification", "audio_classification", "object_detection",
             "segmentation", "audio_segmentation",
@@ -321,9 +275,7 @@ class BatchClassesMapping:
             "joint_relex": self.flat_extraction_iter,
             "classification": self.flat_cat_iter,
             "structuring": self.flat_structuring_iter,
-            "set_structuring": self.flat_set_structuring_iter,
             "open_relex": self.flat_open_relex_iter,
-            "set_open_relex": self.flat_set_open_relex_iter,
             "image_classification": self.flat_image_classification_iter,
             "audio_classification": self.flat_audio_classification_iter,
             "object_detection": self.flat_object_detection_iter,

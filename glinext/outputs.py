@@ -31,56 +31,35 @@ class GLiNExTTextOutput(GLiNExTBaseOutput):
     joint_rel_entity_spans: Optional[torch.LongTensor] = None
     joint_rel_entity_class_idx: Optional[torch.LongTensor] = None
 
+    # Entity-first open relation extraction. Relation logits are (BN, A, R)
+    # and assignment logits are (BN, A, E, 2) over selected entity spans.
+    open_rel_entity_logits: Optional[torch.FloatTensor] = None
     open_rel_logits: Optional[torch.FloatTensor] = None
+    open_rel_assignment_logits: Optional[torch.FloatTensor] = None
     open_rel_batch_origin: Optional[torch.LongTensor] = None
     open_rel_anchor_mask: Optional[torch.Tensor] = None
-    open_rel_span_logits: Optional[torch.FloatTensor] = None
+    open_rel_objectness_logits: Optional[torch.FloatTensor] = None
     open_rel_span_idx: Optional[torch.LongTensor] = None
     open_rel_span_mask: Optional[torch.Tensor] = None
-
-    # Independent entity-first set open relation extraction. Relation-role
-    # logits are (B, A, R, 2); canonical decoder assignment logits retain the
-    # selected entity axis as (B, A, R, E, 2). The trainer flattens its variable
-    # set/schema axes only at the evaluation-aggregation boundary.
-    set_open_rel_entity_logits: Optional[torch.FloatTensor] = None
-    set_open_rel_logits: Optional[torch.FloatTensor] = None
-    set_open_rel_assignment_logits: Optional[torch.FloatTensor] = None
-    set_open_rel_batch_origin: Optional[torch.LongTensor] = None
-    set_open_rel_anchor_mask: Optional[torch.Tensor] = None
-    set_open_rel_objectness_logits: Optional[torch.FloatTensor] = None
-    set_open_rel_span_idx: Optional[torch.LongTensor] = None
-    set_open_rel_span_mask: Optional[torch.Tensor] = None
 
     count_logits: Optional[torch.FloatTensor] = None
     count_batch_origin: Optional[torch.LongTensor] = None
 
-    groups_output: Optional[torch.FloatTensor] = None
-    groups_mask: Optional[torch.Tensor] = None
-
+    # Composite structuring: classical NER token logits, NER-derived field
+    # logits for selected spans, and second-stage anchor-membership logits are
+    # deliberately separate.
+    structuring_entity_logits: Optional[torch.FloatTensor] = None
+    structuring_field_logits: Optional[torch.FloatTensor] = None
     structuring_logits: Optional[torch.FloatTensor] = None
+    # Trainer-friendly transpose of membership logits: variable entity count
+    # occupies dimension 1, which Hugging Face evaluation can pad.
+    structuring_assignment_logits: Optional[torch.FloatTensor] = None
     structuring_batch_origin: Optional[torch.LongTensor] = None
     structuring_anchor_mask: Optional[torch.Tensor] = None
     structuring_objectness_logits: Optional[torch.FloatTensor] = None
     structuring_anchor_relation_scores: Optional[torch.FloatTensor] = None
-    structuring_span_logits: Optional[torch.FloatTensor] = None
     structuring_span_idx: Optional[torch.LongTensor] = None
     structuring_span_mask: Optional[torch.Tensor] = None
-
-    # Composite set structuring: classical NER token logits, NER-derived field
-    # logits for selected spans, and second-stage anchor-membership logits are
-    # deliberately separate.
-    set_structuring_entity_logits: Optional[torch.FloatTensor] = None
-    set_structuring_field_logits: Optional[torch.FloatTensor] = None
-    set_structuring_logits: Optional[torch.FloatTensor] = None
-    # Trainer-friendly transpose of membership logits: variable entity count
-    # occupies dimension 1, which Hugging Face evaluation can pad.
-    set_structuring_assignment_logits: Optional[torch.FloatTensor] = None
-    set_structuring_batch_origin: Optional[torch.LongTensor] = None
-    set_structuring_anchor_mask: Optional[torch.Tensor] = None
-    set_structuring_objectness_logits: Optional[torch.FloatTensor] = None
-    set_structuring_anchor_relation_scores: Optional[torch.FloatTensor] = None
-    set_structuring_span_idx: Optional[torch.LongTensor] = None
-    set_structuring_span_mask: Optional[torch.Tensor] = None
 
     embedding_logits: Optional[torch.FloatTensor] = None
 

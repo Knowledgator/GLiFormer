@@ -29,7 +29,6 @@ from .structuring_types import (
 )
 
 MULTI_LEVEL_META_KEY = "_glinext_structuring_multi_level"
-SET_MULTI_LEVEL_META_KEY = "_glinext_set_structuring_multi_level"
 MULTI_LEVEL_ROOT_KEY = "$root"
 NODE_ID_KEY = "__glinext_multi_level_node_id__"
 NODE_KEEP_KEY = "__glinext_multi_level_keep__"
@@ -884,7 +883,6 @@ def resolve_structuring_processor(
 __all__ = [
     "INTERNAL_INSTANCE_KEYS",
     "MULTI_LEVEL_META_KEY",
-    "SET_MULTI_LEVEL_META_KEY",
     "MULTI_LEVEL_ROOT_KEY",
     "NODE_ID_KEY",
     "NODE_KEEP_KEY",

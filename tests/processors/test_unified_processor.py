@@ -5,9 +5,9 @@ import torch
 from unittest.mock import MagicMock
 from dataclasses import asdict
 
-from glinext.processing.processor import GLiNextProcessor
+from glinext.processing.processor import GLiNextProcessor, GLiNextTextProcessor
 from glinext.config import (
-    GLiNextConfig, NERHeadConfig, ClassificationHeadConfig,
+    NERHeadConfig, ClassificationHeadConfig,
     JointRelexHeadConfig, OpenRelexHeadConfig, StructuringHeadConfig,
     CountHeadConfig, EmbeddingHeadConfig,
 )
@@ -23,21 +23,31 @@ class FakeTokenizer:
     def __init__(self):
         self.unk_token = "[UNK]"
         self.pad_token = "[PAD]"
+        self.last_max_length = None
 
     def __call__(self, texts, is_split_into_words=False, return_tensors=None,
-                 truncation=False, padding=False, add_special_tokens=True):
+                 truncation=False, max_length=None, padding=False,
+                 add_special_tokens=True):
+        self.last_max_length = max_length
         if is_split_into_words:
-            max_len = max(len(t) for t in texts)
+            encoded_lengths = [len(t) for t in texts]
+            if truncation and max_length is not None:
+                encoded_lengths = [min(length, max_length) for length in encoded_lengths]
+            padded_len = max(encoded_lengths)
             input_ids = []
             attention_mask = []
-            for t in texts:
-                ids = list(range(1, len(t) + 1))
-                mask = [1] * len(t)
+            word_ids = []
+            for t, encoded_len in zip(texts, encoded_lengths):
+                ids = list(range(1, encoded_len + 1))
+                mask = [1] * encoded_len
+                item_word_ids = list(range(encoded_len))
                 # Pad
-                ids += [0] * (max_len - len(t))
-                mask += [0] * (max_len - len(t))
+                ids += [0] * (padded_len - encoded_len)
+                mask += [0] * (padded_len - encoded_len)
+                item_word_ids += [None] * (padded_len - encoded_len)
                 input_ids.append(ids)
                 attention_mask.append(mask)
+                word_ids.append(item_word_ids)
             result = {
                 "input_ids": torch.tensor(input_ids),
                 "attention_mask": torch.tensor(attention_mask),
@@ -48,7 +58,7 @@ class FakeTokenizer:
             result_obj.__setitem__ = lambda self_, k, v: result.__setitem__(k, v)
             result_obj.__contains__ = lambda self_, k: k in result
             result_obj.update = result.update
-            result_obj.word_ids = lambda batch_index=0: list(range(len(texts[batch_index])))
+            result_obj.word_ids = lambda batch_index=0: word_ids[batch_index]
             return result_obj
         else:
             # Label tokenization
@@ -129,6 +139,46 @@ class TestTaskProcessorRegistration:
         # Actually, make_config sets ner_config={} by default (from GLiNextConfig defaults)
         # Need to check: when ner_config is set to None explicitly
         assert "classification" not in proc.task_processors
+
+    def test_joint_relex_owns_extraction_processing_without_standalone_ner(
+        self,
+        fake_tokenizer,
+        words_splitter,
+        joint_relex_item,
+    ):
+        config = make_config(
+            default_ner_config=False,
+            ner_config=None,
+            joint_relex_config=asdict(JointRelexHeadConfig()),
+        )
+        processor = GLiNextTextProcessor(
+            config,
+            fake_tokenizer,
+            words_splitter,
+            labels_tokenizer=fake_tokenizer,
+        )
+
+        raw_batch = processor.collate_raw_batch([joint_relex_item])
+        model_inputs = processor.tokenize_and_prepare_labels(
+            raw_batch,
+            prepare_labels=True,
+        )
+
+        assert "ner" not in processor.task_processors
+        assert "joint_relex" in processor.task_processors
+        assert raw_batch["classes_mapping"].total_extraction_groups() == 1
+        assert "ner_labels" in model_inputs
+        assert "rel_labels" in model_inputs
+        assert "ner_labels_input_ids" in model_inputs
+        assert "rel_labels_input_ids" in model_inputs
+
+        all_labels = processor.create_all_labels(
+            [joint_relex_item],
+            raw_batch["classes_mapping"],
+            max_seq_len=5,
+        )
+        assert "ner_labels" in all_labels
+        assert "rel_labels" in all_labels
 
 
 class TestBatchGenerateClassMappings:
@@ -286,10 +336,29 @@ class TestCollateRawBatch:
         assert isinstance(batch["classes_mapping"], BatchClassesMapping)
 
     def test_resolves_spans(self, ner_processor, ner_item_text_spans):
-        batch = ner_processor.collate_raw_batch([ner_item_text_spans])
+        ner_processor.collate_raw_batch([ner_item_text_spans])
         # After collation, spans should be resolved
         # The original item should have tokenized_text
         assert "tokenized_text" in ner_item_text_spans
+
+    def test_structuring_retokenizes_generated_words_with_inference_splitter(
+        self, all_tasks_processor,
+    ):
+        item = {
+            "text": "Claim CLM-789456 approved",
+            # Simulate the old generator, which split hyphenated identifiers.
+            "tokenized_text": ["Claim", "CLM", "-", "789456", "approved"],
+            "structuring": {
+                "claim": [{"claim_number": "CLM-789456"}],
+            },
+        }
+
+        batch = all_tasks_processor.collate_raw_batch([item])
+
+        assert item["tokenized_text"] == ["Claim", "CLM-789456", "approved"]
+        assert batch["tokens"][0] == ["Claim", "CLM-789456", "approved"]
+        assert item["structuring"]["claim"][0]["claim_number"]["start"] == 1
+        assert item["structuring"]["claim"][0]["claim_number"]["end"] == 1
 
     def test_multi_item(self, ner_processor, ner_item_text_spans):
         batch = ner_processor.collate_raw_batch([ner_item_text_spans, ner_item_text_spans])
@@ -307,6 +376,22 @@ class TestCollateRawBatch:
 
 
 class TestTokenizeAndPrepareLabels:
+    def test_encoder_subtokens_are_hard_capped_by_max_len(
+        self, fake_tokenizer, words_splitter,
+    ):
+        config = make_config(max_len=8)
+        processor = GLiNextProcessor(config, fake_tokenizer, words_splitter)
+        item = {"text": " ".join(f"word-{i}" for i in range(20))}
+
+        raw_batch = processor.collate_raw_batch([item])
+        model_input = processor.tokenize_and_prepare_labels(
+            raw_batch,
+            prepare_labels=False,
+        )
+
+        assert fake_tokenizer.last_max_length == 8
+        assert model_input["input_ids"].shape[1] == 8
+
     def test_represent_spans_uses_model_span_keys(self, fake_tokenizer, words_splitter, ner_item_text_spans):
         config = make_config(ner_config={"represent_spans": True, "neg_spans_ratio": 0.0})
         proc = GLiNextProcessor(config, fake_tokenizer, words_splitter)
@@ -320,6 +405,37 @@ class TestTokenizeAndPrepareLabels:
         assert "ner_span_mask" not in model_input
         assert "ner_span_labels" not in model_input
 
+    def test_multi_level_relation_sidecar_survives_collation(
+        self, fake_tokenizer, words_splitter,
+    ):
+        config = make_config(
+            default_ner_config=False,
+            structuring_config={"multi_level": True},
+        )
+        processor = GLiNextProcessor(
+            config,
+            fake_tokenizer,
+            words_splitter,
+        )
+        item = {
+            "text": "Root Child",
+            "structuring": {
+                "tree": [{
+                    "name": "Root",
+                    "children": [{"name": "Child"}],
+                }],
+            },
+        }
+
+        raw_batch = processor.collate_raw_batch([item])
+        model_input = processor.tokenize_and_prepare_labels(
+            raw_batch,
+            prepare_labels=True,
+        )
+
+        assert model_input["structuring_count"].tolist() == [2]
+        assert model_input["structuring_relation_group_mask"].tolist() == [True]
+        assert model_input["structuring_relation_labels"][0, 0, 1] == 1.0
 
 class TestPrepareAllLabelEncoderInputs:
     def test_without_labels_tokenizer(self, ner_processor, ner_item):

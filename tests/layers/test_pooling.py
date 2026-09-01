@@ -83,6 +83,15 @@ class TestCLSPooling:
         out = p(embeddings, mask)
         assert torch.equal(out, embeddings[:, 0])
 
+    def test_empty_sequence_returns_shape_safe_zeros(self):
+        embeddings = torch.empty(2, 0, D)
+        mask = torch.empty(2, 0)
+
+        out = CLSPooling()(embeddings, mask)
+
+        assert out.shape == (2, D)
+        assert torch.equal(out, torch.zeros(2, D))
+
 
 class TestMaxPooling:
     def test_output_shape(self, embeddings, mask):

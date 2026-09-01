@@ -61,6 +61,24 @@ class TestGetClassesMapping:
         mapping = ner_proc.get_classes_mapping([ner_item], shuffle_labels=True)
         assert len(mapping[0].items[0].ner_class_to_id.class_to_id) == 2
 
+    def test_exposes_entity_augmentation_groups(self, ner_proc, ner_item):
+        mapping = ner_proc.get_classes_mapping([ner_item])
+        classes_mapping = make_batch_classes_mapping(
+            extraction_mappings=mapping,
+        )
+
+        groups = ner_proc.get_augmentable_label_groups(
+            [ner_item], classes_mapping,
+        )
+
+        assert len(groups) == 1
+        assert groups[0].task == "ner"
+        assert set(groups[0].positive_labels) == {"person", "location"}
+        groups[0].replace_labels(["location", "organization", "person"])
+        assert list(
+            mapping[0].items[0].ner_class_to_id.class_to_id
+        ) == ["location", "organization", "person"]
+
 
 class TestContributePrompt:
     def test_basic(self, ner_proc, ner_item):

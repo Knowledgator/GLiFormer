@@ -1,6 +1,6 @@
 """GLiNExT decoder — factory that assembles per-task decoders based on config."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch
 
@@ -57,22 +57,10 @@ class GLiNExTDecoder:
             if hasattr(OpenRelexDecoder, 'from_config'):
                 self.task_decoders["open_relex"] = OpenRelexDecoder.from_config(config)
 
-        if getattr(config, "set_open_relex_config", None) is not None:
-            from ..tasks.set_open_relex.decoder import SetOpenRelexDecoder
-            if hasattr(SetOpenRelexDecoder, 'from_config'):
-                self.task_decoders["set_open_relex"] = (
-                    SetOpenRelexDecoder.from_config(config)
-                )
-
         if config.structuring_config is not None:
             from ..tasks.structuring.decoder import StructuringDecoder
             if hasattr(StructuringDecoder, 'from_config'):
                 self.task_decoders["structuring"] = StructuringDecoder.from_config(config)
-
-        if config.set_structuring_config is not None:
-            from ..tasks.set_structuring.decoder import SetStructuringDecoder
-            if hasattr(SetStructuringDecoder, 'from_config'):
-                self.task_decoders["set_structuring"] = SetStructuringDecoder.from_config(config)
 
         if config.embedding_config is not None:
             from ..tasks.embedding.decoder import EmbeddingDecoder
@@ -133,9 +121,7 @@ class GLiNExTDecoder:
                 continue
             task_kwargs = dict(kwargs)
             diagnostics = None
-            if return_anchor_diagnostics and name in {
-                "structuring", "set_structuring",
-            }:
+            if return_anchor_diagnostics and name == "structuring":
                 diagnostics = []
                 task_kwargs["anchor_diagnostics_output"] = diagnostics
             results[name] = decoder.map_results(
