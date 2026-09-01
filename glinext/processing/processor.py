@@ -1915,6 +1915,13 @@ class GLiNextLayoutProcessor(LayoutProcessingMixin, VisionProcessingMixin, GLiNe
         else:
             payloads = [{"image": value} for value in images]
 
+        # ``pages`` also describes text/layout pages (for example, the output
+        # of PDF extraction with ``split_pages=False``).  In the absence of an
+        # image payload there is nothing to associate those page ids with, so
+        # do not interpret the metadata as ``image_page_ids``.
+        if not payloads:
+            return []
+
         raw_page_ids = item.get("image_page_ids")
         if raw_page_ids is None:
             raw_page_ids = item.get("pages")

@@ -1,5 +1,5 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
 
 from transformers import AutoConfig, AutoModel
 
@@ -11,9 +11,9 @@ from .deberta_2d import (
 )
 from .qwen3 import GLiNextQwen3Model, Qwen3BidirectionalModel
 from .qwen3_5 import (
+    QWEN3_5_AVAILABLE,
     GLiNextQwen3_5Model,
     GLiNextQwen3_5TextModel,
-    QWEN3_5_AVAILABLE,
     Qwen3_5BidirectionalModel,
     Qwen3_5Config,
     Qwen3_5TextConfig,
@@ -43,7 +43,7 @@ if QWEN3_5_AVAILABLE:
 class BackboneSpec:
     name: str
     model_class: type
-    config_class: Optional[type] = None
+    config_class: type | None = None
     aliases: tuple[str, ...] = ()
     model_class_names: tuple[str, ...] = ()
 
@@ -54,7 +54,7 @@ BACKBONE_REGISTRY: dict[str, BackboneSpec] = {}
 def register_backbone(
     name: str,
     model_class: type,
-    config_class: Optional[type] = None,
+    config_class: type | None = None,
     aliases: Iterable[str] = (),
     model_class_names: Iterable[str] = (),
 ) -> BackboneSpec:
@@ -67,18 +67,22 @@ def register_backbone(
         aliases=alias_tuple,
         model_class_names=tuple(model_class_names),
     )
-    for key in (normalized, *alias_tuple):
-        if key in BACKBONE_REGISTRY:
+    keys = (normalized, *alias_tuple)
+    seen = set()
+    for key in keys:
+        if key in seen or key in BACKBONE_REGISTRY:
             raise ValueError(f"Backbone {key!r} is already registered")
+        seen.add(key)
+    for key in keys:
         BACKBONE_REGISTRY[key] = spec
     return spec
 
 
-def normalize_backbone_type(backbone_type: Optional[str]) -> str:
+def normalize_backbone_type(backbone_type: str | None) -> str:
     return (backbone_type or "auto").replace("-", "_").lower()
 
 
-def get_backbone(backbone_type: Optional[str]) -> Optional[BackboneSpec]:
+def get_backbone(backbone_type: str | None) -> BackboneSpec | None:
     normalized = normalize_backbone_type(backbone_type)
     if normalized == "auto":
         return None
