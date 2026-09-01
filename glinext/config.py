@@ -1340,10 +1340,15 @@ class StructuringHeadConfig(BaseHeadConfig):
     # the spurious order signal of the data. When False, falls back to the
     # original positional loss.
     use_anchor_matching: bool = True
-    # Loss reduction over the masked BIO/span tensor. "sum" matches GLiNER
+    # Loss reduction over the masked BIO tensor. "sum" matches GLiNER
     # behaviour; "mean" normalises by the number of valid elements which
     # decouples gradient magnitude from anchor count and sequence length.
     bio_loss_reduction: str = "sum"  # "sum" | "mean"
+    # The auxiliary span objective has a different population from token BIO.
+    # Its default mean divides by sum_b(active_spans_b * active_fields_b),
+    # intentionally leaving record anchors as predictions for each span/field
+    # cell. ``sum`` preserves the historical unnormalised objective.
+    span_loss_reduction: str = "mean"  # "sum" | "mean"
     # GLiNER-style negative sampling on BIO/span losses. ``negatives`` is the
     # keep-rate for negative-labelled positions; ``masking`` selects the
     # granularity at which negatives are sampled.
@@ -1514,8 +1519,11 @@ class StructuringHeadConfig(BaseHeadConfig):
             or not 0.0 <= self.negatives <= 1.0
         ):
             raise ValueError("negatives must be finite and in [0, 1]")
-        if self.bio_loss_reduction not in {"sum", "mean"}:
-            raise ValueError("bio_loss_reduction must be 'sum' or 'mean'")
+        for name in ("bio_loss_reduction", "span_loss_reduction"):
+            value = str(getattr(self, name)).lower()
+            if value not in {"sum", "mean"}:
+                raise ValueError(f"{name} must be 'sum' or 'mean'")
+            setattr(self, name, value)
         from .layers.position import (
             FixedSinusoidal1DPositionEmbedding,
             PositionEmbedding,

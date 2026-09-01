@@ -51,6 +51,11 @@ class StructuringHead(AnchoredSpanExtractionHead):
 
         # Loss-shaping config
         self.bio_loss_reduction = getattr(struct_cfg, "bio_loss_reduction", "sum")
+        self.span_loss_reduction = getattr(
+            struct_cfg,
+            "span_loss_reduction",
+            "mean",
+        )
         self.negatives = getattr(struct_cfg, "negatives", 1.0)
         self.masking_mode = getattr(struct_cfg, "masking", "none")
 
@@ -445,6 +450,59 @@ class StructuringHead(AnchoredSpanExtractionHead):
             return (weighted_losses * full_mask).sum() / denom
         return (weighted_losses * full_mask).sum()
 
+    def _reduce_span_loss(
+        self,
+        weighted_losses,
+        loss_mask,
+        span_mask,
+        child_mask,
+    ):
+        """Reduce auxiliary span loss over active span/field cells.
+
+        Span proposals are shared by the record-anchor axis. Normalising by
+        ``sum_b(S_b * C_b)`` keeps the auxiliary loss stable across padded
+        batch/group, span, and field dimensions without averaging away the
+        record-anchor predictions made for each active span/field cell.
+        """
+
+        total = (weighted_losses * loss_mask).sum()
+        if self.span_loss_reduction == "sum":
+            return total
+        span_counts = span_mask.to(weighted_losses.dtype).sum(dim=1)
+        class_counts = child_mask.to(weighted_losses.dtype).sum(dim=1)
+        denominator = (span_counts * class_counts).sum().clamp(min=1.0)
+        return total / denominator
+
+    def _span_loss(
+        self,
+        span_logits,
+        span_labels,
+        anchor_mask,
+        span_mask,
+        child_mask,
+        base_loss_fn,
+    ):
+        """Positional span loss with span-specific reduction."""
+
+        min_A = min(span_logits.shape[1], span_labels.shape[2])
+        min_S = min(span_logits.shape[2], span_labels.shape[1])
+        min_C = min(span_logits.shape[3], span_labels.shape[3])
+
+        pred = span_logits[:, :min_A, :min_S, :min_C]
+        labels = span_labels[:, :min_S, :min_A, :min_C].permute(0, 2, 1, 3)
+        losses = base_loss_fn(pred, labels)
+        full_mask = (
+            anchor_mask[:, :min_A].to(losses.dtype)[:, :, None, None]
+            * span_mask[:, :min_S].to(losses.dtype)[:, None, :, None]
+            * child_mask[:, :min_C].to(losses.dtype)[:, None, None, :]
+        )
+        return self._reduce_span_loss(
+            losses,
+            full_mask,
+            span_mask[:, :min_S],
+            child_mask[:, :min_C],
+        )
+
     @staticmethod
     def _apply_negative_mask(full_mask, negative_mask):
         """Fold sampling into the loss mask, including the mean denominator."""
@@ -556,7 +614,12 @@ class StructuringHead(AnchoredSpanExtractionHead):
             * child_mask[:, :min_C].float()[:, None, None, :]
         )
         loss_mask = self._apply_negative_mask(full_mask, neg_mask)
-        return self._reduce(losses, loss_mask)
+        return self._reduce_span_loss(
+            losses,
+            loss_mask,
+            span_mask[:, :min_S],
+            child_mask[:, :min_C],
+        )
 
     # ── Positional (non-matched) losses with stats ───────────────────
 
