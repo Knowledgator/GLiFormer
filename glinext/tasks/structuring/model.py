@@ -824,15 +824,6 @@ class StructuringHead(NERHead):
             loss_fn=objectness_loss_fn,
         )
 
-    def _reduce_entity_loss(self, loss, entity_mask, child_mask):
-        """Normalize NER by supervised entities and active field classes."""
-
-        if loss is None or self.bio_loss_reduction == "sum":
-            return loss
-        entity_count = entity_mask.to(loss.dtype).sum(dim=1)
-        class_count = child_mask.to(loss.dtype).sum(dim=1)
-        return loss / (entity_count * class_count).sum().clamp(min=1.0)
-
     def forward(
         self,
         shared,
@@ -969,11 +960,11 @@ class StructuringHead(NERHead):
         supervised_anchor_mask = anchor_mask.bool()
         relation_loss = None
         combined_loss = None
-        entity_loss = self._reduce_entity_loss(
-            entity_output.loss,
-            entity_mask,
-            flat_inputs.child_mask,
-        )
+        # Stage 1 is a complete NER pass, and ``NERHead._bio_loss`` already
+        # normalizes it over the active (word x field) cells -- for the reused
+        # standalone head too. Reducing again here would divide the entity
+        # signal a second time and shrink it away from the stage-2 terms.
+        entity_loss = entity_output.loss
         if entity_loss is not None:
             combined_loss = self.entity_loss_coef * entity_loss
 

@@ -368,6 +368,9 @@ class TaskHead(ABC, nn.Module):
         if hasattr(task_cfg, "represent_spans"):
             self.represent_spans = bool(task_cfg.represent_spans)
             self.span_loss_coef = float(task_cfg.span_loss_coef)
+            self.span_loss_reduction = str(
+                getattr(task_cfg, "span_loss_reduction", "mean")
+            )
         if getattr(self, "represent_spans", False):
             from gliner.modeling.span_rep import SpanRepLayer
             self.span_rep_layer = SpanRepLayer(

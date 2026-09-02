@@ -149,10 +149,21 @@ class NERHead(AnchoredSpanExtractionHead):
             )
             if span_labels is not None and span_logits_out is not None:
                 span_losses = loss_fn(span_logits_out, span_labels)
-                span_loss_mask = span_mask.unsqueeze(-1) * child_mask.unsqueeze(1)
+                # One structured prediction per (span, class) cell. Any extra
+                # trailing channel is part of that cell, so it is masked but
+                # kept out of the denominator, as the token BIO loss does.
+                span_cell_mask = span_mask.unsqueeze(-1) * child_mask.unsqueeze(1)
+                span_loss_mask = span_cell_mask
                 if span_losses.dim() == 4:
                     span_loss_mask = span_loss_mask.unsqueeze(-1)
                 span_loss = (span_losses * span_loss_mask).sum()
+                if self.span_loss_reduction == "mean":
+                    # Without this the auxiliary span term is a sum while the
+                    # token term is a mean, so it outweighs it by roughly the
+                    # active cell count (BN x S x C).
+                    span_loss = span_loss / span_cell_mask.to(
+                        span_loss.dtype
+                    ).sum().clamp(min=1.0)
                 token_loss_coef = getattr(self.config, "token_loss_coef", 1.0)
                 loss = token_loss_coef * loss + self.span_loss_coef * span_loss
 

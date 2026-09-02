@@ -439,6 +439,20 @@ class BaseHeadConfig(AnchorHeadConfig):
     represent_spans: bool = False
     neg_spans_ratio: float = 1.0
     span_loss_coef: float = 1.0
+    # The auxiliary span objective has a different population from token BIO.
+    # Its default mean divides by sum_b(active_spans_b * active_classes_b), so
+    # the term does not grow with the number of sampled span candidates or
+    # prompted classes. ``sum`` preserves the historical unnormalised
+    # objective, which is only comparable to a mean-reduced token loss after
+    # scaling ``span_loss_coef`` by that cell count.
+    span_loss_reduction: str = "mean"  # "sum" | "mean"
+
+    def __post_init__(self):
+        super().__post_init__()
+        value = str(self.span_loss_reduction).lower()
+        if value not in {"sum", "mean"}:
+            raise ValueError("span_loss_reduction must be 'sum' or 'mean'")
+        self.span_loss_reduction = value
 
 
 @dataclass
@@ -1093,7 +1107,8 @@ class OpenRelexHeadConfig(BaseHeadConfig):
     anchor_objectness: bool = False
     anchor_objectness_loss_coef: float = 1.0
     anchor_objectness_threshold: Optional[float] = None
-    # Reduction for the masked entity, role, and endpoint losses.
+    # Reduction for the masked role and endpoint losses. The entity BIO loss
+    # is normalized by the NER stage itself and is not reduced again here.
     bio_loss_reduction: str = "sum"
 
     def __post_init__(self):
@@ -1322,11 +1337,6 @@ class _StructuringHeadConfigBase(BaseHeadConfig):
     # behaviour; "mean" normalises by the number of valid elements which
     # decouples gradient magnitude from anchor count and sequence length.
     bio_loss_reduction: str = "sum"  # "sum" | "mean"
-    # The auxiliary span objective has a different population from token BIO.
-    # Its default mean divides by sum_b(active_spans_b * active_fields_b),
-    # intentionally leaving record anchors as predictions for each span/field
-    # cell. ``sum`` preserves the historical unnormalised objective.
-    span_loss_reduction: str = "mean"  # "sum" | "mean"
     # GLiNER-style negative sampling on BIO/span losses. ``negatives`` is the
     # keep-rate for negative-labelled positions; ``masking`` selects the
     # granularity at which negatives are sampled.
@@ -1621,8 +1631,10 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     # Wrong record anchors already provide negative membership supervision.
     neg_spans_ratio: float = 0.0
     entity_loss_coef: float = 1.0
-    # Entity-first structuring losses are normalized by default. Explicit ``sum`` is
-    # retained for loading/training legacy configurations.
+    # Entity-first structuring losses are normalized by default. This governs
+    # the stage-2 record-membership terms; the stage-1 entity BIO loss is
+    # normalized by the NER stage itself. Explicit ``sum`` is retained for
+    # loading/training legacy configurations.
     bio_loss_reduction: str = "mean"
     # Explicit stage-2 record-membership coefficient. ``None`` migrates the
     # historical use of ``span_loss_coef`` without changing old checkpoints.

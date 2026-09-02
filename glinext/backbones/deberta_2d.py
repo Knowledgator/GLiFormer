@@ -504,18 +504,43 @@ class LayoutDebertaPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["LayoutDebertaLayer"]
 
+    @staticmethod
+    def _needs_init(tensor) -> bool:
+        """Whether ``tensor`` still has to be initialized by this model.
+
+        Writing through ``.data`` is invisible to Transformers' guarded
+        initializers, so the loader's own marker is checked here instead. Only
+        tensors that the checkpoint did not provide are (re)initialized.
+        """
+        return tensor is not None and not getattr(
+            tensor, "_is_hf_initialized", False,
+        )
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
+            if self._needs_init(module.weight):
+                module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if self._needs_init(module.bias):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+            if self._needs_init(module.weight):
+                module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
-            module.weight.data.fill_(1.0)
-            module.bias.data.zero_()
+            if self._needs_init(module.weight):
+                module.weight.data.fill_(1.0)
+            if self._needs_init(module.bias):
+                module.bias.data.zero_()
+        elif isinstance(module, LayoutDebertaEmbeddings):
+            # ``position_ids`` is non-persistent, so it is in no checkpoint and
+            # comes back from a meta-device load as uninitialized memory rather
+            # than the arange it was constructed with. Rebuild it here, the way
+            # Transformers' own embedding modules do.
+            if self._needs_init(getattr(module, "position_ids", None)):
+                module.position_ids.copy_(
+                    torch.arange(module.position_ids.shape[-1]).expand((1, -1))
+                )
 
 
 class LayoutDebertaModel(LayoutDebertaPreTrainedModel):

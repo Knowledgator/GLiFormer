@@ -560,16 +560,6 @@ class OpenRelexHead(NERHead):
             loss_fn=base_loss_fn,
         )
 
-    def _reduce_entity_loss(self, loss, word_mask, relation_mask):
-        if loss is None or self.bio_loss_reduction == "sum":
-            return loss
-        per_row_elements = (
-            word_mask.to(loss.dtype).sum(dim=1)
-            * relation_mask.to(loss.dtype).sum(dim=1)
-            * 3
-        )
-        return loss / per_row_elements.sum().clamp(min=1)
-
     def forward(
         self,
         shared,
@@ -664,11 +654,10 @@ class OpenRelexHead(NERHead):
         if self.use_anchor_objectness:
             objectness_logits = self.objectness_head(anchors).squeeze(-1)
 
-        entity_loss = self._reduce_entity_loss(
-            entity_output.loss,
-            entity_output.extra.get("mask", flat_inputs.mask),
-            flat_inputs.child_mask,
-        )
+        # ``NERHead._bio_loss`` already normalizes the entity BIO loss over the
+        # active (word x relation) cells, so it is consumed as returned. A
+        # second reduction here would rescale the same population twice.
+        entity_loss = entity_output.loss
         combined_loss = None
         if entity_loss is not None:
             combined_loss = self.entity_loss_coef * entity_loss

@@ -7,11 +7,9 @@ class SpatialEmbeddings(nn.Module):
         super().__init__()
 
         hidden_size = getattr(config, "hidden_size")
-        layer_norm_eps = getattr(config, "layer_norm_eps", 1e-7)
         dropout = getattr(config, "hidden_dropout_prob", 0.1)
         self.max_2d_position_embeddings = getattr(config, "max_2d_position_embeddings", 1024)
 
-        self.LayerNorm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
         self.dropout = nn.Dropout(dropout)
 
         self.x_position_embeddings = nn.Embedding(self.max_2d_position_embeddings, config.coordinate_size)
@@ -52,8 +50,17 @@ class SpatialEmbeddings(nn.Module):
 
         spatial_position_embeddings = self.calculate_spatial_position_embeddings(bbox)
 
+        # Deliberately no LayerNorm on this branch. The caller adds the result
+        # to the word embeddings and normalizes the sum with its own shared
+        # LayerNorm, which is what LayoutLMv2/v3 do. Normalizing here instead
+        # rescales the branch to unit per-dim variance: at initialization that
+        # is ~8x the norm of the word embeddings, it leaves the encoder input
+        # nearly orthogonal to the text-only input (cosine 0.08), and the model
+        # then predicts nothing whenever boxes are supplied. The LayerNorm also
+        # normalizes away the gradient along its own scale direction, so the
+        # gain never shrinks: after 10k steps it had moved 1.0 -> 0.999951,
+        # against the ~0.01 it would need to stop dominating.
         embeddings = self.proj(spatial_position_embeddings)
 
-        embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
