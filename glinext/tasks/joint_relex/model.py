@@ -854,8 +854,9 @@ class JointRelexHead(NERHead):
             dtype=torch.bool, device=span_rep.device,
         )
         key_mask = span_mask.bool()
-        for start in range(0, entity_count, self.relation_neighbor_chunk_size):
-            end = min(start + self.relation_neighbor_chunk_size, entity_count)
+        chunk_size = self.relation_neighbor_chunk_size or max(entity_count, 1)
+        for start in range(0, entity_count, chunk_size):
+            end = min(start + chunk_size, entity_count)
             scores = torch.sigmoid(torch.bmm(
                 span_rep[:, start:end], span_rep.transpose(1, 2),
             ))
@@ -901,8 +902,9 @@ class JointRelexHead(NERHead):
         """Compute the dense dot-adjacency objective without storing its matrix."""
         total_loss = span_rep.new_zeros(())
         entity_count = span_rep.shape[1]
-        for start in range(0, entity_count, self.relation_neighbor_chunk_size):
-            end = min(start + self.relation_neighbor_chunk_size, entity_count)
+        chunk_size = self.relation_neighbor_chunk_size or max(entity_count, 1)
+        for start in range(0, entity_count, chunk_size):
+            end = min(start + chunk_size, entity_count)
             probabilities = torch.sigmoid(torch.bmm(
                 span_rep[:, start:end], span_rep.transpose(1, 2),
             ))

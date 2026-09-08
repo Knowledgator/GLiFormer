@@ -12,6 +12,14 @@ from gliner.modeling.layers import LayersFuser
 from gliner.utils import MissedPackageException, is_module_available
 
 from glinext.backbones import BackboneSpec, get_backbone
+from glinext.backbones.flash_deberta import (
+    EAGER,
+    FLASH_AUTO,
+    flash_kernels_available,
+    is_flash_kernel,
+    normalize_attn_kernel,
+    padding_lengths,
+)
 
 
 IS_LLM2VEC = is_module_available("llm2vec")
@@ -35,7 +43,15 @@ if IS_TURBOT5:
     from turbot5.model.modeling import T5EncoderModel as FlashT5EncoderModel
 
 if IS_FLASHDEBERTA:
-    from flashdeberta import FlashDebertaV2Model
+    try:
+        from flashdeberta import FlashDebertaV2Model
+    except Exception:  # pragma: no cover - flashdeberta tracks transformers internals
+        warnings.warn(
+            "flashdeberta is installed but could not be imported; falling back to the "
+            "stock DeBERTa encoder.",
+            stacklevel=2,
+        )
+        IS_FLASHDEBERTA = False
 
 if IS_PEFT:
     from peft import LoraConfig, get_peft_model
@@ -47,6 +63,42 @@ def hidden_size(model_config: Any) -> int:
         if value is not None:
             return int(value)
     raise ValueError("Could not infer hidden size from encoder config")
+
+
+def _requested_flash_kernel(config: Any, labels_encoder: bool = False) -> Optional[str]:
+    """The flashdeberta kernel this config asks for, if any.
+
+    ``USE_FLASHDEBERTA`` predates the config field and stays the global switch,
+    labels encoder included; ``_attn_implementation`` names the kernel for the
+    text encoder only, the way the rest of this class reads it.
+    """
+    kernel = None
+    if not labels_encoder:
+        kernel = is_flash_kernel(getattr(config, "_attn_implementation", None))
+    if kernel is None and os.environ.get("USE_FLASHDEBERTA", ""):
+        kernel = FLASH_AUTO
+    return kernel
+
+
+def _configure_layout_flash_attention(encoder_config: Any, requested: Optional[str]) -> None:
+    """Point the ``deberta_2d`` backbone at the flashdeberta kernels.
+
+    The layout backbone runs those kernels itself, through ``attn_kernel``, and
+    ``transformers`` rejects ``flash_attention_2`` for any model that does not
+    declare FA2 support -- so the request moves onto ``attn_kernel`` and the HF
+    field is left at eager.
+    """
+    if is_flash_kernel(getattr(encoder_config, "_attn_implementation", None)) is not None:
+        encoder_config._attn_implementation = EAGER
+    kernel = normalize_attn_kernel(requested or getattr(encoder_config, "attn_kernel", EAGER))
+    if kernel != EAGER and not flash_kernels_available():
+        warnings.warn(
+            f"attn_kernel={kernel!r} needs the flashdeberta package (pip install flashdeberta); "
+            "falling back to eager attention.",
+            stacklevel=2,
+        )
+        kernel = EAGER
+    encoder_config.attn_kernel = kernel
 
 
 def _coerce_backbone_config(encoder_config: Any, backbone: Optional[BackboneSpec]) -> Any:
@@ -97,6 +149,10 @@ class Transformer(nn.Module):
         if config._attn_implementation is not None and not labels_encoder:
             encoder_config._attn_implementation = config._attn_implementation
 
+        flash_kernel = _requested_flash_kernel(config, labels_encoder)
+        if backbone is not None and backbone.name == "deberta_2d":
+            _configure_layout_flash_attention(encoder_config, flash_kernel)
+
         config_name = encoder_config.__class__.__name__
         kwargs: Dict[str, Any] = {}
 
@@ -121,9 +177,19 @@ class Transformer(nn.Module):
                 ModelClass = T5EncoderModel
         elif config_name in {"DebertaV2Config"}:
             custom = True
-            if os.environ.get("USE_FLASHDEBERTA", "") and IS_FLASHDEBERTA:
+            # Both classes pick their attention themselves, and neither declares
+            # FA2 support to transformers, so the HF field stays at eager.
+            if is_flash_kernel(getattr(encoder_config, "_attn_implementation", None)) is not None:
+                encoder_config._attn_implementation = EAGER
+            if flash_kernel is not None and IS_FLASHDEBERTA:
                 ModelClass = FlashDebertaV2Model
             else:
+                if flash_kernel is not None:
+                    warnings.warn(
+                        "Flash attention was requested but the flashdeberta package is missing "
+                        "(pip install flashdeberta); falling back to the stock DeBERTa encoder.",
+                        stacklevel=2,
+                    )
                 ModelClass = DebertaV2Model
         else:
             custom = False
@@ -194,6 +260,14 @@ class Transformer(nn.Module):
             model_name = self.model.__class__.__name__
 
             if model_name in {"DebertaV2Model", "DebertaModel", "FlashDebertaV2Model", "LayoutDebertaModel"}:
+                if model_name == "FlashDebertaV2Model" and padding_lengths(mask_info["block_mask"]) is None:
+                    raise ValueError(
+                        "FlashDebertaV2Model masks attention with one key length per example, so "
+                        "it cannot honour this batch's attention mask (packed segments or left "
+                        "padding) -- tokens would attend where they must not. Use "
+                        "backbone_type='deberta_2d', whose flash kernels take the block mask, or "
+                        "turn flash attention off."
+                    )
                 output = self._forward_deberta(
                     input_ids=input_ids,
                     model_kwargs=model_kwargs,

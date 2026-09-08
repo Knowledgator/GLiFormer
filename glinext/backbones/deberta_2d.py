@@ -17,6 +17,20 @@ from transformers.models.deberta_v2.modeling_deberta_v2 import (
 )
 
 from ..layers.positional_layer import SpatialEmbeddings
+from .flash_deberta import (
+    EAGER,
+    FLASH_BIAS,
+    FLASH_DISENTANGLED,
+    SUPPORTED_HEAD_DIMS,
+    FlashAttentionContext,
+    flash_attention_bias,
+    flash_attention_disentangled,
+    flash_kernels_available,
+    flash_runnable,
+    normalize_attn_kernel,
+    padding_lengths,
+    warn_once,
+)
 
 
 def _prepare_layout_input_mask(
@@ -120,6 +134,7 @@ class LayoutDebertaConfig(HFDebertaV2Config):
         layout_position_buckets: int = 32,
         layout_max_relative_positions: int = 1024,
         layout_bias_propagation: str = "all_layers",
+        attn_kernel: str = EAGER,
         **kwargs,
     ):
         layout_embedding_type = kwargs.pop("spatial_embedding_type", layout_embedding_type)
@@ -136,6 +151,7 @@ class LayoutDebertaConfig(HFDebertaV2Config):
         self.layout_position_buckets = layout_position_buckets
         self.layout_max_relative_positions = layout_max_relative_positions
         self.layout_bias_propagation = layout_bias_propagation
+        self.attn_kernel = normalize_attn_kernel(attn_kernel)
 
 
 class LayoutDebertaEmbeddings(nn.Module):
@@ -273,7 +289,20 @@ class LayoutDisentangledSelfAttention(DisentangledSelfAttention):
         relative_pos=None,
         rel_embeddings=None,
         layout_attention_bias=None,
+        flash_context=None,
     ):
+        if flash_context is not None and not output_attentions:
+            context_layer = self._flash_forward(
+                hidden_states,
+                flash_context,
+                query_states=query_states,
+                relative_pos=relative_pos,
+                rel_embeddings=rel_embeddings,
+                layout_attention_bias=layout_attention_bias,
+            )
+            if context_layer is not None:
+                return context_layer, None
+
         if query_states is None:
             query_states = hidden_states
         query_layer = self.transpose_for_scores(self.query_proj(query_states), self.num_attention_heads)
@@ -324,6 +353,159 @@ class LayoutDisentangledSelfAttention(DisentangledSelfAttention):
             return context_layer, attention_probs
         return context_layer, None
 
+    def _flash_forward(
+        self,
+        hidden_states,
+        flash_context,
+        query_states=None,
+        relative_pos=None,
+        rel_embeddings=None,
+        layout_attention_bias=None,
+    ) -> Optional[torch.Tensor]:
+        """Attention through the Triton kernels, or ``None`` to fall back to eager."""
+        if query_states is None:
+            query_states = hidden_states
+        heads = self.num_attention_heads
+        batch, query_length, _ = query_states.shape
+        key_length = hidden_states.size(1)
+
+        query_layer = self.transpose_for_scores(self.query_proj(query_states), heads)
+        if not flash_runnable(query_layer):
+            warn_once(
+                "Flash attention needs the flashdeberta kernels, a CUDA tensor in fp16/bf16 and a "
+                f"head dim in {sorted(SUPPORTED_HEAD_DIMS)}; got device={query_layer.device.type}, "
+                f"dtype={query_layer.dtype}, head_dim={query_layer.size(-1)}. "
+                "Falling back to eager attention."
+            )
+            return None
+        dropout_prob = getattr(self.dropout, "p", 0.0)
+        if self.training and dropout_prob:
+            warn_once(
+                "The flash kernels have no attention-probability dropout, so "
+                f"attention_probs_dropout_prob={dropout_prob} is ignored while attn_kernel is a flash "
+                "kernel. Set it to 0 to train on the objective the eager path would give you."
+            )
+
+        key_layer = self.transpose_for_scores(self.key_proj(hidden_states), heads)
+        value_layer = self.transpose_for_scores(self.value_proj(hidden_states), heads)
+
+        scale_factor = 1
+        if "c2p" in self.pos_att_type:
+            scale_factor += 1
+        if "p2c" in self.pos_att_type:
+            scale_factor += 1
+        sm_scale = 1.0 / float(scaled_size_sqrt(query_layer, scale_factor))
+
+        query = query_layer.view(batch, heads, query_length, -1)
+        key = key_layer.view(batch, heads, key_length, -1)
+        value = value_layer.view(batch, heads, key_length, -1)
+
+        # The disentangled kernel rebuilds the c2p/p2c terms from the position
+        # projections, which leaves it no room for a layout bias and no way to
+        # express a mask that is not plain right padding.
+        disentangled = (
+            flash_context.kernel != FLASH_BIAS
+            and flash_context.seq_lengths is not None
+            and layout_attention_bias is None
+            and self.relative_attention
+            and rel_embeddings is not None
+            and query_length == key_length
+        )
+        if flash_context.kernel == FLASH_DISENTANGLED and not disentangled:
+            warn_once(
+                "attn_kernel='flash_disentangled' cannot carry a layout bias, a packed attention mask "
+                "or caller-supplied relative positions; using the bias kernel for those batches."
+            )
+
+        if disentangled:
+            pos_key, pos_query = self._flash_position_scores(query, key, rel_embeddings)
+            context_layer = flash_attention_disentangled(
+                query,
+                key,
+                value,
+                flash_context.seq_lengths,
+                pos_key,
+                pos_query,
+                sm_scale,
+                self.position_buckets,
+                self.max_relative_positions,
+            )
+        else:
+            bias = self._flash_attention_bias(
+                query_layer,
+                key_layer,
+                relative_pos,
+                rel_embeddings,
+                scale_factor,
+                layout_attention_bias,
+                flash_context.mask_bias(query.dtype),
+                (batch, heads, query_length, key_length),
+            )
+            context_layer = flash_attention_bias(query, key, value, bias, sm_scale)
+
+        context_layer = context_layer.transpose(1, 2).contiguous()
+        return context_layer.view(batch, query_length, -1)
+
+    def _flash_position_scores(self, query, key, rel_embeddings):
+        """Content-to-position scores the disentangled kernel gathers from.
+
+        Shaped ``(B, H, L, 2 * att_span)``: the kernel picks the bucket for each
+        query/key pair itself, so the full ``L x L`` bias is never built.
+        """
+        att_span = self.pos_ebd_size
+        rel_embeddings = self.pos_dropout(rel_embeddings)[: att_span * 2, :].unsqueeze(0)
+        heads = self.num_attention_heads
+
+        def project(layer):
+            projected = layer(rel_embeddings)
+            return projected.view(1, -1, heads, self.attention_head_size).permute(0, 2, 1, 3)
+
+        pos_key = pos_query = None
+        if "c2p" in self.pos_att_type:
+            key_proj = self.key_proj if self.share_att_key else self.pos_key_proj
+            pos_key = torch.matmul(query, project(key_proj).transpose(-1, -2))
+        if "p2c" in self.pos_att_type:
+            query_proj = self.query_proj if self.share_att_key else self.pos_query_proj
+            pos_query = torch.matmul(key, project(query_proj).transpose(-1, -2))
+        return pos_key, pos_query
+
+    def _flash_attention_bias(
+        self,
+        query_layer,
+        key_layer,
+        relative_pos,
+        rel_embeddings,
+        scale_factor,
+        layout_attention_bias,
+        mask_bias,
+        shape,
+    ) -> torch.Tensor:
+        """Every additive term of the attention scores, as one ``(B, H, Q, K)`` bias.
+
+        The kernel only broadcasts a size-1 batch dimension and its backward
+        pass accumulates the bias gradient without synchronizing across the head
+        grid, so the result is always materialized at the full shape.
+        """
+        batch, heads, query_length, key_length = shape
+        dtype = query_layer.dtype
+
+        bias = None
+        if self.relative_attention and rel_embeddings is not None:
+            rel_att = self.disentangled_attention_bias(
+                query_layer,
+                key_layer,
+                relative_pos,
+                self.pos_dropout(rel_embeddings),
+                scale_factor,
+            )
+            bias = rel_att.view(batch, heads, query_length, key_length).to(dtype=dtype)
+        if layout_attention_bias is not None:
+            layout_attention_bias = layout_attention_bias.to(dtype=dtype)
+            bias = layout_attention_bias if bias is None else bias + layout_attention_bias
+        if bias is None:
+            return mask_bias.expand(batch, heads, query_length, key_length).contiguous()
+        return bias + mask_bias
+
 
 class LayoutDebertaAttention(DebertaV2Attention):
     def __init__(self, config):
@@ -341,6 +523,7 @@ class LayoutDebertaAttention(DebertaV2Attention):
         relative_pos=None,
         rel_embeddings=None,
         layout_attention_bias=None,
+        flash_context=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         self_output, att_matrix = self.self(
             hidden_states,
@@ -350,6 +533,7 @@ class LayoutDebertaAttention(DebertaV2Attention):
             relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
             layout_attention_bias=layout_attention_bias,
+            flash_context=flash_context,
         )
         if query_states is None:
             query_states = hidden_states
@@ -373,6 +557,7 @@ class LayoutDebertaLayer(DebertaV2Layer):
         rel_embeddings=None,
         output_attentions: bool = False,
         layout_attention_bias=None,
+        flash_context=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         attention_output, att_matrix = self.attention(
             hidden_states,
@@ -382,6 +567,7 @@ class LayoutDebertaLayer(DebertaV2Layer):
             relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
             layout_attention_bias=layout_attention_bias,
+            flash_context=flash_context,
         )
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
@@ -396,6 +582,7 @@ class LayoutDebertaEncoder(DebertaV2Encoder):
         self.layer = nn.ModuleList([LayoutDebertaLayer(config) for _ in range(config.num_hidden_layers)])
         self.layout_relative_attention = getattr(config, "layout_relative_attention", False)
         self.layout_bias_propagation = getattr(config, "layout_bias_propagation", "all_layers")
+        self.attn_kernel = normalize_attn_kernel(getattr(config, "attn_kernel", EAGER))
         if self.layout_relative_attention:
             self.layout_position_buckets = getattr(config, "layout_position_buckets", 32)
             self.layout_max_relative_positions = getattr(config, "layout_max_relative_positions", 1024)
@@ -427,6 +614,36 @@ class LayoutDebertaEncoder(DebertaV2Encoder):
             bias = bias * prepared_layout_mask[:, None, None, None].to(dtype=bias.dtype)
         return bias
 
+    def _resolve_flash_context(
+        self,
+        attention_mask,
+        custom_relative_pos: bool,
+        query_states,
+        output_attentions: bool,
+    ) -> Optional[FlashAttentionContext]:
+        """Flash state for this pass, or ``None`` when the eager path has to run.
+
+        Resolved once per pass and shared by every layer: probing the mask is
+        cheap but not free, and the additive mask bias it may need is worth
+        building once.
+        """
+        if self.attn_kernel == EAGER or output_attentions:
+            return None
+        if not flash_kernels_available():
+            warn_once(
+                f"attn_kernel={self.attn_kernel!r} needs the flashdeberta Triton kernels, which are "
+                "not installed (pip install flashdeberta). Falling back to eager attention."
+            )
+            return None
+        seq_lengths = None
+        if self.attn_kernel != FLASH_BIAS and query_states is None and not custom_relative_pos:
+            seq_lengths = padding_lengths(attention_mask)
+        return FlashAttentionContext(
+            kernel=self.attn_kernel,
+            attention_mask=attention_mask,
+            seq_lengths=seq_lengths,
+        )
+
     def _layout_bias_for_layer(self, layout_attention_bias, layer_idx: int):
         if layout_attention_bias is None:
             return None
@@ -454,9 +671,16 @@ class LayoutDebertaEncoder(DebertaV2Encoder):
         else:
             input_mask = attention_mask.sum(-2) > 0
         attention_mask = self.get_attention_mask(attention_mask)
+        custom_relative_pos = relative_pos is not None
         relative_pos = self.get_rel_pos(hidden_states, query_states, relative_pos)
         if layout_attention_bias is None:
             layout_attention_bias = self.get_layout_attention_bias(bbox, layout_input_mask)
+        flash_context = self._resolve_flash_context(
+            attention_mask,
+            custom_relative_pos=custom_relative_pos,
+            query_states=query_states,
+            output_attentions=output_attentions,
+        )
 
         all_hidden_states: Optional[Tuple[torch.Tensor, ...]] = (hidden_states,) if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -473,6 +697,7 @@ class LayoutDebertaEncoder(DebertaV2Encoder):
                 rel_embeddings=rel_embeddings,
                 output_attentions=output_attentions,
                 layout_attention_bias=self._layout_bias_for_layer(layout_attention_bias, i),
+                flash_context=flash_context,
             )
             if output_attentions:
                 all_attentions = all_attentions + (attn_weights,)

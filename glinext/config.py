@@ -1013,7 +1013,8 @@ class JointRelexHeadConfig(BaseHeadConfig):
     # Sparse top-k neighbor selection currently matches the GLiNER ``dot``
     # adjacency exactly while evaluating it in bounded query chunks.
     relation_top_k_neighbors: Optional[int] = None
-    relation_neighbor_chunk_size: int = 64
+    # None disables query chunking and processes the full entity axis at once.
+    relation_neighbor_chunk_size: Optional[int] = 64
 
     def __post_init__(self):
         super().__post_init__()
@@ -1070,12 +1071,17 @@ class JointRelexHeadConfig(BaseHeadConfig):
                 isinstance(value, bool) or int(value) != value or value <= 0
             ):
                 raise ValueError(f"{name} must be a positive integer or None")
-        if (
-            isinstance(self.relation_neighbor_chunk_size, bool)
-            or int(self.relation_neighbor_chunk_size) != self.relation_neighbor_chunk_size
-            or self.relation_neighbor_chunk_size <= 0
-        ):
-            raise ValueError("relation_neighbor_chunk_size must be a positive integer")
+        value = self.relation_neighbor_chunk_size
+        if value is not None:
+            try:
+                chunk_size = int(value)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    "relation_neighbor_chunk_size must be a positive integer or None"
+                ) from error
+            if isinstance(value, bool) or chunk_size != value or chunk_size <= 0:
+                raise ValueError("relation_neighbor_chunk_size must be a positive integer or None")
+            self.relation_neighbor_chunk_size = chunk_size
         if (
             self.relation_top_k_neighbors is not None
             and self.relations_layer != "dot"

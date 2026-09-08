@@ -9,6 +9,12 @@ from .deberta_2d import (
     LayoutDebertaConfig,
     LayoutDebertaModel,
 )
+from .flash_deberta import (
+    ATTN_KERNELS,
+    flash_kernels_available,
+    is_flash_kernel,
+    normalize_attn_kernel,
+)
 from .qwen3 import GLiNextQwen3Model, Qwen3BidirectionalModel
 from .qwen3_5 import (
     QWEN3_5_AVAILABLE,
@@ -132,17 +138,21 @@ if QWEN3_5_AVAILABLE:
     )
 
 __all__ = [
+    "ATTN_KERNELS",
     "BACKBONE_REGISTRY",
     "BackboneSpec",
     "available_backbones",
     "Deberta2DConfig",
     "Deberta2DModel",
+    "flash_kernels_available",
     "get_backbone",
     "GLiNextQwen3_5Model",
     "GLiNextQwen3_5TextModel",
     "GLiNextQwen3Model",
+    "is_flash_kernel",
     "LayoutDebertaConfig",
     "LayoutDebertaModel",
+    "normalize_attn_kernel",
     "normalize_backbone_type",
     "QWEN3_5_AVAILABLE",
     "Qwen3_5BidirectionalModel",
