@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gliformer"
+version = "0.1.0"
+description = "Multi-task information extraction framework with text, layout, vision, audio, and omni-modal GLiFormer models."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "GLiFormer contributors" },
+]
+dependencies = [
+  "accelerate>=1.1.0",
+  "gliner>=0.2.0",
+  "huggingface-hub>=0.20.0",
+  "numpy>=1.23.0",
+  "pillow>=9.0.0",
+  "pydantic>=1.10,<3",
+  "scipy>=1.9.0",
+  "torch>=2.0.0",
+  "transformers>=4.40.0",
+]
+
+[project.optional-dependencies]
+audio = [
+  "torchaudio>=2.0.0",
+]
+demo = [
+  "gradio>=4.0.0",
+  "gliner2[local]>=1.1.2",
+  "sentence-transformers>=2.2.0",
+]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.4.0",
+]
+flash = [
+  "flashdeberta>=0.0.7",
+]
+data = [
+  "datasets>=2.16.0",
+]
+pdf = [
+  "pymupdf>=1.23.0",
+  "pdfplumber>=0.10.0",
+]
+vision = [
+  "torchvision>=0.15.0",
+]
+all = [
+  "gradio>=4.0.0",
+  "datasets>=2.16.0",
+  "flashdeberta>=0.0.7",
+  "gliner2[local]>=1.1.2",
+  "pdfplumber>=0.10.0",
+  "pymupdf>=1.23.0",
+  "pytest>=8.0.0",
+  "sentence-transformers>=2.2.0",
+  "ruff>=0.4.0",
+  "torchaudio>=2.0.0",
+  "torchvision>=0.15.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["gliformer*", "eval_others*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
