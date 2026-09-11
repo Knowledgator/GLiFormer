@@ -78,6 +78,7 @@ class MediaBackboneEncoder(nn.Module):
         model_name: str | None = None,
         from_pretrained: bool = False,
         cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
     ) -> None:
         super().__init__()
         self._validate_class_contract()
@@ -97,6 +98,7 @@ class MediaBackboneEncoder(nn.Module):
         self.model = self._build_model(
             from_pretrained=from_pretrained,
             cache_dir=cache_dir,
+            local_files_only=local_files_only,
         )
         model_hidden_size = encoder_hidden_size(
             getattr(self.model, "config", None),
@@ -136,6 +138,7 @@ class MediaBackboneEncoder(nn.Module):
         self,
         from_pretrained: bool,
         cache_dir: str | Path | None,
+        local_files_only: bool = False,
     ) -> nn.Module:
         local_model = self._build_local_model()
         if local_model is not None:
@@ -151,6 +154,7 @@ class MediaBackboneEncoder(nn.Module):
             model_config = AutoConfig.from_pretrained(
                 self.model_name,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
                 trust_remote_code=True,
             )
 
@@ -163,6 +167,7 @@ class MediaBackboneEncoder(nn.Module):
             return AutoModel.from_pretrained(
                 self.model_name,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
                 trust_remote_code=True,
             )
         return AutoModel.from_config(model_config, trust_remote_code=True)
@@ -196,6 +201,7 @@ class MediaBiEncoder(nn.Module):
         config: Any,
         from_pretrained: bool = False,
         cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -211,6 +217,7 @@ class MediaBiEncoder(nn.Module):
                 config,
                 from_pretrained=from_pretrained,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
             ),
         )
 
@@ -229,6 +236,7 @@ class MediaBiEncoder(nn.Module):
             from_pretrained=from_pretrained,
             labels_encoder=True,
             cache_dir=cache_dir,
+            local_files_only=local_files_only,
         )
         output_hidden_size = int(get_config_value(config, "hidden_size"))
         label_hidden_size = hidden_size(self.labels_encoder.model.config)

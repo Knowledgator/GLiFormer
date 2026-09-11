@@ -191,15 +191,22 @@ class BaseGLiFormer(BaseGLiNER):
         self.model = model_cls(config, from_pretrained=backbone_from_pretrained, cache_dir=cache_dir, **kwargs)
         return self.model
 
-    def _create_data_processor(self, config, cache_dir, tokenizer=None, words_splitter=None, **kwargs):
+    def _create_data_processor(
+        self, config, cache_dir, tokenizer=None, words_splitter=None,
+        local_files_only=False, **kwargs,
+    ):
         """Create processor, loading labels tokenizer for bi-encoder mode."""
         if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir)
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.model_name, cache_dir=cache_dir, local_files_only=local_files_only,
+            )
             self._set_tokenizer_spec_tokens(tokenizer)
 
         labels_tokenizer = None
         if config.labels_encoder is not None:
-            labels_tokenizer = AutoTokenizer.from_pretrained(config.labels_encoder, cache_dir=cache_dir)
+            labels_tokenizer = AutoTokenizer.from_pretrained(
+                config.labels_encoder, cache_dir=cache_dir, local_files_only=local_files_only,
+            )
         else:
             variant = getattr(config, "model_variant", "")
             if variant in {"vision", "audio"}:

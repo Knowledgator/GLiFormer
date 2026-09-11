@@ -83,9 +83,13 @@ class TextEncoder(InputsEmbedsEncoderMixin, GLiNEREncoder):
         config: Any,
         from_pretrained: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
+        local_files_only: bool = False,
     ) -> None:
         nn.Module.__init__(self)
-        self.bert_layer = TextTransformer(config.model_name, config, from_pretrained, cache_dir=cache_dir)
+        self.bert_layer = TextTransformer(
+            config.model_name, config, from_pretrained, cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
         embedding_config = getattr(config, "embedding_config", None)
         encoder_dropout = getattr(embedding_config, "encoder_dropout", None)
         if encoder_dropout is not None:
@@ -103,8 +107,12 @@ class TextBiEncoder(InputsEmbedsEncoderMixin, GLiNERBiEncoder):
         config: Any,
         from_pretrained: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
+        local_files_only: bool = False,
     ) -> None:
-        TextEncoder.__init__(self, config, from_pretrained, cache_dir=cache_dir)
+        TextEncoder.__init__(
+            self, config, from_pretrained, cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
         if config.labels_encoder is not None:
             self.labels_encoder = TextTransformer(
                 config.labels_encoder,
@@ -112,6 +120,7 @@ class TextBiEncoder(InputsEmbedsEncoderMixin, GLiNERBiEncoder):
                 from_pretrained,
                 True,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
             )
             le_hidden_size = hidden_size(self.labels_encoder.model.config)
             if config.hidden_size != le_hidden_size:

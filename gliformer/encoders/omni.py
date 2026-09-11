@@ -89,8 +89,12 @@ class LayoutEncoder(TextEncoder):
         config: Any,
         from_pretrained: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
+        local_files_only: bool = False,
     ) -> None:
-        super().__init__(config, from_pretrained=from_pretrained, cache_dir=cache_dir)
+        super().__init__(
+            config, from_pretrained=from_pretrained, cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
         self.layout_image_tokens = bool(_get_config_value(config, "layout_image_tokens", True))
         self._last_layout_extra_mask: Optional[torch.Tensor] = None
         if self.layout_image_tokens:
@@ -98,6 +102,7 @@ class LayoutEncoder(TextEncoder):
                 config,
                 from_pretrained=from_pretrained,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
             )
             output_hidden_size = int(_get_config_value(config, "hidden_size", self.model_hidden_size))
             if output_hidden_size != self.model_hidden_size:
@@ -465,8 +470,12 @@ class LayoutBiEncoder(TextBiEncoder):
         config: Any,
         from_pretrained: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
+        local_files_only: bool = False,
     ) -> None:
-        super().__init__(config, from_pretrained=from_pretrained, cache_dir=cache_dir)
+        super().__init__(
+            config, from_pretrained=from_pretrained, cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
         self.layout_image_tokens = bool(_get_config_value(config, "layout_image_tokens", True))
         self._last_layout_extra_mask: Optional[torch.Tensor] = None
         if self.layout_image_tokens:
@@ -474,6 +483,7 @@ class LayoutBiEncoder(TextBiEncoder):
                 config,
                 from_pretrained=from_pretrained,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
             )
             output_hidden_size = int(_get_config_value(config, "hidden_size", self.model_hidden_size))
             if output_hidden_size != self.model_hidden_size:
@@ -533,6 +543,7 @@ class OmniEncoder(nn.Module):
         config: Any,
         from_pretrained: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
+        local_files_only: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -540,6 +551,7 @@ class OmniEncoder(nn.Module):
             config,
             from_pretrained=from_pretrained,
             cache_dir=cache_dir,
+            local_files_only=local_files_only,
         )
         self.model_hidden_size = self.text_encoder.model_hidden_size
         self.output_hidden_size = int(_get_config_value(config, "hidden_size", self.model_hidden_size))
@@ -555,12 +567,14 @@ class OmniEncoder(nn.Module):
                 config,
                 from_pretrained=from_pretrained,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
             )
         if "audio" in self.enabled_modalities:
             self.feature_encoders["audio"] = AudioEncoder(
                 config,
                 from_pretrained=from_pretrained,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
             )
 
         if "text" not in self.enabled_modalities and not self.feature_encoders:

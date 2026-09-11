@@ -129,6 +129,7 @@ class Transformer(nn.Module):
         from_pretrained: bool = False,
         labels_encoder: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
+        local_files_only: bool = False,
     ) -> None:
         super().__init__()
         if labels_encoder:
@@ -139,7 +140,10 @@ class Transformer(nn.Module):
         backbone = None if labels_encoder else get_backbone(getattr(config, "backbone_type", "auto"))
 
         if encoder_config is None:
-            encoder_config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
+            encoder_config = AutoConfig.from_pretrained(
+                model_name, cache_dir=cache_dir, trust_remote_code=True,
+                local_files_only=local_files_only,
+            )
             if config.vocab_size != -1 and not labels_encoder:
                 encoder_config.vocab_size = config.vocab_size
         encoder_config = _coerce_backbone_config(encoder_config, backbone)
@@ -201,7 +205,10 @@ class Transformer(nn.Module):
                 pretrained_kwargs["cache_dir"] = cache_dir
             if backbone is not None:
                 pretrained_kwargs["config"] = encoder_config
-            self.model = ModelClass.from_pretrained(model_name, **pretrained_kwargs, trust_remote_code=True)
+            self.model = ModelClass.from_pretrained(
+                model_name, **pretrained_kwargs, trust_remote_code=True,
+                local_files_only=local_files_only,
+            )
         elif not custom:
             self.model = ModelClass.from_config(encoder_config, trust_remote_code=True)
         else:
@@ -215,7 +222,9 @@ class Transformer(nn.Module):
                     stacklevel=2,
                 )
             else:
-                adapter_config = LoraConfig.from_pretrained(model_name)
+                adapter_config = LoraConfig.from_pretrained(
+                    model_name, local_files_only=local_files_only,
+                )
                 self.model = get_peft_model(self.model, adapter_config)
 
         if config.fuse_layers:

@@ -127,10 +127,13 @@ class BaseGLiFormerModel(BaseModel):
         config: GLiFormerConfig,
         from_pretrained: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
+        local_files_only: bool = False,
     ):
         super().__init__(config, from_pretrained, cache_dir)
 
-        self.token_rep_layer = self._init_token_rep_layer(config, from_pretrained, cache_dir)
+        self.token_rep_layer = self._init_token_rep_layer(
+            config, from_pretrained, cache_dir, local_files_only=local_files_only,
+        )
 
         if config.num_rnn_layers > 0:
             self.rnn = LstmSeq2SeqEncoder(config, num_layers=config.num_rnn_layers)
@@ -362,10 +365,14 @@ class BaseGLiFormerModel(BaseModel):
             error_msgs,
         )
 
-    def _init_token_rep_layer(self, config, from_pretrained, cache_dir):
+    def _init_token_rep_layer(self, config, from_pretrained, cache_dir, local_files_only=False):
         if config.labels_encoder is not None:
-            return TextBiEncoder(config, from_pretrained, cache_dir=cache_dir)
-        return TextEncoder(config, from_pretrained, cache_dir=cache_dir)
+            return TextBiEncoder(
+                config, from_pretrained, cache_dir=cache_dir, local_files_only=local_files_only,
+            )
+        return TextEncoder(
+            config, from_pretrained, cache_dir=cache_dir, local_files_only=local_files_only,
+        )
 
     def _encode_label_type(
         self,
@@ -2648,13 +2655,19 @@ class _MediaOnlyBiEncoderModel(BaseGLiFormerModel):
     media_mask_name: str = ""
     bi_encoder_cls = None
 
-    def _init_token_rep_layer(self, config, from_pretrained, cache_dir):
+    def _init_token_rep_layer(self, config, from_pretrained, cache_dir, local_files_only=False):
         if self.bi_encoder_cls is None:
             raise NotImplementedError("media-only model must define bi_encoder_cls")
-        return self.bi_encoder_cls(config, from_pretrained=from_pretrained, cache_dir=cache_dir)
+        return self.bi_encoder_cls(
+            config, from_pretrained=from_pretrained, cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
 
-    def __init__(self, config, from_pretrained=False, cache_dir=None):
-        super().__init__(config, from_pretrained=from_pretrained, cache_dir=cache_dir)
+    def __init__(self, config, from_pretrained=False, cache_dir=None, local_files_only=False):
+        super().__init__(
+            config, from_pretrained=from_pretrained, cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
         self.media_parent_embeddings = nn.ParameterDict(
             {
                 task_name: nn.Parameter(torch.zeros(config.hidden_size))
@@ -3089,10 +3102,14 @@ class GLiFormerLayoutModel(_GLiFormerJointForwardModel):
         "layout_pixel_values",
     }
 
-    def _init_token_rep_layer(self, config, from_pretrained, cache_dir):
+    def _init_token_rep_layer(self, config, from_pretrained, cache_dir, local_files_only=False):
         if config.labels_encoder is not None:
-            return self.layout_bi_encoder_cls(config, from_pretrained, cache_dir=cache_dir)
-        return self.layout_encoder_cls(config, from_pretrained, cache_dir=cache_dir)
+            return self.layout_bi_encoder_cls(
+                config, from_pretrained, cache_dir=cache_dir, local_files_only=local_files_only,
+            )
+        return self.layout_encoder_cls(
+            config, from_pretrained, cache_dir=cache_dir, local_files_only=local_files_only,
+        )
 
     @classmethod
     def _reject_unsupported_input_names(cls, kwargs: dict) -> None:
@@ -3263,7 +3280,7 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
                 f"got {variant!r}"
             ) from exc
 
-    def _init_token_rep_layer(self, config, from_pretrained, cache_dir):
+    def _init_token_rep_layer(self, config, from_pretrained, cache_dir, local_files_only=False):
         if getattr(config, "omni_modalities", None) is None:
             config.omni_modalities = self._infer_omni_modalities(config)
         if config.labels_encoder is not None:
@@ -3271,11 +3288,13 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
                 config,
                 from_pretrained=from_pretrained,
                 cache_dir=cache_dir,
+                local_files_only=local_files_only,
             )
         return self.omni_encoder_cls(
             config,
             from_pretrained=from_pretrained,
             cache_dir=cache_dir,
+            local_files_only=local_files_only,
         )
 
     @classmethod
