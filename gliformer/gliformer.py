@@ -83,9 +83,10 @@ class BaseGLiFormer(BaseGLiNER):
         # results["classification"] -> List[List[dict]]
 
         # Schema-based
-        schema = model.create_schema()
-        schema.add_entities(["person", "org"])
-        schema.add_classes(["positive", "negative"])
+        schema = GLiFormerSchema(
+            entities=["person", "org"],
+            classes=["positive", "negative"],
+        )
         results = model.inference_from_schema(texts, schema)
     """
 
@@ -1549,10 +1550,6 @@ class BaseGLiFormer(BaseGLiNER):
         return torch.cat(all_embeddings, dim=0)
 
     # ── Schema-based inference ─────────────────────────────────────────
-
-    def create_schema(self) -> GLiFormerSchema:
-        """Create a new schema builder for structured inference."""
-        return GLiFormerSchema()
 
     def inference_from_schema(
         self,

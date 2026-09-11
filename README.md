@@ -211,14 +211,15 @@ Each employee stays under its department. Results are dictionaries and lists val
 
 ### Multi-Task Inference
 
-Combine tasks in a reusable schema:
+Construct a reusable schema independently of the model:
 
 ```python
-schema = (
-    model.create_schema()
-    .add_entities(["person", "organization"])
-    .add_classes(["business", "sports", "technology"])
-    .add_structure("employee", ["name", "company"])
+from gliformer import GLiFormerSchema
+
+schema = GLiFormerSchema(
+    entities=["person", "organization"],
+    classes=["business", "sports", "technology"],
+    structures={"employee": ["name", "company"]},
 )
 
 results = model.inference_from_schema(

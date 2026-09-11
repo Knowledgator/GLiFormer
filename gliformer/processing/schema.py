@@ -1,4 +1,4 @@
-"""GLiFormerSchema — fluent builder for multi-task inference schemas."""
+"""GLiFormerSchema — reusable multi-task inference schemas."""
 
 from __future__ import annotations
 
@@ -712,25 +712,76 @@ def build_structuring_output_formatter(
 
 
 class GLiFormerSchema:
-    """Builder for multi-task inference schemas.
+    """A model-independent schema for multi-task inference.
+
+    Construct the schema with task labels and named structures. Entity, class,
+    and relation labels accept a list for one group or a mapping of group names
+    to label lists. Joint relations map group names to dictionaries containing
+    ``entities`` and ``relations``. Structures map names to field lists, typed
+    templates, or Pydantic models. The ``add_*`` methods can extend a schema
+    after construction.
 
     Usage::
 
-        schema = GLiFormerSchema()
-        schema.add_entities(["person", "org"], parent="general")
-        schema.add_classes(["positive", "negative"])
-        schema.add_relations(["works_at", "born_in"])
-        schema.add_structure("person", ["name", "age", "occupation"])
+        schema = GLiFormerSchema(
+            entities={"general": ["person", "org"]},
+            classes=["positive", "negative"],
+            relations=["works_at", "born_in"],
+            structures={"person": ["name", "age", "occupation"]},
+        )
 
         results = model.inference_from_schema(texts, schema)
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        entities: list[str] | dict[str, list[str]] | None = None,
+        classes: list[str] | dict[str, list[str]] | None = None,
+        relations: list[str] | dict[str, list[str]] | None = None,
+        joint_relations: dict[str, dict] | None = None,
+        structures: dict[str, Any] | None = None,
+    ):
         self._entity_groups: list[dict] = []
         self._class_groups: list[dict] = []
         self._relation_groups: list[dict] = []
         self._joint_groups: list[dict] = []
         self._structure_schemas: dict[str, dict] = {}
+
+        for field, groups, add_group in (
+            ("entities", entities, self.add_entities),
+            ("classes", classes, self.add_classes),
+            ("relations", relations, self.add_relations),
+        ):
+            if groups is None:
+                continue
+            if isinstance(groups, list):
+                groups = {None: groups}
+            elif not isinstance(groups, dict):
+                raise TypeError(f"{field} must be a label list or a mapping of group names to label lists")
+            for parent, labels in groups.items():
+                if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+                    raise TypeError(f"{field} labels must be a list of strings")
+                if labels:
+                    add_group(labels, parent=parent)
+
+        if joint_relations is not None:
+            if not isinstance(joint_relations, dict):
+                raise TypeError("joint_relations must map group names to entity/relation groups")
+            for parent, group in joint_relations.items():
+                if not isinstance(group, dict):
+                    raise TypeError("joint_relations groups must be dictionaries")
+                for field in ("entities", "relations"):
+                    labels = group.get(field)
+                    if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+                        raise TypeError(f"joint_relations groups require {field} as a list of strings")
+                self.add_joint_entities_relations(parent=parent, **group)
+
+        if structures is not None:
+            if not isinstance(structures, dict):
+                raise TypeError("structures must map schema names to fields, templates, or Pydantic models")
+            for name, fields in structures.items():
+                self.add_structure(name, fields)
 
     # ── Entity groups (NER) ────────────────────────────────────────────
 

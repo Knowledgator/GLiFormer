@@ -33,7 +33,7 @@ from typing import (
 import gradio as gr
 import torch
 
-from gliformer import GLiFormer, FieldType, GLiFormerPDFProcessor, StructuringOutputFormatter
+from gliformer import GLiFormer, GLiFormerSchema, FieldType, GLiFormerPDFProcessor, StructuringOutputFormatter
 
 # ── Model loading ────────────────────────────────────────────────────────────
 
@@ -3682,17 +3682,17 @@ def load_example(
     )
 
 
-def build_structuring_schema(model, structures: Dict[str, Union[List[str], dict]]):
+def build_structuring_schema(structures: Dict[str, Union[List[str], dict]]):
     """Turn parsed structuring groups into a GLiFormerSchema."""
-    schema = model.create_schema()
+    fields = {}
     for schema_name, schema_spec in structures.items():
         if isinstance(schema_spec, dict) and schema_spec.get("field_types"):
-            schema.add_structure(schema_name, schema_spec["field_types"])
+            fields[schema_name] = schema_spec["field_types"]
         elif isinstance(schema_spec, dict):
-            schema.add_structure(schema_name, schema_spec.get("fields", []))
+            fields[schema_name] = schema_spec.get("fields", [])
         else:
-            schema.add_structure(schema_name, schema_spec)
-    return schema
+            fields[schema_name] = schema_spec
+    return GLiFormerSchema(structures=fields)
 
 
 def parse_multi_level_schema(schema_json: str) -> Optional[Dict[str, Any]]:
@@ -3713,12 +3713,9 @@ def parse_multi_level_schema(schema_json: str) -> Optional[Dict[str, Any]]:
     return schemas
 
 
-def build_multi_level_schema(model, templates: Dict[str, Any]):
+def build_multi_level_schema(templates: Dict[str, Any]):
     """Turn nested schema templates into a GLiFormerSchema."""
-    schema = model.create_schema()
-    for schema_name, template in templates.items():
-        schema.add_structure(schema_name, template)
-    return schema
+    return GLiFormerSchema(structures=templates)
 
 
 def structures_for_inference(
@@ -3849,7 +3846,7 @@ def run_structuring(text: str, groups_value: str, threshold: float, flat_ner: bo
         return "Please add at least one schema group.", ""
 
     model = get_model()
-    schema = build_structuring_schema(model, structures)
+    schema = build_structuring_schema(structures)
     results = model.inference_from_schema(
         schema=schema, texts=text, threshold=threshold, flat_ner=flat_ner
     )
@@ -3878,7 +3875,7 @@ def run_multi_level_structuring(
         return "Please provide a JSON object mapping schema names to templates.", ""
 
     model = get_model()
-    schema = build_multi_level_schema(model, templates)
+    schema = build_multi_level_schema(templates)
     results = model.inference_from_schema(
         schema=schema, texts=text, threshold=threshold, flat_ner=flat_ner
     )
@@ -4060,7 +4057,7 @@ def score_all_structuring(threshold: float, flat_ner: bool):
     for example in STRUCTURING_EXAMPLES:
         structures = parse_structure_groups(groups_json(example))
         results = model.inference_from_schema(
-            schema=build_structuring_schema(model, structures),
+            schema=build_structuring_schema(structures),
             texts=example["text"],
             threshold=threshold,
             flat_ner=flat_ner,
@@ -4080,7 +4077,7 @@ def score_all_multi_level_structuring(threshold: float, flat_ner: bool):
     per_example = []
     for example in MULTI_LEVEL_STRUCTURING_EXAMPLES:
         results = model.inference_from_schema(
-            schema=build_multi_level_schema(model, example["schema"]),
+            schema=build_multi_level_schema(example["schema"]),
             texts=example["text"],
             threshold=threshold,
             flat_ner=flat_ner,
