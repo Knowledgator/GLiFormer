@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from glinext.processing.mappings import (
+from gliformer.processing.mappings import (
     BaseClassMapping,
     BatchClassesMapping,
     CatClassMapping,
@@ -12,7 +12,7 @@ from glinext.processing.mappings import (
     OpenRelexClassMapping,
     OpenRelexItemMapping,
 )
-from glinext.tasks.open_relex.decoder import OpenRelexDecoder
+from gliformer.tasks.open_relex.decoder import OpenRelexDecoder
 from tests.conftest import make_config
 
 

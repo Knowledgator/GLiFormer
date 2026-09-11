@@ -2,13 +2,13 @@
 
 import torch
 
-from glinext.processing.mappings import (
+from gliformer.processing.mappings import (
     BatchClassesMapping,
     CatClassMapping,
     ExtractionClassMapping,
 )
-from glinext.processing.processor import GLiNextTextProcessor
-from glinext.tasks.open_relex.processor import OpenRelexProcessor
+from gliformer.processing.processor import GLiFormerTextProcessor
+from gliformer.tasks.open_relex.processor import OpenRelexProcessor
 from tests.conftest import FakeWordsSplitter, make_config
 
 
@@ -180,7 +180,7 @@ def test_orchestrator_routes_extraction_relations_to_open_without_ner_head():
         default_ner_config=False,
         open_relex_config={"num_fixed_slots": 7},
     )
-    processor = GLiNextTextProcessor(
+    processor = GLiFormerTextProcessor(
         config,
         tokenizer=_TokenizerStub(),
         words_splitter=FakeWordsSplitter(),
@@ -367,7 +367,7 @@ def test_labels_align_after_leading_group_without_relation_schema():
             {"name": "ignored", "relations": []},
             _resolved_relation_group("kept", "works_at", 0, 1),
         ],
-        "_glinext_open_relex_spans_resolved": True,
+        "_gliformer_open_relex_spans_resolved": True,
     }
     open_mapping = processor.get_classes_mapping([item])
 
@@ -402,7 +402,7 @@ def test_labels_align_after_middle_group_without_relation_schema():
             {"name": "ignored", "relations": []},
             _resolved_relation_group("second", "supplies", 1, 2),
         ],
-        "_glinext_open_relex_spans_resolved": True,
+        "_gliformer_open_relex_spans_resolved": True,
     }
     open_mapping = processor.get_classes_mapping([item])
 

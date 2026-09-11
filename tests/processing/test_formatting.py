@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 import pytest
 
-from glinext.processing.formatting import (
+from gliformer.processing.formatting import (
     FieldType,
     StructuringOutputFormatter,
     _convert_bool,

@@ -5,16 +5,16 @@ from dataclasses import asdict
 import pytest
 import torch
 
-from glinext.config import (
+from gliformer.config import (
     AudioClassificationHeadConfig,
     AudioSegmentationHeadConfig,
     ImageClassificationHeadConfig,
     MediaClassificationHeadConfig,
 )
-from glinext.processing.mappings import BatchClassesMapping
-from glinext.tasks.audio.processor import AudioProcessor
-from glinext.tasks.media_processor import MediaTaskProcessor
-from glinext.tasks.vision.processor import VisionProcessor
+from gliformer.processing.mappings import BatchClassesMapping
+from gliformer.tasks.audio.processor import AudioProcessor
+from gliformer.tasks.media_processor import MediaTaskProcessor
+from gliformer.tasks.vision.processor import VisionProcessor
 from tests.conftest import make_config
 from tests.processors.test_unified_processor import FakeTokenizer
 

@@ -3,12 +3,12 @@
 import pytest
 import torch
 
-from glinext.layers.anchor_layer import (
+from gliformer.layers.anchor_layer import (
     FixedTransformerAnchorLayer,
     QueryRNNAnchorLayer,
     QueryTransformerAnchorLayer,
 )
-from glinext.layers.groups import AnchorCrossAttentionLayer
+from gliformer.layers.groups import AnchorCrossAttentionLayer
 
 
 HIDDEN_SIZE = 16

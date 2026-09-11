@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from glinext.tasks.classification.processor import ClassificationProcessor
-from glinext.processing.mappings import (
+from gliformer.tasks.classification.processor import ClassificationProcessor
+from gliformer.processing.mappings import (
     BaseClassMapping, CatClassMapping, BatchClassesMapping,
     ExtractionClassMapping, StructuringClassMapping, OpenRelexClassMapping,
 )

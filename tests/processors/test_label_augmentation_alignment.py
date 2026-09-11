@@ -11,28 +11,28 @@ from dataclasses import asdict
 
 import pytest
 
-from glinext.config import (
+from gliformer.config import (
     AudioClassificationHeadConfig,
     AudioSegmentationHeadConfig,
     ImageClassificationHeadConfig,
     ObjectDetectionHeadConfig,
     SegmentationHeadConfig,
 )
-from glinext.processing.label_augmentation import BatchLabelAugmenter
-from glinext.processing.mappings import (
+from gliformer.processing.label_augmentation import BatchLabelAugmenter
+from gliformer.processing.mappings import (
     BatchClassesMapping,
     CatClassMapping,
     ExtractionClassMapping,
     OpenRelexClassMapping,
     StructuringClassMapping,
 )
-from glinext.tasks.audio.processor import AudioProcessor
-from glinext.tasks.classification.processor import ClassificationProcessor
-from glinext.tasks.joint_relex.processor import JointRelexProcessor
-from glinext.tasks.ner.processor import NERProcessor
-from glinext.tasks.open_relex.processor import OpenRelexProcessor
-from glinext.tasks.structuring.processor import StructuringProcessor
-from glinext.tasks.vision.processor import VisionProcessor
+from gliformer.tasks.audio.processor import AudioProcessor
+from gliformer.tasks.classification.processor import ClassificationProcessor
+from gliformer.tasks.joint_relex.processor import JointRelexProcessor
+from gliformer.tasks.ner.processor import NERProcessor
+from gliformer.tasks.open_relex.processor import OpenRelexProcessor
+from gliformer.tasks.structuring.processor import StructuringProcessor
+from gliformer.tasks.vision.processor import VisionProcessor
 from tests.conftest import FakeWordsSplitter, make_config
 
 

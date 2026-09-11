@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import torch
 
-from glinext.glinext import BaseGLiNExT
-from glinext.layers.pooling import MeanPooling
+from gliformer.gliformer import BaseGLiFormer
+from gliformer.layers.pooling import MeanPooling
 
 
 class RecordingTokenizer:
@@ -41,11 +41,11 @@ def test_embed_text_tokenizes_raw_strings_like_embedding_training():
         device=torch.device("cpu"),
         eval=lambda: None,
         _require_task_heads=lambda *tasks: None,
-        _filter_valid_texts=BaseGLiNExT._filter_valid_texts,
+        _filter_valid_texts=BaseGLiFormer._filter_valid_texts,
     )
     texts = ["Don't split punctuation.", "Keep raw strings!"]
 
-    output = BaseGLiNExT.embed_text(wrapper, texts, batch_size=2)
+    output = BaseGLiFormer.embed_text(wrapper, texts, batch_size=2)
 
     assert output.shape == (2, 2)
     assert tokenizer.calls == [

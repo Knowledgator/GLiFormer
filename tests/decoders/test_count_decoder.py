@@ -5,8 +5,8 @@ import torch
 from dataclasses import dataclass
 from typing import Optional
 
-from glinext.tasks.count.decoder import CountDecoder
-from glinext.config import CountHeadConfig
+from gliformer.tasks.count.decoder import CountDecoder
+from gliformer.config import CountHeadConfig
 from tests.conftest import make_config
 
 

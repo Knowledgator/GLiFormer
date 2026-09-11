@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from glinext.layers import (
+from gliformer.layers import (
     AnchorCrossAttentionLayer,
     AttentionBias,
     PostNormAnchorRefinementBlock,

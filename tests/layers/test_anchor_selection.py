@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from glinext.layers.anchor_layer import (
+from gliformer.layers.anchor_layer import (
     AnchorLayer,
     PositionBucketAnchorLayer,
     TopKDensityDistinctAnchorLayer,

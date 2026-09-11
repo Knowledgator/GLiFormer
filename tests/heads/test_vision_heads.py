@@ -7,17 +7,17 @@ import pytest
 import torch
 from gliner.modeling.loss_functions import focal_loss_with_logits
 
-from glinext.config import (
+from gliformer.config import (
     ImageClassificationHeadConfig,
     ObjectDetectionHeadConfig,
     SegmentationHeadConfig,
 )
-from glinext.tasks import TaskFlatInputs
-from glinext.tasks.box_ops import box_xyxy_to_cxcywh
-from glinext.tasks.losses import binary_focal_or_bce
-from glinext.tasks.media import matched_mask_loss, normalized_objectness_loss
-from glinext.tasks.vision.decoder import ObjectDetectionDecoder, SegmentationDecoder
-from glinext.tasks.vision.model import (
+from gliformer.tasks import TaskFlatInputs
+from gliformer.tasks.box_ops import box_xyxy_to_cxcywh
+from gliformer.tasks.losses import binary_focal_or_bce
+from gliformer.tasks.media import matched_mask_loss, normalized_objectness_loss
+from gliformer.tasks.vision.decoder import ObjectDetectionDecoder, SegmentationDecoder
+from gliformer.tasks.vision.model import (
     ImageClassificationHead,
     ObjectDetectionHead,
     SegmentationHead,
@@ -937,7 +937,7 @@ def test_object_detection_decoder_honors_softmax_single_label_config():
 
 
 def test_vision_decoders_preserve_tiny_fp16_scores_at_zero_threshold():
-    from glinext.tasks.vision.decoder import ImageClassificationDecoder
+    from gliformer.tasks.vision.decoder import ImageClassificationDecoder
 
     image_decoder = ImageClassificationDecoder(config=None)
     cls_output = SimpleNamespace(

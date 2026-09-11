@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from types import SimpleNamespace
 
-from glinext.layers.mlp import create_mlp, FeaturesProjector
+from gliformer.layers.mlp import create_mlp, FeaturesProjector
 
 
 class TestCreateMlp:

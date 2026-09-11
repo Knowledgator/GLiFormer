@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from glinext.tasks.count.processor import CountProcessor
-from glinext.processing.mappings import (
+from gliformer.tasks.count.processor import CountProcessor
+from gliformer.processing.mappings import (
     BaseClassMapping, CatClassMapping, ExtractionItemMapping, ExtractionClassMapping,
     StructuringItemMapping, StructuringClassMapping,
 )

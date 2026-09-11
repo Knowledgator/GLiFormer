@@ -5,7 +5,7 @@ import torch
 from dataclasses import dataclass
 from typing import Optional
 
-from glinext.tasks.classification.decoder import ClassificationDecoder
+from gliformer.tasks.classification.decoder import ClassificationDecoder
 from tests.conftest import make_config
 
 

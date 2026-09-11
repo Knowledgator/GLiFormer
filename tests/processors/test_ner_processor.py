@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from glinext.tasks.ner.processor import NERProcessor
-from glinext.processing.mappings import (
+from gliformer.tasks.ner.processor import NERProcessor
+from gliformer.processing.mappings import (
     BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping, BatchClassesMapping,
     CatClassMapping, StructuringClassMapping, OpenRelexClassMapping,
 )

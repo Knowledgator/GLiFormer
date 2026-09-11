@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.layers.pair_rep import PairRepLayer, PromptRelationExtractor
+from gliformer.layers.pair_rep import PairRepLayer, PromptRelationExtractor
 
 D = 16
 

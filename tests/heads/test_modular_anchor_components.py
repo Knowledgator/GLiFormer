@@ -2,20 +2,20 @@ from dataclasses import asdict
 
 import torch
 
-from glinext.config import (
+from gliformer.config import (
     AudioSegmentationHeadConfig,
     ClassificationHeadConfig,
     ObjectDetectionHeadConfig,
 )
-from glinext.layers import (
+from gliformer.layers import (
     GaussianDistanceAttentionBias,
     PreNormAnchorRefinementBlock,
     RMSNormAnchorNormalization,
 )
-from glinext.tasks import TaskFlatInputs
-from glinext.tasks.audio.model import AudioSegmentationHead
-from glinext.tasks.classification.model import ClassificationHead
-from glinext.tasks.vision.model import ObjectDetectionHead
+from gliformer.tasks import TaskFlatInputs
+from gliformer.tasks.audio.model import AudioSegmentationHead
+from gliformer.tasks.classification.model import ClassificationHead
+from gliformer.tasks.vision.model import ObjectDetectionHead
 from tests.heads.conftest import B, C, D, W, make_config
 
 

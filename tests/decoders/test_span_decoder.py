@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.tasks.span_decoder import Span, SpanDecoder
+from gliformer.tasks.span_decoder import Span, SpanDecoder
 
 
 @pytest.fixture

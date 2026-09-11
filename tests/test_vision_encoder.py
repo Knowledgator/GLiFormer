@@ -4,14 +4,14 @@ import pytest
 import torch
 from torch import nn
 
-import glinext.encoders.media as media_module
-from glinext.encoders.media import MediaBackboneEncoder
-from glinext.encoders.vision import (
+import gliformer.encoders.media as media_module
+from gliformer.encoders.media import MediaBackboneEncoder
+from gliformer.encoders.vision import (
     VisionEncoder,
     VisionPathEmbeddings,
     vision_token_mask,
 )
-from glinext.layers.position import LearnedGrid2DPositionEmbedding
+from gliformer.layers.position import LearnedGrid2DPositionEmbedding
 
 
 def _config(**overrides):

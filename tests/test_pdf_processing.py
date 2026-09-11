@@ -3,9 +3,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from glinext.processing.pdf import (
+from gliformer.processing.pdf import (
     CELL_NEW_LINE,
-    GLiNextPDFProcessor,
+    GLiFormerPDFProcessor,
     PDFTableProcessor,
     _normalize_bbox,
     _scale_box_to_1000,
@@ -24,7 +24,7 @@ def _prefield_values():
 
 def test_prefields_preserve_multiple_pages_without_opening_pdf():
     words, bboxes, pixels = _prefield_values()
-    processor = GLiNextPDFProcessor()
+    processor = GLiFormerPDFProcessor()
 
     rows = processor(
         "not-opened.pdf",
@@ -47,7 +47,7 @@ def test_prefields_preserve_multiple_pages_without_opening_pdf():
 def test_combining_prefield_pages_flattens_layout_and_stacks_images():
     words, bboxes, pixels = _prefield_values()
 
-    rows = GLiNextPDFProcessor()(
+    rows = GLiFormerPDFProcessor()(
         "not-opened.pdf",
         words=words,
         bbox=bboxes,
@@ -81,7 +81,7 @@ def test_combining_prefield_pages_flattens_layout_and_stacks_images():
 )
 def test_prefields_validate_required_and_aligned_values(kwargs, error):
     with pytest.raises(ValueError, match=error):
-        GLiNextPDFProcessor()(
+        GLiFormerPDFProcessor()(
             "not-opened.pdf",
             add_image_token=False,
             **kwargs,
@@ -90,7 +90,7 @@ def test_prefields_validate_required_and_aligned_values(kwargs, error):
 
 def test_prefields_reject_incomplete_page_entries():
     with pytest.raises(ValueError, match="words has 2 page entries"):
-        GLiNextPDFProcessor()(
+        GLiFormerPDFProcessor()(
             "not-opened.pdf",
             words=[["one"], ["two"]],
             bbox=[
@@ -105,7 +105,7 @@ def test_prefields_reject_incomplete_page_entries():
 
 def test_prefields_reject_table_extraction():
     with pytest.raises(ValueError, match="extract_tables=True requires PDF text extraction"):
-        GLiNextPDFProcessor()(
+        GLiFormerPDFProcessor()(
             "not-opened.pdf",
             words=["word"],
             bbox=[[0, 0, 1, 1]],
@@ -190,7 +190,7 @@ def test_page_words_sort_and_scale_pymupdf_tuples():
         ],
     )
 
-    words, bboxes = GLiNextPDFProcessor._page_words(page)
+    words, bboxes = GLiFormerPDFProcessor._page_words(page)
 
     assert words == ["First", "Second"]
     assert bboxes == [[0, 0, 100, 100], [500, 500, 1000, 1000]]

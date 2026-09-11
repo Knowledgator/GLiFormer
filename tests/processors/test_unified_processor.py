@@ -1,17 +1,17 @@
-"""Tests for the unified GLiNextProcessor orchestrator."""
+"""Tests for the unified GLiFormerProcessor orchestrator."""
 
 import pytest
 import torch
 from unittest.mock import MagicMock
 from dataclasses import asdict
 
-from glinext.processing.processor import GLiNextProcessor, GLiNextTextProcessor
-from glinext.config import (
+from gliformer.processing.processor import GLiFormerProcessor, GLiFormerTextProcessor
+from gliformer.config import (
     NERHeadConfig, ClassificationHeadConfig,
     JointRelexHeadConfig, OpenRelexHeadConfig, StructuringHeadConfig,
     CountHeadConfig, EmbeddingHeadConfig,
 )
-from glinext.processing.mappings import BatchClassesMapping
+from gliformer.processing.mappings import BatchClassesMapping
 from tests.conftest import make_config, FakeWordsSplitter
 
 
@@ -94,7 +94,7 @@ def words_splitter():
 @pytest.fixture
 def ner_processor(fake_tokenizer, words_splitter):
     config = make_config()
-    return GLiNextProcessor(config, fake_tokenizer, words_splitter)
+    return GLiFormerProcessor(config, fake_tokenizer, words_splitter)
 
 
 @pytest.fixture
@@ -108,7 +108,7 @@ def all_tasks_processor(fake_tokenizer, words_splitter):
         count_config=asdict(CountHeadConfig()),
         embedding_config=asdict(EmbeddingHeadConfig()),
     )
-    return GLiNextProcessor(config, fake_tokenizer, words_splitter)
+    return GLiFormerProcessor(config, fake_tokenizer, words_splitter)
 
 
 @pytest.fixture
@@ -117,7 +117,7 @@ def ner_cls_processor(fake_tokenizer, words_splitter):
         ner_config=asdict(NERHeadConfig()),
         classification_config=asdict(ClassificationHeadConfig()),
     )
-    return GLiNextProcessor(config, fake_tokenizer, words_splitter)
+    return GLiFormerProcessor(config, fake_tokenizer, words_splitter)
 
 
 # ── Tests ──────────────────────────────────────────────────────────────
@@ -134,9 +134,9 @@ class TestTaskProcessorRegistration:
 
     def test_disabled_tasks(self, fake_tokenizer, words_splitter):
         config = make_config(ner_config=None)
-        proc = GLiNextProcessor(config, fake_tokenizer, words_splitter)
+        proc = GLiFormerProcessor(config, fake_tokenizer, words_splitter)
         # NER is None but default creates it... let's check with explicit None
-        # Actually, make_config sets ner_config={} by default (from GLiNextConfig defaults)
+        # Actually, make_config sets ner_config={} by default (from GLiFormerConfig defaults)
         # Need to check: when ner_config is set to None explicitly
         assert "classification" not in proc.task_processors
 
@@ -151,7 +151,7 @@ class TestTaskProcessorRegistration:
             ner_config=None,
             joint_relex_config=asdict(JointRelexHeadConfig()),
         )
-        processor = GLiNextTextProcessor(
+        processor = GLiFormerTextProcessor(
             config,
             fake_tokenizer,
             words_splitter,
@@ -367,7 +367,7 @@ class TestCollateRawBatch:
 
     def test_represent_spans_adds_span_batch_fields(self, fake_tokenizer, words_splitter, ner_item_text_spans):
         config = make_config(ner_config={"represent_spans": True, "neg_spans_ratio": 0.0})
-        proc = GLiNextProcessor(config, fake_tokenizer, words_splitter)
+        proc = GLiFormerProcessor(config, fake_tokenizer, words_splitter)
         batch = proc.collate_raw_batch([ner_item_text_spans])
         assert "span_idx" in batch
         assert "span_label" in batch
@@ -380,7 +380,7 @@ class TestTokenizeAndPrepareLabels:
         self, fake_tokenizer, words_splitter,
     ):
         config = make_config(max_len=8)
-        processor = GLiNextProcessor(config, fake_tokenizer, words_splitter)
+        processor = GLiFormerProcessor(config, fake_tokenizer, words_splitter)
         item = {"text": " ".join(f"word-{i}" for i in range(20))}
 
         raw_batch = processor.collate_raw_batch([item])
@@ -394,7 +394,7 @@ class TestTokenizeAndPrepareLabels:
 
     def test_represent_spans_uses_model_span_keys(self, fake_tokenizer, words_splitter, ner_item_text_spans):
         config = make_config(ner_config={"represent_spans": True, "neg_spans_ratio": 0.0})
-        proc = GLiNextProcessor(config, fake_tokenizer, words_splitter)
+        proc = GLiFormerProcessor(config, fake_tokenizer, words_splitter)
         raw_batch = proc.collate_raw_batch([ner_item_text_spans])
         model_input = proc.tokenize_and_prepare_labels(raw_batch, prepare_labels=True)
 
@@ -412,7 +412,7 @@ class TestTokenizeAndPrepareLabels:
             default_ner_config=False,
             structuring_config={"multi_level": True},
         )
-        processor = GLiNextProcessor(
+        processor = GLiFormerProcessor(
             config,
             fake_tokenizer,
             words_splitter,
@@ -445,7 +445,7 @@ class TestPrepareAllLabelEncoderInputs:
 
     def test_with_labels_tokenizer(self, fake_tokenizer, words_splitter, ner_item):
         config = make_config()
-        proc = GLiNextProcessor(config, fake_tokenizer, words_splitter, labels_tokenizer=fake_tokenizer)
+        proc = GLiFormerProcessor(config, fake_tokenizer, words_splitter, labels_tokenizer=fake_tokenizer)
         mapping = proc.batch_generate_class_mappings([ner_item])
         result = proc.prepare_all_label_encoder_inputs(mapping)
         assert "ner_labels_input_ids" in result

@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from glinext.tasks.joint_relex.processor import JointRelexProcessor
-from glinext.tasks.ner.processor import NERProcessor
+from gliformer.tasks.joint_relex.processor import JointRelexProcessor
+from gliformer.tasks.ner.processor import NERProcessor
 from tests.conftest import make_config, make_batch_classes_mapping, FakeWordsSplitter
 
 
@@ -100,7 +100,7 @@ class TestCreateLabels:
             ],
         }
         # Build extraction mapping manually with correct rel_class_to_id
-        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+        from gliformer.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
         ext_mapping = [ExtractionClassMapping(items=[
             ExtractionItemMapping(
                 ner_class_to_id=BaseClassMapping(class_to_id={"person": 0, "location": 1}, name="entities"),
@@ -129,7 +129,7 @@ class TestCreateLabels:
         assert result["rel_span_class_idx"][0, :2].tolist() == [0, 1]
 
     def test_samples_no_relation_pairs_like_gliner_relex(self, relex_proc):
-        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+        from gliformer.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
 
         item = {
             "text": "A B C",
@@ -172,7 +172,7 @@ class TestCreateLabels:
         assert result is None
 
     def test_batch_idx(self, relex_proc):
-        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+        from gliformer.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
         item = {
             "text": "A B",
             "extraction": [{"ner": [[0, 0, "X"]], "relations": [[0, "r", 0]]}],
@@ -190,7 +190,7 @@ class TestCreateLabels:
     def test_self_relation_is_not_left_as_an_unscorable_label(
         self, relex_proc,
     ):
-        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+        from gliformer.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
 
         item = {
             "text": "A",
@@ -218,7 +218,7 @@ class TestCreateLabels:
     def test_entity_without_a_prompted_ner_class_is_not_a_relation_endpoint(
         self, relex_proc,
     ):
-        from glinext.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
+        from gliformer.processing.mappings import BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping
 
         item = {
             "text": "A B C",

@@ -5,10 +5,10 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-import glinext.encoders.media as media_encoders
-from glinext.encoders.audio import AudioBiEncoder
-from glinext.encoders.media import MediaBiEncoder
-from glinext.encoders.vision import VisionBiEncoder
+import gliformer.encoders.media as media_encoders
+from gliformer.encoders.audio import AudioBiEncoder
+from gliformer.encoders.media import MediaBiEncoder
+from gliformer.encoders.vision import VisionBiEncoder
 
 
 def test_vision_label_mean_pooling_preserves_embedding_dtype():

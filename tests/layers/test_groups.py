@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import torch
 
-from glinext.layers.groups import (
+from gliformer.layers.groups import (
     AnchorCrossAttentionLayer,
     QueryGroupRNN,
     QueryGroupTransformer,

@@ -7,13 +7,13 @@ import torch
 from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from torch import nn
 
-from glinext.config import StructuringHeadConfig
-from glinext.layers.structuring_relations import (
+from gliformer.config import StructuringHeadConfig
+from gliformer.layers.structuring_relations import (
     anchor_relation_loss,
     remap_anchor_relation_targets,
 )
-from glinext.tasks.losses import binary_focal_or_bce
-from glinext.tasks.structuring.model import StructuringHead
+from gliformer.tasks.losses import binary_focal_or_bce
+from gliformer.tasks.structuring.model import StructuringHead
 from tests.heads.conftest import make_config
 
 

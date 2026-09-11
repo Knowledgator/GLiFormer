@@ -1,27 +1,27 @@
 import importlib.util
 from dataclasses import fields
 
-import glinext
-from glinext.config import (
+import gliformer
+from gliformer.config import (
     JointRelexHeadConfig,
     OpenRelexHeadConfig,
     StructuringHeadConfig,
 )
-from glinext.outputs import (
-    GLiNExTAudioOutput,
-    GLiNExTLayoutOutput,
-    GLiNExTOmniOutput,
-    GLiNExTOutput,
-    GLiNExTTextOutput,
-    GLiNExTVisionOutput,
+from gliformer.outputs import (
+    GLiFormerAudioOutput,
+    GLiFormerLayoutOutput,
+    GLiFormerOmniOutput,
+    GLiFormerOutput,
+    GLiFormerTextOutput,
+    GLiFormerVisionOutput,
 )
-from glinext.processing.mappings import (
+from gliformer.processing.mappings import (
     OpenRelexClassMapping,
     OpenRelexItemMapping,
     StructuringClassMapping,
     StructuringItemMapping,
 )
-from glinext.tasks import TASK_REGISTRY, TaskHead
+from gliformer.tasks import TASK_REGISTRY, TaskHead
 
 
 def test_task_registry_lookup_and_definition_invariants():
@@ -52,8 +52,8 @@ def test_root_exports_canonical_task_types_and_compatibility_alias():
     }
 
     for name, expected in expected_exports.items():
-        assert getattr(glinext, name) is expected
-    assert glinext.RelationsHeadConfig is JointRelexHeadConfig
+        assert getattr(gliformer, name) is expected
+    assert gliformer.RelationsHeadConfig is JointRelexHeadConfig
 
 
 def test_retired_set_prediction_symbols_and_modules_are_not_public():
@@ -66,11 +66,11 @@ def test_retired_set_prediction_symbols_and_modules_are_not_public():
         "SetStructuringClassMapping",
     }
 
-    assert retired_names.isdisjoint(vars(glinext))
-    assert importlib.util.find_spec("glinext.tasks.set_open_relex") is None
-    assert importlib.util.find_spec("glinext.tasks.set_structuring") is None
+    assert retired_names.isdisjoint(vars(gliformer))
+    assert importlib.util.find_spec("gliformer.tasks.set_open_relex") is None
+    assert importlib.util.find_spec("gliformer.tasks.set_structuring") is None
 
-    from glinext.tasks import open_relex, structuring
+    from gliformer.tasks import open_relex, structuring
 
     assert set(open_relex.__all__) == {
         "OpenRelexHead",
@@ -86,17 +86,17 @@ def test_retired_set_prediction_symbols_and_modules_are_not_public():
 
 def test_public_output_exports_use_only_canonical_task_fields():
     output_classes = (
-        GLiNExTTextOutput,
-        GLiNExTLayoutOutput,
-        GLiNExTVisionOutput,
-        GLiNExTAudioOutput,
-        GLiNExTOmniOutput,
-        GLiNExTOutput,
+        GLiFormerTextOutput,
+        GLiFormerLayoutOutput,
+        GLiFormerVisionOutput,
+        GLiFormerAudioOutput,
+        GLiFormerOmniOutput,
+        GLiFormerOutput,
     )
     for output_class in output_classes:
-        assert getattr(glinext, output_class.__name__) is output_class
+        assert getattr(gliformer, output_class.__name__) is output_class
 
-    text_fields = {field.name for field in fields(GLiNExTTextOutput)}
+    text_fields = {field.name for field in fields(GLiFormerTextOutput)}
     assert {
         "open_rel_entity_logits",
         "open_rel_logits",

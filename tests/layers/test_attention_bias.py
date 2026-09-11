@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from glinext.layers import AttentionBias, GaussianDistanceAttentionBias
+from gliformer.layers import AttentionBias, GaussianDistanceAttentionBias
 
 
 def _bias(module, queries, keys, *, heads=1):

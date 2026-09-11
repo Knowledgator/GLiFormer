@@ -3,12 +3,12 @@
 import pytest
 import torch
 
-from glinext.config import (
+from gliformer.config import (
     AudioSegmentationHeadConfig,
     ObjectDetectionHeadConfig,
     StructuringHeadConfig,
 )
-from glinext.layers.position import (
+from gliformer.layers.position import (
     AnchorRefinementPositionEmbeddings,
     PositionEmbedding,
     normalized_grid_1d,

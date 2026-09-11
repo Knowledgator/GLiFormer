@@ -4,16 +4,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import glinext.encoders.media as media_module
-from glinext.config import AudioClassificationHeadConfig, GLiNextConfig
-from glinext.encoders.media import MediaBackboneEncoder
-from glinext.encoders.audio import (
+import gliformer.encoders.media as media_module
+from gliformer.config import AudioClassificationHeadConfig, GLiFormerConfig
+from gliformer.encoders.media import MediaBackboneEncoder
+from gliformer.encoders.audio import (
     AudioEncoder,
     ConvAudioEncoder,
     MelConvAudioEncoder,
     audio_token_mask,
 )
-from glinext.processing.processor import GLiNextProcessor
+from gliformer.processing.processor import GLiFormerProcessor
 from tests.conftest import FakeWordsSplitter
 
 
@@ -78,7 +78,7 @@ def test_external_audio_backbone_uses_shared_construction_and_projection(
 
 
 def test_mel_conv_audio_encoder_returns_time_tokens():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         model_name="unused",
         hidden_size=8,
         default_ner_config=False,
@@ -177,14 +177,14 @@ def test_local_audio_encoder_valid_tokens_are_batch_padding_invariant(
 
 
 def test_audio_processor_keeps_mel_features_2d():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         model_name="unused",
         hidden_size=8,
         model_variant="audio",
         audio_encoder_type="mel",
         audio_classification_config=asdict(AudioClassificationHeadConfig()),
     )
-    processor = GLiNextProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    processor = GLiFormerProcessor(config, FakeTokenizer(), FakeWordsSplitter())
     batch = processor.collate_raw_batch(
         [
             {

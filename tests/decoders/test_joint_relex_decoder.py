@@ -5,9 +5,9 @@ import torch
 from dataclasses import dataclass
 from typing import Optional
 
-from glinext.tasks.joint_relex.decoder import JointRelexDecoder
-from glinext.tasks.span_decoder import Span
-from glinext.processing.mappings import (
+from gliformer.tasks.joint_relex.decoder import JointRelexDecoder
+from gliformer.tasks.span_decoder import Span
+from gliformer.processing.mappings import (
     BaseClassMapping, ExtractionItemMapping, ExtractionClassMapping,
     BatchClassesMapping, CatClassMapping, StructuringClassMapping, OpenRelexClassMapping,
 )

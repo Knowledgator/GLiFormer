@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-import glinext.backbones as backbones
+import gliformer.backbones as backbones
 
 
 class DummyModel:

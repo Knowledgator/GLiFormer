@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.layers.anchor_modeling import (
+from gliformer.layers.anchor_modeling import (
     AnchorModeling, LinearAnchorModeling, RNNAnchorModeling, MLPAnchorModeling,
     TransformerAnchorModeling,
 )

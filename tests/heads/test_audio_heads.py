@@ -6,18 +6,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from glinext.config import (
+from gliformer.config import (
     AudioClassificationHeadConfig,
     AudioSegmentationHeadConfig,
 )
-from glinext.tasks import TaskFlatInputs
-from glinext.tasks.audio.model import (
+from gliformer.tasks import TaskFlatInputs
+from gliformer.tasks.audio.model import (
     AudioClassificationHead,
     AudioSegmentationHead,
 )
-from glinext.tasks.audio.decoder import AudioSegmentationDecoder
-from glinext.tasks.media import MediaClassificationHead, matched_mask_loss
-from glinext.encoders.audio import ConvAudioEncoder
+from gliformer.tasks.audio.decoder import AudioSegmentationDecoder
+from gliformer.tasks.media import MediaClassificationHead, matched_mask_loss
+from gliformer.encoders.audio import ConvAudioEncoder
 from tests.heads.conftest import B, C, D, W, make_config
 
 

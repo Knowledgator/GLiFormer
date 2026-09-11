@@ -5,11 +5,11 @@ from dataclasses import asdict
 import pytest
 import torch
 
-from glinext.config import ClassificationHeadConfig
-from glinext.tasks import TaskFlatInputs
-from glinext.tasks.classification.model import ClassificationHead
-from glinext.tasks.classification.scorer import ClassificationScorer
-from glinext.tasks.losses import binary_focal_or_bce
+from gliformer.config import ClassificationHeadConfig
+from gliformer.tasks import TaskFlatInputs
+from gliformer.tasks.classification.model import ClassificationHead
+from gliformer.tasks.classification.scorer import ClassificationScorer
+from gliformer.tasks.losses import binary_focal_or_bce
 from tests.heads.conftest import B, C, D, W, make_config
 
 

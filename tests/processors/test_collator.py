@@ -4,7 +4,7 @@ from dataclasses import asdict
 import pytest
 import torch
 
-from glinext.config import (
+from gliformer.config import (
     AudioClassificationHeadConfig,
     AudioSegmentationHeadConfig,
     ClassificationHeadConfig,
@@ -12,31 +12,31 @@ from glinext.config import (
     ObjectDetectionHeadConfig,
     SegmentationHeadConfig,
 )
-from glinext.glinext import (
-    GLiNExTAudio,
-    GLiNExTLayout,
-    GLiNExTOmni,
-    GLiNExTText,
-    GLiNExTVision,
+from gliformer.gliformer import (
+    GLiFormerAudio,
+    GLiFormerLayout,
+    GLiFormerOmni,
+    GLiFormerText,
+    GLiFormerVision,
 )
-from glinext.processing.collator import (
-    GLiNExTAudioDataCollator,
-    GLiNExTLayoutDataCollator,
-    GLiNExTOmniDataCollator,
-    GLiNExTTextDataCollator,
-    GLiNExTVisionDataCollator,
-    resolve_glinext_collator_class,
+from gliformer.processing.collator import (
+    GLiFormerAudioDataCollator,
+    GLiFormerLayoutDataCollator,
+    GLiFormerOmniDataCollator,
+    GLiFormerTextDataCollator,
+    GLiFormerVisionDataCollator,
+    resolve_gliformer_collator_class,
 )
-from glinext.processing.label_augmentation import (
+from gliformer.processing.label_augmentation import (
     LABEL_AUGMENTATION_INDEX_KEY,
     LABEL_AUGMENTATION_MARKER_KEY,
 )
-from glinext.processing.processor import (
-    GLiNextAudioProcessor,
-    GLiNextLayoutProcessor,
-    GLiNextOmniProcessor,
-    GLiNextTextProcessor,
-    GLiNextVisionProcessor,
+from gliformer.processing.processor import (
+    GLiFormerAudioProcessor,
+    GLiFormerLayoutProcessor,
+    GLiFormerOmniProcessor,
+    GLiFormerTextProcessor,
+    GLiFormerVisionProcessor,
 )
 from tests.conftest import FakeWordsSplitter, make_config
 from tests.processors.test_unified_processor import FakeTokenizer
@@ -61,12 +61,12 @@ def test_text_collator_applies_same_batch_labels_only_to_marked_training_rows():
         ner_config=None,
         classification_config={},
     )
-    processor = GLiNextTextProcessor(
+    processor = GLiFormerTextProcessor(
         config,
         FakeTokenizer(),
         FakeWordsSplitter(),
     )
-    collator = GLiNExTTextDataCollator(
+    collator = GLiFormerTextDataCollator(
         config,
         processor,
         label_augmentation={
@@ -130,12 +130,12 @@ def test_collator_rejects_mixed_training_and_evaluation_markers():
         ner_config=None,
         classification_config={},
     )
-    processor = GLiNextTextProcessor(
+    processor = GLiFormerTextProcessor(
         config,
         FakeTokenizer(),
         FakeWordsSplitter(),
     )
-    collator = GLiNExTTextDataCollator(
+    collator = GLiFormerTextDataCollator(
         config,
         processor,
         label_augmentation={
@@ -159,20 +159,20 @@ def test_collator_rejects_mixed_training_and_evaluation_markers():
         ])
 
 
-def test_resolve_glinext_collator_class():
-    assert resolve_glinext_collator_class(make_config(model_variant="text")) is GLiNExTTextDataCollator
-    assert resolve_glinext_collator_class(make_config(model_variant="layout")) is GLiNExTLayoutDataCollator
-    assert resolve_glinext_collator_class(make_config(model_variant="vision")) is GLiNExTVisionDataCollator
-    assert resolve_glinext_collator_class(make_config(model_variant="audio")) is GLiNExTAudioDataCollator
-    assert resolve_glinext_collator_class(make_config(model_variant="omni")) is GLiNExTOmniDataCollator
+def test_resolve_gliformer_collator_class():
+    assert resolve_gliformer_collator_class(make_config(model_variant="text")) is GLiFormerTextDataCollator
+    assert resolve_gliformer_collator_class(make_config(model_variant="layout")) is GLiFormerLayoutDataCollator
+    assert resolve_gliformer_collator_class(make_config(model_variant="vision")) is GLiFormerVisionDataCollator
+    assert resolve_gliformer_collator_class(make_config(model_variant="audio")) is GLiFormerAudioDataCollator
+    assert resolve_gliformer_collator_class(make_config(model_variant="omni")) is GLiFormerOmniDataCollator
 
 
 def test_user_facing_wrappers_pin_collator_classes():
-    assert GLiNExTText.data_collator_class is GLiNExTTextDataCollator
-    assert GLiNExTLayout.data_collator_class is GLiNExTLayoutDataCollator
-    assert GLiNExTVision.data_collator_class is GLiNExTVisionDataCollator
-    assert GLiNExTAudio.data_collator_class is GLiNExTAudioDataCollator
-    assert GLiNExTOmni.data_collator_class is GLiNExTOmniDataCollator
+    assert GLiFormerText.data_collator_class is GLiFormerTextDataCollator
+    assert GLiFormerLayout.data_collator_class is GLiFormerLayoutDataCollator
+    assert GLiFormerVision.data_collator_class is GLiFormerVisionDataCollator
+    assert GLiFormerAudio.data_collator_class is GLiFormerAudioDataCollator
+    assert GLiFormerOmni.data_collator_class is GLiFormerOmniDataCollator
 
 
 def test_layout_collator_masks_text_only_rows_in_mixed_batch():
@@ -182,12 +182,12 @@ def test_layout_collator_masks_text_only_rows_in_mixed_batch():
         ner_config=None,
         classification_config={},
     )
-    processor = GLiNextLayoutProcessor(
+    processor = GLiFormerLayoutProcessor(
         config,
         FakeTokenizer(),
         FakeWordsSplitter(),
     )
-    collator = GLiNExTLayoutDataCollator(
+    collator = GLiFormerLayoutDataCollator(
         config,
         processor,
         prepare_labels=False,
@@ -229,12 +229,12 @@ def test_layout_collator_omits_bbox_for_text_only_batch():
         ner_config=None,
         classification_config={},
     )
-    processor = GLiNextLayoutProcessor(
+    processor = GLiFormerLayoutProcessor(
         config,
         FakeTokenizer(),
         FakeWordsSplitter(),
     )
-    collator = GLiNExTLayoutDataCollator(
+    collator = GLiFormerLayoutDataCollator(
         config,
         processor,
         prepare_labels=False,
@@ -262,12 +262,12 @@ def test_text_collator_uses_source_length_retained_after_prompt_truncation():
         ner_config=None,
         structuring_config={"neg_spans_ratio": 0.0},
     )
-    processor = GLiNextTextProcessor(
+    processor = GLiFormerTextProcessor(
         config,
         FakeTokenizer(),
         FakeWordsSplitter(),
     )
-    collator = GLiNExTTextDataCollator(config, processor)
+    collator = GLiFormerTextDataCollator(config, processor)
     batch = collator([{
         "text": "A B C D",
         "structuring": {
@@ -295,12 +295,12 @@ def test_text_collator_filters_structuring_spans_per_item_not_batch_max():
         ner_config=None,
         structuring_config={"neg_spans_ratio": 0.0},
     )
-    processor = GLiNextTextProcessor(
+    processor = GLiFormerTextProcessor(
         config,
         FakeTokenizer(),
         FakeWordsSplitter(),
     )
-    collator = GLiNExTTextDataCollator(config, processor)
+    collator = GLiFormerTextDataCollator(config, processor)
 
     def span(text, index):
         return {"text": text, "start": index, "end": index}
@@ -343,12 +343,12 @@ def test_text_collator_filters_joint_relations_by_retained_source_length():
         max_len=8,
         joint_relex_config={},
     )
-    processor = GLiNextTextProcessor(
+    processor = GLiFormerTextProcessor(
         config,
         FakeTokenizer(),
         FakeWordsSplitter(),
     )
-    collator = GLiNExTTextDataCollator(config, processor)
+    collator = GLiFormerTextDataCollator(config, processor)
     batch = collator([{
         "text": "A B C",
         "extraction": [{
@@ -372,8 +372,8 @@ def test_vision_collator_does_not_add_text_fields():
         default_ner_config=False,
         image_classification_config=asdict(ImageClassificationHeadConfig()),
     )
-    processor = GLiNextVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTVisionDataCollator(config, processor)
+    processor = GLiFormerVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerVisionDataCollator(config, processor)
 
     batch = collator([
         {
@@ -396,8 +396,8 @@ def test_vision_task_specific_inference_labels_only_activate_requested_head():
         image_classification_config=asdict(ImageClassificationHeadConfig()),
         object_detection_config=asdict(ObjectDetectionHeadConfig()),
     )
-    processor = GLiNextVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTVisionDataCollator(config, processor, prepare_labels=False)
+    processor = GLiFormerVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerVisionDataCollator(config, processor, prepare_labels=False)
 
     batch = collator([
         {
@@ -421,8 +421,8 @@ def test_vision_grouped_task_annotations_create_group_specific_labels():
         object_detection_config=asdict(ObjectDetectionHeadConfig()),
         segmentation_config=asdict(SegmentationHeadConfig()),
     )
-    processor = GLiNextVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTVisionDataCollator(config, processor)
+    processor = GLiFormerVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerVisionDataCollator(config, processor)
 
     batch = collator([
         {
@@ -468,8 +468,8 @@ def test_detection_targets_retain_all_valid_objects_in_source_order():
             num_fixed_slots=3,
         )),
     )
-    processor = GLiNextVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTVisionDataCollator(config, processor)
+    processor = GLiFormerVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerVisionDataCollator(config, processor)
 
     batch = collator([{
         "pixel_values": torch.zeros(3, 100, 100),
@@ -512,8 +512,8 @@ def test_vision_classification_is_derived_from_object_groups():
         image_classification_config=asdict(ImageClassificationHeadConfig()),
         object_detection_config=asdict(ObjectDetectionHeadConfig()),
     )
-    processor = GLiNextVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTVisionDataCollator(config, processor)
+    processor = GLiFormerVisionProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerVisionDataCollator(config, processor)
 
     batch = collator([
         {
@@ -544,8 +544,8 @@ def test_audio_collator_does_not_add_text_fields():
         default_ner_config=False,
         audio_classification_config=asdict(AudioClassificationHeadConfig()),
     )
-    processor = GLiNextAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTAudioDataCollator(config, processor)
+    processor = GLiFormerAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerAudioDataCollator(config, processor)
 
     batch = collator([
         {
@@ -568,8 +568,8 @@ def test_audio_task_specific_inference_labels_only_activate_requested_head():
         audio_classification_config=asdict(AudioClassificationHeadConfig()),
         audio_segmentation_config=asdict(AudioSegmentationHeadConfig()),
     )
-    processor = GLiNextAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTAudioDataCollator(config, processor, prepare_labels=False)
+    processor = GLiFormerAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerAudioDataCollator(config, processor, prepare_labels=False)
 
     batch = collator([
         {
@@ -592,8 +592,8 @@ def test_audio_grouped_task_annotations_create_group_specific_labels():
         audio_classification_config=asdict(AudioClassificationHeadConfig()),
         audio_segmentation_config=asdict(AudioSegmentationHeadConfig()),
     )
-    processor = GLiNextAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTAudioDataCollator(config, processor)
+    processor = GLiFormerAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerAudioDataCollator(config, processor)
 
     batch = collator([
         {
@@ -633,7 +633,7 @@ def test_audio_segmentation_preserves_wav_duration_before_processing(tmp_path):
         audio_do_resample=False,
         audio_segmentation_config=asdict(AudioSegmentationHeadConfig()),
     )
-    processor = GLiNextAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    processor = GLiFormerAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
 
     class LengthDoublingProcessor:
         def __call__(self, audio, **kwargs):
@@ -680,7 +680,7 @@ def test_audio_segmentation_infers_precomputed_input_duration(audio_payload, aud
     )
     config_kwargs.update(audio_config)
     config = make_config(**config_kwargs)
-    processor = GLiNextAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    processor = GLiFormerAudioProcessor(config, FakeTokenizer(), FakeWordsSplitter())
     item = {
         **audio_payload,
         "audio_segmentation": [
@@ -709,7 +709,7 @@ def test_omni_audio_duration_metadata_survives_optional_media_collation():
         audio_do_resample=False,
         audio_segmentation_config=asdict(AudioSegmentationHeadConfig()),
     )
-    processor = GLiNextOmniProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    processor = GLiFormerOmniProcessor(config, FakeTokenizer(), FakeWordsSplitter())
     raw_batch = processor.collate_raw_batch([
         {
             "text": "feature row",
@@ -747,8 +747,8 @@ def test_omni_collator_allows_rows_without_every_media_type():
         audio_sampling_rate=None,
         audio_do_resample=False,
     )
-    processor = GLiNextOmniProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTOmniDataCollator(config, processor)
+    processor = GLiFormerOmniProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerOmniDataCollator(config, processor)
 
     batch = collator([
         {
@@ -785,8 +785,8 @@ def test_omni_collator_rejects_explicit_media_task_without_payload():
         model_variant="omni",
         image_classification_config=asdict(ImageClassificationHeadConfig()),
     )
-    processor = GLiNextOmniProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTOmniDataCollator(config, processor)
+    processor = GLiFormerOmniProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerOmniDataCollator(config, processor)
 
     try:
         collator([
@@ -806,8 +806,8 @@ def test_omni_collator_rejects_spatial_padding_that_would_misalign_boxes():
         model_variant="omni",
         image_classification_config=asdict(ImageClassificationHeadConfig()),
     )
-    processor = GLiNextOmniProcessor(config, FakeTokenizer(), FakeWordsSplitter())
-    collator = GLiNExTOmniDataCollator(config, processor)
+    processor = GLiFormerOmniProcessor(config, FakeTokenizer(), FakeWordsSplitter())
+    collator = GLiFormerOmniDataCollator(config, processor)
 
     with pytest.raises(ValueError, match="one processed tensor shape"):
         collator([

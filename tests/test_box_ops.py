@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from glinext.tasks.box_ops import (
+from gliformer.tasks.box_ops import (
     aligned_box_iou,
     aligned_generalized_box_iou,
     box_area,

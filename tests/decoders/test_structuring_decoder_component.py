@@ -5,23 +5,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from glinext.processing.mappings import (
+from gliformer.processing.mappings import (
     BaseClassMapping,
     StructuringClassMapping,
     StructuringItemMapping,
 )
-from glinext.processing.structuring_decoder import (
+from gliformer.processing.structuring_decoder import (
     StructuringDecoder as BaseStructuringDecoder,
 )
-from glinext.processing.structuring_decoder import (
+from gliformer.processing.structuring_decoder import (
     StructuringDecoderComponent,
     resolve_structuring_decoder,
 )
-from glinext.processing.structuring_processor import (
+from gliformer.processing.structuring_processor import (
     StructuringProcessor as BaseStructuringProcessor,
 )
-from glinext.tasks.structuring.decoder import StructuringDecoder
-from glinext.tasks.structuring.processor import StructuringProcessor
+from gliformer.tasks.structuring.decoder import StructuringDecoder
+from gliformer.tasks.structuring.processor import StructuringProcessor
 from tests.conftest import make_config
 
 

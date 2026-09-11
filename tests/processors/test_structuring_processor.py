@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from glinext.model import GLiNExTModel
-from glinext.tasks.structuring.processor import StructuringProcessor
+from gliformer.model import GLiFormerModel
+from gliformer.tasks.structuring.processor import StructuringProcessor
 from tests.conftest import FakeWordsSplitter, make_batch_classes_mapping, make_config
 
 
@@ -876,7 +876,7 @@ class TestMultiLevelStructuring:
 
 class TestModelStructuringCountBridge:
     def test_uses_tail_count_predictions_for_structuring_groups_regression(self):
-        model = object.__new__(GLiNExTModel)
+        model = object.__new__(GLiFormerModel)
         model.config = make_config(count_config={"mode": "regression"})
 
         flat_inputs_map = {
@@ -889,7 +889,7 @@ class TestModelStructuringCountBridge:
         assert torch.equal(result, torch.tensor([3, 0]))
 
     def test_uses_tail_count_predictions_for_structuring_groups_classification(self):
-        model = object.__new__(GLiNExTModel)
+        model = object.__new__(GLiFormerModel)
         model.config = make_config(count_config={"mode": "classification", "max_count": 5})
 
         flat_inputs_map = {

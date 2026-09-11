@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from glinext.layers import AnchorNormalizer
+from gliformer.layers import AnchorNormalizer
 
 
 @pytest.mark.parametrize("normalization", ["layer_norm", "rms_norm", "l2"])

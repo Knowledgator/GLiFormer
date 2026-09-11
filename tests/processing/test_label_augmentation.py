@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from glinext.processing.label_augmentation import (
+from gliformer.processing.label_augmentation import (
     AugmentableLabelGroup,
     BatchLabelAugmenter,
     LabelAugmentationConfig,

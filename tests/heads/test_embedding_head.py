@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from glinext.config import EmbeddingHeadConfig
-from glinext.tasks.embedding.model import (
+from gliformer.config import EmbeddingHeadConfig
+from gliformer.tasks.embedding.model import (
     ContrastiveLoss,
     CosineMarginLoss,
     EmbeddingHead,

@@ -1,10 +1,10 @@
 """Tests for the default prompt-marker vocabulary."""
 
-from glinext.config import GLiNextConfig
+from gliformer.config import GLiFormerConfig
 
 
 def test_default_prompt_marker_convention():
-    config = GLiNextConfig()
+    config = GLiFormerConfig()
 
     assert config.seq_token == "[SEQ]"
     assert config.sep_token == "[SEP]"
@@ -25,7 +25,7 @@ def test_default_prompt_marker_convention():
 
 
 def test_descriptive_token_aliases_override_legacy_names():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         entity_token="[E]",
         class_token="[C]",
         relation_token="[R]",
@@ -44,7 +44,7 @@ def test_descriptive_token_aliases_override_legacy_names():
 
 
 def test_per_task_schema_tokens_are_descriptive():
-    config = GLiNextConfig(per_task_parents=True)
+    config = GLiFormerConfig(per_task_parents=True)
 
     assert config.ner_parent_token == "[ENTITY_SCHEMA]"
     assert config.cat_parent_token == "[CLASS_SCHEMA]"

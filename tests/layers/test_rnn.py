@@ -2,7 +2,7 @@
 
 import torch
 
-from glinext.layers.rnn import RnnSeq2SeqEncoder
+from gliformer.layers.rnn import RnnSeq2SeqEncoder
 
 
 class TestRnnSeq2SeqEncoder:

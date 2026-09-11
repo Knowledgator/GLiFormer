@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.layers.anchor_layer import (
+from gliformer.layers.anchor_layer import (
     AnchorLayer, ParentAnchorLayer, FixedAnchorLayer,
     FixedRNNAnchorLayer, FixedTransformerAnchorLayer,
     RotaryAnchorLayer, QueryRNNAnchorLayer, QueryTransformerAnchorLayer,

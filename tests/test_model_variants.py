@@ -3,49 +3,49 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import glinext.model as model_module
+import gliformer.model as model_module
 
-from glinext.config import (
-    GLiNextAudioConfig,
-    GLiNextConfig,
-    GLiNextLayoutConfig,
-    GLiNextOmniConfig,
-    GLiNextTextConfig,
-    GLiNextVisionConfig,
+from gliformer.config import (
+    GLiFormerAudioConfig,
+    GLiFormerConfig,
+    GLiFormerLayoutConfig,
+    GLiFormerOmniConfig,
+    GLiFormerTextConfig,
+    GLiFormerVisionConfig,
     ObjectDetectionHeadConfig,
 )
-from glinext.model import (
-    GLiNExTAudioModel,
-    GLiNExTAudioOutput,
-    GLiNExTLayoutModel,
-    GLiNExTLayoutOutput,
-    GLiNExTOmniModel,
-    GLiNExTOmniOutput,
-    GLiNExTTextModel,
-    GLiNExTTextOutput,
-    GLiNExTVisionModel,
-    GLiNExTVisionOutput,
-    resolve_glinext_model_class,
+from gliformer.model import (
+    GLiFormerAudioModel,
+    GLiFormerAudioOutput,
+    GLiFormerLayoutModel,
+    GLiFormerLayoutOutput,
+    GLiFormerOmniModel,
+    GLiFormerOmniOutput,
+    GLiFormerTextModel,
+    GLiFormerTextOutput,
+    GLiFormerVisionModel,
+    GLiFormerVisionOutput,
+    resolve_gliformer_model_class,
 )
-from glinext.glinext import (
-    BaseGLiNeXT,
-    GLiNExT,
-    GLiNExTAudio,
-    GLiNExTLayout,
-    GLiNExTOmni,
-    GLiNExTText,
-    GLiNExTVision,
+from gliformer.gliformer import (
+    BaseGLiFormer,
+    GLiFormer,
+    GLiFormerAudio,
+    GLiFormerLayout,
+    GLiFormerOmni,
+    GLiFormerText,
+    GLiFormerVision,
 )
-from glinext.encoders.audio import AudioBiEncoder
-from glinext.encoders.base import Transformer
-from glinext.encoders.omni import LayoutBiEncoder, LayoutEncoder
-from glinext.encoders.vision import VisionBiEncoder
-from glinext.backbones.deberta_2d import (
+from gliformer.encoders.audio import AudioBiEncoder
+from gliformer.encoders.base import Transformer
+from gliformer.encoders.omni import LayoutBiEncoder, LayoutEncoder
+from gliformer.encoders.vision import VisionBiEncoder
+from gliformer.backbones.deberta_2d import (
     LayoutDebertaConfig,
     LayoutDebertaEmbeddings,
     LayoutDebertaModel,
 )
-from glinext.processing.mappings import (
+from gliformer.processing.mappings import (
     BaseClassMapping,
     BatchClassesMapping,
     CatClassMapping,
@@ -58,7 +58,7 @@ from glinext.processing.mappings import (
     VisionClassMapping,
     VisionItemMapping,
 )
-from glinext.tasks import TASK_REGISTRY, TaskFlatInputs, TaskHeadOutput
+from gliformer.tasks import TASK_REGISTRY, TaskFlatInputs, TaskHeadOutput
 
 
 def make_config(**overrides):
@@ -69,7 +69,7 @@ def make_config(**overrides):
         "ner_config": None,
     }
     defaults.update(overrides)
-    return GLiNextConfig(**defaults)
+    return GLiFormerConfig(**defaults)
 
 
 def test_named_label_batches_share_one_padded_encoder_pass():
@@ -83,7 +83,7 @@ def test_named_label_batches_share_one_padded_encoder_pass():
 
     labels_encoder = RecordingLabelsEncoder()
     owner = SimpleNamespace(token_rep_layer=labels_encoder)
-    encoded = model_module.BaseGLiNextModel._encode_label_inputs_batched(
+    encoded = model_module.BaseGLiFormerModel._encode_label_inputs_batched(
         owner,
         {
             "classification": (
@@ -127,7 +127,7 @@ def test_word_rnn_skips_empty_rows_in_mixed_batches():
         [True, False, False, False],
     ])
 
-    encoded = model_module.BaseGLiNextModel._apply_word_rnn(
+    encoded = model_module.BaseGLiFormerModel._apply_word_rnn(
         owner,
         words,
         mask,
@@ -148,7 +148,7 @@ def test_word_rnn_accepts_a_completely_empty_word_axis():
     words = torch.empty(2, 0, 3)
     mask = torch.empty(2, 0, dtype=torch.bool)
 
-    encoded = model_module.BaseGLiNextModel._apply_word_rnn(
+    encoded = model_module.BaseGLiFormerModel._apply_word_rnn(
         owner,
         words,
         mask,
@@ -158,11 +158,11 @@ def test_word_rnn_accepts_a_completely_empty_word_axis():
 
 
 def test_resolves_explicit_single_modality_models():
-    assert resolve_glinext_model_class(make_config(model_variant="text")) is GLiNExTTextModel
-    assert resolve_glinext_model_class(make_config(model_variant="layout")) is GLiNExTLayoutModel
-    assert resolve_glinext_model_class(make_config(model_variant="vision")) is GLiNExTVisionModel
-    assert resolve_glinext_model_class(make_config(model_variant="audio")) is GLiNExTAudioModel
-    assert resolve_glinext_model_class(make_config(model_variant="omni")) is GLiNExTOmniModel
+    assert resolve_gliformer_model_class(make_config(model_variant="text")) is GLiFormerTextModel
+    assert resolve_gliformer_model_class(make_config(model_variant="layout")) is GLiFormerLayoutModel
+    assert resolve_gliformer_model_class(make_config(model_variant="vision")) is GLiFormerVisionModel
+    assert resolve_gliformer_model_class(make_config(model_variant="audio")) is GLiFormerAudioModel
+    assert resolve_gliformer_model_class(make_config(model_variant="omni")) is GLiFormerOmniModel
 
 
 @pytest.mark.parametrize(
@@ -190,47 +190,47 @@ def test_model_variant_aliases_are_rejected(variant):
 
 
 def test_intermediate_text_media_model_classes_are_removed():
-    assert not hasattr(model_module, "GLiNExTTextVisionBiEncoderModel")
-    assert not hasattr(model_module, "GLiNExTTextVisionUniEncoderModel")
-    assert not hasattr(model_module, "GLiNExTTextAudioModel")
-    assert not hasattr(model_module, "GLiNExTTextAudioUniEncoderModel")
+    assert not hasattr(model_module, "GLiFormerTextVisionBiEncoderModel")
+    assert not hasattr(model_module, "GLiFormerTextVisionUniEncoderModel")
+    assert not hasattr(model_module, "GLiFormerTextAudioModel")
+    assert not hasattr(model_module, "GLiFormerTextAudioUniEncoderModel")
 
 
 def test_omni_model_infers_active_modalities():
-    assert GLiNExTOmniModel._infer_omni_modalities(make_config(model_variant="omni")) == ("text", "vision", "audio")
+    assert GLiFormerOmniModel._infer_omni_modalities(make_config(model_variant="omni")) == ("text", "vision", "audio")
 
 
 def test_text_variant_does_not_infer_omni_from_encoder_fields():
     config = make_config(model_variant="text", vision_encoder_type="patch", audio_encoder_type="conv")
-    assert resolve_glinext_model_class(config) is GLiNExTTextModel
+    assert resolve_gliformer_model_class(config) is GLiFormerTextModel
 
 
 def test_omni_model_rejects_unknown_variant_for_modalities():
     with pytest.raises(ValueError, match="requires model_variant"):
-        GLiNExTOmniModel._infer_omni_modalities(make_config(model_variant="text"))
+        GLiFormerOmniModel._infer_omni_modalities(make_config(model_variant="text"))
 
 
 def test_user_facing_factory_resolves_concrete_wrappers():
-    assert GLiNExT._get_glinext_class(make_config(model_variant="text")) is GLiNExTText
-    assert GLiNExT._get_glinext_class(make_config(model_variant="layout")) is GLiNExTLayout
-    assert GLiNExT._get_glinext_class(make_config(model_variant="vision")) is GLiNExTVision
-    assert GLiNExT._get_glinext_class(make_config(model_variant="audio")) is GLiNExTAudio
-    assert GLiNExT._get_glinext_class(make_config(model_variant="omni")) is GLiNExTOmni
+    assert GLiFormer._get_gliformer_class(make_config(model_variant="text")) is GLiFormerText
+    assert GLiFormer._get_gliformer_class(make_config(model_variant="layout")) is GLiFormerLayout
+    assert GLiFormer._get_gliformer_class(make_config(model_variant="vision")) is GLiFormerVision
+    assert GLiFormer._get_gliformer_class(make_config(model_variant="audio")) is GLiFormerAudio
+    assert GLiFormer._get_gliformer_class(make_config(model_variant="omni")) is GLiFormerOmni
 
 
 def test_user_facing_wrappers_pin_internal_model_classes():
-    assert issubclass(GLiNExTText, BaseGLiNeXT)
-    assert GLiNExTText.model_class is GLiNExTTextModel
-    assert GLiNExTLayout.model_class is GLiNExTLayoutModel
-    assert GLiNExTVision.model_class is GLiNExTVisionModel
-    assert GLiNExTAudio.model_class is GLiNExTAudioModel
-    assert GLiNExTOmni.model_class is GLiNExTOmniModel
+    assert issubclass(GLiFormerText, BaseGLiFormer)
+    assert GLiFormerText.model_class is GLiFormerTextModel
+    assert GLiFormerLayout.model_class is GLiFormerLayoutModel
+    assert GLiFormerVision.model_class is GLiFormerVisionModel
+    assert GLiFormerAudio.model_class is GLiFormerAudioModel
+    assert GLiFormerOmni.model_class is GLiFormerOmniModel
 
 
 def test_structure_forwards_an_explicit_objectness_threshold():
     class Probe:
-        _normalize_texts = staticmethod(BaseGLiNeXT._normalize_texts)
-        _single_or_batch = staticmethod(BaseGLiNeXT._single_or_batch)
+        _normalize_texts = staticmethod(BaseGLiFormer._normalize_texts)
+        _single_or_batch = staticmethod(BaseGLiFormer._single_or_batch)
 
         def inference(self, texts, **kwargs):
             self.inference_call = (texts, kwargs)
@@ -238,7 +238,7 @@ def test_structure_forwards_an_explicit_objectness_threshold():
 
     probe = Probe()
 
-    result = BaseGLiNeXT.structure(
+    result = BaseGLiFormer.structure(
         probe,
         "document",
         structures={"record": ["field"]},
@@ -253,8 +253,8 @@ def test_structure_forwards_an_explicit_objectness_threshold():
 
 def test_structure_formats_direct_typed_templates():
     class Probe:
-        _normalize_texts = staticmethod(BaseGLiNeXT._normalize_texts)
-        _single_or_batch = staticmethod(BaseGLiNeXT._single_or_batch)
+        _normalize_texts = staticmethod(BaseGLiFormer._normalize_texts)
+        _single_or_batch = staticmethod(BaseGLiFormer._single_or_batch)
 
         def inference(self, texts, **kwargs):
             return {
@@ -263,7 +263,7 @@ def test_structure_formats_direct_typed_templates():
                 ]
             }
 
-    result = BaseGLiNeXT.structure(
+    result = BaseGLiFormer.structure(
         Probe(),
         "document",
         structures={
@@ -284,8 +284,8 @@ def test_structure_returns_opt_in_anchor_diagnostics():
     }
 
     class Probe:
-        _normalize_texts = staticmethod(BaseGLiNeXT._normalize_texts)
-        _single_or_batch = staticmethod(BaseGLiNeXT._single_or_batch)
+        _normalize_texts = staticmethod(BaseGLiFormer._normalize_texts)
+        _single_or_batch = staticmethod(BaseGLiFormer._single_or_batch)
 
         def inference(self, texts, **kwargs):
             assert kwargs["return_anchor_diagnostics"] is True
@@ -294,7 +294,7 @@ def test_structure_returns_opt_in_anchor_diagnostics():
                 "structuring_anchor_diagnostics": [diagnostics],
             }
 
-    result = BaseGLiNeXT.structure(
+    result = BaseGLiFormer.structure(
         Probe(),
         "document",
         structures={"record": ["field"]},
@@ -351,11 +351,11 @@ def test_predict_relations_uses_canonical_entity_first_inference_argument():
     }
 
     class Probe:
-        _normalize_texts = staticmethod(BaseGLiNeXT._normalize_texts)
-        _single_or_batch = staticmethod(BaseGLiNeXT._single_or_batch)
-        _label_group_count = staticmethod(BaseGLiNeXT._label_group_count)
+        _normalize_texts = staticmethod(BaseGLiFormer._normalize_texts)
+        _single_or_batch = staticmethod(BaseGLiFormer._single_or_batch)
+        _label_group_count = staticmethod(BaseGLiFormer._label_group_count)
         _collapse_single_group_results = staticmethod(
-            BaseGLiNeXT._collapse_single_group_results
+            BaseGLiFormer._collapse_single_group_results
         )
 
         def inference(self, texts, **kwargs):
@@ -363,7 +363,7 @@ def test_predict_relations_uses_canonical_entity_first_inference_argument():
             assert kwargs["relations"] == ["works_at"]
             return {"open_relex": [[[triple]]]}
 
-    result = BaseGLiNeXT.predict_relations(
+    result = BaseGLiFormer.predict_relations(
         Probe(),
         "Alice Acme",
         ["works_at"],
@@ -373,10 +373,10 @@ def test_predict_relations_uses_canonical_entity_first_inference_argument():
 
 
 def test_single_media_models_use_dedicated_bi_encoders():
-    assert GLiNExTVisionModel.bi_encoder_cls is VisionBiEncoder
-    assert GLiNExTAudioModel.bi_encoder_cls is AudioBiEncoder
-    assert GLiNExTLayoutModel.layout_encoder_cls is LayoutEncoder
-    assert GLiNExTLayoutModel.layout_bi_encoder_cls is LayoutBiEncoder
+    assert GLiFormerVisionModel.bi_encoder_cls is VisionBiEncoder
+    assert GLiFormerAudioModel.bi_encoder_cls is AudioBiEncoder
+    assert GLiFormerLayoutModel.layout_encoder_cls is LayoutEncoder
+    assert GLiFormerLayoutModel.layout_bi_encoder_cls is LayoutBiEncoder
 
 
 def test_media_parent_embedding_source_rejects_unknown_values():
@@ -392,7 +392,7 @@ def test_media_parent_embedding_source_fixed_uses_task_parameter():
     media_tokens = torch.zeros(2, 3, 4)
     media_mask = torch.ones(2, 3)
 
-    parent = GLiNExTVisionModel._media_parent_embedding_for_task(
+    parent = GLiFormerVisionModel._media_parent_embedding_for_task(
         dummy,
         "object_detection",
         media_tokens,
@@ -412,7 +412,7 @@ def test_media_parent_embedding_source_mean_uses_masked_media_tokens():
     ])
     media_mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
 
-    parent = GLiNExTVisionModel._media_parent_embedding_for_task(
+    parent = GLiFormerVisionModel._media_parent_embedding_for_task(
         dummy,
         "object_detection",
         media_tokens,
@@ -432,7 +432,7 @@ def test_media_parent_embedding_source_first_uses_first_valid_media_token():
     ])
     media_mask = torch.tensor([[0, 1], [1, 1]])
 
-    parent = GLiNExTVisionModel._media_parent_embedding_for_task(
+    parent = GLiFormerVisionModel._media_parent_embedding_for_task(
         dummy,
         "object_detection",
         media_tokens,
@@ -676,47 +676,47 @@ def test_layout_deberta_rejects_layout_mask_without_bbox():
 def test_layout_kwargs_only_accepts_canonical_input_names():
     bbox = torch.zeros(1, 4, 4, dtype=torch.long)
     pixel_values = torch.zeros(1, 3, 16, 16)
-    result = GLiNExTLayoutModel._layout_kwargs({"bbox": bbox, "pixel_values": pixel_values})
+    result = GLiFormerLayoutModel._layout_kwargs({"bbox": bbox, "pixel_values": pixel_values})
 
     assert set(result) == {"bbox", "pixel_values"}
     assert result["bbox"] is bbox
     assert result["pixel_values"] is pixel_values
 
     layout_input_mask = torch.tensor([True])
-    result = GLiNExTLayoutModel._layout_kwargs(
+    result = GLiFormerLayoutModel._layout_kwargs(
         {"bbox": bbox, "layout_input_mask": layout_input_mask}
     )
     assert result["layout_input_mask"] is layout_input_mask
 
     page_token_ids = torch.zeros(1, 4, dtype=torch.long)
     page_input_mask = torch.tensor([True])
-    result = GLiNExTLayoutModel._layout_kwargs(
+    result = GLiFormerLayoutModel._layout_kwargs(
         {"page_token_ids": page_token_ids, "page_input_mask": page_input_mask}
     )
     assert result["page_token_ids"] is page_token_ids
     assert result["page_input_mask"] is page_input_mask
 
     with pytest.raises(ValueError, match="canonical input names"):
-        GLiNExTLayoutModel._layout_kwargs({"word_bboxes": bbox})
+        GLiFormerLayoutModel._layout_kwargs({"word_bboxes": bbox})
 
     with pytest.raises(ValueError, match="canonical input names"):
-        GLiNExTLayoutModel._layout_kwargs({"layout_bbox": bbox})
+        GLiFormerLayoutModel._layout_kwargs({"layout_bbox": bbox})
 
 
 def test_omni_kwargs_only_accepts_canonical_input_names():
     pixel_values = torch.zeros(1, 3, 16, 16)
     audio_values = torch.zeros(1, 16000)
-    result = GLiNExTOmniModel._omni_kwargs({"pixel_values": pixel_values, "audio_values": audio_values})
+    result = GLiFormerOmniModel._omni_kwargs({"pixel_values": pixel_values, "audio_values": audio_values})
 
     assert set(result) == {"pixel_values", "audio_values"}
     assert result["pixel_values"] is pixel_values
     assert result["audio_values"] is audio_values
 
     with pytest.raises(ValueError, match="canonical input names"):
-        GLiNExTOmniModel._omni_kwargs({"input_values": audio_values})
+        GLiFormerOmniModel._omni_kwargs({"input_values": audio_values})
 
     with pytest.raises(ValueError, match="canonical input names"):
-        GLiNExTOmniModel._omni_kwargs({"vision_pixel_values": pixel_values})
+        GLiFormerOmniModel._omni_kwargs({"vision_pixel_values": pixel_values})
 
 
 def test_text_and_layout_forward_use_text_task_path(monkeypatch):
@@ -729,21 +729,21 @@ def test_text_and_layout_forward_use_text_task_path(monkeypatch):
     def fail_joint_forward(self, *args, **kwargs):
         raise AssertionError("text/layout forward should not call a generic or omni path")
 
-    monkeypatch.setattr(GLiNExTTextModel, "_forward_text_task_heads", fake_text_forward)
-    monkeypatch.setattr(GLiNExTLayoutModel, "_forward_text_task_heads", fake_text_forward)
-    monkeypatch.setattr(GLiNExTTextModel, "_forward_task_heads", fail_joint_forward)
-    monkeypatch.setattr(GLiNExTLayoutModel, "_forward_task_heads", fail_joint_forward)
-    monkeypatch.setattr(GLiNExTTextModel, "_forward_all_tasks", fail_joint_forward)
-    monkeypatch.setattr(GLiNExTLayoutModel, "_forward_all_tasks", fail_joint_forward)
-    monkeypatch.setattr(GLiNExTTextModel, "_forward_omni_task_heads", fail_joint_forward)
-    monkeypatch.setattr(GLiNExTLayoutModel, "_forward_omni_task_heads", fail_joint_forward)
+    monkeypatch.setattr(GLiFormerTextModel, "_forward_text_task_heads", fake_text_forward)
+    monkeypatch.setattr(GLiFormerLayoutModel, "_forward_text_task_heads", fake_text_forward)
+    monkeypatch.setattr(GLiFormerTextModel, "_forward_task_heads", fail_joint_forward)
+    monkeypatch.setattr(GLiFormerLayoutModel, "_forward_task_heads", fail_joint_forward)
+    monkeypatch.setattr(GLiFormerTextModel, "_forward_all_tasks", fail_joint_forward)
+    monkeypatch.setattr(GLiFormerLayoutModel, "_forward_all_tasks", fail_joint_forward)
+    monkeypatch.setattr(GLiFormerTextModel, "_forward_omni_task_heads", fail_joint_forward)
+    monkeypatch.setattr(GLiFormerLayoutModel, "_forward_omni_task_heads", fail_joint_forward)
 
-    text_model = object.__new__(GLiNExTTextModel)
-    layout_model = object.__new__(GLiNExTLayoutModel)
+    text_model = object.__new__(GLiFormerTextModel)
+    layout_model = object.__new__(GLiFormerLayoutModel)
 
-    assert isinstance(GLiNExTTextModel.forward(text_model), GLiNExTTextOutput)
-    assert isinstance(GLiNExTLayoutModel.forward(layout_model), GLiNExTLayoutOutput)
-    assert calls == ["GLiNExTTextModel", "GLiNExTLayoutModel"]
+    assert isinstance(GLiFormerTextModel.forward(text_model), GLiFormerTextOutput)
+    assert isinstance(GLiFormerLayoutModel.forward(layout_model), GLiFormerLayoutOutput)
+    assert calls == ["GLiFormerTextModel", "GLiFormerLayoutModel"]
 
 
 def test_layout_forward_accepts_pixel_values_and_rejects_audio(monkeypatch):
@@ -753,21 +753,21 @@ def test_layout_forward_accepts_pixel_values_and_rejects_audio(monkeypatch):
         captured.update(kwargs)
         return self.output_cls()
 
-    monkeypatch.setattr(GLiNExTLayoutModel, "_forward_text_task_heads", fake_text_forward)
+    monkeypatch.setattr(GLiFormerLayoutModel, "_forward_text_task_heads", fake_text_forward)
 
-    layout_model = object.__new__(GLiNExTLayoutModel)
+    layout_model = object.__new__(GLiFormerLayoutModel)
     pixel_values = torch.zeros(1, 3, 16, 16)
     bbox = torch.zeros(1, 4, 4, dtype=torch.long)
 
     assert isinstance(
-        GLiNExTLayoutModel.forward(layout_model, pixel_values=pixel_values, bbox=bbox),
-        GLiNExTLayoutOutput,
+        GLiFormerLayoutModel.forward(layout_model, pixel_values=pixel_values, bbox=bbox),
+        GLiFormerLayoutOutput,
     )
     assert captured["pixel_values"] is pixel_values
     assert captured["bbox"] is bbox
 
     with pytest.raises(ValueError, match="unsupported media arguments"):
-        GLiNExTLayoutModel.forward(layout_model, audio_values=torch.zeros(1, 16000))
+        GLiFormerLayoutModel.forward(layout_model, audio_values=torch.zeros(1, 16000))
 
 
 def test_omni_forward_uses_omni_task_path(monkeypatch):
@@ -777,12 +777,12 @@ def test_omni_forward_uses_omni_task_path(monkeypatch):
     def fail_text_forward(self, *args, **kwargs):
         raise AssertionError("omni forward should not call the text-only path")
 
-    monkeypatch.setattr(GLiNExTOmniModel, "_forward_omni_task_heads", fake_omni_forward)
-    monkeypatch.setattr(GLiNExTOmniModel, "_forward_text_task_heads", fail_text_forward)
+    monkeypatch.setattr(GLiFormerOmniModel, "_forward_omni_task_heads", fake_omni_forward)
+    monkeypatch.setattr(GLiFormerOmniModel, "_forward_text_task_heads", fail_text_forward)
 
-    omni_model = object.__new__(GLiNExTOmniModel)
+    omni_model = object.__new__(GLiFormerOmniModel)
 
-    assert isinstance(GLiNExTOmniModel.forward(omni_model), GLiNExTOmniOutput)
+    assert isinstance(GLiFormerOmniModel.forward(omni_model), GLiFormerOmniOutput)
 
 
 def test_media_task_features_do_not_fallback_to_text_embeddings():
@@ -793,7 +793,7 @@ def test_media_task_features_do_not_fallback_to_text_embeddings():
     audio = torch.full((1, 5, 4), 3.0)
     audio_mask = torch.ones(1, 5, dtype=torch.long)
 
-    image_features, image_mask = GLiNExTOmniModel._features_for_task(
+    image_features, image_mask = GLiFormerOmniModel._features_for_task(
         task_name="image_classification",
         words_embedding=words,
         word_mask=word_mask,
@@ -802,7 +802,7 @@ def test_media_task_features_do_not_fallback_to_text_embeddings():
         audio_embedding=audio,
         audio_mask=audio_mask,
     )
-    audio_features, returned_audio_mask = GLiNExTOmniModel._features_for_task(
+    audio_features, returned_audio_mask = GLiFormerOmniModel._features_for_task(
         task_name="audio_classification",
         words_embedding=words,
         word_mask=word_mask,
@@ -823,7 +823,7 @@ def test_media_task_features_raise_when_modality_missing():
     word_mask = torch.ones(1, 2, dtype=torch.long)
 
     with pytest.raises(ValueError, match="requires vision embeddings"):
-        GLiNExTOmniModel._features_for_task(
+        GLiFormerOmniModel._features_for_task(
             task_name="object_detection",
             words_embedding=words,
             word_mask=word_mask,
@@ -834,7 +834,7 @@ def test_media_task_features_raise_when_modality_missing():
         )
 
     with pytest.raises(ValueError, match="requires audio embeddings"):
-        GLiNExTOmniModel._features_for_task(
+        GLiFormerOmniModel._features_for_task(
             task_name="audio_segmentation",
             words_embedding=words,
             word_mask=word_mask,
@@ -859,20 +859,20 @@ def test_text_task_path_does_not_call_generic_forward(monkeypatch):
         mask = torch.ones(1, 2, dtype=torch.long)
         return token_embeds, prompts_embedding, prompts_embedding_mask, words_embedding, mask
 
-    monkeypatch.setattr(GLiNExTTextModel, "_forward_task_heads", fail_generic_forward)
-    monkeypatch.setattr(GLiNExTTextModel, "get_representations", fake_get_representations)
+    monkeypatch.setattr(GLiFormerTextModel, "_forward_task_heads", fail_generic_forward)
+    monkeypatch.setattr(GLiFormerTextModel, "get_representations", fake_get_representations)
     monkeypatch.setattr(
-        GLiNExTTextModel,
+        GLiFormerTextModel,
         "_encode_all_labels_batched",
         lambda self, *args: (None, None, None, None),
     )
     monkeypatch.setattr(
-        GLiNExTTextModel,
+        GLiFormerTextModel,
         "_build_forward_flat_inputs",
         lambda self, **kwargs: ({}, None, None),
     )
     monkeypatch.setattr(
-        GLiNExTTextModel,
+        GLiFormerTextModel,
         "_encode_embedding_pair_inputs",
         lambda self, *args: (None, None),
     )
@@ -882,29 +882,29 @@ def test_text_task_path_does_not_call_generic_forward(monkeypatch):
         return None, {}
 
     monkeypatch.setattr(
-        GLiNExTTextModel,
+        GLiFormerTextModel,
         "_execute_forward_heads",
         capture_head_inputs,
     )
     monkeypatch.setattr(
-        GLiNExTTextModel,
+        GLiFormerTextModel,
         "_collect_forward_output",
         lambda self, **kwargs: self.output_cls(),
     )
 
-    text_model = object.__new__(GLiNExTTextModel)
+    text_model = object.__new__(GLiFormerTextModel)
     structuring_span_idx = torch.tensor([[[0, 0]]])
     structuring_span_mask = torch.ones(1, 1, dtype=torch.bool)
     structuring_span_labels = torch.ones(1, 1, 1, 1)
 
     assert isinstance(
-        GLiNExTTextModel._forward_text_task_heads(
+        GLiFormerTextModel._forward_text_task_heads(
             text_model,
             structuring_span_idx=structuring_span_idx,
             structuring_span_mask=structuring_span_mask,
             structuring_span_labels=structuring_span_labels,
         ),
-        GLiNExTTextOutput,
+        GLiFormerTextOutput,
     )
     assert captured_batch_kwargs["structuring_span_idx"] is structuring_span_idx
     assert captured_batch_kwargs["structuring_span_mask"] is structuring_span_mask
@@ -916,18 +916,18 @@ def test_text_task_path_does_not_call_generic_forward(monkeypatch):
 
 def test_text_model_forward_returns_exact_text_output(monkeypatch):
     def fake_text_forward(self, *args, **kwargs):
-        return GLiNExTOmniOutput(
+        return GLiFormerOmniOutput(
             ner_logits=torch.zeros(1, 1, 1),
             image_classification_logits=torch.zeros(1, 1),
             vision_embedding=torch.zeros(1, 1, 1),
         )
 
-    monkeypatch.setattr(GLiNExTTextModel, "_forward_text_task_heads", fake_text_forward)
+    monkeypatch.setattr(GLiFormerTextModel, "_forward_text_task_heads", fake_text_forward)
 
-    text_model = object.__new__(GLiNExTTextModel)
-    output = GLiNExTTextModel.forward(text_model)
+    text_model = object.__new__(GLiFormerTextModel)
+    output = GLiFormerTextModel.forward(text_model)
 
-    assert type(output) is GLiNExTTextOutput
+    assert type(output) is GLiFormerTextOutput
     assert output.ner_logits is not None
     assert not hasattr(output, "image_classification_logits")
     assert not hasattr(output, "vision_embedding")
@@ -949,27 +949,27 @@ def test_omni_task_path_forwards_structuring_span_targets(monkeypatch):
         "vision_prefix_tokens": None,
     }
     monkeypatch.setattr(
-        GLiNExTOmniModel,
+        GLiFormerOmniModel,
         "_encode_forward_representations",
         lambda self, **kwargs: representations,
     )
     monkeypatch.setattr(
-        GLiNExTOmniModel,
+        GLiFormerOmniModel,
         "_encode_all_labels_batched",
         lambda self, *args: (None, None, None, None),
     )
     monkeypatch.setattr(
-        GLiNExTOmniModel,
+        GLiFormerOmniModel,
         "_encode_media_labels_batched",
         lambda self, kwargs: None,
     )
     monkeypatch.setattr(
-        GLiNExTOmniModel,
+        GLiFormerOmniModel,
         "_build_forward_flat_inputs",
         lambda self, **kwargs: ({}, None, None),
     )
     monkeypatch.setattr(
-        GLiNExTOmniModel,
+        GLiFormerOmniModel,
         "_encode_embedding_pair_inputs",
         lambda self, *args: (None, None),
     )
@@ -980,29 +980,29 @@ def test_omni_task_path_forwards_structuring_span_targets(monkeypatch):
         return None, {}
 
     monkeypatch.setattr(
-        GLiNExTOmniModel,
+        GLiFormerOmniModel,
         "_execute_forward_heads",
         capture_head_inputs,
     )
     monkeypatch.setattr(
-        GLiNExTOmniModel,
+        GLiFormerOmniModel,
         "_collect_forward_output",
         lambda self, **kwargs: self.output_cls(),
     )
 
-    model = object.__new__(GLiNExTOmniModel)
+    model = object.__new__(GLiFormerOmniModel)
     structuring_span_idx = torch.tensor([[[0, 0]]])
     structuring_span_mask = torch.ones(1, 1, dtype=torch.bool)
     structuring_span_labels = torch.ones(1, 1, 1, 1)
 
-    output = GLiNExTOmniModel._forward_task_heads(
+    output = GLiFormerOmniModel._forward_task_heads(
         model,
         structuring_span_idx=structuring_span_idx,
         structuring_span_mask=structuring_span_mask,
         structuring_span_labels=structuring_span_labels,
     )
 
-    assert isinstance(output, GLiNExTOmniOutput)
+    assert isinstance(output, GLiFormerOmniOutput)
     assert captured_batch_kwargs["structuring_span_idx"] is structuring_span_idx
     assert captured_batch_kwargs["structuring_span_mask"] is structuring_span_mask
     assert (
@@ -1012,7 +1012,7 @@ def test_omni_task_path_forwards_structuring_span_targets(monkeypatch):
 
 
 def test_collect_output_preserves_both_structuring_stages():
-    model = object.__new__(GLiNExTTextModel)
+    model = object.__new__(GLiFormerTextModel)
     entity_logits = torch.zeros(1, 4, 2, 3)
     field_logits = torch.zeros(1, 3, 2)
     membership_logits = torch.zeros(1, 4, 3)
@@ -1026,7 +1026,7 @@ def test_collect_output_preserves_both_structuring_stages():
     prompts = torch.zeros(1, 2, 8)
     prompt_mask = torch.ones(1, 2, dtype=torch.long)
 
-    output = GLiNExTTextModel._collect_forward_output(
+    output = GLiFormerTextModel._collect_forward_output(
         model,
         final_loss=None,
         head_outputs={
@@ -1066,103 +1066,103 @@ def test_collect_output_preserves_both_structuring_stages():
 
 
 def test_modality_outputs_preserve_flat_attribute_api():
-    assert hasattr(GLiNExTTextOutput(), "ner_logits")
-    assert hasattr(GLiNExTLayoutOutput(), "structuring_logits")
-    assert hasattr(GLiNExTTextOutput(), "structuring_field_logits")
-    assert hasattr(GLiNExTTextOutput(), "structuring_assignment_logits")
-    assert not hasattr(GLiNExTTextOutput(), "set_structuring_field_logits")
-    assert hasattr(GLiNExTVisionOutput(), "object_detection_logits")
-    assert hasattr(GLiNExTAudioOutput(), "audio_segmentation_logits")
-    assert hasattr(GLiNExTOmniOutput(), "ner_logits")
-    assert hasattr(GLiNExTOmniOutput(), "image_classification_logits")
-    assert hasattr(GLiNExTOmniOutput(), "audio_classification_logits")
+    assert hasattr(GLiFormerTextOutput(), "ner_logits")
+    assert hasattr(GLiFormerLayoutOutput(), "structuring_logits")
+    assert hasattr(GLiFormerTextOutput(), "structuring_field_logits")
+    assert hasattr(GLiFormerTextOutput(), "structuring_assignment_logits")
+    assert not hasattr(GLiFormerTextOutput(), "set_structuring_field_logits")
+    assert hasattr(GLiFormerVisionOutput(), "object_detection_logits")
+    assert hasattr(GLiFormerAudioOutput(), "audio_segmentation_logits")
+    assert hasattr(GLiFormerOmniOutput(), "ner_logits")
+    assert hasattr(GLiFormerOmniOutput(), "image_classification_logits")
+    assert hasattr(GLiFormerOmniOutput(), "audio_classification_logits")
 
 
 def test_specialized_config_variants_and_defaults():
-    text = GLiNextTextConfig(model_name="unused")
+    text = GLiFormerTextConfig(model_name="unused")
     assert text.model_variant == "text"
-    assert text.model_type == "glinext-text"
-    layout = GLiNextLayoutConfig(model_name="unused")
+    assert text.model_type == "gliformer-text"
+    layout = GLiFormerLayoutConfig(model_name="unused")
     assert layout.model_variant == "layout"
-    assert layout.model_type == "glinext-layout"
+    assert layout.model_type == "gliformer-layout"
     assert layout.use_layout is True
-    vision = GLiNextVisionConfig(model_name="unused")
+    vision = GLiFormerVisionConfig(model_name="unused")
     assert vision.model_variant == "vision"
-    assert vision.model_type == "glinext-vision"
-    audio = GLiNextAudioConfig(model_name="unused")
+    assert vision.model_type == "gliformer-vision"
+    audio = GLiFormerAudioConfig(model_name="unused")
     assert audio.model_variant == "audio"
-    assert audio.model_type == "glinext-audio"
-    omni = GLiNextOmniConfig(model_name="unused")
+    assert audio.model_type == "gliformer-audio"
+    omni = GLiFormerOmniConfig(model_name="unused")
     assert omni.model_variant == "omni"
-    assert omni.model_type == "glinext-omni"
+    assert omni.model_type == "gliformer-omni"
 
 
 def test_specialized_configs_reject_wrong_variant():
     with pytest.raises(ValueError, match="requires model_variant='text'"):
-        GLiNextTextConfig(model_name="unused", model_variant="vision")
+        GLiFormerTextConfig(model_name="unused", model_variant="vision")
     with pytest.raises(ValueError, match="requires model_variant='layout'"):
-        GLiNextLayoutConfig(model_name="unused", model_variant="text")
+        GLiFormerLayoutConfig(model_name="unused", model_variant="text")
 
 
 def test_single_media_configs_do_not_default_enable_ner():
-    assert GLiNextVisionConfig(model_name="unused").ner_config is None
-    assert GLiNextAudioConfig(model_name="unused").ner_config is None
-    assert GLiNextTextConfig(model_name="unused").ner_config is not None
+    assert GLiFormerVisionConfig(model_name="unused").ner_config is None
+    assert GLiFormerAudioConfig(model_name="unused").ner_config is None
+    assert GLiFormerTextConfig(model_name="unused").ner_config is not None
 
 
 def test_specialized_configs_reject_cross_modality_task_configs():
     with pytest.raises(ValueError, match="text tasks only"):
-        GLiNextTextConfig(model_name="unused", image_classification_config={})
+        GLiFormerTextConfig(model_name="unused", image_classification_config={})
     with pytest.raises(ValueError, match="vision tasks only"):
-        GLiNextVisionConfig(model_name="unused", classification_config={})
+        GLiFormerVisionConfig(model_name="unused", classification_config={})
     with pytest.raises(ValueError, match="audio tasks only"):
-        GLiNextAudioConfig(model_name="unused", segmentation_config={})
+        GLiFormerAudioConfig(model_name="unused", segmentation_config={})
 
 
 def test_factory_coerces_dicts_to_specialized_config_classes():
     assert isinstance(
-        GLiNExT._coerce_config({
+        GLiFormer._coerce_config({
             "model_name": "unused",
-            "model_type": "glinext-layout",
+            "model_type": "gliformer-layout",
         }),
-        GLiNextLayoutConfig,
+        GLiFormerLayoutConfig,
     )
     assert isinstance(
-        GLiNExT._coerce_config({
+        GLiFormer._coerce_config({
             "model_name": "unused",
             "model_variant": "vision",
             "image_classification_config": {},
         }),
-        GLiNextVisionConfig,
+        GLiFormerVisionConfig,
     )
     assert isinstance(
-        GLiNExT._coerce_config({
+        GLiFormer._coerce_config({
             "model_name": "unused",
             "model_variant": "audio",
             "audio_classification_config": {},
         }),
-        GLiNextAudioConfig,
+        GLiFormerAudioConfig,
     )
 
 
 def test_factory_model_type_takes_precedence_over_model_variant():
-    config = GLiNExT._coerce_config({
+    config = GLiFormer._coerce_config({
         "model_name": "unused",
-        "model_type": "glinext-layout",
+        "model_type": "gliformer-layout",
         "model_variant": "vision",
     })
-    assert isinstance(config, GLiNextLayoutConfig)
+    assert isinstance(config, GLiFormerLayoutConfig)
     assert config.model_variant == "layout"
 
 
 def test_specialized_config_serialization_is_variant_specific():
-    layout = GLiNextLayoutConfig(
+    layout = GLiFormerLayoutConfig(
         model_name="unused",
         structuring_config={},
         layout_image_tokens=False,
         max_page_embeddings=77,
     ).to_dict()
-    assert layout["model_type"] == "glinext-layout"
+    assert layout["model_type"] == "gliformer-layout"
     assert layout["model_variant"] == "layout"
     assert "structuring_config" in layout
     assert "audio_model_name" not in layout
@@ -1171,8 +1171,8 @@ def test_specialized_config_serialization_is_variant_specific():
     assert layout["layout_image_tokens"] is False
     assert layout["max_page_embeddings"] == 77
 
-    vision = GLiNextVisionConfig(model_name="unused", image_classification_config={}).to_dict()
-    assert vision["model_type"] == "glinext-vision"
+    vision = GLiFormerVisionConfig(model_name="unused", image_classification_config={}).to_dict()
+    assert vision["model_type"] == "gliformer-vision"
     assert "image_classification_config" in vision
     assert "ner_config" not in vision
     assert "audio_encoder_config" not in vision
@@ -1180,7 +1180,7 @@ def test_specialized_config_serialization_is_variant_specific():
     assert "neg_spans_ratio" not in vision
     assert "span_loss_coef" not in vision
 
-    omni = GLiNextOmniConfig(
+    omni = GLiFormerOmniConfig(
         model_name="unused",
         layout_image_tokens=False,
         max_page_embeddings=91,
@@ -1192,13 +1192,13 @@ def test_specialized_config_serialization_is_variant_specific():
 def test_dense_vision_config_rejects_untracked_geometric_processors():
     detection = asdict(ObjectDetectionHeadConfig())
     with pytest.raises(ValueError, match="center-cropped"):
-        GLiNextVisionConfig(
+        GLiFormerVisionConfig(
             model_name="unused",
             object_detection_config=detection,
             vision_center_crop_size=128,
         )
     with pytest.raises(ValueError, match="vision_processor_type='custom'"):
-        GLiNextVisionConfig(
+        GLiFormerVisionConfig(
             model_name="unused",
             object_detection_config=detection,
             vision_processor_type="auto",
@@ -1206,7 +1206,7 @@ def test_dense_vision_config_rejects_untracked_geometric_processors():
 
 
 def test_local_learned_positions_default_to_patch_capacity():
-    config = GLiNextVisionConfig(
+    config = GLiFormerVisionConfig(
         model_name="unused",
         vision_encoder_type="patch",
         image_size=32,
@@ -1227,7 +1227,7 @@ def test_legacy_detector_migration_is_non_mutating_and_preserves_semantics():
     }
     original = dict(legacy_detection)
 
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         model_name="unused",
         ner_config=None,
         object_detection_config=legacy_detection,
@@ -1241,7 +1241,7 @@ def test_legacy_detector_migration_is_non_mutating_and_preserves_semantics():
     assert config.object_detection_config.multi_label is False
     assert config.object_detection_config.memory_position_in_values is True
     assert config.segmentation_config.reuse_detection_head is False
-    assert GLiNextConfig(
+    assert GLiFormerConfig(
         model_name="unused",
         ner_config=None,
         segmentation_config={},
@@ -1249,7 +1249,7 @@ def test_legacy_detector_migration_is_non_mutating_and_preserves_semantics():
 
 
 def test_modern_set_prediction_uses_scaled_dot_scoring():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         model_name="unused",
         ner_config=None,
         object_detection_config={},
@@ -1259,7 +1259,7 @@ def test_modern_set_prediction_uses_scaled_dot_scoring():
 
 
 def test_registry_position_checkpoint_preserves_legacy_keys_only_values():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         model_name="unused",
         ner_config=None,
         object_detection_config={
@@ -1273,23 +1273,23 @@ def test_registry_position_checkpoint_preserves_legacy_keys_only_values():
 
 def test_factory_coercion_enforces_variant_specific_validation():
     with pytest.raises(ValueError, match="vision tasks only"):
-        GLiNExT._coerce_config({
+        GLiFormer._coerce_config({
             "model_name": "unused",
             "model_variant": "vision",
             "classification_config": {},
         })
 
-    permissive_base = GLiNextConfig(
+    permissive_base = GLiFormerConfig(
         model_name="unused",
         model_variant="audio",
         segmentation_config={},
     )
     with pytest.raises(ValueError, match="audio tasks only"):
-        GLiNExT._coerce_config(permissive_base)
+        GLiFormer._coerce_config(permissive_base)
 
 
 def test_config_resolves_task_config_by_name():
-    config = GLiNextOmniConfig(
+    config = GLiFormerOmniConfig(
         model_name="unused",
         classification_config={},
         image_classification_config={},
@@ -1334,7 +1334,7 @@ def test_ner_only_flat_inputs_do_not_activate_joint_relex():
             ExtractionItemMapping(BaseClassMapping({"person": 0})),
         ])],
     )
-    model = object.__new__(GLiNExTTextModel)
+    model = object.__new__(GLiFormerTextModel)
     torch.nn.Module.__init__(model)
     model.heads = {"ner": None, "joint_relex": None}
     model.config = SimpleNamespace(
@@ -1393,7 +1393,7 @@ def test_structuring_prompt_markers_are_partitioned_by_schema(monkeypatch):
             StructuringItemMapping(fields),
         ])],
     )
-    model = object.__new__(GLiNExTTextModel)
+    model = object.__new__(GLiFormerTextModel)
     torch.nn.Module.__init__(model)
     model.heads = {"structuring": None}
     model.config = SimpleNamespace(
@@ -1464,7 +1464,7 @@ def test_structuring_flat_inputs_accept_flat_label_encoder_namespace():
             StructuringItemMapping(fields),
         ])],
     )
-    model = object.__new__(GLiNExTTextModel)
+    model = object.__new__(GLiFormerTextModel)
     torch.nn.Module.__init__(model)
     model.heads = {"structuring": None}
     model.config = SimpleNamespace(
@@ -1524,13 +1524,13 @@ def test_flat_inputs_pack_flat_biencoder_labels_by_group_size():
             ]),
         ],
     )
-    model = object.__new__(GLiNExTVisionModel)
+    model = object.__new__(GLiFormerVisionModel)
     words = torch.zeros(2, 4, 3)
     word_mask = torch.ones(2, 4, dtype=torch.long)
     parents = torch.ones(2, 2, 3)
     child_embeds = torch.arange(18, dtype=torch.float).view(6, 3)
 
-    flat = GLiNExTVisionModel._build_flat_inputs(
+    flat = GLiFormerVisionModel._build_flat_inputs(
         model,
         parents,
         child_embeds,
@@ -1581,7 +1581,7 @@ def test_relation_prompts_reuse_group_layout_for_per_item_packing():
         ]
     )
     relation_mask = torch.ones(2, 3, dtype=torch.long)
-    model = object.__new__(GLiNExTTextModel)
+    model = object.__new__(GLiFormerTextModel)
 
     flat_prompts, flat_mask = model._build_flat_rel_prompts(
         relation_prompts,
@@ -1622,7 +1622,7 @@ def test_set_prediction_counts_expand_from_items_to_flat_label_groups(
         batch_origin=torch.tensor([0, 0, 1]),
     )
 
-    expanded = GLiNExTVisionModel._flatten_set_prediction_count(
+    expanded = GLiFormerVisionModel._flatten_set_prediction_count(
         torch.tensor(item_counts),
         flat_inputs,
         task_name,

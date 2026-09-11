@@ -1,7 +1,7 @@
 import torch
 
-from glinext.processing.collator import GLiNExTTextDataCollator
-from glinext.processing.processor import GLiNextTextProcessor
+from gliformer.processing.collator import GLiFormerTextDataCollator
+from gliformer.processing.processor import GLiFormerTextProcessor
 from tests.conftest import FakeWordsSplitter, make_config
 from tests.processors.test_unified_processor import FakeTokenizer
 
@@ -12,12 +12,12 @@ def test_root_candidate_embedding_rows_keep_anchor_text_during_collation():
         ner_config=None,
         embedding_config={},
     )
-    processor = GLiNextTextProcessor(
+    processor = GLiFormerTextProcessor(
         config,
         FakeTokenizer(),
         FakeWordsSplitter(),
     )
-    collator = GLiNExTTextDataCollator(config, processor)
+    collator = GLiFormerTextDataCollator(config, processor)
 
     batch = collator(
         [

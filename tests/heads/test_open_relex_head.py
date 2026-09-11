@@ -1,17 +1,18 @@
 """Tests for entity-first open relation extraction."""
 
 import warnings
+from unittest import mock
 
 import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from glinext.config import GLiNextConfig, OpenRelexHeadConfig
-from glinext.layers import AnchorLayer
-from glinext.model import BaseGLiNextModel, GLiNExTTextModel
-from glinext.tasks.ner.model import NERHead
-from glinext.tasks.open_relex.model import OpenRelexHead
+from gliformer.config import GLiFormerConfig, OpenRelexHeadConfig
+from gliformer.layers import AnchorLayer
+from gliformer.model import BaseGLiFormerModel, GLiFormerTextModel
+from gliformer.tasks.ner.model import NERHead
+from gliformer.tasks.open_relex.model import OpenRelexHead
 from tests.heads.conftest import D, make_config
 
 FIXED_WIDTH_ANCHOR_LAYERS = [
@@ -164,13 +165,13 @@ class TestOpenRelexConfiguration:
             default_ner_config=False,
             open_relex_config={"num_fixed_slots": 2},
         )
-        reloaded = GLiNextConfig(**config.to_dict())
+        reloaded = GLiFormerConfig(**config.to_dict())
 
         assert reloaded.open_relex_config.head_type == "open_relex"
         assert reloaded.open_relex_config.num_fixed_slots == 2
 
     def test_model_registers_canonical_head(self, monkeypatch):
-        config = GLiNextConfig(
+        config = GLiFormerConfig(
             model_name="unused",
             hidden_size=D,
             vocab_size=32,
@@ -183,12 +184,12 @@ class TestOpenRelexConfiguration:
             },
         )
         monkeypatch.setattr(
-            BaseGLiNextModel,
+            BaseGLiFormerModel,
             "_init_token_rep_layer",
             lambda *args, **kwargs: nn.Identity(),
         )
 
-        model = GLiNExTTextModel(config)
+        model = GLiFormerTextModel(config)
 
         assert "open_relex" in model.heads
         assert isinstance(model.heads["open_relex"], OpenRelexHead)
@@ -321,7 +322,7 @@ class TestOpenRelexEntityFirstFlow:
             return extracted_spans, extracted_mask
 
         monkeypatch.setattr(
-            "glinext.tasks.open_relex.model.extract_spans_from_tokens",
+            "gliformer.tasks.open_relex.model.extract_spans_from_tokens",
             fake_extract,
         )
 
@@ -553,16 +554,43 @@ class TestOpenRelexMatching:
 
         assert torch.allclose(loss, expected)
 
-    def test_mean_reduction_normalizes_entity_bio_elements(self):
-        head = _make_head(bio_loss_reduction="mean")
-        reduced = head._reduce_entity_loss(
-            torch.tensor(15.0),
-            torch.tensor([[1, 1], [1, 0]], dtype=torch.bool),
-            torch.tensor([[1, 1], [1, 0]], dtype=torch.bool),
-        )
+    def test_entity_loss_is_normalized_exactly_once(self, shared, flat_inputs):
+        """The entity term is the NER stage's loss, not a re-reduced copy.
 
-        # (2 words * 2 relations + 1 word * 1 relation) * 3 BIO roles.
-        assert torch.equal(reduced, torch.tensor(1.0))
+        ``NERHead._bio_loss`` already divides by the active (word x relation)
+        cells, so the head-level reduction must leave it alone; reducing again
+        rescaled the same population a second time.
+        """
+        head = _make_head(bio_loss_reduction="mean")
+        observed = []
+        original_bio_loss = type(head)._bio_loss
+
+        def spy(self, *args, **kwargs):
+            loss = original_bio_loss(self, *args, **kwargs)
+            observed.append(loss)
+            return loss
+
+        entity_labels = torch.zeros(
+            flat_inputs.words_embedding.shape[0],
+            flat_inputs.words_embedding.shape[1],
+            flat_inputs.child_embedding.shape[1],
+            3,
+        )
+        entity_labels[0, 1, 0, 0] = 1.0
+
+        with mock.patch.object(type(head), "_bio_loss", spy):
+            output = head(
+                shared,
+                {},
+                flat_inputs=flat_inputs,
+                base_loss_fn=self._loss_fn,
+                open_rel_entity_labels=entity_labels,
+            )
+
+        assert len(observed) == 1
+        assert output.extra["entity_loss"].item() == pytest.approx(
+            observed[0].item()
+        )
 
     def test_zero_gold_groups_supervise_unused_slots(
         self,

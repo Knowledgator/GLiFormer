@@ -5,8 +5,8 @@ import torch
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from glinext.tasks.ner.decoder import NERDecoder
-from glinext.tasks.span_decoder import Span
+from gliformer.tasks.ner.decoder import NERDecoder
+from gliformer.tasks.span_decoder import Span
 from tests.conftest import make_config
 
 

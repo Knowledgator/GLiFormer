@@ -4,8 +4,8 @@ import pytest
 from unittest.mock import MagicMock
 from dataclasses import asdict
 
-from glinext.config import (
-    GLiNextConfig,
+from gliformer.config import (
+    GLiFormerConfig,
     NERHeadConfig,
     ClassificationHeadConfig,
     JointRelexHeadConfig,
@@ -14,7 +14,7 @@ from glinext.config import (
     CountHeadConfig,
     EmbeddingHeadConfig,
 )
-from glinext.processing.mappings import (
+from gliformer.processing.mappings import (
     BaseClassMapping,
     CatClassMapping,
     ExtractionItemMapping,
@@ -51,7 +51,7 @@ def words_splitter():
 # ── Minimal config ─────────────────────────────────────────────────────
 
 def make_config(**overrides):
-    """Build a GLiNextConfig with sensible test defaults."""
+    """Build a GLiFormerConfig with sensible test defaults."""
     defaults = dict(
         ent_token="[ENT]",
         sep_token="[SEP]",
@@ -64,7 +64,7 @@ def make_config(**overrides):
         words_splitter_type="whitespace",
     )
     defaults.update(overrides)
-    return GLiNextConfig(**defaults)
+    return GLiFormerConfig(**defaults)
 
 
 @pytest.fixture

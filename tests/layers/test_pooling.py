@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.layers.pooling import (
+from gliformer.layers.pooling import (
     Pooling, MeanPooling, CLSPooling, MaxPooling, WeightedPooling,
 )
 

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.tasks.span_processor import SpanProcessor
+from gliformer.tasks.span_processor import SpanProcessor
 from tests.conftest import make_config, FakeWordsSplitter
 
 

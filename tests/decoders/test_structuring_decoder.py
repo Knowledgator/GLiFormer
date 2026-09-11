@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from glinext.outputs import GLiNExTOutput
-from glinext.processing.mappings import (
+from gliformer.outputs import GLiFormerOutput
+from gliformer.processing.mappings import (
     BaseClassMapping,
     BatchClassesMapping,
     CatClassMapping,
@@ -15,10 +15,10 @@ from glinext.processing.mappings import (
     StructuringClassMapping,
     StructuringItemMapping,
 )
-from glinext.processing.structuring_decoder import (
+from gliformer.processing.structuring_decoder import (
     align_structuring_anchors,
 )
-from glinext.tasks.structuring.decoder import StructuringDecoder
+from gliformer.tasks.structuring.decoder import StructuringDecoder
 from tests.conftest import make_config
 
 
@@ -260,7 +260,7 @@ def test_structuring_decoder_joins_ner_fields_with_anchor_membership():
     field_logits = torch.full((1, 2, 2), -10.0)
     field_logits[0, 0, 0] = 4.0
     field_logits[0, 1, 1] = 4.0
-    output = GLiNExTOutput(
+    output = GLiFormerOutput(
         batch_size=1,
         structuring_entity_logits=torch.zeros(1, 3, 2, 3),
         structuring_field_logits=field_logits,
@@ -289,7 +289,7 @@ def test_structuring_decoder_applies_anchor_objectness():
         structuring_config={"num_fixed_slots": 2},
     )
     decoder = StructuringDecoder.from_config(config)
-    output = GLiNExTOutput(
+    output = GLiFormerOutput(
         batch_size=1,
         structuring_entity_logits=torch.zeros(1, 1, 1, 3),
         structuring_field_logits=torch.full((1, 1, 1), 5.0),
@@ -315,7 +315,7 @@ def test_structuring_decoder_rejects_misaligned_shapes():
         structuring_config={"num_fixed_slots": 2},
     )
     decoder = StructuringDecoder.from_config(config)
-    output = GLiNExTOutput(
+    output = GLiFormerOutput(
         batch_size=1,
         structuring_field_logits=torch.zeros(1, 2, 1),
         structuring_logits=torch.zeros(1, 2, 2),
@@ -851,7 +851,7 @@ def test_hierarchy_mode_uses_shared_anchor_alignment():
     field_logits[0, 1, 1] = 5.0
     relation_scores = torch.zeros(1, 2, 2)
     relation_scores[0, 0, 1] = 0.8
-    output = GLiNExTOutput(
+    output = GLiFormerOutput(
         batch_size=1,
         structuring_entity_logits=torch.zeros(1, 2, 2, 3),
         structuring_field_logits=field_logits,
@@ -895,7 +895,7 @@ def test_multi_level_relation_does_not_revive_rejected_empty_anchors():
     decoder = StructuringDecoder.from_config(config)
     relations = torch.zeros(1, 2, 2)
     relations[0, 0, 1] = 0.9
-    output = GLiNExTOutput(
+    output = GLiFormerOutput(
         batch_size=1,
         structuring_entity_logits=torch.zeros(1, 1, 2, 3),
         structuring_field_logits=torch.full((1, 1, 2), -10.0),

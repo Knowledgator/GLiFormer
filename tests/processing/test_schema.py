@@ -7,14 +7,14 @@ from typing import Optional
 
 import pytest
 
-from glinext.processing.formatting import FieldType, StructuringOutputFormatter
-from glinext.processing.schema import (
-    GLiNExTSchema,
+from gliformer.processing.formatting import FieldType, StructuringOutputFormatter
+from gliformer.processing.schema import (
+    GLiFormerSchema,
     _pydantic_to_field_types,
     build_structuring_output_formatter,
     normalize_structuring_schemas,
 )
-from glinext.tasks.structuring.processor import StructuringProcessor
+from gliformer.tasks.structuring.processor import StructuringProcessor
 from tests.conftest import FakeWordsSplitter, make_config
 
 pydantic = pytest.importorskip("pydantic")
@@ -51,7 +51,7 @@ class FactoryModel(pydantic.BaseModel):
 
 
 def test_flat_pydantic_schema_keeps_legacy_inference_shape():
-    schema = GLiNExTSchema().add_structure("flat", FlatModel)
+    schema = GLiFormerSchema().add_structure("flat", FlatModel)
 
     assert schema.to_inference_kwargs() == {
         "structures": {
@@ -74,14 +74,14 @@ def test_pydantic_defaults_and_factories_do_not_leak_undefined_sentinels():
     assert field_types["tags"].default == []
     assert "undefined" not in repr(field_types).lower()
 
-    formatter = GLiNExTSchema().add_structure("factory", FactoryModel).build_output_formatter()
+    formatter = GLiFormerSchema().add_structure("factory", FactoryModel).build_output_formatter()
     assert formatter is not None
     assert formatter.format({"factory": [{"value": "invalid"}]}) == {"factory": [{"value": 7}]}
 
 
 def test_nested_pydantic_schema_emits_recursive_descriptor():
     descriptor = (
-        GLiNExTSchema().add_structure("order", Order).to_inference_kwargs()["structures"]["order"]
+        GLiFormerSchema().add_structure("order", Order).to_inference_kwargs()["structures"]["order"]
     )
 
     assert descriptor["fields"] == {
@@ -107,7 +107,7 @@ def test_nested_pydantic_schema_emits_recursive_descriptor():
 
 
 def test_nested_pydantic_descriptor_is_a_multi_level_processor_contract():
-    structures = GLiNExTSchema().add_structure("order", Order).to_inference_kwargs()["structures"]
+    structures = GLiFormerSchema().add_structure("order", Order).to_inference_kwargs()["structures"]
     original = deepcopy(structures)
     processor = StructuringProcessor(
         make_config(
@@ -142,7 +142,7 @@ def test_nested_pydantic_descriptor_is_a_multi_level_processor_contract():
 
 
 def test_nested_pydantic_formatter_recurses_through_objects_and_lists():
-    formatter = GLiNExTSchema().add_structure("order", Order).build_output_formatter()
+    formatter = GLiFormerSchema().add_structure("order", Order).build_output_formatter()
     assert formatter is not None
 
     result = formatter.format(
@@ -183,7 +183,7 @@ def test_descriptor_key_names_remain_literal_pydantic_fields_in_formatter():
         fields: Address
         required_fields: int
 
-    formatter = GLiNExTSchema().add_structure("literal", LiteralFields).build_output_formatter()
+    formatter = GLiFormerSchema().add_structure("literal", LiteralFields).build_output_formatter()
     assert formatter is not None
     assert formatter.format(
         {
@@ -205,7 +205,7 @@ def test_descriptor_key_names_remain_literal_pydantic_fields_in_formatter():
 
 
 def test_descriptor_key_names_remain_valid_legacy_typed_mapping_fields():
-    schema = GLiNExTSchema().add_structure(
+    schema = GLiFormerSchema().add_structure(
         "literal",
         {"fields": {"inner": "int"}, "required_fields": "int"},
     )
@@ -241,7 +241,7 @@ def test_descriptor_key_names_remain_valid_legacy_typed_mapping_fields():
 
 
 def test_fields_only_descriptor_remains_backward_compatible():
-    schema = GLiNExTSchema().add_structure(
+    schema = GLiFormerSchema().add_structure(
         "record",
         {"fields": {"count": "int"}},
     )
@@ -302,7 +302,7 @@ def test_formatter_accepts_recursive_processor_descriptor_directly():
 
 
 def test_nested_typed_mapping_uses_the_same_descriptor_shape():
-    schema = GLiNExTSchema().add_structure(
+    schema = GLiFormerSchema().add_structure(
         "order",
         {
             "order_id": "int",
@@ -365,7 +365,7 @@ def test_pydantic_v1_compatibility_namespace_is_supported():
         tags: list[int] = v1.Field(default_factory=list)
 
     V1Envelope.update_forward_refs(V1Child=V1Child, Optional=Optional)
-    schema = GLiNExTSchema().add_structure("envelope", V1Envelope)
+    schema = GLiFormerSchema().add_structure("envelope", V1Envelope)
     descriptor = schema.to_inference_kwargs()["structures"]["envelope"]
 
     # Pydantic v1 treats Optional[T] without an explicit default as optional.
@@ -401,7 +401,7 @@ def test_pydantic_root_list_preserves_raw_shape_and_formats_items():
     class RootItems(pydantic.RootModel[list[LineItem]]):
         pass
 
-    schema = GLiNExTSchema().add_structure("$root", RootItems)
+    schema = GLiFormerSchema().add_structure("$root", RootItems)
     assert schema.to_inference_kwargs() == {"structures": {"$root": [{"sku": "", "quantity": ""}]}}
 
     formatter = schema.build_output_formatter()
@@ -410,7 +410,7 @@ def test_pydantic_root_list_preserves_raw_shape_and_formats_items():
 
 
 def test_root_object_formatter_accepts_unwrapped_decoder_output():
-    schema = GLiNExTSchema().add_structure("$root", Address)
+    schema = GLiFormerSchema().add_structure("$root", Address)
     assert schema.to_inference_kwargs() == {
         "structures": {
             "$root": {
@@ -440,7 +440,7 @@ def test_cyclic_pydantic_models_fail_with_a_clear_error():
         RecursiveNode.update_forward_refs(RecursiveNode=RecursiveNode)
 
     with pytest.raises(ValueError, match="Cyclic Pydantic structuring schemas"):
-        GLiNExTSchema().add_structure("node", RecursiveNode)
+        GLiFormerSchema().add_structure("node", RecursiveNode)
 
 
 def test_unified_template_supports_required_markers_and_portable_types():
@@ -465,7 +465,7 @@ def test_unified_template_supports_required_markers_and_portable_types():
         "$required": ["active"],
     }
 
-    schema = GLiNExTSchema().add_structure("mission", template)
+    schema = GLiFormerSchema().add_structure("mission", template)
     descriptor = schema.to_inference_kwargs()["structures"]["mission"]
 
     assert descriptor == {
@@ -535,7 +535,7 @@ def test_unified_template_supports_required_markers_and_portable_types():
 
 
 def test_advanced_template_field_options_apply_defaults_and_enums():
-    schema = GLiNExTSchema().add_structure(
+    schema = GLiFormerSchema().add_structure(
         "mission",
         {
             "status": {
@@ -621,12 +621,12 @@ def test_pydantic_output_validation_is_opt_in_and_returns_dicts():
         count: int = 2
 
     default_formatter = (
-        GLiNExTSchema()
+        GLiFormerSchema()
         .add_structure("record", ValidatedRecord)
         .build_output_formatter()
     )
     validating_formatter = (
-        GLiNExTSchema()
+        GLiFormerSchema()
         .add_structure("record", ValidatedRecord, validate_output=True)
         .build_output_formatter()
     )
@@ -642,7 +642,7 @@ def test_pydantic_output_validation_is_opt_in_and_returns_dicts():
 
 def test_validate_output_rejects_non_pydantic_templates():
     with pytest.raises(TypeError, match="requires a Pydantic"):
-        GLiNExTSchema().add_structure(
+        GLiFormerSchema().add_structure(
             "record",
             {"name": "string"},
             validate_output=True,
@@ -657,7 +657,7 @@ def test_direct_template_normalizes_to_the_same_processor_wire_descriptor():
     }
 
     assert normalize_structuring_schemas({"mission": template}) == (
-        GLiNExTSchema()
+        GLiFormerSchema()
         .add_structure("mission", template)
         .to_inference_kwargs()["structures"]
     )
@@ -685,7 +685,7 @@ def test_named_pydantic_root_list_validates_the_whole_record_list():
         pass
 
     formatter = (
-        GLiNExTSchema()
+        GLiFormerSchema()
         .add_structure("items", RootItems, validate_output=True)
         .build_output_formatter()
     )

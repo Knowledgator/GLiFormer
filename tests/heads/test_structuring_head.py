@@ -1,21 +1,30 @@
 """Tests for the canonical entity-first structuring task."""
 
 from dataclasses import asdict
+from unittest import mock
 
 import pytest
 import torch
 from torch import nn
 
-from glinext.config import (
-    GLiNextConfig,
+from gliformer.config import (
+    GLiFormerConfig,
     NERHeadConfig,
     StructuringHeadConfig,
 )
-from glinext.model import BaseGLiNextModel, GLiNExTTextModel
-from glinext.tasks import TaskHeadOutput
-from glinext.tasks.ner.model import NERHead
-from glinext.tasks.structuring.model import StructuringHead
+from gliformer.model import BaseGLiFormerModel, GLiFormerTextModel
+from gliformer.tasks import TaskHeadOutput
+from gliformer.tasks.ner.model import NERHead
+from gliformer.tasks.structuring.model import StructuringHead
 from tests.heads.conftest import D, make_config
+
+
+def _binary_loss_fn(predictions, labels):
+    return torch.nn.functional.binary_cross_entropy_with_logits(
+        predictions,
+        labels.to(predictions.dtype),
+        reduction="none",
+    )
 
 
 def _make_head(**kwargs):
@@ -61,7 +70,7 @@ def _make_reused_head(**kwargs):
 
 
 def _make_text_model(monkeypatch, **task_configs):
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         model_name="unused",
         hidden_size=D,
         vocab_size=32,
@@ -70,11 +79,11 @@ def _make_text_model(monkeypatch, **task_configs):
         **task_configs,
     )
     monkeypatch.setattr(
-        BaseGLiNextModel,
+        BaseGLiFormerModel,
         "_init_token_rep_layer",
         lambda *args, **kwargs: nn.Identity(),
     )
-    return GLiNExTTextModel(config)
+    return GLiFormerTextModel(config)
 
 
 class _KnownAnchors(nn.Module):
@@ -167,7 +176,7 @@ class TestStructuringConfiguration:
 
     def test_config_round_trip_keeps_the_canonical_field(self):
         config = make_config(structuring_config={"num_fixed_slots": 2})
-        reloaded = GLiNextConfig(**config.to_dict())
+        reloaded = GLiFormerConfig(**config.to_dict())
 
         assert isinstance(
             reloaded.structuring_config,
@@ -213,7 +222,7 @@ class TestStructuringConfiguration:
         self,
         monkeypatch,
     ):
-        config = GLiNextConfig(
+        config = GLiFormerConfig(
             model_name="unused",
             hidden_size=D,
             vocab_size=32,
@@ -226,12 +235,12 @@ class TestStructuringConfiguration:
             },
         )
         monkeypatch.setattr(
-            BaseGLiNextModel,
+            BaseGLiFormerModel,
             "_init_token_rep_layer",
             lambda *args, **kwargs: nn.Identity(),
         )
 
-        model = GLiNExTTextModel(config)
+        model = GLiFormerTextModel(config)
 
         assert list(model.heads) == ["structuring"]
 
@@ -253,7 +262,7 @@ class TestStructuringConfiguration:
             },
         )
 
-        reloaded = GLiNextConfig(**config.to_dict())
+        reloaded = GLiFormerConfig(**config.to_dict())
 
         assert config.structuring_config.reuse_ner_head is True
         assert reloaded.structuring_config.reuse_ner_head is True
@@ -301,13 +310,13 @@ class TestStructuringConfiguration:
 
     def test_reuse_ner_head_requires_enabled_compatible_ner(self):
         with pytest.raises(ValueError, match="requires an enabled ner_config"):
-            GLiNextConfig(
+            GLiFormerConfig(
                 default_ner_config=False,
                 structuring_config={"reuse_ner_head": True},
             )
 
         with pytest.raises(ValueError, match="anchor_mode='parent'"):
-            GLiNextConfig(
+            GLiFormerConfig(
                 ner_config={
                     "anchor_layer": {
                         "type": "fixed",
@@ -670,7 +679,7 @@ class TestStructuringEntityFirstFlow:
             return spans, span_mask
 
         monkeypatch.setattr(
-            "glinext.tasks.structuring.model.extract_spans_from_tokens",
+            "gliformer.tasks.structuring.model.extract_spans_from_tokens",
             extract,
         )
 
@@ -807,7 +816,7 @@ class TestStructuringEntityFirstFlow:
             raise AssertionError("prediction span extraction was called")
 
         monkeypatch.setattr(
-            "glinext.tasks.structuring.model.extract_spans_from_tokens",
+            "gliformer.tasks.structuring.model.extract_spans_from_tokens",
             unexpected_extraction,
         )
         batch_size, word_count = flat_inputs.words_embedding.shape[:2]
@@ -987,20 +996,48 @@ class TestStructuringEntityFirstFlow:
         assert observed["targets"].tolist() == [[0.0, 1.0, 0.0]]
         assert loss.item() == pytest.approx(3.0)
 
-    def test_mean_entity_loss_uses_entity_and_class_counts(self):
-        head = _make_head(bio_loss_reduction="mean")
-        reduced = head._reduce_entity_loss(
-            torch.tensor(16.0),
-            entity_mask=torch.tensor(
-                [[True, True, False], [True, False, False]]
-            ),
-            child_mask=torch.tensor(
-                [[True, True, True], [True, True, False]]
-            ),
-        )
+    def test_entity_loss_is_normalized_exactly_once(self, shared, flat_inputs):
+        """The reported entity loss is the NER stage's own normalized loss.
 
-        # First row: 2 entities * 3 classes; second: 1 * 2.
-        assert reduced.item() == pytest.approx(2.0)
+        ``NERHead._bio_loss`` already divides by the active (word x field)
+        cells; a head-level reduction on top of that used to shrink the entity
+        term by a further factor of sum_b(entities_b * fields_b).
+        """
+        head = _make_head(bio_loss_reduction="mean")
+        observed = []
+        original_bio_loss = type(head)._bio_loss
+
+        def spy(self, *args, **kwargs):
+            loss = original_bio_loss(self, *args, **kwargs)
+            observed.append(loss)
+            return loss
+
+        batch_size = flat_inputs.words_embedding.shape[0]
+        token_count = flat_inputs.words_embedding.shape[1]
+        field_count = flat_inputs.child_embedding.shape[1]
+        spans = torch.tensor([[[0, 0], [1, 2]], [[0, 1], [2, 3]]])
+        span_mask = torch.ones(batch_size, 2, dtype=torch.bool)
+        labels = torch.zeros(batch_size, 2, token_count, field_count, 3)
+        labels[:, 0, 0, 0] = 1.0
+        span_labels = torch.zeros(batch_size, 2, spans.shape[1], field_count)
+
+        with mock.patch.object(type(head), "_bio_loss", spy):
+            output = head(
+                shared,
+                {},
+                flat_inputs=flat_inputs,
+                structuring_labels=labels,
+                structuring_count=torch.ones(batch_size, dtype=torch.long),
+                structuring_span_idx=spans,
+                structuring_span_mask=span_mask,
+                structuring_span_labels=span_labels,
+                base_loss_fn=_binary_loss_fn,
+            )
+
+        assert len(observed) == 1
+        assert output.extra["entity_loss"].item() == pytest.approx(
+            observed[0].item()
+        )
 
     def test_mean_matching_loss_masks_anchors_without_gold(self):
         head = _make_head(num_fixed_slots=3, bio_loss_reduction="mean")

@@ -1,10 +1,10 @@
 from torch import nn
 
-from glinext.glinext import GLiNExT
+from gliformer.gliformer import GLiFormer
 
 
 def test_train_head_only_parameters_keeps_shared_layers_frozen():
-    wrapper = object.__new__(GLiNExT)
+    wrapper = object.__new__(GLiFormer)
 
     model = nn.Module()
     model.encoder = nn.Linear(4, 4)
@@ -17,7 +17,7 @@ def test_train_head_only_parameters_keeps_shared_layers_frozen():
 
     wrapper.__dict__["model"] = model
 
-    stats = GLiNExT.train_head_only_parameters(wrapper)
+    stats = GLiFormer.train_head_only_parameters(wrapper)
 
     assert stats["trainable_params"] == sum(param.numel() for param in head.private.parameters())
     assert all(not param.requires_grad for param in model.encoder.parameters())

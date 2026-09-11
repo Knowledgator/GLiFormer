@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from glinext.tasks.matcher import HungarianMatcher, minimum_cost_assignment
+from gliformer.tasks.matcher import HungarianMatcher, minimum_cost_assignment
 
 
 @pytest.mark.parametrize(

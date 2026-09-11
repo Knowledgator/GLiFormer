@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.tasks.embedding.processor import EmbeddingProcessor
+from gliformer.tasks.embedding.processor import EmbeddingProcessor
 from tests.conftest import make_config
 
 

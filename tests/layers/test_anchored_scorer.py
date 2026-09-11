@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.layers.anchored_scorer import AnchoredSpanScorer
+from gliformer.layers.anchored_scorer import AnchoredSpanScorer
 
 D = 16
 

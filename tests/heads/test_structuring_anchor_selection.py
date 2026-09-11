@@ -4,8 +4,8 @@ import pytest
 import torch
 from unittest.mock import Mock
 
-from glinext.config import StructuringHeadConfig
-from glinext.tasks.structuring.model import StructuringHead
+from gliformer.config import StructuringHeadConfig
+from gliformer.tasks.structuring.model import StructuringHead
 from tests.heads.conftest import B, make_config
 
 

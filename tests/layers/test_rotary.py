@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.layers.rotary import RotaryEmbedding, rotate_half, apply_rotary_pos_emb
+from gliformer.layers.rotary import RotaryEmbedding, rotate_half, apply_rotary_pos_emb
 
 
 class TestRotaryEmbedding:

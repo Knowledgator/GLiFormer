@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from glinext.layers.attention import (
+from gliformer.layers.attention import (
     SelfAttentionBlock, CrossAttentionBlock, Fuser, LayerwiseAttention,
 )
 

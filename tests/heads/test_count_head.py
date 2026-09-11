@@ -3,11 +3,11 @@
 import pytest
 import torch
 
-from glinext.tasks.count.model import CountHead, CountModule
-from glinext.tasks import TaskHeadOutput
+from gliformer.tasks.count.model import CountHead, CountModule
+from gliformer.tasks import TaskHeadOutput
 from tests.heads.conftest import make_config, D, B, W, C
 from dataclasses import asdict
-from glinext.config import CountHeadConfig
+from gliformer.config import CountHeadConfig
 
 
 # ── CountModule ──────────────────────────────────────────────────────────

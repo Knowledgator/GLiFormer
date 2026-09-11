@@ -6,11 +6,11 @@ import pytest
 import torch
 from torch import nn
 
-from glinext.config import GLiNextConfig, JointRelexHeadConfig, NERHeadConfig
-from glinext.model import BaseGLiNextModel, GLiNExTTextModel
-from glinext.tasks import TaskHeadOutput
-from glinext.tasks.joint_relex.model import JointRelexHead
-from glinext.tasks.ner.model import NERHead
+from gliformer.config import GLiFormerConfig, JointRelexHeadConfig, NERHeadConfig
+from gliformer.model import BaseGLiFormerModel, GLiFormerTextModel
+from gliformer.tasks import TaskHeadOutput
+from gliformer.tasks.joint_relex.model import JointRelexHead
+from gliformer.tasks.ner.model import NERHead
 from tests.heads.conftest import B, C, D, W, make_config
 
 
@@ -63,7 +63,7 @@ class TestJointRelexHeadConstruction:
         monkeypatch,
         reuse_ner,
     ):
-        config = GLiNextConfig(
+        config = GLiFormerConfig(
             model_name="unused",
             hidden_size=D,
             vocab_size=32,
@@ -72,12 +72,12 @@ class TestJointRelexHeadConstruction:
             joint_relex_config=asdict(JointRelexHeadConfig()),
         )
         monkeypatch.setattr(
-            BaseGLiNextModel,
+            BaseGLiFormerModel,
             "_init_token_rep_layer",
             lambda *args, **kwargs: nn.Identity(),
         )
 
-        model = GLiNExTTextModel(config)
+        model = GLiFormerTextModel(config)
         joint_head = model.heads["joint_relex"]
         state_keys = tuple(model.state_dict())
 
@@ -101,7 +101,7 @@ class TestJointRelexHeadConstruction:
         self,
         monkeypatch,
     ):
-        config = GLiNextConfig(
+        config = GLiFormerConfig(
             model_name="unused",
             hidden_size=D,
             vocab_size=32,
@@ -110,11 +110,11 @@ class TestJointRelexHeadConstruction:
             joint_relex_config=asdict(JointRelexHeadConfig()),
         )
         monkeypatch.setattr(
-            BaseGLiNextModel,
+            BaseGLiFormerModel,
             "_init_token_rep_layer",
             lambda *args, **kwargs: nn.Identity(),
         )
-        model = GLiNExTTextModel(config)
+        model = GLiFormerTextModel(config)
         legacy_state = model.state_dict()
         for key, value in tuple(legacy_state.items()):
             if not key.startswith("heads.ner."):
@@ -163,6 +163,27 @@ class TestJointRelexHeadConstruction:
             JointRelexHeadConfig(
                 relations_layer="mlp", relation_top_k_neighbors=2,
             )
+
+    @pytest.mark.parametrize("sparse", [False, True])
+    def test_null_neighbor_chunk_size_is_preserved(self, sparse):
+        config = JointRelexHeadConfig(
+            relation_neighbor_chunk_size=None,
+            relations_layer="dot" if sparse else None,
+            relation_top_k_neighbors=2 if sparse else None,
+        )
+        assert config.relation_neighbor_chunk_size is None
+        assert asdict(config)["relation_neighbor_chunk_size"] is None
+
+    @pytest.mark.parametrize("value", [1, 128, 512, 64.0])
+    def test_neighbor_chunk_size_is_normalized_to_integer(self, value):
+        config = JointRelexHeadConfig(relation_neighbor_chunk_size=value)
+        assert config.relation_neighbor_chunk_size == value
+        assert isinstance(config.relation_neighbor_chunk_size, int)
+
+    @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "64", "invalid", float("inf"), float("nan")])
+    def test_invalid_neighbor_chunk_size_has_clear_error(self, value):
+        with pytest.raises(ValueError, match="relation_neighbor_chunk_size"):
+            JointRelexHeadConfig(relation_neighbor_chunk_size=value)
 
     def test_relation_loss_reduction_must_be_supported(self):
         with pytest.raises(ValueError, match="relation_loss_reduction"):
@@ -541,7 +562,7 @@ class TestJointRelexHeadForward:
             raise AssertionError("NER-only inference must not construct relation pairs")
 
         monkeypatch.setattr(
-            "glinext.tasks.joint_relex.model.extract_spans_from_tokens",
+            "gliformer.tasks.joint_relex.model.extract_spans_from_tokens",
             fail_extract,
         )
         out = head(shared, {}, flat_inputs=flat_inputs)
@@ -778,13 +799,14 @@ class TestJointRelexHeadForward:
         assert output.extra["rel_logits"].shape == (B, 2, 2)
         assert output.extra["rel_idx"].shape == (B, 2, 2)
 
-    def test_sparse_neighbors_do_not_materialize_dense_adjacency(
-        self, shared, flat_inputs, monkeypatch,
+    @pytest.mark.parametrize("chunk_size", [1, None])
+    def test_sparse_neighbors_bypass_dense_adjacency_layer(
+        self, shared, flat_inputs, monkeypatch, chunk_size,
     ):
         head = _make_head(
             relations_layer="dot",
             relation_top_k_neighbors=1,
-            relation_neighbor_chunk_size=1,
+            relation_neighbor_chunk_size=chunk_size,
         )
 
         def fail_dense(*args, **kwargs):
@@ -808,13 +830,14 @@ class TestJointRelexHeadForward:
         assert output.extra["rel_idx"].shape[1] == entity_count
         assert output.extra["rel_mask"].sum(dim=1).tolist() == [entity_count] * B
 
+    @pytest.mark.parametrize("chunk_size", [1, None])
     def test_sparse_training_uses_chunked_adjacency_loss(
-        self, shared, flat_inputs, monkeypatch,
+        self, shared, flat_inputs, monkeypatch, chunk_size,
     ):
         head = _make_head(
             relations_layer="dot",
             relation_top_k_neighbors=1,
-            relation_neighbor_chunk_size=1,
+            relation_neighbor_chunk_size=chunk_size,
         )
 
         def fail_dense(*args, **kwargs):

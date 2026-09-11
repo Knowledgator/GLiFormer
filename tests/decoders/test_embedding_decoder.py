@@ -5,7 +5,7 @@ import torch
 from dataclasses import dataclass
 from typing import Optional
 
-from glinext.tasks.embedding.decoder import EmbeddingDecoder
+from gliformer.tasks.embedding.decoder import EmbeddingDecoder
 from tests.conftest import make_config
 
 

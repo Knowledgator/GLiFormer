@@ -3,12 +3,17 @@
 import pytest
 import torch
 
-from glinext.tasks.ner.model import NERHead
-from glinext.tasks import TaskHeadOutput
-from glinext.tasks.losses import binary_focal_or_bce
+from gliformer.tasks.ner.model import NERHead
+from gliformer.tasks import TaskHeadOutput
+from gliformer.tasks.losses import binary_focal_or_bce
 from tests.heads.conftest import make_config, D, B, W, C
 from dataclasses import asdict
-from glinext.config import NERHeadConfig
+from gliformer.config import NERHeadConfig
+
+
+def _ones_loss(logits, targets):
+    """Elementwise loss of 1.0 per cell, so reductions are readable."""
+    return torch.ones_like(logits)
 
 
 def _make_head(**kwargs):
@@ -122,6 +127,76 @@ class TestNERHeadForward:
             focal_loss_prob_margin=0.1,
         ).sum() / (B * W * C)
         torch.testing.assert_close(output.loss, expected)
+
+    def test_span_loss_default_is_a_mean_over_active_span_class_cells(
+        self,
+        shared,
+        flat_inputs,
+    ):
+        """The auxiliary span term is reduced like the token term.
+
+        Left as a masked sum it outweighs the mean-reduced token loss by
+        roughly the active (BN x S x C) cell count.
+        """
+        head = _make_head(represent_spans=True)
+        assert head.span_loss_reduction == "mean"
+        span_count = 4
+        ner_labels = torch.zeros(B, W, C, 3)
+        span_idx = torch.zeros(B, span_count, 2, dtype=torch.long)
+        span_idx[:, :, 1] = 1
+        span_mask = torch.ones(B, span_count, dtype=torch.bool)
+        span_labels = torch.zeros(B, span_count, C)
+        span_labels[0, 0, 0] = 1.0
+        call = dict(
+            flat_inputs=flat_inputs,
+            ner_labels=ner_labels,
+            span_idx=span_idx,
+            span_mask=span_mask,
+            span_labels=span_labels,
+            base_loss_fn=_ones_loss,
+        )
+
+        token_only = head(shared, {}, flat_inputs=flat_inputs,
+                          ner_labels=ner_labels, base_loss_fn=_ones_loss)
+        with_spans = head(shared, {}, **call)
+
+        # Every element costs 1.0. The token term is 3.0 (three BIO channels
+        # per active cell, which are excluded from its denominator) and the
+        # span term is the mean over B * span_count * C cells, so 1.0.
+        assert token_only.loss.item() == pytest.approx(3.0)
+        assert with_spans.loss.item() == pytest.approx(4.0)
+
+    def test_span_loss_sum_keeps_the_historical_objective(
+        self,
+        shared,
+        flat_inputs,
+    ):
+        head = _make_head(represent_spans=True, span_loss_reduction="sum")
+        span_count = 4
+        ner_labels = torch.zeros(B, W, C, 3)
+        span_idx = torch.zeros(B, span_count, 2, dtype=torch.long)
+        span_idx[:, :, 1] = 1
+        span_mask = torch.ones(B, span_count, dtype=torch.bool)
+        span_labels = torch.zeros(B, span_count, C)
+
+        output = head(
+            shared,
+            {},
+            flat_inputs=flat_inputs,
+            ner_labels=ner_labels,
+            span_idx=span_idx,
+            span_mask=span_mask,
+            span_labels=span_labels,
+            base_loss_fn=_ones_loss,
+        )
+
+        # Token mean (3.0) plus the unnormalized span sum over B * S * C,
+        # which is the term that used to swamp it.
+        assert output.loss.item() == pytest.approx(3.0 + B * span_count * C)
+
+    def test_span_loss_reduction_rejects_unknown_values(self):
+        with pytest.raises(ValueError, match="span_loss_reduction"):
+            NERHeadConfig(span_loss_reduction="avg")
 
     def test_output_extra_contains_embeddings(self, shared, flat_inputs):
         head = _make_head()

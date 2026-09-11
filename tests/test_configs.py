@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from glinext.config import GLiNextConfig, resolve_glinext_config_class
+from gliformer.config import GLiFormerConfig, resolve_gliformer_config_class
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 CONFIG_PATHS = tuple(sorted(CONFIG_DIR.glob("*.yaml")))
@@ -59,12 +59,12 @@ def test_shipped_config_uses_component_anchor_schema_and_loads(config_path):
         f"{sorted(legacy_fields)}"
     )
 
-    config_class = resolve_glinext_config_class(model_config)
+    config_class = resolve_gliformer_config_class(model_config)
     config_class(**model_config)
 
 
 def test_joint_relex_uses_gliner_parameter_names():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         joint_relex_config={
             "relations_layer": "dot",
             "triples_layer": None,
@@ -78,22 +78,22 @@ def test_joint_relex_uses_gliner_parameter_names():
 
 
 def test_cosine_margin_embedding_config_round_trips_and_validates_margin():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         embedding_config={"loss_fn": "cosine_margin", "margin": 0.25},
     )
 
     assert config.embedding_config.loss_fn == "cosine_margin"
     assert config.embedding_config.margin == pytest.approx(0.25)
-    assert GLiNextConfig(**config.to_dict()).embedding_config.margin == pytest.approx(0.25)
+    assert GLiFormerConfig(**config.to_dict()).embedding_config.margin == pytest.approx(0.25)
 
     with pytest.raises(ValueError, match=r"margin must be in \[-1, 1\]"):
-        GLiNextConfig(
+        GLiFormerConfig(
             embedding_config={"loss_fn": "cosine_margin", "margin": 1.1},
         )
 
 
 def test_embedding_projection_dropout_round_trips_and_validates():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         embedding_config={
             "projection_dim": 32,
             "projection_dropout": 0.0,
@@ -103,19 +103,19 @@ def test_embedding_projection_dropout_round_trips_and_validates():
 
     assert config.embedding_config.projection_dropout == 0.0
     assert config.embedding_config.encoder_dropout == 0.0
-    reloaded = GLiNextConfig(**config.to_dict())
+    reloaded = GLiFormerConfig(**config.to_dict())
     assert reloaded.embedding_config.projection_dropout == 0.0
     assert reloaded.embedding_config.encoder_dropout == 0.0
 
     for invalid in (-0.1, 1.0, float("inf")):
         with pytest.raises(ValueError, match="projection_dropout"):
-            GLiNextConfig(
+            GLiFormerConfig(
                 embedding_config={"projection_dropout": invalid},
             )
 
     for invalid in (-0.1, 1.0, float("inf")):
         with pytest.raises(ValueError, match="encoder_dropout"):
-            GLiNextConfig(
+            GLiFormerConfig(
                 embedding_config={"encoder_dropout": invalid},
             )
 
@@ -125,7 +125,7 @@ def test_multitask_joint_relex_configures_anchor_refinement():
         (CONFIG_DIR / "multitask.yaml").read_text(encoding="utf-8")
     )["model"]
 
-    config = resolve_glinext_config_class(model_config)(**model_config)
+    config = resolve_gliformer_config_class(model_config)(**model_config)
     joint_config = config.joint_relex_config
 
     assert joint_config.relations_layer is None
@@ -138,7 +138,7 @@ def test_multitask_joint_relex_configures_anchor_refinement():
 
 
 def test_legacy_strategy_specific_structuring_matcher_cost_is_discarded():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         default_ner_config=False,
         structuring_config={"position_bucket_matcher_cost": 0.1},
     )
@@ -151,7 +151,7 @@ def test_open_relex_training_config_uses_entity_first_head_without_standalone_ne
         (CONFIG_DIR / "open_relex.yaml").read_text(encoding="utf-8")
     )["model"]
 
-    config = resolve_glinext_config_class(model_config)(**model_config)
+    config = resolve_gliformer_config_class(model_config)(**model_config)
 
     assert model_config["default_ner_config"] is False
     assert config.ner_config is None
@@ -168,7 +168,7 @@ def test_open_relex_training_config_uses_entity_first_loss_policy():
     )
     model_config = payload["model"]
     head_config = model_config["open_relex_config"]
-    config = resolve_glinext_config_class(model_config)(**model_config)
+    config = resolve_gliformer_config_class(model_config)(**model_config)
 
     assert model_config["default_ner_config"] is False
     assert config.ner_config is None
@@ -184,7 +184,7 @@ def test_multitask_config_has_independent_normalized_text_task_losses():
     )
     model_config = payload["model"]
 
-    config = resolve_glinext_config_class(model_config)(**model_config)
+    config = resolve_gliformer_config_class(model_config)(**model_config)
 
     for task_config in (
         config.ner_config,
@@ -221,7 +221,7 @@ def test_structuring_training_config_uses_entity_first_head():
 
 
 def test_multi_level_structuring_defaults_off_and_round_trips():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         default_ner_config=False,
         structuring_config={"multi_level": True},
         structuring_child_token="<child>",
@@ -233,12 +233,12 @@ def test_multi_level_structuring_defaults_off_and_round_trips():
     assert config.structuring_child_token == "<child>"
     assert config.structuring_end_token == "<end>"
 
-    reloaded = GLiNextConfig(**config.to_dict())
+    reloaded = GLiFormerConfig(**config.to_dict())
     assert reloaded.structuring_config.multi_level is True
     assert reloaded.structuring_child_token == "<child>"
     assert reloaded.structuring_end_token == "<end>"
 
-    legacy = GLiNextConfig(
+    legacy = GLiFormerConfig(
         default_ner_config=False,
         structuring_config={},
     )
@@ -246,7 +246,7 @@ def test_multi_level_structuring_defaults_off_and_round_trips():
 
 
 def test_structuring_mode_components_round_trip():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         default_ner_config=False,
         structuring_config={
             "structure_mode": {
@@ -265,12 +265,12 @@ def test_structuring_mode_components_round_trip():
     assert config.structuring_config.multi_level is True
     assert mode.decoder["params"]["relation_threshold"] == 0.65
 
-    reloaded = GLiNextConfig(**config.to_dict())
+    reloaded = GLiFormerConfig(**config.to_dict())
     assert reloaded.structuring_config.effective_structure_mode().type == "multi_level"
 
 
 def test_structuring_mode_explicit_options_and_assignment_coef_round_trip():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         default_ner_config=False,
         structuring_config={
             "span_loss_coef": 2.0,
@@ -288,7 +288,7 @@ def test_structuring_mode_explicit_options_and_assignment_coef_round_trip():
     assert mode.decoder_spec()["params"]["relation_threshold"] == 0.27
     assert config.structuring_config.assignment_loss_coef == 3.0
 
-    reloaded = GLiNextConfig(**config.to_dict())
+    reloaded = GLiFormerConfig(**config.to_dict())
     assert reloaded.structuring_config.assignment_loss_coef == 3.0
     assert (
         reloaded.structuring_config.effective_structure_mode()
@@ -298,7 +298,7 @@ def test_structuring_mode_explicit_options_and_assignment_coef_round_trip():
 
 
 def test_structuring_assignment_coef_migrates_from_span_coef():
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         default_ner_config=False,
         structuring_config={"span_loss_coef": 2.5},
     )
@@ -308,7 +308,7 @@ def test_structuring_assignment_coef_migrates_from_span_coef():
 
 def test_legacy_multi_level_flag_rejects_an_explicit_flat_mode():
     with pytest.raises(ValueError, match="conflicts"):
-        GLiNextConfig(
+        GLiFormerConfig(
             default_ner_config=False,
             structuring_config={
                 "multi_level": True,
@@ -319,7 +319,7 @@ def test_legacy_multi_level_flag_rejects_an_explicit_flat_mode():
 
 def test_multi_level_rejects_symmetric_relation_modes():
     with pytest.raises(ValueError, match="must be 'mlp'"):
-        GLiNextConfig(
+        GLiFormerConfig(
             default_ner_config=False,
             structuring_config={
                 "multi_level": True,
@@ -370,7 +370,7 @@ def test_multitask_joint_and_structuring_reuse_enabled_ner_head():
     )
     model_config = payload["model"]
 
-    config = resolve_glinext_config_class(model_config)(**model_config)
+    config = resolve_gliformer_config_class(model_config)(**model_config)
 
     assert config.ner_config is not None
     assert config.joint_relex_config is not None
@@ -410,7 +410,7 @@ def test_legacy_set_config_keys_are_load_only(
     canonical_key,
     canonical_head_type,
 ):
-    config = GLiNextConfig(
+    config = GLiFormerConfig(
         default_ner_config=False,
         **{legacy_key: {"head_type": legacy_head_type}},
     )
@@ -432,7 +432,7 @@ def test_legacy_set_config_keys_are_load_only(
 )
 def test_legacy_and_canonical_config_keys_conflict(canonical_key, legacy_key):
     with pytest.raises(ValueError, match="configured in both"):
-        GLiNextConfig(
+        GLiFormerConfig(
             default_ner_config=False,
             **{canonical_key: {}, legacy_key: {}},
         )

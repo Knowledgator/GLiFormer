@@ -1,11 +1,11 @@
-"""Tests for GLiNExTDecoder — the general decoder factory and unflatten utility."""
+"""Tests for GLiFormerDecoder — the general decoder factory and unflatten utility."""
 
 import torch
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-from glinext.processing.decoder import GLiNExTDecoder, unflatten_by_batch_origin
-from glinext.config import (
+from gliformer.processing.decoder import GLiFormerDecoder, unflatten_by_batch_origin
+from gliformer.config import (
     NERHeadConfig,
     ClassificationHeadConfig,
     JointRelexHeadConfig,
@@ -43,7 +43,7 @@ class TestUnflattenByBatchOrigin:
         assert out == [["a"], []]
 
 
-# ── GLiNExTDecoder construction ──────────────────────────────────────────
+# ── GLiFormerDecoder construction ──────────────────────────────────────────
 
 @dataclass
 class FakeModelOutput:
@@ -100,7 +100,7 @@ class FakeModelOutput:
                     self.batch_size = BN
 
 
-class TestGLiNExTDecoderConstruction:
+class TestGLiFormerDecoderConstruction:
     def test_no_tasks(self):
         config = make_config(
             ner_config=None,
@@ -114,12 +114,12 @@ class TestGLiNExTDecoderConstruction:
         config.structuring_config = None
         config.count_config = None
         config.embedding_config = None
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
         assert len(dec.task_decoders) == 0
 
     def test_ner_only(self):
         config = make_config(ner_config=asdict(NERHeadConfig()))
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
         assert "ner" in dec.task_decoders
 
     def test_all_tasks(self):
@@ -132,20 +132,20 @@ class TestGLiNExTDecoderConstruction:
             count_config=asdict(CountHeadConfig()),
             embedding_config=asdict(EmbeddingHeadConfig()),
         )
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
         expected = {"ner", "classification", "joint_relex", "open_relex",
                     "structuring", "count", "embedding"}
         assert set(dec.task_decoders.keys()) == expected
 
 
-class TestGLiNExTDecoderDecode:
+class TestGLiFormerDecoderDecode:
     def test_empty_output_all_tasks(self):
         config = make_config(
             ner_config=asdict(NERHeadConfig()),
             classification_config=asdict(ClassificationHeadConfig()),
             embedding_config=asdict(EmbeddingHeadConfig()),
         )
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
         out = FakeModelOutput()
         results = dec.decode(out)
         # All decoders return [] for None logits
@@ -154,7 +154,7 @@ class TestGLiNExTDecoderDecode:
 
     def test_ner_decode(self):
         config = make_config(ner_config=asdict(NERHeadConfig()))
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
 
         logits = torch.full((1, 5, 2, 3), -10.0)
         logits[0, 0, 0, :] = 5.0  # entity at pos 0, class 0
@@ -167,7 +167,7 @@ class TestGLiNExTDecoderDecode:
 
     def test_classification_decode(self):
         config = make_config(classification_config=asdict(ClassificationHeadConfig()))
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
 
         logits = torch.tensor([[5.0, -5.0]])
         out = FakeModelOutput(cat_logits=logits)
@@ -179,7 +179,7 @@ class TestGLiNExTDecoderDecode:
 
     def test_embedding_decode(self):
         config = make_config(embedding_config=asdict(EmbeddingHeadConfig()))
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
 
         logits = torch.tensor([0.9, 0.1])
         out = FakeModelOutput(embedding_logits=logits)
@@ -193,7 +193,7 @@ class TestGLiNExTDecoderDecode:
             classification_config=asdict(ClassificationHeadConfig()),
             embedding_config=asdict(EmbeddingHeadConfig()),
         )
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
 
         ner_logits = torch.full((1, 5, 1, 3), -10.0)
         ner_logits[0, 0, 0, :] = 5.0
@@ -215,7 +215,7 @@ class TestGLiNExTDecoderDecode:
 
     def test_kwargs_forwarded(self):
         config = make_config(ner_config=asdict(NERHeadConfig()))
-        dec = GLiNExTDecoder(config)
+        dec = GLiFormerDecoder(config)
 
         logits = torch.full((1, 5, 1, 3), 0.0)
         logits[0, 0, 0, :] = 5.0
@@ -233,7 +233,7 @@ def test_map_results_routes_opt_in_anchor_diagnostics_separately():
         ner_config=None,
         structuring_config=None,
     )
-    decoder = GLiNExTDecoder(config)
+    decoder = GLiFormerDecoder(config)
 
     class ProbeDecoder:
         def map_results(

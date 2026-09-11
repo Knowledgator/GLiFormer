@@ -4,8 +4,8 @@ import pytest
 import torch
 from dataclasses import asdict
 
-from glinext.config import (
-    GLiNextConfig,
+from gliformer.config import (
+    GLiFormerConfig,
     NERHeadConfig,
     ClassificationHeadConfig,
     JointRelexHeadConfig,
@@ -14,7 +14,7 @@ from glinext.config import (
     CountHeadConfig,
     EmbeddingHeadConfig,
 )
-from glinext.tasks import SharedRepresentations, TaskFlatInputs
+from gliformer.tasks import SharedRepresentations, TaskFlatInputs
 
 
 # ── Dimensions ───────────────────────────────────────────────────────────
@@ -26,7 +26,7 @@ C = 3    # number of classes / prompt embeddings
 
 
 def make_config(**overrides):
-    """Build a GLiNextConfig with test defaults (small hidden_size)."""
+    """Build a GLiFormerConfig with test defaults (small hidden_size)."""
     defaults = dict(
         ent_token="[ENT]",
         sep_token="[SEP]",
@@ -42,7 +42,7 @@ def make_config(**overrides):
         projector_hidden_act="gelu",
     )
     defaults.update(overrides)
-    return GLiNextConfig(**defaults)
+    return GLiFormerConfig(**defaults)
 
 
 @pytest.fixture

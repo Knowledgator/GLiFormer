@@ -8,15 +8,15 @@ from gliner.modeling.loss_functions import focal_loss_with_logits
 from torch import nn
 from transformers.trainer_pt_utils import nested_concat
 
-from glinext.config import ObjectDetectionHeadConfig, StructuringHeadConfig
-from glinext.glinext import BaseGLiNExT
-from glinext.model import BaseGLiNextModel
-from glinext.outputs import GLiNExTTextOutput, GLiNExTVisionOutput
-from glinext.tasks.losses import binary_focal_or_bce
-from glinext.training import (
+from gliformer.config import ObjectDetectionHeadConfig, StructuringHeadConfig
+from gliformer.gliformer import BaseGLiFormer
+from gliformer.model import BaseGLiFormerModel
+from gliformer.outputs import GLiFormerTextOutput, GLiFormerVisionOutput
+from gliformer.tasks.losses import binary_focal_or_bce
+from gliformer.training import (
     _LABEL_KEYS,
     ClassificationParentNameDropoutDataset,
-    GLiNExTTrainer,
+    GLiFormerTrainer,
     LABEL_AUGMENTATION_INDEX_KEY,
     LABEL_AUGMENTATION_MARKER_KEY,
     TrainingLabelAugmentationDataset,
@@ -24,7 +24,7 @@ from glinext.training import (
 
 
 class _TaskLossModel(nn.Module):
-    """Tiny kwargs-only model mirroring GLiNExT's forward contract."""
+    """Tiny kwargs-only model mirroring GLiFormer's forward contract."""
 
     def __init__(self, label_key: str):
         super().__init__()
@@ -53,9 +53,9 @@ class _RecordingAccelerator:
         loss.backward()
 
 
-def _bare_trainer(*, gradient_accumulation_steps: int = 1) -> GLiNExTTrainer:
+def _bare_trainer(*, gradient_accumulation_steps: int = 1) -> GLiFormerTrainer:
     """Build the unit under test without requiring the optional accelerate package."""
-    trainer = object.__new__(GLiNExTTrainer)
+    trainer = object.__new__(GLiFormerTrainer)
     trainer.args = SimpleNamespace(
         device=torch.device("cpu"),
         n_gpu=1,
@@ -100,17 +100,17 @@ class _CheckpointingBackbone(nn.Module):
         self.enabled = False
 
 
-def _bare_glinext(*backbones: nn.Module) -> BaseGLiNExT:
-    wrapper = object.__new__(BaseGLiNExT)
+def _bare_gliformer(*backbones: nn.Module) -> BaseGLiFormer:
+    wrapper = object.__new__(BaseGLiFormer)
     nn.Module.__init__(wrapper)
     wrapper.model = nn.ModuleList(backbones)
     return wrapper
 
 
-def test_glinext_forwards_gradient_checkpointing_to_all_backbones():
+def test_gliformer_forwards_gradient_checkpointing_to_all_backbones():
     text_backbone = _CheckpointingBackbone()
     labels_backbone = _CheckpointingBackbone(legacy_signature=True)
-    model = _bare_glinext(text_backbone, labels_backbone)
+    model = _bare_gliformer(text_backbone, labels_backbone)
 
     assert model.supports_gradient_checkpointing
     assert not model.is_gradient_checkpointing
@@ -130,8 +130,8 @@ def test_glinext_forwards_gradient_checkpointing_to_all_backbones():
     assert not model.is_gradient_checkpointing
 
 
-def test_glinext_rejects_gradient_checkpointing_without_capable_backbone():
-    model = _bare_glinext(nn.Linear(2, 2))
+def test_gliformer_rejects_gradient_checkpointing_without_capable_backbone():
+    model = _bare_gliformer(nn.Linear(2, 2))
 
     assert not model.supports_gradient_checkpointing
     with pytest.raises(ValueError, match="no backbone that supports"):
@@ -149,7 +149,7 @@ def test_train_model_forwards_full_checkpoint_resume(monkeypatch):
         def train(self, **kwargs):
             calls["train"] = kwargs
 
-    monkeypatch.setattr("glinext.training.GLiNExTTrainer", _Trainer)
+    monkeypatch.setattr("gliformer.training.GLiFormerTrainer", _Trainer)
     owner = SimpleNamespace(
         config=SimpleNamespace(),
         data_processor=SimpleNamespace(transformer_tokenizer="tokenizer"),
@@ -157,7 +157,7 @@ def test_train_model_forwards_full_checkpoint_resume(monkeypatch):
     )
     training_args = SimpleNamespace()
 
-    trainer = BaseGLiNExT.train_model(
+    trainer = BaseGLiFormer.train_model(
         owner,
         train_dataset=[{"text": "example"}],
         training_args=training_args,
@@ -184,7 +184,7 @@ def test_train_model_applies_parent_name_dropout_only_to_training_data(
         def train(self, **kwargs):
             calls["train"] = kwargs
 
-    monkeypatch.setattr("glinext.training.GLiNExTTrainer", _Trainer)
+    monkeypatch.setattr("gliformer.training.GLiFormerTrainer", _Trainer)
     owner = SimpleNamespace(
         config=SimpleNamespace(),
         data_processor=SimpleNamespace(transformer_tokenizer="tokenizer"),
@@ -205,7 +205,7 @@ def test_train_model_applies_parent_name_dropout_only_to_training_data(
         }],
     }]
 
-    BaseGLiNExT.train_model(
+    BaseGLiFormer.train_model(
         owner,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -241,7 +241,7 @@ def test_train_model_wires_label_augmentation_only_to_training_data(
     monkeypatch,
     caplog,
 ):
-    from glinext.processing.label_augmentation import LabelAugmentationConfig
+    from gliformer.processing.label_augmentation import LabelAugmentationConfig
 
     calls = {}
 
@@ -277,7 +277,7 @@ def test_train_model_wires_label_augmentation_only_to_training_data(
         "from_value",
         staticmethod(_from_value),
     )
-    monkeypatch.setattr("glinext.training.GLiNExTTrainer", _Trainer)
+    monkeypatch.setattr("gliformer.training.GLiFormerTrainer", _Trainer)
 
     def _create_data_collator(**kwargs):
         calls["collator"] = kwargs
@@ -298,7 +298,7 @@ def test_train_model_wires_label_augmentation_only_to_training_data(
     )
 
     with caplog.at_level("WARNING"):
-        BaseGLiNExT.train_model(
+        BaseGLiFormer.train_model(
             owner,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
@@ -387,7 +387,7 @@ def test_classification_parent_name_dropout_samples_both_prompt_views(
     }]
     samples = iter([0.49, 0.50])
     monkeypatch.setattr(
-        "glinext.training.random.random",
+        "gliformer.training.random.random",
         lambda: next(samples),
     )
     dataset = ClassificationParentNameDropoutDataset(records, probability=0.5)
@@ -428,7 +428,7 @@ def test_training_args_preserve_explicit_zero_optimizer_values_and_inherit_none(
         "create_training_args",
         classmethod(upstream_factory),
     )
-    explicit_zero = BaseGLiNExT.create_training_args(
+    explicit_zero = BaseGLiFormer.create_training_args(
         output_dir=tmp_path / "explicit-zero",
         learning_rate=3e-4,
         weight_decay=0.07,
@@ -437,7 +437,7 @@ def test_training_args_preserve_explicit_zero_optimizer_values_and_inherit_none(
         use_cpu=True,
         report_to="none",
     )
-    inherited = BaseGLiNExT.create_training_args(
+    inherited = BaseGLiFormer.create_training_args(
         output_dir=tmp_path / "inherited",
         learning_rate=3e-4,
         weight_decay=0.07,
@@ -521,7 +521,7 @@ def test_training_step_skips_label_free_batch_without_forward(caplog):
     trainer = _bare_trainer()
     model = _TaskLossModel("ner_labels")
 
-    with caplog.at_level("WARNING", logger="glinext.training"):
+    with caplog.at_level("WARNING", logger="gliformer.training"):
         loss = trainer.training_step(
             model,
             {"features": torch.tensor([1.0])},
@@ -554,7 +554,7 @@ class _DetectionLossModel(nn.Module):
         class_logits = torch.tensor([[[1.0, -1.0]]])
         boxes = torch.tensor([[[0.1, 0.2, 0.3, 0.4]]])
         objectness = torch.tensor([[0.25]])
-        return GLiNExTVisionOutput(
+        return GLiFormerVisionOutput(
             loss=class_logits.sum() * 0.0,
             object_detection_logits=class_logits,
             object_detection_boxes=boxes,
@@ -585,7 +585,7 @@ class _StructuringLossModel(nn.Module):
         entity_logits = torch.zeros(1, 4, 2, 3)
         field_logits = torch.zeros(1, 3, 2)
         assignment_logits = torch.zeros(1, 3, 4)
-        return GLiNExTTextOutput(
+        return GLiFormerTextOutput(
             loss=entity_logits.sum(),
             structuring_entity_logits=entity_logits,
             structuring_field_logits=field_logits,
@@ -636,7 +636,7 @@ class _OpenRelexLossModel(nn.Module):
             entity_count,
             2,
         )
-        return GLiNExTTextOutput(
+        return GLiFormerTextOutput(
             loss=assignment_logits.sum() * 0.0,
             open_rel_assignment_logits=assignment_logits,
             open_rel_span_idx=torch.zeros(
@@ -692,7 +692,7 @@ class _StructuringRelationLossModel(nn.Module):
     def forward(self, **kwargs):
         relation_labels = kwargs["structuring_relation_labels"]
         scores = relation_labels.float() + 0.25
-        return GLiNExTTextOutput(
+        return GLiFormerTextOutput(
             loss=scores.sum() * 0.0,
             **{self.score_field: scores},
         )
@@ -766,7 +766,7 @@ def _loss_owner(task_config):
 
 def test_model_orchestration_defaults_binary_tasks_to_focal_loss():
     owner = _loss_owner(ObjectDetectionHeadConfig())
-    loss_fn = BaseGLiNextModel._make_task_loss_fn(
+    loss_fn = BaseGLiFormerModel._make_task_loss_fn(
         owner,
         "object_detection",
         {},
@@ -786,7 +786,7 @@ def test_structuring_keeps_all_anchor_negatives_despite_runtime_sampler():
         masking="none",
     )
     owner = _loss_owner(task_config)
-    loss_fn = BaseGLiNextModel._make_task_loss_fn(
+    loss_fn = BaseGLiFormerModel._make_task_loss_fn(
         owner,
         "structuring",
         {"negatives": 0.005, "masking": "global"},
@@ -815,7 +815,7 @@ def test_model_orchestration_uses_bce_when_both_focal_controls_are_disabled():
             focal_loss_gamma=0.0,
         )
     )
-    loss_fn = BaseGLiNextModel._make_task_loss_fn(
+    loss_fn = BaseGLiFormerModel._make_task_loss_fn(
         owner,
         "object_detection",
         {},
@@ -835,7 +835,7 @@ def test_model_orchestration_uses_bce_when_both_focal_controls_are_disabled():
 
 def test_model_orchestration_uses_config_style_runtime_focal_values():
     owner = _loss_owner(ObjectDetectionHeadConfig())
-    loss_fn = BaseGLiNextModel._make_task_loss_fn(
+    loss_fn = BaseGLiFormerModel._make_task_loss_fn(
         owner,
         "object_detection",
         {
@@ -870,7 +870,7 @@ def test_model_orchestration_keeps_focal_when_either_control_is_enabled(
             focal_loss_gamma=gamma,
         )
     )
-    loss_fn = BaseGLiNextModel._make_task_loss_fn(
+    loss_fn = BaseGLiFormerModel._make_task_loss_fn(
         owner,
         "object_detection",
         {},
@@ -896,7 +896,7 @@ def test_zero_focal_alpha_with_positive_gamma_keeps_positive_gradients():
             focal_loss_gamma=2.0,
         )
     )
-    loss_fn = BaseGLiNextModel._make_task_loss_fn(
+    loss_fn = BaseGLiFormerModel._make_task_loss_fn(
         owner,
         "object_detection",
         {},
@@ -936,7 +936,7 @@ def test_model_orchestration_uses_stable_focal_instead_of_upstream_loss():
         raise AssertionError("the upstream focal primitive must not be called")
 
     owner._loss = fail_if_called
-    loss_fn = BaseGLiNextModel._make_task_loss_fn(
+    loss_fn = BaseGLiFormerModel._make_task_loss_fn(
         owner,
         "object_detection",
         {},
