@@ -244,6 +244,43 @@ print(results["structuring"][0])
 
 `inference` and `inference_from_schema` return a dictionary keyed by task, with one entry per input text under each key. You can also pass `entities`, `classes`, `relations`, and `structures` directly to `model.inference(...)`.
 
+### Document Layout Processing
+
+Use a trained layout checkpoint with an NER head to extract fields from a PDF using both text and word bounding boxes. Install the PDF dependencies first:
+
+```bash
+pip install "gliformer[pdf]"
+```
+
+This example uses a text-and-box layout checkpoint, such as one trained with the [2D DeBERTa configuration](configs/layout_deberta2d.yaml):
+
+```python
+from gliformer import GLiFormer
+
+layout_model = GLiFormer.from_pretrained(
+    "path/to/layout-checkpoint", load_tokenizer=True
+)
+
+results = layout_model.parse_pdf(
+    "invoice.pdf",
+    entities=["invoice number", "invoice date", "vendor", "total amount"],
+    add_image_token=False,
+    return_pixel_values=False,
+    split_pages=True,
+    return_pages=True,
+    threshold=0.5,
+)
+
+for page_index, entities in zip(results["pages"], results["ner"]):
+    print(f"Page {page_index + 1}")
+    for entity in entities:
+        print(entity["text"], "=>", entity["label"])
+```
+
+`parse_pdf` extracts embedded PDF text and normalizes word boxes to the 0–1000 coordinate range. Results are grouped by page; `pages=[0, 1]` selects the first two pages. For a checkpoint that also consumes page images, set `add_image_token=True` and `return_pixel_values=True`.
+
+For scanned documents, supply externally extracted OCR tokens as `words` and matching `[x0, y0, x1, y1]` boxes as `bbox`, normalized to the same 0–1000 range. You can also pass `structures`, `classes`, or `relations` when the checkpoint has the corresponding trained heads.
+
 ### Text Embeddings
 
 A checkpoint with an embedding head can produce vectors for similarity and retrieval:
