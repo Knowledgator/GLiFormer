@@ -6,14 +6,23 @@
 
 **Text · Documents · Images · Audio**
 
+[![PyPI](https://img.shields.io/pypi/v/gliformer)](https://pypi.org/project/gliformer/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](pyproject.toml)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c)](pyproject.toml)
 [![Built on GLiNER](https://img.shields.io/badge/Built%20on-GLiNER-8A2BE2)](https://github.com/urchade/GLiNER)
+[![Docs](https://img.shields.io/badge/Docs-GLiFormer-0A7EA4)](https://docs.knowledgator.com/docs/frameworks/gliformer/)
+[![Research](https://img.shields.io/badge/Research-Knowledgator-8A2BE2)](https://www.knowledgator.com/research)
+[![Discord](https://img.shields.io/badge/Discord-Join%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/dkyeAgs9DGa)
 
 [Quick Start](#quick-start) • [Structuring](#structured-extraction) • [Usage](#usage) • [Training](#training) • [Architectures](#architectures) • [Evaluation](#evaluation)
 
 </div>
 
+<p align="center">
+  <img src="assets/gliformer-tasks.gif"
+       alt="GLiFormer supported tasks"
+       width="900">
+</p>
 GLiFormer is a framework for training and running models that turn unstructured inputs into labeled spans, relations, classifications, and structured records. Built on [GLiNER](https://github.com/urchade/GLiNER), it combines a shared encoder with configurable task heads and lets you specify entity types, class labels, relation types, and extraction schemas at inference time.
 
 Alongside text extraction, the codebase includes model variants for document layout, vision, audio, and combined modalities. Available tasks depend on the heads and modalities configured and trained in your checkpoint.

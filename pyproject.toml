@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gliformer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Multi-task information extraction framework with text, layout, vision, audio, and omni-modal GLiFormer models."
 readme = "README.md"
 requires-python = ">=3.10"
