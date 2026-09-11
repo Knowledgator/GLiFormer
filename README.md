@@ -23,6 +23,7 @@
        alt="GLiFormer supported tasks"
        width="900">
 </p>
+
 GLiFormer is a framework for training and running models that turn unstructured inputs into labeled spans, relations, classifications, and structured records. Built on [GLiNER](https://github.com/urchade/GLiNER), it combines a shared encoder with configurable task heads and lets you specify entity types, class labels, relation types, and extraction schemas at inference time.
 
 Alongside text extraction, the codebase includes model variants for document layout, vision, audio, and combined modalities. Available tasks depend on the heads and modalities configured and trained in your checkpoint.
