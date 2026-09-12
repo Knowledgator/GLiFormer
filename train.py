@@ -11,7 +11,7 @@ from gliner.training.trainer import TrainingArguments
 from gliner.utils import load_config_as_namespace, namespace_to_dict
 from transformers.trainer_utils import get_last_checkpoint
 
-from glinext import GLiNExT
+from gliformer import GLiFormer
 
 _STRUCTURING_CHECKPOINT_OVERRIDE_FIELDS = (
     "loss_coef",
@@ -262,11 +262,11 @@ def _architecture_value(value):
 def validate_checkpoint_architecture(model, model_cfg: dict):
     """Reject active YAML changes that require differently shaped modules."""
 
-    from glinext.config import resolve_glinext_config_class
+    from gliformer.config import resolve_gliformer_config_class
 
     mismatches = []
     checkpoint_model_cfg = model.config
-    active_config_class = resolve_glinext_config_class(model_cfg)
+    active_config_class = resolve_gliformer_config_class(model_cfg)
     active_model_cfg = active_config_class(**model_cfg)
     for name in sorted(_GLOBAL_ARCHITECTURE_FIELDS & set(model_cfg)):
         if not hasattr(checkpoint_model_cfg, name) or not hasattr(
@@ -376,7 +376,7 @@ def _set_training_arg(target, explicit, name, value, source):
 def _build_training_kwargs(train_cfg: dict, *, has_eval: bool):
     """Translate and validate YAML training settings for ``train_model``.
 
-    Existing GLiNExT names remain supported at the top level. Arbitrary
+    Existing GLiFormer names remain supported at the top level. Arbitrary
     standard ``TrainingArguments`` values belong under ``trainer_args`` so a
     typo cannot silently become an ignored keyword.
     """
@@ -650,14 +650,14 @@ def apply_checkpoint_config_overrides(model, model_cfg: dict):
                 ]
                 anchor_layer.normalization = normalization
                 if hasattr(anchor_layer, "normalizer"):
-                    from glinext.layers import AnchorNormalizer
+                    from gliformer.layers import AnchorNormalizer
 
                     anchor_layer.normalizer = AnchorNormalizer.from_config(
                         normalization,
                         int(model.config.hidden_size),
                     )
         if "anchor_normalization" in configured_values:
-            from glinext.layers import AnchorNormalizer
+            from gliformer.layers import AnchorNormalizer
 
             normalizer_name = (
                 "record_anchor_normalizer"
@@ -724,7 +724,7 @@ def apply_checkpoint_config_overrides(model, model_cfg: dict):
                 raise ValueError(
                     "embedding encoder_dropout must be finite and in [0, 1)"
                 )
-            from glinext.encoders.text import set_text_encoder_dropout
+            from gliformer.encoders.text import set_text_encoder_dropout
 
             embedding_config.encoder_dropout = encoder_dropout
             embedding_head.encoder_dropout = encoder_dropout
@@ -738,7 +738,7 @@ def apply_checkpoint_config_overrides(model, model_cfg: dict):
             applied.append("encoder_dropout")
 
         if "loss_fn" in embedding_values or "margin" in embedding_values:
-            from glinext.tasks.embedding.model import EmbeddingLoss
+            from gliformer.tasks.embedding.model import EmbeddingLoss
 
             loss_fn = embedding_values.get(
                 "loss_fn",
@@ -879,11 +879,11 @@ def prepare_training_records(records, model):
 
 
 def build_model(model_cfg: dict, train_cfg: dict):
-    """Build or load GLiNExT model."""
+    """Build or load GLiFormer model."""
     prev_path = train_cfg.get("prev_path")
     if prev_path and str(prev_path).lower() not in ("none", "null", ""):
         print(f"Loading pretrained model from: {prev_path}")
-        model = GLiNExT.from_pretrained(prev_path)
+        model = GLiFormer.from_pretrained(prev_path)
         validate_checkpoint_architecture(model, model_cfg)
         applied = apply_checkpoint_config_overrides(model, model_cfg)
         if applied:
@@ -893,7 +893,7 @@ def build_model(model_cfg: dict, train_cfg: dict):
             )
         return model
     print("Initializing model from config...")
-    return GLiNExT.load_from_config(model_cfg)
+    return GLiFormer.load_from_config(model_cfg)
 
 
 def main(cfg_path: str, resume_from_checkpoint: str | bool | None = None):
@@ -982,7 +982,7 @@ def main(cfg_path: str, resume_from_checkpoint: str | bool | None = None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train GLiNExT model")
+    parser = argparse.ArgumentParser(description="Train GLiFormer model")
     parser.add_argument("--config", type=str, default="configs/config.yaml",
                         help="Path to config file (YAML or JSON)")
     parser.add_argument(
