@@ -116,14 +116,13 @@ class StructuringDecoder(SpanDecoder):
         objectness_logits,
         objectness_threshold,
         *,
-        relation_scores=None,
         expected_shape=None,
     ):
         """Combine the structural anchor mask with objectness gating.
 
         Returns a boolean mask of the same shape as ``anchor_mask`` (or the
-        objectness mask, when anchor_mask is None). Anchors where objectness
-        falls below the threshold are dropped from decoding.
+        objectness mask, when anchor_mask is None). Objectness must be strictly
+        above the threshold; parent-child relations cannot override this gate.
         """
         for value, name in (
             (anchor_mask, self.anchor_mask_attr),
@@ -155,51 +154,6 @@ class StructuringDecoder(SpanDecoder):
             return anchor_mask.bool() if anchor_mask.dtype != torch.bool else anchor_mask
 
         return anchor_mask.bool() & obj_mask
-
-    def _rescue_nested_relation_anchors(
-        self,
-        anchor_mask,
-        raw_anchor_mask,
-        relation_scores,
-        multi_level_contexts,
-    ):
-        """Retain relation-linked containers only inside real hierarchies.
-
-        A relation may bridge a fieldless parent/child container, but it must
-        be connected to at least one objectness-selected slot. Relations alone
-        never create a graph, and root-only schemas never use relation rescue.
-        """
-
-        if anchor_mask is None or relation_scores is None:
-            return anchor_mask
-        rescued = anchor_mask.bool().clone()
-        for batch_idx, context in enumerate(multi_level_contexts or []):
-            mapping = context.get("mapping") if context else None
-            hierarchy = list(getattr(mapping, "hierarchy", None) or [])
-            if not any(tuple(node.get("path") or ()) for node in hierarchy):
-                continue
-            edges = relation_scores[batch_idx] >= self.anchor_relations_threshold
-            edges = edges.clone()
-            edges.fill_diagonal_(False)
-            valid = (
-                raw_anchor_mask[batch_idx].bool()
-                if raw_anchor_mask is not None
-                else torch.ones_like(rescued[batch_idx])
-            )
-            active = rescued[batch_idx]
-            if not active.any():
-                continue
-            while True:
-                neighbours = (
-                    edges[active].any(dim=0)
-                    | edges[:, active].any(dim=1)
-                )
-                expanded = valid & (active | neighbours)
-                if torch.equal(expanded, active):
-                    break
-                active = expanded
-            rescued[batch_idx] = active
-        return rescued
 
     def _prepare_decode_context(
         self,
@@ -259,14 +213,7 @@ class StructuringDecoder(SpanDecoder):
             raw_anchor_mask,
             objectness_logits,
             float(objectness_threshold),
-            relation_scores=relation_scores,
             expected_shape=(batch_groups, anchor_count),
-        )
-        anchor_mask = self._rescue_nested_relation_anchors(
-            anchor_mask,
-            raw_anchor_mask,
-            relation_scores,
-            multi_level_contexts,
         )
         reliable_presence_mask = None
         if objectness_logits is not None:

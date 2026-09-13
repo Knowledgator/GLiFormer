@@ -309,6 +309,59 @@ def test_structuring_decoder_applies_anchor_objectness():
     assert len(result[0][0]) == 1
 
 
+@pytest.mark.parametrize(
+    ("objectness_threshold", "rejected_logit"),
+    [(0.5, -10.0), (0.5, 0.0), (0.9, 1.0)],
+)
+@pytest.mark.parametrize("rejected_anchor", [0, 1])
+@pytest.mark.parametrize("with_anchor_mask", [False, True])
+def test_multi_level_relations_cannot_override_objectness(
+    objectness_threshold, rejected_logit, rejected_anchor, with_anchor_mask,
+):
+    decoder = StructuringDecoder.from_config(make_config(structuring_config={
+        "multi_level": True,
+        "anchor_objectness": True,
+        "anchor_relations_threshold": 0.5,
+    }))
+    objectness = torch.full((1, 2), 5.0)
+    objectness[0, rejected_anchor] = rejected_logit
+    relations = torch.zeros(1, 2, 2)
+    relations[0, 0, 1] = 0.99
+    output = _entity_first_output(
+        1, 2, 2,
+        [(0, 0, 0, 0, 0), (0, 1, 1, 1, 1)],
+        structuring_objectness_logits=objectness,
+        structuring_anchor_relation_scores=relations,
+    )
+    if not with_anchor_mask:
+        output.structuring_anchor_mask = None
+
+    decoded = decoder.decode(
+        output,
+        classes_mapping=_make_multi_level_mapping(),
+        texts=[["Root", "Child"]],
+        threshold=0.5,
+        objectness_threshold=objectness_threshold,
+        preserve_empty_records=True,
+    )
+    assert [node["anchor_index"] for node in decoded[0][0]["nodes"]] == [
+        1 - rejected_anchor,
+    ]
+    result = decoder.map_results(
+        decoded,
+        valid_to_orig_idx=[0],
+        all_start_maps=[[0, 5]],
+        all_end_maps=[[4, 10]],
+        valid_texts=["Root Child"],
+        num_original=1,
+    )
+    expected = (
+        {"children": [{"value": "Child"}]}
+        if rejected_anchor == 0 else {"name": "Root"}
+    )
+    assert result == [{"catalog": [expected]}]
+
+
 def test_structuring_decoder_rejects_misaligned_shapes():
     config = make_config(
         default_ner_config=False,
@@ -341,6 +394,9 @@ def test_hierarchy_mode_preserves_anchor_indices_and_aligns_graph():
     decoder = StructuringDecoder.from_config(config)
     relation_scores = torch.zeros(1, 3, 3)
     relation_scores[0, 0, 2] = 0.9
+    # Strong relations to a rejected slot must not activate it.
+    relation_scores[0, 0, 1] = 0.99
+    relation_scores[0, 1, 2] = 0.99
     # These high invalid edges must not create cycles or reverse the hierarchy.
     relation_scores[0, 2, 0] = 0.99
     relation_scores[0, 0, 0] = 0.99
@@ -642,7 +698,18 @@ def test_collapsed_decoder_merges_complementary_sibling_fragments():
     ]
 
 
-def test_multi_level_relations_rescue_fieldless_container_from_objectness():
+@pytest.mark.parametrize(
+    ("container_logit", "leaf_logit", "expected_anchors"),
+    [
+        (5.0, 5.0, [0, 1, 2]),
+        (-5.0, 5.0, [0, 2]),
+        (0.0, 5.0, [0, 2]),
+        (-5.0, -5.0, [0]),
+    ],
+)
+def test_multi_level_fieldless_container_requires_objectness(
+    container_logit, leaf_logit, expected_anchors,
+):
     config = make_config(structuring_config={
         "multi_level": True,
         "anchor_objectness": True,
@@ -699,7 +766,9 @@ def test_multi_level_relations_rescue_fieldless_container_from_objectness():
         3,
         2,
         [(0, 0, 0, 0, 0), (0, 2, 1, 1, 1)],
-        structuring_objectness_logits=torch.tensor([[5.0, -5.0, 5.0]]),
+        structuring_objectness_logits=torch.tensor([
+            [5.0, container_logit, leaf_logit],
+        ]),
         structuring_anchor_relation_scores=relations,
     )
 
@@ -707,7 +776,11 @@ def test_multi_level_relations_rescue_fieldless_container_from_objectness():
         output,
         classes_mapping=mapping,
         texts=[["Root", "Leaf"]],
+        threshold=0.5,
     )
+    assert [
+        node["anchor_index"] for node in decoded[0][0]["nodes"]
+    ] == expected_anchors
     result = decoder.map_results(
         decoded,
         valid_to_orig_idx=[0],
@@ -717,10 +790,14 @@ def test_multi_level_relations_rescue_fieldless_container_from_objectness():
         num_original=1,
     )
 
-    assert result == [{"catalog": [{
-        "name": "Root",
-        "children": [{"items": [{"value": "Leaf"}]}],
-    }]}]
+    nested_leaf = {"children": [{"items": [{"value": "Leaf"}]}]}
+    if expected_anchors == [0, 1, 2]:
+        expected = [{"name": "Root", **nested_leaf}]
+    elif expected_anchors == [0, 2]:
+        expected = [{"name": "Root"}, nested_leaf]
+    else:
+        expected = [{"name": "Root"}]
+    assert result == [{"catalog": expected}]
 
 
 def test_multi_level_filters_empty_records_at_every_nested_level():
@@ -796,26 +873,27 @@ def test_root_only_schema_relations_do_not_bypass_objectness():
             "fields": [],
         }],
     )
-    raw_mask = torch.ones(1, 2, dtype=torch.bool)
-    objectness = torch.tensor([[5.0, -5.0]])
     relations = torch.zeros(1, 2, 2)
     relations[0, 0, 1] = 0.99
-
-    resolved = decoder._resolve_anchor_mask(
-        raw_mask,
-        objectness,
-        0.5,
-        relation_scores=relations,
-        expected_shape=(1, 2),
+    output = _entity_first_output(
+        1, 2, 1,
+        [(0, 0, 0, 0, 0), (0, 1, 1, 1, 0)],
+        structuring_objectness_logits=torch.tensor([[5.0, -5.0]]),
+        structuring_anchor_relation_scores=relations,
     )
-    rescued = decoder._rescue_nested_relation_anchors(
-        resolved,
-        raw_mask,
-        relations,
-        [{"mapping": mapping}],
+    decoded = decoder.decode(
+        output,
+        classes_mapping=BatchClassesMapping(
+            cat_mapping=[CatClassMapping(cat_class_to_id=[])],
+            extraction_mapping=[ExtractionClassMapping()],
+            structuring_mapping=[StructuringClassMapping(
+                items=[mapping], multi_level=True,
+            )],
+        ),
+        threshold=0.5,
     )
 
-    assert rescued.tolist() == [[True, False]]
+    assert [node["anchor_index"] for node in decoded[0][0]["nodes"]] == [0]
 
 
 def test_structuring_decoder_rejects_short_anchor_mask():
