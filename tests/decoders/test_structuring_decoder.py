@@ -15,11 +15,13 @@ from gliformer.processing.mappings import (
     StructuringClassMapping,
     StructuringItemMapping,
 )
+from gliformer.processing.schema import normalize_structuring_schemas
 from gliformer.processing.structuring_decoder import (
     align_structuring_anchors,
 )
 from gliformer.tasks.structuring.decoder import StructuringDecoder
-from tests.conftest import make_config
+from gliformer.tasks.structuring.processor import StructuringProcessor
+from tests.conftest import FakeWordsSplitter, make_config
 
 
 @dataclass
@@ -1099,6 +1101,86 @@ def test_hierarchy_formatting_unwraps_raw_root_object():
     )
 
     assert result == [{"name": "Root"}]
+
+
+@pytest.mark.parametrize(
+    ("hazards_spec", "hazard_count", "expected_hazards"),
+    [
+        pytest.param([""], 0, [], id="empty-list"),
+        pytest.param([""], 1, ["fire"], id="singleton-list"),
+        pytest.param([""], 2, ["fire", "smoke"], id="multiple-list-values"),
+        pytest.param("", 0, None, id="missing-scalar"),
+        pytest.param("", 1, "fire", id="single-scalar"),
+        pytest.param("", 2, "smoke", id="best-scalar-value"),
+    ],
+)
+@pytest.mark.parametrize("schema_location", ["named", "root_object", "root_list", "child"])
+def test_normalized_schema_preserves_primitive_field_cardinality(
+    hazards_spec, hazard_count, expected_hazards, schema_location,
+):
+    config = make_config(structuring_config={"multi_level": True})
+    processor = StructuringProcessor(config, words_splitter=FakeWordsSplitter())
+    decoder = StructuringDecoder.from_config(config)
+    template = {"name": "", "hazards": hazards_spec}
+    structures = {
+        "named": {"incident": template},
+        "root_object": {"$root": template},
+        "root_list": [template],
+        "child": {"incident": {"events": [template]}},
+    }[schema_location]
+    normalized = normalize_structuring_schemas(structures)
+    assert normalize_structuring_schemas(normalized) == normalized
+    item = {}
+    processor.contribute_inference_input(item, structures=normalized)
+    structuring_mapping = processor.get_classes_mapping([item])
+    mapping = BatchClassesMapping(
+        cat_mapping=[CatClassMapping(cat_class_to_id=[])],
+        extraction_mapping=[ExtractionClassMapping()],
+        structuring_mapping=structuring_mapping,
+    )
+    field_ids = structuring_mapping[0].items[0].field_class_to_id.class_to_id
+    nested = schema_location == "child"
+    prefix = "events." if nested else ""
+    record_anchor = 1 if nested else 0
+    anchor_count = 2 if nested else 1
+    spans = [(0, record_anchor, 0, 0, field_ids[f"{prefix}name"])]
+    spans.extend(
+        (0, record_anchor, index + 1, index + 1, field_ids[f"{prefix}hazards"], 4.0 + index)
+        for index in range(hazard_count)
+    )
+    relations = torch.zeros(1, anchor_count, anchor_count)
+    if nested:
+        relations[0, 0, 1] = 0.9
+    output = _entity_first_output(
+        1, anchor_count, len(field_ids), spans,
+        structuring_objectness_logits=torch.full((1, anchor_count), 5.0),
+        structuring_anchor_relation_scores=relations,
+    )
+
+    decoded = decoder.decode(
+        output,
+        classes_mapping=mapping,
+        texts=[["report", "fire", "smoke"]],
+        threshold=0.5,
+    )
+    result = decoder.map_results(
+        decoded,
+        valid_to_orig_idx=[0],
+        all_start_maps=[[0, 7, 12]],
+        all_end_maps=[[6, 11, 17]],
+        valid_texts=["report fire smoke"],
+        num_original=1,
+        structures=normalized,
+    )
+
+    record = {"name": "report", "hazards": expected_hazards}
+    expected = {
+        "named": {"incident": [record]},
+        "root_object": record,
+        "root_list": [record],
+        "child": {"incident": [{"events": [record]}]},
+    }[schema_location]
+    assert result == [expected]
 
 
 def test_hierarchy_formatting_preserves_arrays_and_empty_containers():
