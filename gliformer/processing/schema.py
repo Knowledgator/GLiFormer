@@ -572,15 +572,20 @@ def _node_to_descriptor(
         raise TypeError("A named structuring schema must describe an object")
 
     children: dict[str, dict[str, Any]] = {}
-    has_inline_objects = False
+    preserve_field_shapes = False
     for name, child in node.fields.items():
         if child.kind == "array" and child.item is not None and child.item.kind == "object":
             children[name] = _node_to_descriptor(child.item)
-        elif child.kind in {"object", "array"}:
-            has_inline_objects = True
+        elif child.kind in {"object", "array"} or (
+            isinstance(child.type_spec, FieldType)
+            and child.type_spec.type_name == "list"
+        ):
+            # Primitive lists are scalar nodes, but their array shape must
+            # survive serialization so decoding retains every field value.
+            preserve_field_shapes = True
 
     required = _descriptor_required_fields(node)
-    if children or has_inline_objects:
+    if children or preserve_field_shapes:
         resolved_description = description if description is not None else node.description
         descriptor: dict[str, Any] = {
             "fields": {
@@ -595,7 +600,7 @@ def _node_to_descriptor(
             descriptor["description"] = resolved_description
         return descriptor
 
-    # Preserve the exact flat descriptor accepted by earlier releases.
+    # Preserve the legacy flat descriptor for scalar-only fields.
     return {
         "fields": list(node.fields),
         "required_fields": required,

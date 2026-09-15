@@ -50,17 +50,50 @@ class FactoryModel(pydantic.BaseModel):
     value: int = pydantic.Field(default_factory=lambda: 7)
 
 
-def test_flat_pydantic_schema_keeps_legacy_inference_shape():
+def test_flat_pydantic_schema_preserves_primitive_list_shape():
     schema = GLiFormerSchema().add_structure("flat", FlatModel)
 
     assert schema.to_inference_kwargs() == {
         "structures": {
             "flat": {
-                "fields": ["name", "count", "tags"],
+                "fields": {"name": "", "count": "", "tags": []},
+                "children": {},
                 "required_fields": ["name"],
             }
         }
     }
+    assert schema.requires_multi_level is False
+
+
+@pytest.mark.parametrize(
+    "field_spec",
+    [
+        pytest.param([], id="empty-list"),
+        pytest.param([""], id="list-exemplar"),
+        pytest.param(list[str], id="annotation"),
+        pytest.param(FieldType("list"), id="field-type"),
+        pytest.param(
+            {"$type": "array", "$items": "string"},
+            id="field-descriptor",
+        ),
+    ],
+)
+def test_normalization_preserves_primitive_list_annotations(field_spec):
+    template = {"!hazards": field_spec}
+    expected = {
+        "incident": {
+            "fields": {"hazards": []},
+            "children": {},
+            "required_fields": ["hazards"],
+        },
+    }
+    normalized = normalize_structuring_schemas({"incident": template})
+
+    assert normalized == expected
+    assert normalize_structuring_schemas(normalized) == expected
+    schema = GLiFormerSchema().add_structure("incident", template)
+    assert schema.to_inference_kwargs()["structures"] == expected
+    assert schema.requires_multi_level is False
 
 
 def test_pydantic_defaults_and_factories_do_not_leak_undefined_sentinels():
@@ -552,7 +585,8 @@ def test_advanced_template_field_options_apply_defaults_and_enums():
     assert schema.to_inference_kwargs() == {
         "structures": {
             "mission": {
-                "fields": ["status", "mass", "scores"],
+                "fields": {"status": "", "mass": "", "scores": []},
+                "children": {},
                 "required_fields": ["mass"],
             }
         }
@@ -566,22 +600,26 @@ def test_advanced_template_field_options_apply_defaults_and_enums():
     }
 
 
-def test_same_flat_template_is_accepted_directly_by_flat_processor():
+@pytest.mark.parametrize("normalize_schema", [False, True])
+def test_same_flat_template_is_accepted_directly_by_flat_processor(normalize_schema):
     processor = StructuringProcessor(
         make_config(default_ner_config=False, structuring_config={}),
         words_splitter=FakeWordsSplitter(),
     )
     item = {}
+    structures = {
+        "mission": {
+            "!name": "string",
+            "cost": "number",
+            "agencies": ["string"],
+        },
+    }
+    if normalize_schema:
+        structures = normalize_structuring_schemas(structures)
 
     processor.contribute_inference_input(
         item,
-        structures={
-            "mission": {
-                "!name": "string",
-                "cost": "number",
-                "agencies": ["string"],
-            }
-        },
+        structures=structures,
     )
 
     assert item["structuring_schema"]["mission"] == {
