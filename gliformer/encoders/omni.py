@@ -326,6 +326,29 @@ class LayoutEncoder(TextEncoder):
         **kwargs: Any,
     ) -> torch.Tensor:
         bbox = LayoutEncoder._pop_bbox(kwargs, bbox)
+        # Text-only layout checkpoints can use the inherited GLiNER packing
+        # path. Layout/media-aligned tensors require coordinated packing and
+        # deliberately fall back to the established unpacked implementation.
+        if (
+            kwargs.get("packing_config") is not None
+            and input_ids is not None
+            and inputs_embeds is None
+            and bbox is None
+            and page_token_ids is None
+            and page_input_mask is None
+            and pixel_values is None
+            and vision_attention_mask is None
+            and image_batch_idx is None
+            and image_page_ids is None
+        ):
+            return TextEncoder.forward(
+                self,
+                input_ids,
+                attention_mask,
+                **kwargs,
+            )
+        kwargs.pop("packing_config", None)
+        kwargs.pop("token_lengths", None)
         model_kwargs = dict(kwargs)
         page_token_ids = model_kwargs.pop("page_token_ids", page_token_ids)
         page_input_mask = model_kwargs.pop("page_input_mask", page_input_mask)
