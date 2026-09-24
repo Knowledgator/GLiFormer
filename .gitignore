@@ -1,3 +1,64 @@
+# Python bytecode and tool caches
 __pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# IDE and operating-system metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Runtime output, logs, and temporary files
+*.log
+logs/
+tmp/
+temp/
+.cache/
+ray_results/
+wandb/
+mlruns/
+outputs/
+runs/
+
+# Local model/data artifacts. Published weights belong in external storage.
+checkpoints/
+models/
+data/
+*.bin
+*.ckpt
+*.onnx
+*.pt
+*.pth
+*.safetensors
+.agents/
+.codex/
+
 scripts/
 benchmarks/
