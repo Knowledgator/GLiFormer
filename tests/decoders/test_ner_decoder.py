@@ -105,6 +105,19 @@ class TestNERDecoderTokenLevel:
         result = decoder.decode(out, classes_mapping={0: "A"}, threshold=0.99)
         assert len(result[0][0]) == 0
 
+    def test_per_row_thresholds(self, decoder):
+        logits = _bio_logits(2, 2, 1, [(0, 0, 0, 0), (1, 0, 0, 0)])
+        out = FakeModelOutput(ner_logits=logits)
+        result = decoder.decode(
+            out,
+            classes_mapping={0: "A"},
+            threshold=[0.5, 0.99999],
+            flat_ner=[True, True],
+            multi_label=[False, False],
+        )
+        assert len(result[0][0]) == 1
+        assert result[1][0] == []
+
 
 class TestNERDecoderSpanLevel:
     def test_span_level_preferred(self, decoder):
