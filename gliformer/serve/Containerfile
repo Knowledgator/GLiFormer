@@ -1,0 +1,18 @@
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+WORKDIR /app
+
+COPY . /app/gliformer
+RUN pip install --no-cache-dir "/app/gliformer[serve,polylora]"
+
+COPY gliformer/serve/docker-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENV TOKENIZERS_PARALLELISM=true
+ENV GLIFORMER_MODEL=knowledgator/gliformer-base-v1
+ENV GLIFORMER_DEVICE=cuda
+ENV GLIFORMER_DTYPE=bfloat16
+ENV GLIFORMER_MAX_BATCH_SIZE=32
+
+EXPOSE 8000
+ENTRYPOINT ["/entrypoint.sh"]

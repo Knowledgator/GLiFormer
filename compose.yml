@@ -1,0 +1,38 @@
+services:
+  gliformer-serve:
+    build:
+      context: .
+      dockerfile: gliformer/serve/Containerfile
+    ports:
+      - "8000:8000"
+    environment:
+      GLIFORMER_MODEL: ${GLIFORMER_MODEL:-knowledgator/gliformer-base-v1}
+      GLIFORMER_DEVICE: ${GLIFORMER_DEVICE:-cuda}
+      GLIFORMER_DTYPE: ${GLIFORMER_DTYPE:-bfloat16}
+      GLIFORMER_MAX_BATCH_SIZE: ${GLIFORMER_MAX_BATCH_SIZE:-32}
+      GLIFORMER_DISABLE_COMPILE: ${GLIFORMER_DISABLE_COMPILE:-true}
+      GLIFORMER_COMPILE_BACKEND: ${GLIFORMER_COMPILE_BACKEND:-aot_eager}
+      GLIFORMER_DISABLE_MEMORY_CALIBRATION: ${GLIFORMER_DISABLE_MEMORY_CALIBRATION:-false}
+      GLIFORMER_ENABLE_SEQUENCE_PACKING: ${GLIFORMER_ENABLE_SEQUENCE_PACKING:-false}
+      GLIFORMER_ENABLE_POLYLORA: ${GLIFORMER_ENABLE_POLYLORA:-false}
+      GLIFORMER_POLYLORA_ADAPTERS: ${GLIFORMER_POLYLORA_ADAPTERS:-}
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+      - polylora-cache:/models/adapters
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/gliformer/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+volumes:
+  huggingface-cache:
+  polylora-cache:
