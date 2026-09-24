@@ -5,7 +5,7 @@ from typing import List
 import torch
 
 from .. import TaskDecoder
-from ...processing.decoder import unflatten_by_batch_origin
+from ...processing.decoder import resolve_batch_control, unflatten_by_batch_origin
 
 
 class ClassificationDecoder(TaskDecoder):
@@ -32,8 +32,11 @@ class ClassificationDecoder(TaskDecoder):
         if model_output.cat_logits is None:
             return []
 
-        threshold = threshold or self.threshold
+        threshold = self.threshold if threshold is None else threshold
         probs = torch.sigmoid(model_output.cat_logits)
+        mixed_controls = any(isinstance(value, (list, tuple)) for value in (
+            threshold, multi_label
+        ))
 
         # Build per-flat-group id→name mappings from classes_mapping
         id_to_class_maps = []
@@ -44,14 +47,20 @@ class ClassificationDecoder(TaskDecoder):
 
         flat_results = []
         for b in range(probs.shape[0]):
+            if mixed_controls:
+                origin = int(model_output.cat_batch_origin[b].item())
+                threshold_b = resolve_batch_control(threshold, origin, self.threshold)
+                multi_label_b = resolve_batch_control(multi_label, origin, True)
+            else:
+                threshold_b, multi_label_b = threshold, multi_label
             id_to_class = id_to_class_maps[b] if b < len(id_to_class_maps) else {}
             num_classes = len(id_to_class) if id_to_class else probs.shape[1]
 
-            if multi_label:
+            if multi_label_b:
                 predictions = []
                 for c in range(num_classes):
                     score = probs[b, c].item()
-                    if score > threshold:
+                    if score > threshold_b:
                         predictions.append({
                             "class_name": id_to_class.get(c, str(c)),
                             "score": score,
@@ -61,7 +70,7 @@ class ClassificationDecoder(TaskDecoder):
                 valid_probs = probs[b, :num_classes]
                 best_idx = valid_probs.argmax().item()
                 best_score = valid_probs[best_idx].item()
-                if best_score > threshold:
+                if best_score > threshold_b:
                     predictions = [{
                         "class_name": id_to_class.get(best_idx, str(best_idx)),
                         "score": best_score,
