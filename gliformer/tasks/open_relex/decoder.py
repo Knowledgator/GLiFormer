@@ -2,7 +2,10 @@
 
 import torch
 
-from ...processing.decoder import unflatten_by_batch_origin
+from ...processing.decoder import (
+    resolve_batch_control,
+    unflatten_by_batch_origin,
+)
 from ..span_decoder import SpanDecoder
 
 
@@ -248,14 +251,46 @@ class OpenRelexDecoder(SpanDecoder):
                 if batch_origin.numel() else 0
             )
 
+        mixed_controls = any(isinstance(value, (list, tuple)) for value in (
+            threshold, objectness_threshold
+        ))
         relation_probs = torch.sigmoid(logits)
         assignment_probs = torch.sigmoid(assignment_logits)
-        active_anchors = self._active_anchor_mask(
-            logits,
-            anchor_mask,
-            objectness_logits,
-            objectness_threshold,
-        )
+        if mixed_controls:
+            objectness_values = []
+            for group_index in range(batch_groups):
+                origin = int(batch_origin[group_index].item())
+                threshold_value = resolve_batch_control(
+                    threshold, origin, self.threshold
+                )
+                objectness_value = resolve_batch_control(
+                    objectness_threshold, origin, None
+                )
+                if objectness_value is None:
+                    objectness_value = (
+                        self.objectness_threshold
+                        if self.objectness_threshold is not None
+                        else threshold_value
+                    )
+                objectness_values.append(objectness_value)
+            objectness_by_group = torch.tensor(
+                objectness_values,
+                device=logits.device,
+                dtype=relation_probs.dtype,
+            ).unsqueeze(1)
+            active_anchors = self._active_anchor_mask(
+                logits,
+                anchor_mask,
+                objectness_logits,
+                objectness_by_group,
+            )
+        else:
+            active_anchors = self._active_anchor_mask(
+                logits,
+                anchor_mask,
+                objectness_logits,
+                objectness_threshold,
+            )
         relation_maps = self._build_flat_relation_maps(
             classes_mapping,
             batch_groups,
@@ -264,6 +299,10 @@ class OpenRelexDecoder(SpanDecoder):
         flat_results = []
         for batch_idx in range(batch_groups):
             text_idx = int(batch_origin[batch_idx].item())
+            threshold_b = (
+                resolve_batch_control(threshold, text_idx, self.threshold)
+                if mixed_controls else threshold
+            )
             relation_map = relation_maps[batch_idx]
             valid_entities = span_mask[batch_idx].bool().clone()
             valid_entities &= span_idx[batch_idx, :, 0] >= 0
@@ -289,7 +328,7 @@ class OpenRelexDecoder(SpanDecoder):
                         ].masked_fill(~valid_entities, float("-inf"))
                         entity_idx = int(candidates.argmax().item())
                         entity_score = float(candidates[entity_idx].item())
-                        if entity_score <= threshold:
+                        if entity_score <= threshold_b:
                             break
                         endpoint_ids.append(entity_idx)
                         endpoint_scores.append(entity_score)
@@ -318,7 +357,7 @@ class OpenRelexDecoder(SpanDecoder):
                             pair_idx,
                             relation_idx,
                         ].item())
-                        if relation_score <= threshold:
+                        if relation_score <= threshold_b:
                             continue
 
                         relation_name = relation_map.get(

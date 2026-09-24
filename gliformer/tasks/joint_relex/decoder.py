@@ -11,7 +11,7 @@ import torch
 from ..span_decoder import Span  # noqa: F401 — re-exported
 from ..ner.decoder import NERDecoder
 from ..open_relex.decoder import OpenRelexDecoder
-from ...processing.decoder import unflatten_by_batch_origin
+from ...processing.decoder import resolve_batch_control, unflatten_by_batch_origin
 
 
 class JointRelexDecoder(NERDecoder):
@@ -93,6 +93,9 @@ class JointRelexDecoder(NERDecoder):
             batch_origin = getattr(model_output, "joint_rel_batch_origin", None)
             if batch_origin is not None and bn < batch_origin.numel():
                 source_batch_idx = int(batch_origin[bn].item())
+            threshold_bn = resolve_batch_control(
+                threshold, source_batch_idx, self.threshold
+            )
             rel_map = (
                 rel_id_to_classes[bn]
                 if isinstance(rel_id_to_classes, list) and bn < len(rel_id_to_classes)
@@ -106,7 +109,7 @@ class JointRelexDecoder(NERDecoder):
                     if rel_map and c not in rel_map:
                         continue
                     score = probs[bn, p, c].item()
-                    if score <= threshold:
+                    if score <= threshold_bn:
                         continue
 
                     head_id = pair_idx[bn, p, 0].item()
