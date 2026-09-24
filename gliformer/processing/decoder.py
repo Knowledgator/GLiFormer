@@ -7,6 +7,32 @@ import torch
 from ..config import GLiFormerConfig
 
 
+def resolve_batch_control(value, batch_index: int, default=None):
+    """Resolve a scalar or B-aligned control for one original batch row."""
+    if isinstance(value, (list, tuple)):
+        if batch_index >= len(value):
+            raise ValueError(
+                f"Per-row decoder control has length {len(value)}, "
+                f"but row {batch_index} was requested"
+            )
+        resolved = value[batch_index]
+    else:
+        resolved = value
+    return default if resolved is None else resolved
+
+
+def expand_batch_control(value, batch_origin, size: int, default=None) -> list:
+    """Expand a B-aligned control to flattened BN decoder groups."""
+    return [
+        resolve_batch_control(
+            value,
+            int(batch_origin[index].item()) if batch_origin is not None else index,
+            default,
+        )
+        for index in range(size)
+    ]
+
+
 def unflatten_by_batch_origin(results: list, batch_origin: torch.Tensor, batch_size: int) -> List[list]:
     """Group BN-indexed results back to B-indexed list of lists.
 
