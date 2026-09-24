@@ -376,6 +376,45 @@ GLIFORMER_MODEL_ID=path/to/checkpoint python demo.py
 
 The demo includes annotated examples for NER, classification, relations, structured extraction, and embeddings. Select a checkpoint with the heads needed by the tabs you want to use.
 
+## Serving and PolyLoRA
+
+GLiFormer includes a Ray Serve deployment, a concurrent sync/async HTTP client,
+heterogeneous multitask batching, GPU-memory-aware sizing, sequence packing,
+health endpoints, and optional per-request PolyLoRA adapters.
+
+```bash
+pip install -e ".[serve,polylora]"
+python -m gliformer.serve \
+  --model knowledgator/gliformer-base-v1 \
+  --device cuda \
+  --dtype float16
+```
+
+The `/gliformer` endpoint accepts any compatible combination of `entities`,
+`classes`, `relations`, `joint_relations`, and `structures`. Embeddings are
+available at `/gliformer/embeddings`.
+
+```bash
+curl -X POST http://localhost:8000/gliformer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Alice works for Acme in Paris.",
+    "entities": ["person", "organization", "location"],
+    "classes": ["employment", "geography"],
+    "threshold": 0.3
+  }'
+```
+
+Dynamic batches may contain different task combinations, schemas, decoding
+controls, and PolyLoRA adapter IDs. A schema or label set passed with a list of
+texts is shared by all texts by default; use `PerText` when values differ per
+text. `GLiFormerClient` provides HTTP access, while `GLiFormerFactory` provides
+a lifecycle-managed in-process Ray deployment.
+
+See the **[complete serving guide](docs/serving.md)** for the HTTP API, Python
+client, heterogeneous batching, sequence packing, memory calibration,
+containers, and PolyLoRA configuration.
+
 ## Evaluation
 
 Run task-specific evaluators from the repository root. For example, evaluate NER on a prepared CrossNER dataset:
