@@ -443,6 +443,28 @@ class BaseGLiFormer(BaseGLiNER):
             input_x.append(item)
         return input_x
 
+    def _build_heterogeneous_inference_input(
+        self,
+        all_tokens: List[List[str]],
+        requests: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Build one collator batch whose rows may use different task schemas."""
+        input_x = []
+        task_processors = self.data_processor.task_processors.values()
+        for tokens, request in zip(all_tokens, requests, strict=True):
+            item: Dict[str, Any] = {"tokenized_text": tokens}
+            for processor in task_processors:
+                processor.contribute_inference_input(
+                    item,
+                    entities=request.get("entities"),
+                    classes=request.get("classes"),
+                    relations=request.get("relations"),
+                    joint_relations=request.get("joint_relations"),
+                    structures=request.get("structures"),
+                )
+            input_x.append(item)
+        return input_x
+
     def _build_pdf_inference_input(
         self,
         pdf_items: List[Dict[str, Any]],
@@ -515,6 +537,20 @@ class BaseGLiFormer(BaseGLiNER):
             all_end_token_idx_to_text_idx.append(end_token_idx_to_text_idx)
 
         return all_tokens, all_start_token_idx_to_text_idx, all_end_token_idx_to_text_idx
+
+    def create_inference_collator(self, *, return_tokens: bool = True):
+        """Create a reusable inference collator.
+
+        Servers should keep one instance instead of rebuilding tokenizer and
+        task-collation state for every request batch.
+        """
+        collator_cls = self.data_collator_class or resolve_gliformer_collator_class(self.config)
+        return collator_cls(
+            self.config,
+            data_processor=self.data_processor,
+            return_tokens=return_tokens,
+            prepare_labels=False,
+        )
 
     @staticmethod
     def _pdf_tokens_to_text_and_maps(tokens: List[str]) -> Tuple[str, List[int], List[int]]:
@@ -638,6 +674,7 @@ class BaseGLiFormer(BaseGLiNER):
         objectness_threshold: Optional[float] = None,
         preserve_empty_records: bool = False,
         return_anchor_diagnostics: bool = False,
+        inference_collator: Optional[Any] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -748,20 +785,19 @@ class BaseGLiFormer(BaseGLiNER):
         )
 
         # Create collator (inference mode: no labels)
-        collator_cls = self.data_collator_class or resolve_gliformer_collator_class(self.config)
-        collator = collator_cls(
-            self.config,
-            data_processor=self.data_processor,
-            return_tokens=True,
-            prepare_labels=False,
-        )
-
-        data_loader = DataLoader(
-            input_x,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=collator,
-        )
+        collator = inference_collator or self.create_inference_collator(return_tokens=True)
+        if inference_collator is None:
+            batches = DataLoader(
+                input_x,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collator,
+            )
+        else:
+            batches = (
+                collator(input_x[offset:offset + batch_size])
+                for offset in range(0, len(input_x), batch_size)
+            )
 
         # Process batches
         if manual_structuring_count is not None:
@@ -773,8 +809,9 @@ class BaseGLiFormer(BaseGLiNER):
             decoder_kwargs["preserve_empty_records"] = True
 
         all_decoded, all_classes_mappings = self._process_multitask_batches(
-            data_loader, threshold, flat_ner, multi_label,
+            batches, threshold, flat_ner, multi_label,
             decoder_kwargs=decoder_kwargs or None,
+            total_items=len(input_x),
             **kwargs,
         )
 
@@ -791,6 +828,152 @@ class BaseGLiFormer(BaseGLiNER):
             structuring_dedup=structuring_dedup,
             return_anchor_diagnostics=return_anchor_diagnostics,
         )
+
+    @torch.no_grad()
+    def inference_requests(
+        self,
+        requests: List[Dict[str, Any]],
+        *,
+        threshold: float = 0.5,
+        flat_ner: bool = True,
+        multi_label: bool = False,
+        batch_size: int = 8,
+        inference_collator: Optional[Any] = None,
+        objectness_threshold: Optional[float] = None,
+        preserve_empty_records: bool = False,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """Infer heterogeneous text/task schemas in shared model forwards.
+
+        Task presence, schemas, adapters, and decoding controls may differ per
+        row while the compatible rows share model forwards.
+        """
+        if not requests:
+            return []
+        texts = [request.get("text") for request in requests]
+        if any(not isinstance(text, str) for text in texts):
+            raise TypeError("Each inference request must contain a string 'text'")
+
+        normalized_requests = []
+        for request in requests:
+            item = dict(request)
+            if item.get("structures") is not None:
+                item["structures"] = normalize_structuring_schemas(item["structures"])
+            self._validate_requested_inference_heads(
+                entities=item.get("entities"),
+                classes=item.get("classes"),
+                relations=item.get("relations"),
+                joint_relations=item.get("joint_relations"),
+                structures=item.get("structures"),
+            )
+            normalized_requests.append(item)
+
+        def per_request(name, default):
+            return [
+                request[name] if request.get(name) is not None else default
+                for request in normalized_requests
+            ]
+
+        row_thresholds = per_request("threshold", threshold)
+        row_flat_ner = per_request("flat_ner", flat_ner)
+        row_multi_label = per_request("multi_label", multi_label)
+        row_objectness = per_request("objectness_threshold", objectness_threshold)
+        row_preserve_empty = per_request("preserve_empty_records", preserve_empty_records)
+        shared_decoder_kwargs = dict(kwargs.pop("decoder_kwargs", None) or {})
+        decoder_keys = set(shared_decoder_kwargs)
+        for request in normalized_requests:
+            decoder_keys.update((request.get("decoder_kwargs") or {}).keys())
+        row_decoder_controls = {
+            key: [
+                (request.get("decoder_kwargs") or {}).get(
+                    key, shared_decoder_kwargs.get(key)
+                )
+                for request in normalized_requests
+            ]
+            for key in decoder_keys
+        }
+        row_decoder_controls["objectness_threshold"] = row_objectness
+        row_decoder_controls["preserve_empty_records"] = row_preserve_empty
+
+        valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
+        if not valid_texts:
+            return [{} for _ in requests]
+        valid_requests = [normalized_requests[index] for index in valid_to_orig_idx]
+        row_thresholds = [row_thresholds[index] for index in valid_to_orig_idx]
+        row_flat_ner = [row_flat_ner[index] for index in valid_to_orig_idx]
+        row_multi_label = [row_multi_label[index] for index in valid_to_orig_idx]
+        row_decoder_controls = {
+            key: [values[index] for index in valid_to_orig_idx]
+            for key, values in row_decoder_controls.items()
+        }
+
+        def collapse(values):
+            if not values:
+                return values
+            first = values[0]
+            return first if all(value == first for value in values[1:]) else values
+
+        row_thresholds = collapse(row_thresholds)
+        row_flat_ner = collapse(row_flat_ner)
+        row_multi_label = collapse(row_multi_label)
+        row_decoder_controls = {
+            key: collapse(values) for key, values in row_decoder_controls.items()
+        }
+        all_tokens, all_start_maps, all_end_maps = self.prepare_inputs(valid_texts)
+        input_x = self._build_heterogeneous_inference_input(all_tokens, valid_requests)
+        collator = inference_collator or self.create_inference_collator(return_tokens=True)
+        batches = (
+            collator(input_x[offset:offset + batch_size])
+            for offset in range(0, len(input_x), batch_size)
+        )
+        forward_kwargs = dict(kwargs)
+        forward_kwargs["adapter_ids"] = [request.get("adapter_id") for request in valid_requests]
+        decoded, mappings = self._process_multitask_batches(
+            batches,
+            row_thresholds,
+            row_flat_ner,
+            row_multi_label,
+            decoder_kwargs=row_decoder_controls,
+            total_items=len(input_x),
+            **forward_kwargs,
+        )
+
+        results: List[Dict[str, Any]] = [{} for _ in requests]
+        for valid_index, original_index in enumerate(valid_to_orig_idx):
+            row_decoded = {
+                task: [values[valid_index]]
+                for task, values in decoded.items()
+                if valid_index < len(values)
+            }
+            row_mappings = [mappings[valid_index]] if valid_index < len(mappings) else []
+            mapped = self._map_multitask_results(
+                row_decoded,
+                [0],
+                [all_start_maps[valid_index]],
+                [all_end_maps[valid_index]],
+                [valid_texts[valid_index]],
+                1,
+                row_mappings,
+                structures=valid_requests[valid_index].get("structures"),
+                structuring_dedup=valid_requests[valid_index].get("structuring_dedup", True),
+                return_anchor_diagnostics=valid_requests[valid_index].get(
+                    "return_anchor_diagnostics", False
+                ),
+            )
+            requested_tasks = {
+                "ner": "entities",
+                "classification": "classes",
+                "open_relex": "relations",
+                "joint_relex": "joint_relations",
+                "structuring": "structures",
+            }
+            results[original_index] = {
+                task: values[0]
+                for task, values in mapped.items()
+                if task.endswith("_anchor_diagnostics")
+                or valid_requests[valid_index].get(requested_tasks.get(task, "")) is not None
+            }
+        return results
 
     @torch.no_grad()
     def parse_pdf(
@@ -971,6 +1154,16 @@ class BaseGLiFormer(BaseGLiNER):
         num_original: int,
     ) -> Dict[str, Any]:
         result = dict(kwargs)
+        adapter_ids = result.get("adapter_ids")
+        if isinstance(adapter_ids, str):
+            adapter_ids = [adapter_ids] * num_original
+        if isinstance(adapter_ids, (list, tuple)):
+            if len(adapter_ids) != num_original:
+                raise ValueError(
+                    "adapter_ids must contain one id per input text: "
+                    f"expected {num_original}, got {len(adapter_ids)}"
+                )
+            result["adapter_ids"] = [adapter_ids[idx] for idx in valid_to_orig_idx]
         for key in (
             "pixel_values", "vision_attention_mask", "vision_input_mask",
             "audio_values", "audio_attention_mask", "audio_input_mask", "bbox",
@@ -988,17 +1181,20 @@ class BaseGLiFormer(BaseGLiNER):
         for key, value in kwargs.items():
             if isinstance(value, torch.Tensor) and value.shape[0] == total:
                 result[key] = value[offset:offset + batch_size]
+            elif key == "adapter_ids" and isinstance(value, (list, tuple)) and len(value) == total:
+                result[key] = list(value[offset:offset + batch_size])
             else:
                 result[key] = value
         return result
 
     def _process_multitask_batches(
         self,
-        data_loader: DataLoader,
+        data_loader,
         threshold: float,
         flat_ner: bool,
         multi_label: Optional[bool],
         decoder_kwargs: Optional[Dict[str, Any]] = None,
+        total_items: Optional[int] = None,
         **kwargs,
     ) -> Tuple[Dict[str, list], list]:
         """Run model forward + decode for each batch, accumulating per-task results.
@@ -1011,7 +1207,8 @@ class BaseGLiFormer(BaseGLiNER):
         model_dtype = self._model_floating_dtype()
         accumulated: Dict[str, list] = {}
         all_classes_mappings: list = []
-        total_items = len(data_loader.dataset) if hasattr(data_loader, "dataset") else 0
+        if total_items is None:
+            total_items = len(data_loader.dataset) if hasattr(data_loader, "dataset") else 0
         offset = 0
 
         for batch in data_loader:
@@ -1029,13 +1226,31 @@ class BaseGLiFormer(BaseGLiNER):
 
             batch_size = self._infer_batch_size(batch, model_batch)
             batch_kwargs = self._batch_forward_kwargs(kwargs, offset, batch_size, total_items)
+            batch_threshold = self._batch_control(threshold, offset, batch_size, total_items)
+            batch_flat_ner = self._batch_control(flat_ner, offset, batch_size, total_items)
+            batch_multi_label = self._batch_control(multi_label, offset, batch_size, total_items)
+            batch_decoder_kwargs = {
+                key: self._batch_control(value, offset, batch_size, total_items)
+                for key, value in (decoder_kwargs or {}).items()
+            }
+            forward_threshold = (
+                min(batch_threshold) if isinstance(batch_threshold, list) else batch_threshold
+            )
             # Joint Relex must score the same greedily selected entity list
             # that the NER decoder will expose to relation-index resolution.
-            batch_kwargs.setdefault("relation_flat_ner", flat_ner)
-            batch_kwargs.setdefault("relation_multi_label", multi_label)
+            batch_kwargs.setdefault(
+                "relation_flat_ner",
+                all(batch_flat_ner) if isinstance(batch_flat_ner, list) else batch_flat_ner,
+            )
+            batch_kwargs.setdefault(
+                "relation_multi_label",
+                any(batch_multi_label) if isinstance(batch_multi_label, list) else batch_multi_label,
+            )
 
             # Forward — kwargs (e.g. manual_structuring_count, multimodal tensors) flow through.
-            model_output = self.model(**model_batch, threshold=threshold, **batch_kwargs)
+            model_output = self.model(
+                **model_batch, threshold=forward_threshold, **batch_kwargs
+            )
             offset += batch_size
 
             # Decode
@@ -1045,11 +1260,11 @@ class BaseGLiFormer(BaseGLiNER):
             decoded = self.decoder.decode(
                 model_output,
                 classes_mapping=classes_mapping,
-                threshold=threshold,
-                flat_ner=flat_ner,
-                multi_label=multi_label,
+                threshold=batch_threshold,
+                flat_ner=batch_flat_ner,
+                multi_label=batch_multi_label,
                 texts=tokens,
-                **(decoder_kwargs or {}),
+                **batch_decoder_kwargs,
             )
 
             # Accumulate per-item classes_mapping for schema name resolution
@@ -1064,6 +1279,12 @@ class BaseGLiFormer(BaseGLiNER):
                 accumulated[task_name].extend(task_results)
 
         return accumulated, all_classes_mappings
+
+    @staticmethod
+    def _batch_control(value, offset: int, batch_size: int, total: int):
+        if isinstance(value, list) and len(value) == total:
+            return value[offset:offset + batch_size]
+        return value
 
     def _model_floating_dtype(self) -> Optional[torch.dtype]:
         for parameter in self.model.parameters():
@@ -1442,6 +1663,7 @@ class BaseGLiFormer(BaseGLiNER):
         self,
         texts: Union[str, List[str]],
         batch_size: int = 8,
+        adapter_ids: Optional[Union[str, List[Optional[str]]]] = None,
     ) -> torch.Tensor:
         """Compute text embeddings via the shared encoder.
 
@@ -1478,6 +1700,18 @@ class BaseGLiFormer(BaseGLiNER):
 
         device = self.device
         all_embeddings = []
+        if isinstance(adapter_ids, str):
+            adapter_ids = [adapter_ids] * len(texts)
+        if isinstance(adapter_ids, list):
+            if len(adapter_ids) != len(texts):
+                raise ValueError(
+                    "adapter_ids must contain one id per input text: "
+                    f"expected {len(texts)}, got {len(adapter_ids)}"
+                )
+            valid_adapter_ids = [adapter_ids[index] for index in valid_to_orig_idx]
+        else:
+            valid_adapter_ids = None
+        offset = 0
 
         # Get EmbeddingHead's pooling if available
         embedding_head = self.model.heads["embedding"] if (hasattr(self.model, "heads") and "embedding" in self.model.heads) else None
@@ -1487,7 +1721,15 @@ class BaseGLiFormer(BaseGLiNER):
             attention_mask = batch["attention_mask"].to(device)
 
             # Encode through shared encoder — same as training
-            token_embeds = self.model.encode_embedding_tokens(input_ids, attention_mask)
+            encoder_kwargs = {}
+            if valid_adapter_ids is not None:
+                encoder_kwargs["adapter_ids"] = valid_adapter_ids[offset:offset + input_ids.shape[0]]
+            token_embeds = self.model.encode_embedding_tokens(
+                input_ids,
+                attention_mask,
+                **encoder_kwargs,
+            )
+            offset += input_ids.shape[0]
 
             # Pool using EmbeddingHead's pooling layer — same as training
             if embedding_head is not None:

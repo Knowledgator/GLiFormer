@@ -120,6 +120,26 @@ class TestJointRelexDecoder:
         result = decoder.decode(out, classes_mapping={0: "A"})
         assert result[0][0] == []
 
+    def test_per_row_thresholds_apply_to_entities_and_relations(self, decoder):
+        out = FakeModelOutput(
+            ner_logits=_bio_logits(
+                2, 2, 1, [(0, 0, 0, 0), (0, 1, 1, 0),
+                          (1, 0, 0, 0), (1, 1, 1, 0)],
+            ),
+            joint_rel_logits=torch.full((2, 1, 1), 5.0),
+            joint_rel_idx=torch.tensor([[[0, 1]], [[0, 1]]]),
+            joint_rel_mask=torch.ones(2, 1, dtype=torch.bool),
+        )
+        result = decoder.decode(
+            out,
+            classes_mapping={0: "A"},
+            threshold=[0.5, 0.99999],
+            flat_ner=[True, True],
+            multi_label=[False, False],
+        )
+        assert len(result[0][0]) == 1
+        assert result[1][0] == []
+
     def test_masked_pairs_skipped(self, decoder):
         ner_logits = _bio_logits(1, 5, 1, [(0, 0, 0, 0), (0, 2, 2, 0)])
         rel_logits = torch.tensor([[[5.0], [5.0]]])  # 2 pairs, both strong

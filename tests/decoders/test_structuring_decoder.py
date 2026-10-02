@@ -250,6 +250,27 @@ def _entity_first_output(
     )
 
 
+def test_per_row_structuring_thresholds():
+    decoder = StructuringDecoder.from_config(make_config())
+    output = _entity_first_output(
+        2,
+        1,
+        1,
+        [(0, 0, 0, 0, 0, 5.0), (1, 0, 0, 0, 0, 5.0)],
+        structuring_objectness_logits=torch.full((2, 1), 5.0),
+    )
+    result = decoder.decode(
+        output,
+        classes_mapping=_make_field_mapping(["name"], batch_size=2),
+        texts=[["Alice"], ["Bob"]],
+        threshold=[0.5, 0.99999],
+        objectness_threshold=[0.5, 0.99999],
+        preserve_empty_records=[False, False],
+    )
+    assert result[0][0]
+    assert result[1][0] == []
+
+
 def test_structuring_decoder_joins_ner_fields_with_anchor_membership():
     config = make_config(
         default_ner_config=False,

@@ -1175,7 +1175,11 @@ class BaseGLiFormerModel(BaseModel):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run encoder and extract prompt + word embeddings."""
-        encoder_kwargs = {k: kwargs[k] for k in ("packing_config", "pair_attention_mask") if k in kwargs}
+        encoder_kwargs = {
+            k: kwargs[k]
+            for k in ("packing_config", "pair_attention_mask", "token_lengths", "adapter_ids")
+            if k in kwargs
+        }
 
         if _has_labels_encoder(self.token_rep_layer) and labels_input_ids is not None:
             token_embeds, labels_embeds = self.token_rep_layer(
@@ -1270,6 +1274,8 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         representation_keys = {
             "packing_config",
             "pair_attention_mask",
+            "token_lengths",
+            "adapter_ids",
             "token_type_ids",
             "position_ids",
             "head_mask",
@@ -2465,6 +2471,8 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         representation_keys = {
             "packing_config",
             "pair_attention_mask",
+            "token_lengths",
+            "adapter_ids",
             "bbox",
             "layout_input_mask",
             "page_token_ids",
@@ -3126,6 +3134,7 @@ class GLiFormerLayoutModel(_GLiFormerJointForwardModel):
         allowed = {
             "packing_config",
             "pair_attention_mask",
+            "token_lengths",
             "token_type_ids",
             "position_ids",
             "head_mask",
@@ -3140,6 +3149,7 @@ class GLiFormerLayoutModel(_GLiFormerJointForwardModel):
             "vision_attention_mask",
             "image_batch_idx",
             "image_page_ids",
+            "adapter_ids",
         }
         return {key: kwargs[key] for key in allowed if key in kwargs}
 
@@ -3310,9 +3320,11 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
     def _omni_kwargs(cls, kwargs: dict) -> dict:
         allowed = {
             "packing_config", "pair_attention_mask", "pixel_values",
+            "token_lengths",
             "vision_attention_mask", "audio_values", "audio_attention_mask",
             "vision_input_mask", "audio_input_mask", "bbox", "layout_input_mask",
             "vision_encoder_kwargs", "interpolate_pos_encoding", "pixel_mask",
+            "adapter_ids",
         }
         cls._reject_unsupported_input_names(kwargs)
         return {key: kwargs[key] for key in allowed if key in kwargs}

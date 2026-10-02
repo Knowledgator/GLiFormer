@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from . import TaskDecoder
+from ..processing.decoder import resolve_batch_control
 
 
 @dataclass
@@ -226,10 +227,19 @@ class SpanDecoder(TaskDecoder):
             List of lists of Span objects per sample.
         """
         all_spans = []
+        mixed_controls = any(isinstance(value, (list, tuple)) for value in (
+            threshold, flat_ner, multi_label
+        ))
         for i in range(batch_size):
             id_to_class_i = self._get_id_to_class(id_to_classes, i)
+            if mixed_controls:
+                threshold_i = resolve_batch_control(threshold, i, self.threshold)
+                flat_ner_i = resolve_batch_control(flat_ner, i, True)
+                multi_label_i = resolve_batch_control(multi_label, i, False)
+            else:
+                threshold_i, flat_ner_i, multi_label_i = threshold, flat_ner, multi_label
             spans = self.decode_bio_spans(
-                logits[i], id_to_class_i, threshold, flat_ner, multi_label,
+                logits[i], id_to_class_i, threshold_i, flat_ner_i, multi_label_i,
             )
             all_spans.append(spans)
         return all_spans
@@ -261,9 +271,18 @@ class SpanDecoder(TaskDecoder):
         batch_size = span_logits.size(0)
         span_probs = torch.sigmoid(span_logits)
         all_spans = []
+        mixed_controls = any(isinstance(value, (list, tuple)) for value in (
+            threshold, flat_ner, multi_label
+        ))
 
         for i in range(batch_size):
             id_to_class_i = self._get_id_to_class(id_to_classes, i)
+            if mixed_controls:
+                threshold_i = resolve_batch_control(threshold, i, self.threshold)
+                flat_ner_i = resolve_batch_control(flat_ner, i, True)
+                multi_label_i = resolve_batch_control(multi_label, i, False)
+            else:
+                threshold_i, flat_ner_i, multi_label_i = threshold, flat_ner, multi_label
             spans = []
             valid_indices = torch.where(span_mask[i])[0]
 
@@ -271,7 +290,7 @@ class SpanDecoder(TaskDecoder):
                 span_start = span_idx[i, span_pos, 0].item()
                 span_end = span_idx[i, span_pos, 1].item()
                 probs = span_probs[i, span_pos]
-                class_indices = torch.where(probs > threshold)[0]
+                class_indices = torch.where(probs > threshold_i)[0]
 
                 for class_idx in class_indices:
                     class_id = class_idx.item()
@@ -283,7 +302,7 @@ class SpanDecoder(TaskDecoder):
                             score=probs[class_idx].item(),
                         ))
 
-            all_spans.append(self.greedy_search(spans, flat_ner, multi_label))
+            all_spans.append(self.greedy_search(spans, flat_ner_i, multi_label_i))
         return all_spans
 
     def greedy_search(

@@ -7,7 +7,7 @@ and span-level decoding (when represent_spans is enabled in NERHead).
 from typing import Dict, List, Union
 
 from ..span_decoder import Span, SpanDecoder
-from ...processing.decoder import unflatten_by_batch_origin
+from ...processing.decoder import expand_batch_control, unflatten_by_batch_origin
 
 
 class NERDecoder(SpanDecoder):
@@ -57,8 +57,25 @@ class NERDecoder(SpanDecoder):
         if model_output.ner_logits is None and model_output.span_logits is None:
             return []
 
-        threshold = threshold or self.threshold
         id_to_classes = self._get_ner_id_to_classes(classes_mapping)
+        batch_origin = model_output.ner_batch_origin
+        flat_size = (
+            model_output.span_logits.shape[0]
+            if model_output.span_logits is not None
+            else model_output.ner_logits.shape[0]
+        )
+        if any(isinstance(value, (list, tuple)) for value in (
+            threshold, flat_ner, multi_label
+        )):
+            threshold = expand_batch_control(
+                threshold, batch_origin, flat_size, self.threshold
+            )
+            flat_ner = expand_batch_control(flat_ner, batch_origin, flat_size, True)
+            multi_label = expand_batch_control(
+                multi_label, batch_origin, flat_size, False
+            )
+        else:
+            threshold = self.threshold if threshold is None else threshold
 
         # Prefer span-level decoding when available
         if (model_output.span_logits is not None

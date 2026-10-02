@@ -91,6 +91,7 @@ from .gliformer import (
     GLiFormerVision,
 )
 from .training import GLiFormerTrainer
+from gliner import InferencePackingConfig
 
 # Backward compat alias
 RelationsHeadConfig = JointRelexHeadConfig

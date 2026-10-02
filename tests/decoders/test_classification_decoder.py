@@ -90,6 +90,16 @@ class TestClassificationDecoder:
         assert 0.0 < score < 1.0
         assert abs(score - torch.sigmoid(torch.tensor(2.0)).item()) < 1e-5
 
+    def test_per_row_thresholds(self, decoder):
+        out = FakeModelOutput(cat_logits=torch.tensor([[2.0], [2.0]]))
+        result = decoder.decode(
+            out,
+            threshold=[0.5, 0.99],
+            multi_label=[True, True],
+        )
+        assert len(result[0][0]) == 1
+        assert result[1][0] == []
+
 
 class TestClassificationDecoderSingleLabel:
     def test_single_label_picks_best(self, decoder):

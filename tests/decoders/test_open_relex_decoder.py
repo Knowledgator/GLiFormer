@@ -263,3 +263,27 @@ def test_map_results_converts_each_directed_endpoint_to_character_offsets():
             "score": 0.9,
         }
     ]
+
+
+def test_per_row_thresholds_apply_without_redecoding_the_batch():
+    decoder = _decoder()
+    logits = torch.full((2, 1, 1), 8.0)
+    assignments = torch.full((2, 1, 2, 2), -8.0)
+    assignments[:, 0, 0, 0] = 8.0
+    assignments[:, 0, 1, 1] = 8.0
+    spans = torch.tensor([[[0, 0], [1, 1]], [[0, 0], [1, 1]]])
+    output = _output(logits, assignments, spans)
+
+    decoded = decoder.decode(
+        output,
+        classes_mapping=_mapping(
+            _item_mapping("related_to"),
+            _item_mapping("related_to"),
+        ),
+        texts=[["A", "B"], ["C", "D"]],
+        threshold=[0.5, 0.99999],
+        objectness_threshold=[0.5, 0.99999],
+    )
+
+    assert len(decoded[0][0]) == 1
+    assert decoded[1][0] == []

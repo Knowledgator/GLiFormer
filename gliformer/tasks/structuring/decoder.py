@@ -2,7 +2,7 @@
 
 import torch
 
-from ...processing.decoder import unflatten_by_batch_origin
+from ...processing.decoder import resolve_batch_control, unflatten_by_batch_origin
 from ...processing.structuring_decoder import StructuringDecoder as _BaseStructuringDecoder
 from ..span_decoder import Span
 
@@ -81,19 +81,69 @@ class StructuringDecoder(_BaseStructuringDecoder):
         class_count = field_logits.shape[2]
         membership_probs = torch.sigmoid(membership_logits)
         field_probs = torch.sigmoid(field_logits)
+        batch_origin = getattr(model_output, self.batch_origin_attr, None)
+        if batch_origin is None:
+            batch_origin = torch.arange(batch_groups, device=membership_logits.device)
+        mixed_controls = any(isinstance(value, (list, tuple)) for value in (
+            threshold, flat_ner, multi_label, objectness_threshold,
+            preserve_empty_records,
+        ))
+        threshold_values = None
+        objectness_values = None
+        context_threshold = threshold
+        context_objectness_threshold = objectness_threshold
+        if mixed_controls:
+            threshold_values = [
+                resolve_batch_control(
+                    threshold, int(batch_origin[index].item()), self.threshold
+                )
+                for index in range(batch_groups)
+            ]
+            objectness_values = []
+            for index, threshold_value in enumerate(threshold_values):
+                origin = int(batch_origin[index].item())
+                objectness_value = resolve_batch_control(
+                    objectness_threshold, origin, None
+                )
+                if objectness_value is None:
+                    objectness_value = (
+                        self.objectness_threshold
+                        if self.objectness_threshold is not None
+                        else threshold_value
+                    )
+                objectness_values.append(objectness_value)
+            context_threshold = min(threshold_values)
+            context_objectness_threshold = min(objectness_values)
         context = self._prepare_decode_context(
             model_output,
             classes_mapping,
             batch_groups=batch_groups,
             anchor_count=anchor_count,
             device=membership_logits.device,
-            threshold=threshold,
-            objectness_threshold=objectness_threshold,
+            threshold=context_threshold,
+            objectness_threshold=context_objectness_threshold,
         )
+        objectness_logits = getattr(model_output, self.objectness_logits_attr, None)
 
         flat_results = []
         for batch_idx in range(batch_groups):
             text_idx = int(context.batch_origin[batch_idx].item())
+            threshold_b = (
+                threshold_values[batch_idx]
+                if mixed_controls else context.threshold
+            )
+            flat_ner_b = (
+                resolve_batch_control(flat_ner, text_idx, True)
+                if mixed_controls else flat_ner
+            )
+            multi_label_b = (
+                resolve_batch_control(multi_label, text_idx, False)
+                if mixed_controls else multi_label
+            )
+            preserve_empty_b = (
+                resolve_batch_control(preserve_empty_records, text_idx, False)
+                if mixed_controls else preserve_empty_records
+            )
             field_id_to_class = (
                 context.id_to_fields[batch_idx]
                 if batch_idx < len(context.id_to_fields)
@@ -117,6 +167,13 @@ class StructuringDecoder(_BaseStructuringDecoder):
                     )
                 ):
                     continue
+                if (
+                    mixed_controls
+                    and objectness_logits is not None
+                    and float(torch.sigmoid(objectness_logits[batch_idx, anchor_idx]).item())
+                    <= objectness_values[batch_idx]
+                ):
+                    continue
 
                 spans = []
                 for entity_idx in valid_entities.tolist():
@@ -125,10 +182,10 @@ class StructuringDecoder(_BaseStructuringDecoder):
                         anchor_idx,
                         entity_idx,
                     ]
-                    if membership_score <= context.threshold:
+                    if membership_score <= threshold_b:
                         continue
                     class_ids = torch.where(
-                        field_probs[batch_idx, entity_idx] > context.threshold
+                        field_probs[batch_idx, entity_idx] > threshold_b
                     )[0]
                     for class_idx in class_ids.tolist():
                         if class_idx not in field_id_to_class:
@@ -155,16 +212,29 @@ class StructuringDecoder(_BaseStructuringDecoder):
                             )
                         )
 
-                spans = self.greedy_search(spans, flat_ner, multi_label)
+                spans = self.greedy_search(spans, flat_ner_b, multi_label_b)
                 fields = self._spans_to_fields(spans, texts, text_idx)
                 anchor_entries.append({
                     "anchor_index": anchor_idx,
                     "fields": fields,
                     "presence_is_reliable": bool(
-                        context.reliable_presence_mask is not None
-                        and context.reliable_presence_mask[
-                            batch_idx, anchor_idx
-                        ]
+                        (
+                            objectness_logits is not None
+                            and float(torch.sigmoid(
+                                objectness_logits[batch_idx, anchor_idx]
+                            ).item()) > objectness_values[batch_idx]
+                            and (
+                                context.raw_anchor_mask is None
+                                or context.raw_anchor_mask[batch_idx, anchor_idx]
+                            )
+                        )
+                        if mixed_controls
+                        else (
+                            context.reliable_presence_mask is not None
+                            and context.reliable_presence_mask[
+                                batch_idx, anchor_idx
+                            ]
+                        )
                     ),
                 })
             flat_results.append(
@@ -175,7 +245,7 @@ class StructuringDecoder(_BaseStructuringDecoder):
                         if context.relation_scores is not None else None
                     ),
                     context=group_context,
-                    preserve_empty_records=preserve_empty_records,
+                    preserve_empty_records=preserve_empty_b,
                 )
             )
 
