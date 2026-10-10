@@ -160,6 +160,53 @@ class TorchVisionImageProcessor:
         return {"pixel_values": pixel_values} if return_tensors == "pt" else pixel_values
 
 
+class NativeImageProcessor:
+    """A multimodal backbone's own image processor, held to a pixel budget.
+
+    Returns the flattened patches and the ``(t, h, w)`` patch grid the backbone's
+    vision tower reads. Images keep their aspect ratio and are resized so that
+    their area stays within ``[min_pixels, max_pixels]``, which bounds the image
+    tokens a row adds to the sequence.
+    """
+
+    # Stock processors allow images of several thousand tokens.
+    DEFAULT_MAX_PIXELS = 512 * 512
+
+    def __init__(self, processor: Any, min_pixels: Optional[int] = None, max_pixels: Optional[int] = None):
+        self.processor = processor
+        self.max_pixels = int(max_pixels) if max_pixels is not None else self.DEFAULT_MAX_PIXELS
+        default_min = getattr(getattr(processor, "size", None), "shortest_edge", None)
+        self.min_pixels = int(min_pixels) if min_pixels is not None else int(default_min or 0)
+        self.min_pixels = min(self.min_pixels, self.max_pixels)
+
+    @classmethod
+    def from_config(cls, config):
+        source = getattr(config, "vision_processor_name", None) or getattr(config, "model_name", None)
+        if source is None:
+            raise ValueError("vision_processor_type='native' requires model_name or vision_processor_name.")
+        return cls(
+            AutoImageProcessor.from_pretrained(source),
+            min_pixels=getattr(config, "vision_min_pixels", None),
+            max_pixels=getattr(config, "vision_max_pixels", None),
+        )
+
+    def __call__(self, images, return_tensors: Optional[str] = None, **kwargs):
+        output = self.processor(
+            images=images,
+            return_tensors="pt",
+            size={"shortest_edge": self.min_pixels, "longest_edge": self.max_pixels},
+        )
+        if "image_grid_thw" not in output:
+            raise ValueError(
+                f"{type(self.processor).__name__} does not return image_grid_thw; "
+                "vision_processor_type='native' needs a patch-grid image processor."
+            )
+        return {
+            "pixel_values": torch.as_tensor(output["pixel_values"], dtype=torch.float),
+            "image_grid_thw": torch.as_tensor(output["image_grid_thw"], dtype=torch.long).view(-1, 3),
+        }
+
+
 class TorchAudioProcessor:
     """Configurable audio processor backed by torchaudio transforms."""
 
@@ -415,6 +462,8 @@ class VisionProcessingMixin:
                 self.vision_input_processor = AutoProcessor.from_pretrained(source)
             except ValueError:
                 self.vision_input_processor = AutoImageProcessor.from_pretrained(source)
+        elif self.vision_input_processor is None and processor_mode == "native":
+            self.vision_input_processor = NativeImageProcessor.from_config(self.config)
         elif self.vision_input_processor is None:
             self.vision_input_processor = TorchVisionImageProcessor.from_config(self.config)
         self._vision_processor_initialized = True
@@ -423,15 +472,41 @@ class VisionProcessingMixin:
         if not getattr(self, "_vision_processor_initialized", False):
             self._build_vision_processor()
 
+    def _uses_native_vision(self) -> bool:
+        return str(getattr(self.config, "vision_processor_type", "") or "").lower() == "native"
+
     def _has_vision_inputs(self) -> bool:
-        return any(name in self.task_processors for name in _VISION_TASKS)
+        # A native tower puts the image into the sequence, where text heads read it too.
+        return self._uses_native_vision() or any(name in self.task_processors for name in _VISION_TASKS)
 
     def _open_image(self, item: Dict[str, Any]) -> Tuple[Image.Image, Tuple[int, int]]:
         path = item.get("image")
         if path is None:
             raise ValueError("Vision tasks require each item to contain 'image' or 'pixel_values'.")
-        image = Image.open(path).convert("RGB")
+        image = path if isinstance(path, Image.Image) else Image.open(path)
+        image = image.convert("RGB")
         return image, (image.height, image.width)
+
+    def load_native_image(self, item: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+        """Patches ``(patches, patch_dim)`` and patch grid ``(3,)`` for the backbone's vision tower."""
+        if item.get("pixel_values") is not None:
+            if item.get("image_grid_thw") is None:
+                raise ValueError("Precomputed native pixel_values need their image_grid_thw.")
+            pixel_values = torch.as_tensor(item["pixel_values"], dtype=torch.float)
+            grid = torch.as_tensor(item["image_grid_thw"], dtype=torch.long).view(-1, 3)
+            orig_size = tuple(int(v) for v in item.get("_image_size", (0, 0)))
+        else:
+            self._ensure_vision_processor()
+            image, orig_size = self._open_image(item)
+            output = self.vision_input_processor(images=image, return_tensors="pt")
+            pixel_values, grid = output["pixel_values"], output["image_grid_thw"]
+        if grid.shape[0] != 1:
+            raise ValueError(f"Native vision takes one image per row, got {grid.shape[0]}.")
+        if pixel_values.dim() != 2 or pixel_values.shape[0] != int(grid[0].prod()):
+            raise ValueError(
+                f"pixel_values of shape {tuple(pixel_values.shape)} do not match image_grid_thw {grid[0].tolist()}."
+            )
+        return pixel_values, grid[0], orig_size
 
     def _apply_vision_processor(self, image: Image.Image, orig_size: Tuple[int, int]) -> Tuple[torch.Tensor, Tuple[int, int]]:
         self._ensure_vision_processor()
@@ -2064,9 +2139,40 @@ class GLiFormerOmniProcessor(
             else:
                 item.pop("_skip_audio_tasks", None)
 
+    def _prepare_native_vision_batch(self, batch_list):
+        """Per-row patches padded over the patch axis; rows without an image get an all-zero grid."""
+        loaded = {}
+        for idx, item in enumerate(batch_list):
+            if item.get("_skip_vision_tasks"):
+                continue
+            loaded[idx] = self.load_native_image(item)
+            item["_image_size"] = loaded[idx][2]
+        if not loaded:
+            return {}
+
+        max_patches = max(patches.shape[0] for patches, _, _ in loaded.values())
+        patch_dim = next(iter(loaded.values()))[0].shape[1]
+        pixel_values = torch.zeros((len(batch_list), max_patches, patch_dim), dtype=torch.float)
+        image_grid_thw = torch.zeros((len(batch_list), 3), dtype=torch.long)
+        image_sizes = torch.zeros((len(batch_list), 2), dtype=torch.long)
+        vision_input_mask = torch.zeros(len(batch_list), dtype=torch.long)
+        for idx, (patches, grid, image_size) in loaded.items():
+            pixel_values[idx, : patches.shape[0]] = patches
+            image_grid_thw[idx] = grid
+            image_sizes[idx] = torch.tensor(image_size, dtype=torch.long)
+            vision_input_mask[idx] = 1
+        return {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "image_sizes": image_sizes,
+            "vision_input_mask": vision_input_mask,
+        }
+
     def _prepare_optional_vision_batch(self, batch_list):
         if not self._has_vision_inputs():
             return {}
+        if self._uses_native_vision():
+            return self._prepare_native_vision_batch(batch_list)
 
         image_tensors = [None for _ in batch_list]
         image_sizes = [(0, 0) for _ in batch_list]
@@ -2218,6 +2324,8 @@ class GLiFormerOmniProcessor(
             )
         if batch.get("pixel_values") is not None:
             tokenized_input["pixel_values"] = batch["pixel_values"]
+        if batch.get("image_grid_thw") is not None:
+            tokenized_input["image_grid_thw"] = batch["image_grid_thw"]
         if batch.get("vision_attention_mask") is not None:
             tokenized_input["vision_attention_mask"] = batch["vision_attention_mask"]
         if batch.get("vision_input_mask") is not None:

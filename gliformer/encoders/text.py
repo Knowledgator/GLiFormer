@@ -68,6 +68,18 @@ class InputsEmbedsEncoderMixin:
             token_embeddings = self.projection(token_embeddings)
         return token_embeddings
 
+    def encode_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Run the backbone on token ids, passing its own extra inputs (e.g. image patches) through."""
+        token_embeddings = self.bert_layer(input_ids, attention_mask=attention_mask, **kwargs)
+        if hasattr(self, "projection"):
+            token_embeddings = self.projection(token_embeddings)
+        return token_embeddings
+
 
 class TextTransformer(Transformer):
     """GLiFormer transformer variant exposed from GLiFormer."""

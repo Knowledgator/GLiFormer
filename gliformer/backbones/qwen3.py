@@ -1,9 +1,11 @@
 import math
+import inspect
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
 from transformers.cache_utils import Cache
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -29,13 +31,22 @@ def _config_bool(config: Qwen3Config, *names: str, default: bool = False) -> boo
     return default
 
 
+# Older transformers releases have no way to hand sdpa an additive bias.
+_SDPA_TAKES_POSITION_BIAS = "position_bias" in inspect.signature(sdpa_attention_forward).parameters
+
+
 def _relative_position_type(config: Qwen3Config) -> str:
+    """The configured relative position encoding; unset or null means ``none``."""
     value = getattr(config, "relative_pos_encoding", None)
+    if value is None:
+        return "none"
+    if isinstance(value, str):
+        value = value.lower()
 
     if value not in RELATIVE_POSITION_TYPES:
         raise ValueError(
             f"Unknown Qwen3 relative position encoding {value!r}. "
-            f"Expected one of {sorted(RELATIVE_POSITION_TYPES)}."
+            f"Expected null or one of {sorted(RELATIVE_POSITION_TYPES)}."
         )
     return value
 
@@ -117,10 +128,15 @@ def _get_position_ids(
     return query_positions, key_positions
 
 
+def _is_flash_attention(config: Qwen3Config) -> bool:
+    return "flash" in str(getattr(config, "_attn_implementation", None) or "")
+
+
 def _bidirectional_attention_mask(
     attention_mask: Optional[torch.Tensor],
     input_embeds: torch.Tensor,
     past_key_values: Optional[Cache],
+    flash_attention: bool = False,
 ) -> Optional[torch.Tensor]:
     batch_size, query_length = input_embeds.shape[:2]
     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -128,6 +144,14 @@ def _bidirectional_attention_mask(
 
     if attention_mask is None:
         return None
+    if flash_attention:
+        # Flash attention unpads from the 2D padding mask itself.
+        if attention_mask.dim() != 2:
+            raise ValueError(
+                "Flash attention needs a 2D padding attention_mask, "
+                f"got shape {tuple(attention_mask.shape)}."
+            )
+        return attention_mask
     if attention_mask.dim() == 4:
         return attention_mask
     if attention_mask.dim() != 2:
@@ -184,6 +208,54 @@ def eager_attention_forward_with_position_bias(
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
+
+
+def attention_forward_with_position_bias(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    position_bias: Optional[torch.Tensor] = None,
+    **kwargs,
+):
+    """Biased attention on the backend ``config._attn_implementation`` names.
+
+    sdpa folds the bias into its additive mask; flash attention has no additive
+    term at all, so a relative position encoding cannot run on it.
+    """
+    attn_implementation = getattr(module.config, "_attn_implementation", None)
+    if _is_flash_attention(module.config):
+        raise ValueError(
+            f"relative_pos_encoding={module.relative_pos_encoding!r} adds an attention bias, which "
+            f"{attn_implementation!r} cannot apply. Use _attn_implementation='sdpa' or 'eager', "
+            "or set relative_pos_encoding to null."
+        )
+    if attn_implementation == "sdpa" and _SDPA_TAKES_POSITION_BIAS:
+        return sdpa_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            position_bias=position_bias,
+            **kwargs,
+        )
+    return eager_attention_forward_with_position_bias(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout=dropout,
+        scaling=scaling,
+        position_bias=position_bias,
+        **kwargs,
+    )
 
 
 class GLiFormerQwen3Attention(Qwen3Attention):
@@ -308,7 +380,7 @@ class GLiFormerQwen3Attention(Qwen3Attention):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         position_bias = self._relative_bias(query_states, key_states, position_ids, cache_position)
-        attn_output, attn_weights = eager_attention_forward_with_position_bias(
+        attn_output, attn_weights = attention_forward_with_position_bias(
             self,
             query_states,
             key_states,
@@ -373,7 +445,10 @@ class GLiFormerQwen3Model(Qwen3PreTrainedModel):
 
     Extra config fields:
       - ``bidirectional_attention``: if true, uses padding-only attention masks.
-      - ``relative_pos_encoding``: one of ``none``, ``t5``, ``deberta``, ``alibi``.
+      - ``relative_pos_encoding``: null/``none`` for stock Qwen3 attention, or one of
+        ``t5``, ``deberta``, ``alibi`` for an additive bias on top of RoPE.
+      - ``_attn_implementation``: ``sdpa``, ``flash_attention_2`` or ``eager``; a relative
+        position bias runs on ``sdpa`` or ``eager`` only.
       - ``relative_attention_num_buckets`` / ``position_buckets`` for T5 buckets.
       - ``relative_attention_max_distance`` / ``max_relative_positions``.
     """
@@ -442,7 +517,9 @@ class GLiFormerQwen3Model(Qwen3PreTrainedModel):
             position_ids = cache_position.unsqueeze(0)
 
         if not isinstance(mask_mapping := attention_mask, dict):
-            bidirectional_mask = _bidirectional_attention_mask(attention_mask, inputs_embeds, past_key_values)
+            bidirectional_mask = _bidirectional_attention_mask(
+                attention_mask, inputs_embeds, past_key_values, _is_flash_attention(self.config)
+            )
             mask_mapping = {"full_attention": bidirectional_mask, "sliding_attention": bidirectional_mask}
 
         hidden_states = inputs_embeds
@@ -460,6 +537,7 @@ class GLiFormerQwen3Model(Qwen3PreTrainedModel):
                 past_key_values=past_key_values,
                 use_cache=False,
                 cache_position=cache_position,
+                is_causal=False,
                 **kwargs,
             )
 

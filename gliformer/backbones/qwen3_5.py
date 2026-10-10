@@ -8,10 +8,11 @@ from .qwen3 import (
     _bidirectional_attention_mask,
     _config_bool,
     _get_position_ids,
+    _is_flash_attention,
     _relative_position_bucket,
     _relative_position_type,
     _get_alibi_slopes,
-    eager_attention_forward_with_position_bias,
+    attention_forward_with_position_bias,
 )
 
 try:
@@ -32,6 +33,11 @@ try:
         repeat_kv,
     )
 
+    try:
+        from transformers.masking_utils import create_recurrent_attention_mask
+    except ImportError:  # older releases keep this on the text model as `_update_linear_attn_mask`
+        create_recurrent_attention_mask = None
+
     QWEN3_5_AVAILABLE = True
 except ImportError:
     Qwen3_5Config = None
@@ -42,7 +48,11 @@ except ImportError:
 if QWEN3_5_AVAILABLE:
 
     class GLiFormerQwen3_5Attention(Qwen3_5Attention):
-        """Qwen3.5 full attention with optional additive relative position encodings."""
+        """Qwen3.5 full attention with optional additive relative position encodings.
+
+        With ``relative_pos_encoding`` unset this is the stock attention, on whichever
+        backend ``_attn_implementation`` names (``sdpa``, ``flash_attention_2``, ``eager``).
+        """
 
         def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
             super().__init__(config=config, layer_idx=layer_idx)
@@ -161,7 +171,7 @@ if QWEN3_5_AVAILABLE:
             if past_key_values is not None:
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-            attn_output, attn_weights = eager_attention_forward_with_position_bias(
+            attn_output, attn_weights = attention_forward_with_position_bias(
                 self,
                 query_states,
                 key_states,
@@ -250,6 +260,22 @@ if QWEN3_5_AVAILABLE:
             self.gradient_checkpointing = False
             self.post_init()
 
+        def _linear_attention_mask(
+            self,
+            attention_mask: torch.Tensor | None,
+            inputs_embeds: torch.Tensor,
+            past_key_values: Cache | None,
+        ) -> torch.Tensor | None:
+            """The 2D padding mask for the Gated DeltaNet layers, however this transformers builds it."""
+            if create_recurrent_attention_mask is None:
+                return self._update_linear_attn_mask(attention_mask, past_key_values)
+            return create_recurrent_attention_mask(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+            )
+
         def forward(
             self,
             input_ids: torch.LongTensor | None = None,
@@ -294,8 +320,10 @@ if QWEN3_5_AVAILABLE:
                 text_position_ids = None
                 rope_position_ids = position_ids
 
-            full_attention_mask = _bidirectional_attention_mask(attention_mask, inputs_embeds, past_key_values)
-            linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
+            full_attention_mask = _bidirectional_attention_mask(
+                attention_mask, inputs_embeds, past_key_values, _is_flash_attention(self.config)
+            )
+            linear_attn_mask = self._linear_attention_mask(attention_mask, inputs_embeds, past_key_values)
             hidden_states = inputs_embeds
             position_embeddings = self.rotary_emb(hidden_states, rope_position_ids)
 
@@ -308,6 +336,7 @@ if QWEN3_5_AVAILABLE:
                     position_ids=text_position_ids,
                     past_key_values=past_key_values,
                     use_cache=False,
+                    is_causal=False,
                     **kwargs,
                 )
 
@@ -344,6 +373,14 @@ if QWEN3_5_AVAILABLE:
             self.language_model = GLiFormerQwen3_5TextModel._from_config(text_config)
             self.rope_deltas = None
             self.post_init()
+
+        def forward(self, *args, **kwargs):
+            try:
+                return super().forward(*args, **kwargs)
+            finally:
+                # Kept by the stock model to continue a generation. An encoder never does,
+                # and a later inputs_embeds call would be shifted by this batch's deltas.
+                self.rope_deltas = None
 
 
     Qwen3_5BidirectionalModel = GLiFormerQwen3_5Model

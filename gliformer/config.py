@@ -2102,6 +2102,9 @@ class GLiFormerConfig(BaseGLiNERConfig):
         vision_do_normalize: bool = False,
         vision_image_mean: Optional[list[float]] = None,
         vision_image_std: Optional[list[float]] = None,
+        vision_min_pixels: Optional[int] = None,
+        vision_max_pixels: Optional[int] = None,
+        freeze_native_vision: bool = True,
         **kwargs,
     ):
         # Load-only aliases for checkpoints written while the entity-first
@@ -2143,10 +2146,25 @@ class GLiFormerConfig(BaseGLiNERConfig):
             )
 
         allowed_processor_types = {"custom", "auto"}
-        if vision_processor_type not in allowed_processor_types:
+        # "native": the backbone's own vision tower, fed by its own image processor.
+        native_vision = str(vision_encoder_type or "").lower() == "native"
+        if native_vision:
+            vision_encoder_type = "native"
+            if vision_processor_type == "custom":
+                vision_processor_type = "native"
+        if vision_processor_type not in allowed_processor_types | {"native"}:
             raise ValueError(
                 "vision_processor_type must be one of "
-                f"{sorted(allowed_processor_types)}, got {vision_processor_type!r}."
+                f"{sorted(allowed_processor_types | {'native'})}, got {vision_processor_type!r}."
+            )
+        if native_vision != (vision_processor_type == "native"):
+            raise ValueError(
+                "vision_encoder_type='native' and vision_processor_type='native' go together: "
+                "a backbone's vision tower only reads patches from its own image processor."
+            )
+        if native_vision and vision_model_name is not None:
+            raise ValueError(
+                "vision_encoder_type='native' uses the backbone's vision tower; drop vision_model_name."
             )
         if audio_processor_type not in allowed_processor_types:
             raise ValueError(
@@ -2449,6 +2467,15 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.backbone_type = normalize_backbone_type(backbone_type)
         if self.backbone_type != "auto":
             get_backbone(self.backbone_type)
+        if native_vision:
+            backbone = get_backbone(self.backbone_type)
+            if backbone is None or "vision" not in backbone.native_modalities:
+                raise ValueError(
+                    "vision_encoder_type='native' needs a backbone_type that ships a vision tower "
+                    f"(e.g. 'qwen3_5'), got {self.backbone_type!r}."
+                )
+            if model_variant != "omni":
+                raise ValueError("vision_encoder_type='native' is only available with model_variant='omni'.")
 
         vision_tasks_enabled = (
             self.image_classification_config is not None
@@ -2468,6 +2495,11 @@ class GLiFormerConfig(BaseGLiNERConfig):
             raise ValueError(
                 "Detection and segmentation require vision_processor_type='custom' "
                 "until external processor geometry metadata is available"
+            )
+        if dense_vision_tasks_enabled and vision_processor_type == "native":
+            raise ValueError(
+                "Detection and segmentation are not supported with vision_encoder_type='native' yet: "
+                "its image grid varies per row."
             )
         if vision_tasks_enabled and vision_model_name is None and vision_encoder_type is None:
             vision_encoder_type = "patch"
@@ -2634,6 +2666,9 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.vision_do_normalize = vision_do_normalize
         self.vision_image_mean = vision_image_mean
         self.vision_image_std = vision_image_std
+        self.vision_min_pixels = vision_min_pixels
+        self.vision_max_pixels = vision_max_pixels
+        self.freeze_native_vision = freeze_native_vision
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -2898,6 +2933,9 @@ _VISION_SERIALIZED_FIELDS = frozenset(
         "vision_do_normalize",
         "vision_image_mean",
         "vision_image_std",
+        "vision_min_pixels",
+        "vision_max_pixels",
+        "freeze_native_vision",
         "image_classification_loss_coef",
         "object_detection_loss_coef",
         "segmentation_loss_coef",

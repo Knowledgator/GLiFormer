@@ -7,6 +7,14 @@ from torch import nn
 
 from .audio import AudioEncoder, audio_token_mask
 from .media import apply_input_mask, get_config_value as _get_config_value
+from .native_vision import (
+    build_native_vision_batch,
+    gather_text_tokens,
+    gather_vision_tokens,
+    native_vision_spec,
+    native_vision_tower,
+    uses_native_vision,
+)
 from .text import TextBiEncoder, TextEncoder
 from .vision import VisionEncoder, vision_encoder_kwargs, vision_token_mask
 
@@ -58,6 +66,8 @@ _TRANSFORMER_KWARGS = {
     "layout_input_mask",
     "page_input_mask",
 }
+# The stock multimodal forward builds its own rotary positions from the image grids.
+_NATIVE_TRANSFORMER_KWARGS = {"head_mask", "output_attentions", "output_hidden_states", "return_dict"}
 
 
 class LayoutEncoder(TextEncoder):
@@ -585,7 +595,10 @@ class OmniEncoder(nn.Module):
         self.enabled_modalities = set(enabled_modalities)
 
         self.feature_encoders = nn.ModuleDict()
-        if "vision" in self.enabled_modalities:
+        self.native_vision = None
+        if "vision" in self.enabled_modalities and uses_native_vision(config):
+            self._init_native_vision(config)
+        elif "vision" in self.enabled_modalities:
             self.feature_encoders["vision"] = VisionEncoder(
                 config,
                 from_pretrained=from_pretrained,
@@ -625,6 +638,82 @@ class OmniEncoder(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.text_encoder.get_input_embeddings()
+
+    def _init_native_vision(self, config: Any) -> None:
+        backbone = self.text_encoder.bert_layer.model
+        self.native_vision = native_vision_spec(backbone)
+        if self.native_vision is None:
+            raise ValueError(
+                "vision_encoder_type='native' needs a backbone with its own vision tower, "
+                f"but {backbone.__class__.__name__} has none."
+            )
+        if bool(_get_config_value(config, "freeze_native_vision", True)):
+            native_vision_tower(backbone).requires_grad_(False)
+
+    def _encode_native_vision(
+        self,
+        input_ids: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        pixel_values: Optional[torch.Tensor],
+        image_grid_thw: Optional[torch.Tensor],
+        vision_input_mask: Optional[torch.Tensor],
+        kwargs: Dict[str, Any],
+    ) -> OmniEncoderOutput:
+        """Encode text and images in one stock multimodal forward of the backbone."""
+        if input_ids is None:
+            raise ValueError("Native vision encodes from input_ids; inputs_embeds is not supported.")
+        if kwargs.get("audio_values") is not None:
+            raise NotImplementedError("Native vision cannot be combined with audio inputs yet.")
+        if pixel_values is not None and image_grid_thw is None:
+            raise ValueError(
+                "Native vision needs image_grid_thw next to pixel_values; "
+                "build batches with vision_processor_type='native'."
+            )
+
+        text_mask = _resize_mask(attention_mask, input_ids)
+        native = None
+        if pixel_values is not None:
+            native = build_native_vision_batch(
+                self.native_vision, input_ids, text_mask, pixel_values, image_grid_thw, vision_input_mask,
+            )
+        model_kwargs = {key: value for key, value in kwargs.items() if key in _NATIVE_TRANSFORMER_KWARGS}
+        if native is None:
+            encoded = self.text_encoder.encode_input_ids(input_ids, text_mask, **model_kwargs)
+            return OmniEncoderOutput(
+                embeddings=encoded,
+                attention_mask=text_mask,
+                modality_order=("text",),
+                modality_lengths={"text": int(encoded.shape[1])},
+                modality_spans={"text": (0, int(encoded.shape[1]))},
+                text_embeddings=encoded,
+                text_attention_mask=text_mask,
+            )
+
+        encoded = self.text_encoder.encode_input_ids(
+            native.input_ids,
+            native.attention_mask,
+            pixel_values=native.pixel_values,
+            image_grid_thw=native.image_grid_thw,
+            mm_token_type_ids=native.mm_token_type_ids,
+            **model_kwargs,
+        )
+        text_embeddings = gather_text_tokens(encoded, native)
+        vision_embeddings = gather_vision_tokens(encoded, native)
+        # Rows interleave at their own offsets, so the spans index the split outputs.
+        vision_length, text_length = int(vision_embeddings.shape[1]), int(text_embeddings.shape[1])
+        return OmniEncoderOutput(
+            embeddings=encoded,
+            attention_mask=native.attention_mask,
+            modality_order=("vision", "text"),
+            modality_lengths={"vision": vision_length, "text": text_length},
+            modality_spans={"vision": (0, vision_length), "text": (vision_length, vision_length + text_length)},
+            text_embeddings=text_embeddings,
+            text_attention_mask=text_mask,
+            vision_embeddings=vision_embeddings,
+            vision_attention_mask=native.vision_mask,
+            vision_spatial_shape=native.spatial_shape,
+            vision_prefix_tokens=torch.zeros_like(native.spatial_shape[:, 0]),
+        )
 
     def _add_modality_embedding(self, name: str, embeddings: torch.Tensor) -> torch.Tensor:
         return embeddings + self.modality_embeddings[name].view(1, 1, -1).to(dtype=embeddings.dtype)
@@ -786,8 +875,20 @@ class OmniEncoder(nn.Module):
         audio_values: Optional[torch.Tensor] = None,
         audio_attention_mask: Optional[torch.Tensor] = None,
         audio_input_mask: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> OmniEncoderOutput:
+        if self.native_vision is not None:
+            if inputs_embeds is not None:
+                raise ValueError("Native vision encodes from input_ids; inputs_embeds is not supported.")
+            return self._encode_native_vision(
+                input_ids,
+                attention_mask,
+                pixel_values,
+                image_grid_thw,
+                vision_input_mask,
+                {**kwargs, "audio_values": audio_values},
+            )
         text_inputs, text_mask = self._text_inputs(input_ids, inputs_embeds, attention_mask)
         (
             vision_inputs,

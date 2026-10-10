@@ -411,6 +411,10 @@ class BaseGLiFormer(BaseGLiNER):
                 self.config.vocab_size = model_embeds.num_embeddings
                 if hasattr(self.config, "encoder_config") and self.config.encoder_config is not None:
                     self.config.encoder_config.vocab_size = model_embeds.num_embeddings
+                    # Multimodal backbones build their embedding table from the nested text config.
+                    text_config = getattr(self.config.encoder_config, "text_config", None)
+                    if text_config is not None:
+                        text_config.vocab_size = model_embeds.num_embeddings
 
     def _build_inference_input(
         self,
@@ -675,6 +679,7 @@ class BaseGLiFormer(BaseGLiNER):
         preserve_empty_records: bool = False,
         return_anchor_diagnostics: bool = False,
         inference_collator: Optional[Any] = None,
+        images: Optional[Any] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -684,6 +689,10 @@ class BaseGLiFormer(BaseGLiNER):
 
         Args:
             texts: Input text(s).
+            images: Optional image per text (path or PIL image, ``None`` for a
+                text-only row) that the text is read together with. Needs a
+                model whose processor loads images, e.g.
+                ``vision_encoder_type='native'``.
             entities: NER entity types. ``List[str]`` for single group,
                 ``Dict[str, List[str]]`` for named groups.
             classes: Classification labels. Same format as entities.
@@ -736,6 +745,11 @@ class BaseGLiFormer(BaseGLiNER):
         if isinstance(texts, str):
             texts = [texts]
         num_original = len(texts)
+        if images is not None:
+            if not isinstance(images, (list, tuple)):
+                images = [images]
+            if len(images) != num_original:
+                raise ValueError(f"images must contain one entry per text: expected {num_original}, got {len(images)}")
 
         # Filter empty texts
         valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
@@ -783,6 +797,10 @@ class BaseGLiFormer(BaseGLiNER):
             joint_relations,
             structures,
         )
+        if images is not None:
+            for item, orig_idx in zip(input_x, valid_to_orig_idx):
+                if images[orig_idx] is not None:
+                    item["image"] = images[orig_idx]
 
         # Create collator (inference mode: no labels)
         collator = inference_collator or self.create_inference_collator(return_tokens=True)
@@ -1165,7 +1183,7 @@ class BaseGLiFormer(BaseGLiNER):
                 )
             result["adapter_ids"] = [adapter_ids[idx] for idx in valid_to_orig_idx]
         for key in (
-            "pixel_values", "vision_attention_mask", "vision_input_mask",
+            "pixel_values", "image_grid_thw", "vision_attention_mask", "vision_input_mask",
             "audio_values", "audio_attention_mask", "audio_input_mask", "bbox",
             "layout_input_mask", "page_token_ids", "page_input_mask",
         ):
@@ -2362,6 +2380,9 @@ class GLiFormer(nn.Module, PyTorchModelHubMixin):
         **model_kwargs,
     ):
         config_instance = cls._coerce_config(config)
+        if _attn_implementation is None:
+            # transformers leaves this field out of to_dict(), which the loader rebuilds the config from.
+            _attn_implementation = getattr(config_instance, "_attn_implementation", None)
         gliformer_class = cls._get_gliformer_class(config_instance)
         loader_kwargs = BaseGLiFormer._supported_base_loader_kwargs(
             gliformer_class.load_from_config,

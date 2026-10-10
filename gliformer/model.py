@@ -1287,6 +1287,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             "page_token_ids",
             "page_input_mask",
             "pixel_values",
+            "image_grid_thw",
             "audio_values",
             "vision_attention_mask",
             "audio_attention_mask",
@@ -3319,7 +3320,7 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
     @classmethod
     def _omni_kwargs(cls, kwargs: dict) -> dict:
         allowed = {
-            "packing_config", "pair_attention_mask", "pixel_values",
+            "packing_config", "pair_attention_mask", "pixel_values", "image_grid_thw",
             "token_lengths",
             "vision_attention_mask", "audio_values", "audio_attention_mask",
             "vision_input_mask", "audio_input_mask", "bbox", "layout_input_mask",
