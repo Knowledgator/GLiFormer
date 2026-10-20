@@ -447,10 +447,10 @@ class TextProcessingMixin:
 
         label_enc = self.prepare_all_label_encoder_inputs(classes_mapping)
         tokenized_inputs.update(label_enc)
-        tokenized_inputs.update(self.prepare_all_typed_inputs(classes_mapping))
+        tokenized_inputs.update(self.prepare_all_typed_inputs(classes_mapping, texts))
         return tokenized_inputs
 
-    def prepare_all_typed_inputs(self, classes_mapping):
+    def prepare_all_typed_inputs(self, classes_mapping, texts=None):
         """Label-free typed-field tensors (option indices, field kinds)."""
 
         result = {}
@@ -460,7 +460,11 @@ class TextProcessingMixin:
         for proc in getattr(self, "task_processors", {}).values():
             prepare = getattr(proc, "prepare_typed_inputs", None)
             if prepare is not None:
-                result.update(prepare(classes_mapping, use_labels_encoder=use_labels_encoder))
+                result.update(prepare(
+                    classes_mapping,
+                    use_labels_encoder=use_labels_encoder,
+                    texts=texts,
+                ))
         return result
 
 

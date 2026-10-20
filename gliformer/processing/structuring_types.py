@@ -610,7 +610,7 @@ def schema_node_exemplar(node: SchemaNode) -> Any:
             )
         ]
     typed = schema_node_typed_spec(node)
-    if typed is not None and typed.kind != "span":
+    if typed is not None and (typed.kind != "span" or typed.format):
         # The descriptor travels through the wire envelope so the processor
         # can recover the class/quantity type at the leaf.
         return typed.to_dict()

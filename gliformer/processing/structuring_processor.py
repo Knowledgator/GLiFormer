@@ -28,6 +28,7 @@ from .mappings import (
     StructuringClassMapping,
     StructuringItemMapping,
 )
+from .typed_fields import stat_level as _stat_level
 from .typed_fields import (
     QUANTITY_KIND,
     TypedFieldSpec,
@@ -37,8 +38,15 @@ from .typed_fields import (
     lookup_group_types,
 )
 
+from . import typed_regression as tr
+
 STRUCTURING_EVIDENCE_KEY = "structuring_evidence"
+_MENTIONS_CACHE_KEY = "_gliformer_typed_mentions"
 _TYPED_PREPARED_FLAG = "_gliformer_structuring_typed_prepared"
+
+
+def stat_level_or_none(name):
+    return _stat_level(name)
 
 
 class StructuringProcessor(SpanProcessor):
@@ -67,6 +75,12 @@ class StructuringProcessor(SpanProcessor):
         self.typed_enabled = bool(getattr(self.task_config, "typed_fields", False))
         self.option_token = getattr(config, "option_token", "[OPTION]")
         self.typed_num_bins = int(getattr(self.task_config, "typed_num_bins", 256))
+        # "regression": calendar/number regression heads; "histogram": the
+        # earlier anchor + binned-offset head (kept for old checkpoints).
+        self.typed_regression = (
+            str(getattr(self.task_config, "typed_quantity_head", "histogram")) == "regression"
+        )
+        self.typed_max_mentions = int(getattr(self.task_config, "typed_max_mentions", 64))
         self._typed_spec_cache = {}
 
         # Resolve the processing strategy independently of the prediction
@@ -560,6 +574,9 @@ class StructuringProcessor(SpanProcessor):
                             spec,
                             target_x,
                             snippets=snippets if isinstance(snippets, list) else (),
+                            # Regression heads do not use anchors; only a
+                            # verbatim value is a sound span target.
+                            allow_offset=not self.typed_regression,
                         )
                     if anchor is not None:
                         instance[label] = {
@@ -591,6 +608,7 @@ class StructuringProcessor(SpanProcessor):
         for data_key, instances in structuring.items():
             schema_name = names.get(data_key, data_key)
             list_specs = {}
+            formatted_specs = {}
             for label, raw in self._raw_group_types(item, data_key, schema_name).items():
                 spec = self._spec(raw)
                 if spec.type == "list" and spec.items in {
@@ -600,6 +618,35 @@ class StructuringProcessor(SpanProcessor):
                         type=spec.items, unit=spec.unit, integer=spec.integer,
                         decimals=spec.decimals,
                     )
+                elif spec.type == "text" and spec.format:
+                    formatted_specs[label] = TypedFieldSpec(
+                        type=spec.format, unit=spec.unit, integer=spec.integer,
+                        decimals=spec.decimals, dayfirst=spec.dayfirst,
+                    )
+            for instance in instances if formatted_specs else ():
+                if not isinstance(instance, dict):
+                    continue
+                for label, format_spec in formatted_specs.items():
+                    value = instance.get(label)
+                    if value is None or isinstance(value, dict) or (
+                        isinstance(value, str) and value and value in text
+                    ):
+                        continue
+                    target_x = format_spec.encode(value)
+                    anchor = (
+                        find_anchor(text, format_spec, target_x, allow_offset=False)
+                        if target_x is not None else None
+                    )
+                    if anchor is not None:
+                        instance[label] = {
+                            "text": anchor["text"], "start": anchor["start"], "end": anchor["end"],
+                        }
+                    else:
+                        # Normalized value with no verbatim source: do not
+                        # train "no span" for the field.
+                        unresolved = instance.setdefault(TYPED_UNRESOLVED_KEY, [])
+                        if label not in unresolved:
+                            unresolved.append(label)
             if not list_specs:
                 continue
             for instance in instances:
@@ -650,7 +697,7 @@ class StructuringProcessor(SpanProcessor):
             return [], []
         return typed_field_layout(struct_item, spec_factory=self._spec)
 
-    def prepare_typed_inputs(self, classes_mapping, use_labels_encoder=False):
+    def prepare_typed_inputs(self, classes_mapping, use_labels_encoder=False, texts=None):
         """Label-free tensors the typed heads need at training and inference."""
 
         if not self.typed_enabled:
@@ -723,7 +770,62 @@ class StructuringProcessor(SpanProcessor):
                 "structuring_typed_quantity_bounded": quantity_bounded,
                 "structuring_typed_quantity_reference": quantity_reference,
             })
+            if self.typed_regression:
+                tensors.update(self._regression_inputs(layouts, mapping_list, texts))
         return tensors
+
+    def _words_mentions(self, words):
+        return tr.find_mentions(list(words or ()), max_mentions=self.typed_max_mentions)
+
+    def _item_mentions(self, item):
+        cached = item.get(_MENTIONS_CACHE_KEY)
+        if cached is not None:
+            return cached
+        words = item.get("tokenized_text")
+        if not words:
+            _spans, words = self._tokenize_text(item)
+        mentions = self._words_mentions(words)
+        item[_MENTIONS_CACHE_KEY] = mentions
+        return mentions
+
+    def _regression_inputs(self, layouts, mapping_list, texts):
+        """Field families, number spaces, and number/year mentions."""
+
+        total_groups = len(layouts)
+        max_quantity = max((len(q) for _, _, q in layouts), default=0)
+        family = torch.zeros(total_groups, max_quantity, dtype=torch.long)
+        space = torch.zeros(total_groups, max_quantity, dtype=torch.long)
+        quantile_scale = torch.ones(total_groups, max_quantity)
+        for group_idx, (_batch_idx, _, quantity_fields) in enumerate(layouts):
+            for slot, (_label, _field_id, spec) in enumerate(quantity_fields):
+                field_family = tr.quantity_family(spec)
+                family[group_idx, slot] = field_family
+                space[group_idx, slot] = {"log": 0, "bounded": 1, "signed": 2}[
+                    tr.number_space(spec)
+                ]
+                if field_family in (tr.FAMILY_TIME, tr.FAMILY_DATETIME):
+                    quantile_scale[group_idx, slot] = 15.0  # minutes
+        rows = list(texts) if texts is not None else [[] for _ in mapping_list]
+        mentions = [self._words_mentions(words) for words in rows]
+        width = max((len(row) for row in mentions), default=0) or 1
+        batch = len(rows)
+        spans = torch.zeros(batch, width, 2, dtype=torch.long)
+        features = torch.zeros(batch, width, tr.NUM_MENTION_FEATURES)
+        mask = torch.zeros(batch, width, dtype=torch.bool)
+        for row, row_mentions in enumerate(mentions):
+            for index, mention in enumerate(row_mentions):
+                spans[row, index, 0] = mention.start
+                spans[row, index, 1] = mention.end
+                features[row, index] = torch.tensor(tr.mention_features(mention))
+                mask[row, index] = True
+        return {
+            "structuring_typed_quantity_family": family,
+            "structuring_typed_quantity_space": space,
+            "structuring_typed_quantity_scale": quantile_scale,
+            "structuring_typed_mention_spans": spans,
+            "structuring_typed_mention_features": features,
+            "structuring_typed_mention_mask": mask,
+        }
 
     @staticmethod
     def _hierarchy_field_label(field):
@@ -1219,6 +1321,7 @@ class StructuringProcessor(SpanProcessor):
             result.update(self._create_typed_labels(
                 classes_mapping,
                 group_instances,
+                batch_list=batch_list,
                 total_groups=total_groups,
                 max_instances=max_instances,
                 max_fields=max_fields,
@@ -1241,6 +1344,7 @@ class StructuringProcessor(SpanProcessor):
         total_groups,
         max_instances,
         max_fields,
+        batch_list=None,
     ):
         """Targets for class and quantity fields on the gold-record axis.
 
@@ -1285,6 +1389,7 @@ class StructuringProcessor(SpanProcessor):
             total_groups, max_instances, max(max_class, 1), dtype=torch.bool
         )
         quantity_entries = []
+        regression_entries = []
         max_points = 1
 
         for flat_idx, (instances, item_limit) in group_instances.items():
@@ -1311,6 +1416,11 @@ class StructuringProcessor(SpanProcessor):
                     if label not in typed_values:
                         continue
                     gold = typed_values[label]
+                    if self.typed_regression:
+                        regression_entries.append(
+                            (flat_idx, batch_idx, inst_idx, slot, spec, gold, reference)
+                        )
+                        continue
                     anchor_x = None
                     anchor = instance.get(label)
                     if (
@@ -1340,7 +1450,14 @@ class StructuringProcessor(SpanProcessor):
         if max_class > 0 and max_options > 0:
             result["structuring_typed_class_targets"] = class_targets
             result["structuring_typed_class_unit_mask"] = class_unit_mask
-        if max_quantity > 0:
+        if max_quantity > 0 and self.typed_regression:
+            result.update(self._regression_labels(
+                regression_entries,
+                batch_list or [],
+                shape=(total_groups, max_instances, max_quantity),
+                max_horizon=max_horizon,
+            ))
+        elif max_quantity > 0:
             shape = (total_groups, max_instances, max_quantity)
             levels = torch.zeros(*shape, max_horizon, max_points)
             values = torch.zeros(*shape, max_horizon, max_points)
@@ -1375,6 +1492,103 @@ class StructuringProcessor(SpanProcessor):
                 "structuring_typed_quantity_presence_mask": presence_mask,
                 "structuring_typed_quantity_origin": origin_mode,
             })
+        return result
+
+    def _regression_labels(self, entries, batch_list, *, shape, max_horizon):
+        """Number and date/time regression targets.
+
+        Number targets ``(G, R, Cq, H, ...)``: exponent soft labels, digits,
+        sign, zero flag, the value in the field's regression space ``z``,
+        and labelled quantiles on ``QUANTILE_LEVELS``. Date/time targets
+        ``(G, R, Cq, ...)``: year, calendar component classes (-1 when not
+        applicable), and labelled quantile offsets in days/minutes.
+        """
+
+        levels = len(tr.QUANTILE_LEVELS)
+        number = {
+            "exp_soft": torch.zeros(*shape, max_horizon, tr.NUM_EXP_CLASSES),
+            "digits": torch.zeros(*shape, max_horizon),
+            "negative": torch.zeros(*shape, max_horizon),
+            "zero": torch.zeros(*shape, max_horizon, dtype=torch.bool),
+            "z": torch.zeros(*shape, max_horizon),
+            "point_mask": torch.zeros(*shape, max_horizon, dtype=torch.bool),
+            "quantiles": torch.zeros(*shape, max_horizon, levels),
+            "quantiles_mask": torch.zeros(*shape, max_horizon, levels, dtype=torch.bool),
+        }
+        temporal = {
+            "era": torch.full(shape, -1, dtype=torch.long),
+            "year_digits": torch.full((*shape, tr.YEAR_DIGITS), -1, dtype=torch.long),
+            "year_mask": torch.zeros(*shape, dtype=torch.bool),
+            "quantiles": torch.zeros(*shape, levels),
+            "quantiles_mask": torch.zeros(*shape, levels, dtype=torch.bool),
+        }
+        for name in ("month", "day", "hour", "minute", "second"):
+            temporal[name] = torch.full(shape, -1, dtype=torch.long)
+        presence = torch.zeros(*shape)
+        presence_mask = torch.zeros(*shape, dtype=torch.bool)
+
+        for flat_idx, batch_idx, inst_idx, slot, spec, gold, reference in entries:
+            index = (flat_idx, inst_idx, slot)
+            family = tr.quantity_family(spec)
+            if gold is None:
+                presence_mask[index] = True
+                continue
+            if family == tr.FAMILY_NUMBER:
+                parsed = tr.quantile_targets(gold, spec, spec.horizon)
+                if parsed is None:
+                    continue
+                points, labelled = parsed
+                for step in range(min(spec.horizon, max_horizon)):
+                    target = tr.number_target(points[step], spec)
+                    cell = (*index, step)
+                    number["z"][cell] = target.z
+                    number["negative"][cell] = float(target.negative)
+                    number["zero"][cell] = target.zero
+                    number["digits"][cell] = target.digits
+                    if target.exponent_soft:
+                        number["exp_soft"][cell] = torch.tensor(target.exponent_soft)
+                    number["point_mask"][cell] = True
+                    for level_idx, value in enumerate(labelled[step]):
+                        if value is not None:
+                            number["quantiles"][(*cell, level_idx)] = tr.number_to_space(value, spec)
+                            number["quantiles_mask"][(*cell, level_idx)] = True
+            else:
+                point = gold.get("value", gold.get("median")) if isinstance(gold, dict) else gold
+                components = tr.temporal_target(point, family)
+                if components is None:
+                    continue
+                if family != tr.FAMILY_TIME:
+                    era, digits = tr.year_to_era_digits(components.year)
+                    temporal["era"][index] = era
+                    temporal["year_digits"][index] = torch.tensor(digits)
+                    temporal["year_mask"][index] = True
+                    temporal["month"][index] = components.month - 1
+                    temporal["day"][index] = components.day - 1
+                if family != tr.FAMILY_DATE:
+                    temporal["hour"][index] = components.hour
+                    temporal["minute"][index] = components.minute
+                    temporal["second"][index] = components.second
+                if isinstance(gold, dict):
+                    center = tr.temporal_units(point, family)
+                    for name, value in gold.items():
+                        try:
+                            level = stat_level_or_none(name)
+                        except ValueError:
+                            continue
+                        if level is None:
+                            continue
+                        units = tr.temporal_units(value, family)
+                        for level_idx, grid in enumerate(tr.QUANTILE_LEVELS):
+                            if units is not None and center is not None and abs(grid - level) < 1e-6:
+                                temporal["quantiles"][(*index, level_idx)] = units - center
+                                temporal["quantiles_mask"][(*index, level_idx)] = True
+            presence_mask[index] = True
+            presence[index] = 1.0
+
+        result = {f"structuring_typed_number_{k}": v for k, v in number.items()}
+        result.update({f"structuring_typed_temporal_{k}": v for k, v in temporal.items()})
+        result["structuring_typed_quantity_presence"] = presence
+        result["structuring_typed_quantity_presence_mask"] = presence_mask
         return result
 
     def create_span_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):

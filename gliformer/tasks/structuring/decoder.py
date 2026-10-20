@@ -255,6 +255,9 @@ class StructuringDecoder(_BaseStructuringDecoder):
                         kwargs.get("typed_presence_threshold"), text_idx, None
                     ),
                     output_mode=group_context.get("output_mode"),
+                    details=bool(resolve_batch_control(
+                        kwargs.get("typed_details"), text_idx, False
+                    )),
                 )
             flat_results.append(
                 self._finalize_anchor_group(

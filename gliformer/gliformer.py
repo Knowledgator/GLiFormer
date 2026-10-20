@@ -461,6 +461,26 @@ class BaseGLiFormer(BaseGLiNER):
                 if name != "typed_fields":
                     setattr(struct_cfg, name, value)
         if already:
+            wants_regression = (
+                str(getattr(struct_cfg, "typed_quantity_head", "histogram")) == "regression"
+            )
+            if wants_regression and not hasattr(head, "typed_regression_head"):
+                # Upgrade an earlier typed checkpoint to the regression head;
+                # its class head and readout are kept.
+                from .tasks.structuring.typed_regression import TypedRegressionModule
+
+                parameter = next(head.typed_head.parameters())
+                head.typed_regression = True
+                head.typed_regression_head = TypedRegressionModule(
+                    int(self.config.hidden_size),
+                    float(getattr(self.config, "dropout", 0.0)),
+                    max_horizon=int(getattr(struct_cfg, "typed_max_horizon", 64)),
+                ).to(device=parameter.device, dtype=parameter.dtype)
+                head.typed_quantile_loss_coef = float(
+                    getattr(struct_cfg, "typed_quantile_loss_coef", 0.5)
+                )
+                self._rebuild_structuring_processor()
+                return True
             return False
 
         struct_cfg.typed_fields = True
@@ -481,15 +501,18 @@ class BaseGLiFormer(BaseGLiNER):
         )
         head.typed_head.to(device=parameter.device, dtype=parameter.dtype)
 
+        self._rebuild_structuring_processor()
+        return True
+
+    def _rebuild_structuring_processor(self):
         processor = self.data_processor
         old = processor.task_processors.get("structuring")
         if old is not None:
             processor.task_processors["structuring"] = type(old)(
                 self.config,
-                tokenizer,
+                processor.transformer_tokenizer,
                 getattr(processor, "words_splitter", None),
             )
-        return True
 
     def _init_option_token_embedding(self, embeddings, old_num_tokens: int) -> None:
         """Start a newly added ``[OPTION]`` row from the ``[FIELD]`` row.

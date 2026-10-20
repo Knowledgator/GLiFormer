@@ -23,6 +23,10 @@ from ..matcher import (
     matched_objectness_loss,
 )
 from ..ner.model import NERHead
+from .typed_regression import (
+    SPACE_BOUNDED,
+    TypedRegressionModule,
+)
 from .typed import (
     ORIGIN_ANCHOR,
     ORIGIN_REFERENCE,
@@ -216,6 +220,18 @@ class StructuringHead(NERHead):
             num_bins=task_cfg.typed_num_bins,
             num_heads=task_cfg.typed_readout_heads,
             max_horizon=task_cfg.typed_max_horizon,
+        )
+        self.typed_regression = (
+            str(getattr(task_cfg, "typed_quantity_head", "histogram")) == "regression"
+        )
+        if self.typed_regression:
+            self.typed_regression_head = TypedRegressionModule(
+                hidden_size,
+                dropout,
+                max_horizon=task_cfg.typed_max_horizon,
+            )
+        self.typed_quantile_loss_coef = float(
+            getattr(task_cfg, "typed_quantile_loss_coef", 0.5)
         )
         # Token ids are assigned after the tokenizer grows, i.e. after this
         # head is built, so they are read from the config at forward time.
@@ -1119,8 +1135,13 @@ class StructuringHead(NERHead):
                 # Batches without some typed kinds leave those parameters
                 # without gradients, which DDP rejects unless it searches for
                 # unused parameters. A zero-weighted term keeps them attached.
+                typed_modules = [self.typed_head]
+                if getattr(self, "typed_regression", False):
+                    typed_modules.append(self.typed_regression_head)
                 combined_loss = combined_loss + 0.0 * sum(
-                    parameter.sum() for parameter in self.typed_head.parameters()
+                    parameter.sum()
+                    for module in typed_modules
+                    for parameter in module.parameters()
                 )
 
         relation_loss, weighted_relation_loss = maybe_anchor_relation_loss(
@@ -1398,7 +1419,22 @@ class StructuringHead(NERHead):
                     extra["typed_class_none_logits"] = none_logits
                     extra["typed_class_field_mask"] = field_ok
 
-        if quantity_field_idx is not None:
+        if quantity_field_idx is not None and getattr(self, "typed_regression", False):
+            loss, regression_extra = self._typed_regression_forward(
+                batch,
+                flat_inputs=flat_inputs,
+                child=child,
+                records=records,
+                record_mask=record_mask,
+                words_embedding=words_embedding,
+                word_mask=word_mask,
+                num_gold=num_gold,
+                supervised=supervised,
+            )
+            if loss is not None:
+                add(loss, 1.0)
+            extra.update(regression_extra)
+        elif quantity_field_idx is not None:
             quantity_field_idx = quantity_field_idx.to(device)
             quantity_mask = batch["structuring_typed_quantity_field_mask"].to(device).bool()
             bounded = batch["structuring_typed_quantity_bounded"].to(device).bool()
@@ -1491,6 +1527,142 @@ class StructuringHead(NERHead):
                     "typed_quantity_field_mask": quantity_mask,
                 })
         return total, extra
+
+    def _typed_regression_forward(
+        self,
+        batch,
+        *,
+        flat_inputs,
+        child,
+        records,
+        record_mask,
+        words_embedding,
+        word_mask,
+        num_gold,
+        supervised,
+    ):
+        """Number and date/time regression for quantity fields."""
+
+        head = self.typed_regression_head
+        device = records.device
+        origin = flat_inputs.batch_origin.to(device)
+
+        def per_group(name, default=None):
+            value = batch.get(name)
+            return value.to(device)[origin] if value is not None else default
+
+        field_idx = batch["structuring_typed_quantity_field_idx"].to(device)
+        field_mask = batch["structuring_typed_quantity_field_mask"].to(device).bool()
+        horizon = batch["structuring_typed_quantity_horizon"].to(device).long()
+        family = batch["structuring_typed_quantity_family"].to(device)
+        space = batch["structuring_typed_quantity_space"].to(device)
+        scale = batch["structuring_typed_quantity_scale"].to(device)
+
+        spans = per_group("structuring_typed_mention_spans")
+        features = per_group("structuring_typed_mention_features")
+        mention_mask = per_group("structuring_typed_mention_mask")
+        groups = records.shape[0]
+        if spans is None:
+            spans = torch.zeros(groups, 1, 2, dtype=torch.long, device=device)
+            features = torch.zeros(groups, 1, 5, device=device)
+            mention_mask = torch.zeros(groups, 1, dtype=torch.bool, device=device)
+        memory, visible = head.mention_memory(
+            words_embedding, word_mask, spans, features, mention_mask,
+        )
+        # The readout sees the text plus one vector per number/year mention.
+        memory_words = torch.cat([words_embedding, memory.to(words_embedding.dtype)], dim=1)
+        memory_mask = torch.cat([word_mask.bool(), visible], dim=1)
+        fields = self._gather_fields(child, field_idx)
+        vectors = self.typed_head.record_field_vectors(records, fields, memory_words, memory_mask)
+
+        steps = int(horizon.max().item()) if horizon.numel() else 1
+        outputs = head.forward_heads(vectors, steps)
+        if supervised:
+            if batch.get("structuring_typed_quantity_presence") is None:
+                return None, {}
+            take = lambda name: batch[name].to(device)[:, :num_gold]  # noqa: E731
+            presence = take("structuring_typed_quantity_presence")
+            unit = (
+                take("structuring_typed_quantity_presence_mask").bool()
+                & record_mask[:, :, None]
+                & field_mask[:, None, :]
+            )
+            present = unit & presence.gt(0.5)
+            is_number = family.eq(0)[:, None, :]
+            step_valid = (
+                torch.arange(steps, device=device)[None, None, None, :]
+                < horizon[:, None, :, None]
+            )
+            number_targets = {
+                "space": space,
+                "exp_soft": take("structuring_typed_number_exp_soft")[:, :, :, :steps],
+                "digits": take("structuring_typed_number_digits")[:, :, :, :steps],
+                "negative": take("structuring_typed_number_negative")[:, :, :, :steps],
+                "zero": take("structuring_typed_number_zero")[:, :, :, :steps],
+                "z": take("structuring_typed_number_z")[:, :, :, :steps],
+                "quantiles": take("structuring_typed_number_quantiles")[:, :, :, :steps],
+                "quantiles_mask": take("structuring_typed_number_quantiles_mask")[:, :, :, :steps],
+            }
+            number_steps = take("structuring_typed_number_point_mask")[:, :, :, :steps].bool() & step_valid
+            median_loss, quantile_loss = head.number_losses(
+                outputs["number"], number_targets, present & is_number, number_steps,
+            )
+
+            temporal_targets = {
+                name: take(f"structuring_typed_temporal_{name}")
+                for name in ("year_mask", "era", "year_digits", "month", "day", "hour",
+                             "minute", "second", "quantiles", "quantiles_mask")
+            }
+            temporal_targets["quantile_scale"] = scale
+            component_loss, temporal_quantile_loss = head.temporal_losses(
+                outputs["temporal"],
+                temporal_targets,
+                present & ~is_number,
+            )
+            presence_loss = F.binary_cross_entropy_with_logits(
+                outputs["presence_logit"].float(), presence.float(), reduction="none",
+            )
+            presence_loss = (presence_loss * unit).sum() / unit.sum().clamp(min=1)
+            total = (
+                self.typed_quantity_loss_coef * (median_loss + component_loss)
+                + self.typed_quantile_loss_coef * (quantile_loss + temporal_quantile_loss)
+                + self.typed_presence_loss_coef * presence_loss
+            )
+            return total, {
+                "typed_number_loss": median_loss.detach(),
+                "typed_number_quantile_loss": quantile_loss.detach(),
+                "typed_temporal_loss": component_loss.detach(),
+                "typed_temporal_quantile_loss": temporal_quantile_loss.detach(),
+                "typed_presence_loss": presence_loss.detach(),
+            }
+
+        number = outputs["number"]
+        temporal = outputs["temporal"]
+        packed = {
+            "family": family,
+            "space": space,
+            "scale": scale,
+            "field_mask": field_mask,
+            "presence_logit": outputs["presence_logit"].float(),
+            "number_negative_prob": torch.sigmoid(number["sign_logit"].float()),
+            "number_exp_probs": torch.softmax(number["exp_logits"].float(), dim=-1),
+            "number_digits": number["digits"].float(),
+            "number_z": number["z"].float(),
+            "number_bounded_median": number["bounded_median"].float(),
+            "number_offsets": quantile_offsets_tensor(number["offset_raw"]).float(),
+            "temporal_offsets": quantile_offsets_tensor(temporal["offset_raw"]).float(),
+            "era_probs": torch.softmax(temporal["era_logits"].float(), dim=-1),
+            "year_digit_probs": torch.softmax(temporal["year_digit_logits"].float(), dim=-1),
+        }
+        for name in ("month", "day", "hour", "minute", "second"):
+            packed[f"{name}_probs"] = torch.softmax(temporal[f"{name}_logits"].float(), dim=-1)
+        return None, {"typed_regression": packed}
+
+
+def quantile_offsets_tensor(raw):
+    from .typed_regression import quantile_offsets
+
+    return quantile_offsets(raw)
 
 
 __all__ = ["StructuringHead"]

@@ -1689,6 +1689,18 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     typed_presence_threshold: float = 0.5
     # Minimum field x membership probability for a span to anchor a quantity.
     typed_anchor_threshold: float = 0.1
+    # Quantity head: "regression" (number decomposition, calendar components,
+    # year-anchor pointer, quantile offsets) or "histogram" (anchor + binned
+    # offset; the default so earlier typed checkpoints keep loading).
+    typed_quantity_head: str = "histogram"
+    # Quantile-offset loss weight of the regression head.
+    typed_quantile_loss_coef: float = 0.5
+    # Numbers/years in the input given to the regression head as memory.
+    typed_max_mentions: int = 64
+    # Split-conformal widening of predicted intervals per family, fitted on
+    # held-out data: {"number": log10 units, "date": days, "time": minutes,
+    # "datetime": minutes}.
+    typed_conformal: Optional[dict[str, float]] = None
     # Training-time prompt augmentation for typed fields.
     typed_description_dropout: float = 0.3
     typed_shuffle_options: bool = True
@@ -1700,6 +1712,9 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
         if not isinstance(self.reuse_ner_head, bool):
             raise TypeError("reuse_ner_head must be a boolean")
         self.typed_fields = bool(self.typed_fields)
+        self.typed_quantity_head = str(self.typed_quantity_head).lower()
+        if self.typed_quantity_head not in {"histogram", "regression"}:
+            raise ValueError("typed_quantity_head must be 'histogram' or 'regression'")
         if int(self.typed_num_bins) < 2:
             raise ValueError("typed_num_bins must be at least 2")
         self.typed_num_bins = int(self.typed_num_bins)
@@ -1711,6 +1726,7 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
             "typed_quantity_loss_coef",
             "typed_point_loss_coef",
             "typed_presence_loss_coef",
+            "typed_quantile_loss_coef",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
@@ -1860,6 +1876,8 @@ class GLiFormerConfig(BaseGLiNERConfig):
         """Discard retired matcher policies tied to a specific anchor strategy."""
 
         config.pop("position_bucket_matcher_cost", None)
+        # The year-anchor pointer was removed; the year is always regressed.
+        config.pop("typed_year_mode", None)
 
     @staticmethod
     def _canonicalize_head_type(

@@ -586,7 +586,7 @@ def _node_to_descriptor(
             preserve_field_shapes = True
         elif (
             (typed := schema_node_typed_spec(child)) is not None
-            and typed.kind != "span"
+            and (typed.kind != "span" or typed.format)
         ):
             # Typed fields serialize as descriptor exemplars.
             preserve_field_shapes = True

@@ -71,6 +71,8 @@ class GLiFormerTextOutput(GLiFormerBaseOutput):
     structuring_typed_quantity_presence_logits: Optional[torch.FloatTensor] = None
     structuring_typed_quantity_anchor_entity: Optional[torch.LongTensor] = None
     structuring_typed_quantity_origin: Optional[torch.LongTensor] = None
+    # Regression quantity head outputs (dict of tensors keyed by component).
+    structuring_typed_regression: Optional[dict] = None
 
     embedding_logits: Optional[torch.FloatTensor] = None
 

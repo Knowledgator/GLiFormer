@@ -1,5 +1,7 @@
 """Shared hierarchy, mapping, and formatting support for structuring."""
 
+import math
+
 from dataclasses import dataclass
 
 import torch
@@ -15,6 +17,7 @@ from ._structuring_alignment import (
     make_multi_level_group_result,
     resolve_structuring_decoder,
 )
+from . import typed_regression as tr
 from ._structuring_hierarchy import typed_field_layout
 from .structuring_processor import MULTI_LEVEL_ROOT_KEY
 from .structuring_types import is_structuring_descriptor
@@ -24,6 +27,37 @@ from .typed_fields import (
     TypedFieldSpec,
     decode_quantity,
 )
+
+
+def _stat_level(name):
+    from .typed_fields import stat_level
+
+    return stat_level(name)
+
+
+def _round_regressed(value, spec):
+    """Regressed numbers carry ~4-6 significant digits; drop the rest."""
+
+    if not isinstance(value, float) or spec.integer or spec.decimals is not None:
+        return value
+    if spec.step is not None or value == 0.0 or not math.isfinite(value):
+        return value
+    digits = 6 - int(math.floor(math.log10(abs(value)))) - 1
+    return float(round(value, max(digits, 0)))
+
+
+class _FormattedSpan:
+    """Parse an extraction span into its ``$format`` (ISO date, number, ...)."""
+
+    def __init__(self, spec):
+        self.spec = spec
+
+    def __call__(self, span_text, context=None, span_start=None):
+        x = self.spec.parse_in_context(span_text or "", context, span_start)
+        return None if x is None else self.spec.decode(x)
+
+    def __deepcopy__(self, memo):
+        return self
 
 
 class _AnchoredQuantity:
@@ -137,6 +171,9 @@ class StructuringDecoder(SpanDecoder):
             getattr(struct_cfg, "typed_presence_threshold", 0.5)
             if struct_cfg is not None else 0.5
         )
+        self.typed_conformal = dict(
+            getattr(struct_cfg, "typed_conformal", None) or {}
+        ) if struct_cfg is not None else {}
         self.component = resolve_structuring_decoder(
             decoder_spec,
             multi_level=configured_multi_level,
@@ -317,6 +354,7 @@ class StructuringDecoder(SpanDecoder):
         class_threshold=None,
         presence_threshold=None,
         output_mode=None,
+        details=False,
     ):
         """Replace typed fields' anchor spans with decoded typed values.
 
@@ -421,6 +459,18 @@ class StructuringDecoder(SpanDecoder):
                         "text": "" if value is None else str(value),
                         "score": score,
                     })
+            regression = getattr(model_output, "structuring_typed_regression", None)
+            if regression is not None:
+                for slot, (label, _field_id, spec) in enumerate(quantity_fields):
+                    if not carries(entry, label):
+                        continue
+                    field = self._decode_regression_field(
+                        regression, group_idx, anchor, slot, spec,
+                        presence_threshold=presence_threshold, details=details,
+                    )
+                    if field is not None:
+                        entry["fields"].append({"field": label, **field})
+                continue
             if probs is None:
                 continue
             for slot, (label, _field_id, spec) in enumerate(quantity_fields):
@@ -482,11 +532,167 @@ class StructuringDecoder(SpanDecoder):
                 entry["fields"].append(field)
         return anchor_entries
 
+    def _decode_regression_field(
+        self, outputs, group, anchor, slot, spec, *, presence_threshold, details,
+    ):
+        """Typed value of one regressed field for one record slot."""
+
+        if slot >= outputs["family"].shape[1] or not bool(outputs["field_mask"][group, slot]):
+            return None
+        present_prob = float(torch.sigmoid(outputs["presence_logit"][group, anchor, slot]))
+        family = int(outputs["family"][group, slot])
+        if family == tr.FAMILY_NUMBER:
+            guess, confidence = self._decode_regression_number(outputs, group, anchor, slot, spec)
+        else:
+            guess, confidence = self._decode_regression_temporal(
+                outputs, group, anchor, slot, spec, family,
+            )
+        value = guess if present_prob > presence_threshold else None
+        if details:
+            payload = {
+                "value": value,
+                "p_null": round(1.0 - present_prob, 4),
+                "confidence": round(confidence * present_prob, 4),
+                "guess": guess,
+            }
+            return {"value": payload, "text": "" if value is None else str(value), "score": present_prob}
+        if value is None:
+            return None
+        return {"value": value, "text": str(value), "score": present_prob}
+
+    def _widen(self, family, offsets):
+        """Split-conformal widening of non-median quantile offsets."""
+
+        widen = float(self.typed_conformal.get(tr.FAMILY_NAMES[family], 0.0) or 0.0)
+        if not widen:
+            return offsets
+        widened = []
+        for level, offset in zip(tr.QUANTILE_LEVELS, offsets):
+            share = abs(level - 0.5) / 0.4  # 1.0 at p10/p90
+            sign = -1.0 if level < 0.5 else (1.0 if level > 0.5 else 0.0)
+            widened.append(offset + sign * widen * share)
+        return widened
+
+    def _decode_regression_number(self, outputs, group, anchor, slot, spec):
+        stats = tuple(spec.stats) or ("value",)
+        horizon = min(spec.horizon, outputs["number_z"].shape[3])
+        series = {name: [] for name in stats}
+        confidences = []
+        space = tr.number_space(spec)
+        for step in range(horizon):
+            cell = (group, anchor, slot, step)
+            exp_probs = outputs["number_exp_probs"][cell].tolist()
+            x, z50, negative = tr.decode_number_median(
+                exp_probs,
+                float(outputs["number_digits"][cell]),
+                float(outputs["number_z"][cell]),
+                float(outputs["number_negative_prob"][cell]),
+                spec,
+                bounded_median=float(outputs["number_bounded_median"][cell]),
+            )
+            offsets = outputs["number_offsets"][cell].tolist()
+            if space == "log":
+                # The fitted number constant is in log10 units.
+                offsets = self._widen(tr.FAMILY_NUMBER, offsets)
+            levels = [z50 + offset for offset in offsets]
+            confidences.append(
+                max(exp_probs) if space == "log" else 1.0
+            )
+            for name in stats:
+                level = _stat_level(name)
+                if level is None or abs(level - 0.5) < 1e-9:
+                    raw = x
+                else:
+                    # A negative log-space value flips the order of levels.
+                    effective = 1.0 - level if (space == "log" and negative) else level
+                    z = tr.interpolate_level(effective, levels)
+                    raw = tr.number_from_space(z, spec, negative=negative)
+                series[name].append(_round_regressed(spec.decode(raw), spec))
+        confidence = sum(confidences) / len(confidences) if confidences else 0.0
+        if horizon == 1:
+            flat = {name: values[0] for name, values in series.items()}
+        else:
+            flat = series
+        if stats == ("value",):
+            return flat["value"], confidence
+        return flat, confidence
+
+    def _decode_regression_temporal(self, outputs, group, anchor, slot, spec, family):
+        cell = (group, anchor, slot)
+        components = {}
+        confidence = 1.0
+        if family != tr.FAMILY_TIME:
+            era_probs = outputs["era_probs"][cell]
+            digit_probs = outputs["year_digit_probs"][cell]
+            era = int(era_probs.argmax())
+            digits = digit_probs.argmax(-1).tolist()
+            year = tr.era_digits_to_year(era, digits)
+            confidence *= float(era_probs.max()) * float(digit_probs.max(-1).values.prod())
+            month_probs = outputs["month_probs"][cell]
+            month = int(month_probs.argmax()) + 1
+            day_probs = outputs["day_probs"][cell].clone()
+            limit = tr.days_in_month(min(max(year, 1), 9999), month)
+            day_probs[limit:] = 0.0
+            day = int(day_probs.argmax()) + 1
+            confidence *= float(month_probs.max()) * float(day_probs.max())
+            components.update(year=year, month=month, day=day)
+        if family != tr.FAMILY_DATE:
+            for name in ("hour", "minute", "second"):
+                probs = outputs[f"{name}_probs"][cell]
+                components[name] = int(probs.argmax())
+                if name != "second":
+                    confidence *= float(probs.max())
+        point = tr.compose_temporal(family, **components)
+        stats = tuple(spec.stats) or ("value",)
+        if point is None or stats == ("value",):
+            return point, confidence
+        scale = float(outputs["scale"][group, slot])
+        offsets = self._widen(
+            family, [offset * scale for offset in outputs["temporal_offsets"][cell].tolist()]
+        )
+        result = {}
+        for name in stats:
+            level = _stat_level(name)
+            if level is None or abs(level - 0.5) < 1e-9:
+                result[name] = point
+                continue
+            units = tr.interpolate_level(level, offsets)
+            units = math.floor(units) if level < 0.5 else math.ceil(units)
+            result[name] = tr.shift_temporal(point, family, units)
+        return result, confidence
+
     @staticmethod
     def _convert_typed_list_items(anchor_entries, struct_item):
-        """Parse spans of number/date list fields into typed item values."""
+        """Parse spans of number/date list fields into typed item values.
+
+        Extraction fields (``$type: "text"`` with ``$format``) are parsed the
+        same way; their value is re-parsed from the original text during
+        reconstruction and falls back to the copied span when unparseable.
+        """
 
         field_types = getattr(struct_item, "field_types", None) or {}
+        formatted = {}
+        for label, raw in field_types.items():
+            spec = TypedFieldSpec.from_value(raw)
+            if spec.type == "text" and spec.format:
+                formatted[label] = TypedFieldSpec(
+                    type=spec.format, unit=spec.unit, integer=spec.integer,
+                    decimals=spec.decimals, dayfirst=spec.dayfirst,
+                )
+        if formatted:
+            for entry in anchor_entries:
+                for field in entry["fields"]:
+                    format_spec = formatted.get(field.get("field"))
+                    if format_spec is None or "value" in field:
+                        continue
+                    parser = _FormattedSpan(format_spec)
+                    parsed = parser(str(field.get("text", "")))
+                    field.update({
+                        "value": parsed if parsed is not None else field.get("text", ""),
+                        "anchor_start": field.get("start", -1),
+                        "anchor_end": field.get("end", -1),
+                        "decode_from_anchor": parser,
+                    })
         item_specs = {}
         for label, raw in field_types.items():
             spec = TypedFieldSpec.from_value(raw)

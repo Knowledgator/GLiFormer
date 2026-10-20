@@ -118,6 +118,9 @@ SPEC_OPTION_KEYS = frozenset(
         "items",
         "base",
         "dayfirst",
+        "signed",
+        "unit_scale",
+        "format",
     }
 )
 DESCRIPTOR_OPTION_KEYS = frozenset(f"${key}" for key in SPEC_OPTION_KEYS)
@@ -331,6 +334,13 @@ class TypedFieldSpec:
     base: str | None = None
     # Day/month order of ambiguous numeric dates; None detects per document.
     dayfirst: bool | None = None
+    # Regressed numbers that may be negative or cross zero use asinh space.
+    signed: bool = False
+    # Regressed numbers are predicted in this unit (e.g. 1e6 for millions).
+    number_scale: float | None = None
+    # Extraction fields (type "text") parse their span into this type:
+    # number, date, time, datetime, or duration.
+    format: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -367,6 +377,17 @@ class TypedFieldSpec:
                 raise ValueError(f"Unsupported quantity base {self.base!r}")
         if self.items is not None:
             self.items = normalize_typed_name(self.items)
+        self.signed = bool(self.signed)
+        if self.number_scale is not None:
+            self.number_scale = float(self.number_scale)
+            if not self.number_scale > 0:
+                raise ValueError("unit_scale must be positive")
+        if self.format is not None:
+            self.format = normalize_typed_name(self.format)
+            if self.type != "text":
+                raise ValueError("$format applies to extraction fields of type 'text'")
+            if self.format not in QUANTITY_BASE_TYPES:
+                raise ValueError(f"Unsupported extraction format {self.format!r}")
         if self.type in QUANTITY_TYPES:
             if not self.stats:
                 self.stats = (
@@ -449,11 +470,15 @@ class TypedFieldSpec:
             ("$items", self.items),
             ("$base", self.base),
             ("$dayfirst", self.dayfirst),
+            ("$unit_scale", self.number_scale),
+            ("$format", self.format),
         ):
             if value is not None:
                 result[key] = value
         if self.integer:
             result["$integer"] = True
+        if self.signed:
+            result["$signed"] = True
         if self.type == "forecast":
             result["$horizon"] = self.horizon
         if self.kind == QUANTITY_KIND:
@@ -520,6 +545,9 @@ class TypedFieldSpec:
             items=values.get("items"),
             base=values.get("base"),
             dayfirst=values.get("dayfirst"),
+            signed=bool(values.get("signed", False)),
+            number_scale=values.get("unit_scale"),
+            format=values.get("format"),
             extra=extra,
         )
 
@@ -529,7 +557,7 @@ class TypedFieldSpec:
         """Plain-word type description rendered after the field name."""
 
         if self.type == "text":
-            return ""
+            return f"( text , {self.format} )" if self.format else ""
         parts = [self.type if self.type != "list" else f"list of {self.items or 'text'}"]
         if self.kind == CLASS_KIND:
             parts.append("multiple" if self.multi else "single")

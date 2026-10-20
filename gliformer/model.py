@@ -2124,6 +2124,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             structuring_typed_quantity_origin=struct_out.extra.get(
                 "typed_quantity_origin"
             ),
+            structuring_typed_regression=struct_out.extra.get("typed_regression"),
             embedding_logits=emb_out.logits,
             image_classification_logits=image_cls_out.logits,
             image_classification_batch_origin=flat_inputs_map["image_classification"].batch_origin if "image_classification" in flat_inputs_map else None,
