@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-from collections import defaultdict
 from typing import Any
 
 import torch
@@ -14,36 +12,11 @@ from gliner import InferencePackingConfig
 
 from gliformer import GLiFormer
 
-from .client import PerText
+from .api import AnalyzeEngine, APIError, capabilities_from_model
 from .config import GLiFormerServeConfig
 from .memory import GLiFormerMemoryEstimator
 
 logger = logging.getLogger(__name__)
-
-HTTP_PAYLOAD_KEYS = {
-    "text", "entities", "classes", "relations", "joint_relations", "structures",
-    "threshold", "flat_ner", "multi_label", "adapter_id",
-    "manual_structuring_count", "structuring_dedup", "objectness_threshold",
-    "preserve_empty_records", "decoder_kwargs",
-}
-_BATCH_ERROR_KEY = "__gliformer_serve_error__"
-_REQUEST_ERRORS = (KeyError, TypeError, ValueError, OverflowError)
-
-
-def _batch_error(exc: Exception) -> dict[str, Any]:
-    status = 500
-    if isinstance(exc, OverflowError):
-        status = 413
-    elif isinstance(exc, KeyError):
-        status = 404
-    elif isinstance(exc, (TypeError, ValueError)):
-        status = 400
-    return {
-        _BATCH_ERROR_KEY: True,
-        "status": status,
-        "error": str(exc),
-        "error_type": type(exc).__name__,
-    }
 
 
 class GLiFormerServer:
@@ -102,6 +75,17 @@ class GLiFormerServer:
             and config.device.startswith("cuda")
         ):
             self._calibrate_memory()
+        processor = getattr(self.model, "data_processor", None)
+        self._tokenizer = getattr(processor, "transformer_tokenizer", None)
+        self.capabilities_info = capabilities_from_model(self.model, config)
+        self.engine = AnalyzeEngine(
+            self.capabilities_info,
+            run_rows=self._run_rows,
+            embed=self._embed,
+            count_tokens=self._count_tokens,
+            resolve_adapter=self._resolve_adapter,
+            render_task_names=config.render_task_names,
+        )
 
     def _create_packing_config(self) -> InferencePackingConfig | None:
         """Enable packing only for encoder paths with verified mask semantics."""
@@ -234,32 +218,22 @@ class GLiFormerServer:
             min_seq_len=self.config.calibration_min_seq_len,
         )
 
-    @staticmethod
-    def _schema_word_count(value: Any) -> int:
-        if value is None:
-            return 0
-        if isinstance(value, str):
-            return len(value.split())
-        if isinstance(value, dict):
-            return sum(
-                GLiFormerServer._schema_word_count(key)
-                + GLiFormerServer._schema_word_count(item)
-                for key, item in value.items()
-            )
-        if isinstance(value, (list, tuple)):
-            return sum(GLiFormerServer._schema_word_count(item) for item in value)
-        return 0
+    def _count_tokens(self, text: str) -> int:
+        """Subword tokens of ``text`` as the model's encoder sees it."""
+        tokenizer = self._tokenizer
+        if tokenizer is None:
+            return len(text.split())
+        return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
-    def observed_seq_len(self, payloads: list[dict[str, Any]]) -> int:
-        observed = self.config.calibration_min_seq_len
-        for payload in payloads:
-            words = len(payload.get("text", "").split())
-            words += sum(
-                self._schema_word_count(payload.get(key))
-                for key in ("entities", "classes", "relations", "joint_relations", "structures")
-            )
-            observed = max(observed, words)
-        return min(observed, self.config.max_model_len)
+    @staticmethod
+    def observed_seq_len_of(texts: list[str], minimum: int, maximum: int) -> int:
+        observed = max([minimum, *(len(text.split()) for text in texts)])
+        return min(observed, maximum)
+
+    def observed_seq_len(self, texts: list[str]) -> int:
+        return self.observed_seq_len_of(
+            texts, self.config.calibration_min_seq_len, self.config.max_model_len,
+        )
 
     def batch_size_fn(self, seq_len: int | None = None) -> int:
         if not torch.cuda.is_available() or not self.memory_estimator.per_sample_table:
@@ -365,138 +339,28 @@ class GLiFormerServer:
             )
         return result
 
-    def predict(
-        self,
-        texts: str | list[str],
-        *,
-        entities=None,
-        classes=None,
-        relations=None,
-        joint_relations=None,
-        structures=None,
-        embed: bool = False,
-        threshold: float | None = None,
-        flat_ner: bool = True,
-        multi_label: bool = False,
-        batch_size: int | None = None,
-        adapter_ids: str | list[str | None] | None = None,
-        **kwargs,
-    ) -> dict[str, list]:
-        """Run any combination of GLiFormer text tasks."""
-        normalized_texts = [texts] if isinstance(texts, str) else list(texts)
-        if isinstance(adapter_ids, list):
-            if len(adapter_ids) != len(normalized_texts):
-                raise ValueError("adapter_ids length must match texts length")
-            resolved = [self.ensure_adapter_loaded(item) for item in adapter_ids]
-        else:
-            adapter = self.ensure_adapter_loaded(adapter_ids)
-            resolved = [adapter] * len(normalized_texts) if adapter is not None else None
+    # -- analyze API --------------------------------------------------------
 
-        result: dict[str, list] = {}
-        if any(item is not None for item in (
-            entities, classes, relations, joint_relations, structures
-        )):
-            result.update(self.model.inference(
-                normalized_texts,
-                entities=entities,
-                classes=classes,
-                relations=relations,
-                joint_relations=joint_relations,
-                structures=structures,
-                threshold=self.config.default_threshold if threshold is None else threshold,
-                flat_ner=flat_ner,
-                multi_label=multi_label,
-                batch_size=batch_size or self.config.default_batch_size,
-                adapter_ids=resolved,
-                **({"inference_collator": self.collator} if self.collator is not None else {}),
-                **({"packing_config": self.packing_config} if self.packing_config is not None else {}),
-                **kwargs,
-            ))
-        if embed:
-            embeddings = self.model.embed_text(
-                normalized_texts,
-                batch_size=batch_size or self.config.default_batch_size,
-                adapter_ids=resolved,
-            )
-            result["embedding"] = embeddings.detach().cpu().tolist()
-        return result
-
-    def _filter_labels(self, value: Any) -> Any:
-        """Apply the configured label cap without changing descriptions."""
-        limit = self.config.max_labels
-        if limit <= 0 or value is None:
-            return value
-        if isinstance(value, dict):
-            return dict(list(value.items())[:limit])
-        if isinstance(value, list):
-            return value[:limit]
-        return value
-
-    def validate_payload(self, payload: Any) -> dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise TypeError("JSON body must be an object")
-        unknown = sorted(set(payload) - HTTP_PAYLOAD_KEYS)
-        if unknown:
-            raise ValueError(f"Unsupported request fields: {', '.join(unknown)}")
-        text = payload.get("text")
-        if not isinstance(text, str):
-            raise TypeError("JSON body must contain a string 'text'")
-        if len(text) > self.config.max_text_chars:
-            raise OverflowError(
-                f"text exceeds max_text_chars={self.config.max_text_chars}"
-            )
-        if not any(payload.get(key) is not None for key in (
-            "entities", "classes", "relations", "joint_relations", "structures"
-        )):
-            raise ValueError("At least one GLiFormer task schema is required")
-        for key in ("flat_ner", "multi_label", "preserve_empty_records"):
-            if key in payload and not isinstance(payload[key], bool):
-                raise TypeError(f"{key} must be a boolean")
-        if "threshold" in payload and not isinstance(payload["threshold"], (int, float)):
-            raise TypeError("threshold must be numeric")
-        validated = dict(payload)
-        for key in ("entities", "classes", "relations"):
-            validated[key] = self._filter_labels(validated.get(key))
-        return validated
-
-    @staticmethod
-    def _request_group_key(payload: dict[str, Any]) -> str:
-        """Group only by controls that alter the shared model forward."""
-        control_keys = {
-            "manual_structuring_count",
-        }
-        shared = {key: payload[key] for key in control_keys if key in payload}
-        return json.dumps(shared, sort_keys=True, separators=(",", ":"), default=str)
-
-    def _predict_payload_group(
-        self,
-        group: list[tuple[int, dict[str, Any]]],
-    ) -> list[dict[str, Any]]:
-        first = group[0][1]
-        texts = [item["text"] for _, item in group]
+    def _run_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Run planned model rows with OOM-safe adaptive batch sizes."""
+        inference_requests = getattr(self.model, "inference_requests", None)
+        if not callable(inference_requests):
+            raise TypeError("Model does not implement heterogeneous inference_requests")
         safe_batch_size = min(
-            len(texts),
-            self.batch_size_fn(self.observed_seq_len([item for _, item in group])),
+            len(rows),
+            self.batch_size_fn(self.observed_seq_len([row["text"] for row in rows])),
         )
         while True:
             try:
-                controls = {
-                    "threshold": self.config.default_threshold,
-                    "flat_ner": True,
-                    "multi_label": False,
-                    "batch_size": safe_batch_size,
+                controls: dict[str, Any] = {
+                    "batch_size": max(1, safe_batch_size),
+                    "return_group_index": True,
                 }
-                for key in ("manual_structuring_count",):
-                    if key in first:
-                        controls[key] = first[key]
                 if self.collator is not None:
                     controls["inference_collator"] = self.collator
                 if self.packing_config is not None:
                     controls["packing_config"] = self.packing_config
-                inference_requests = getattr(self.model, "inference_requests", None)
-                if not callable(inference_requests):
-                    raise TypeError("Model does not implement heterogeneous inference_requests")
-                return inference_requests([item for _, item in group], **controls)
+                return inference_requests(rows, **controls)
             except torch.cuda.OutOfMemoryError:
                 if safe_batch_size <= 1:
                     raise
@@ -509,107 +373,46 @@ class GLiFormerServer:
                 safe_batch_size = next_size
                 torch.cuda.empty_cache()
 
-    def predict_payloads(
-        self,
-        payloads: list[dict[str, Any]],
-        *,
-        isolate_errors: bool = False,
-    ) -> list[dict[str, Any]]:
-        """Batch compatible requests while optionally isolating item failures."""
-        grouped: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
-        results: list[dict[str, Any] | None] = [None] * len(payloads)
-        for index, payload in enumerate(payloads):
+    def _embed(self, texts: list[str], adapter_ids: list[str | None]) -> list[list[float]]:
+        safe_batch_size = min(len(texts), self.batch_size_fn(self.observed_seq_len(texts)))
+        resolved = adapter_ids if any(item is not None for item in adapter_ids) else None
+        while True:
             try:
-                validated = self.validate_payload(payload)
-                validated["adapter_id"] = self.ensure_adapter_loaded(
-                    validated.get("adapter_id")
-                )
-                grouped[self._request_group_key(validated)].append((index, validated))
-            except _REQUEST_ERRORS as exc:
-                if not isolate_errors:
+                return self.model.embed_text(
+                    texts,
+                    batch_size=max(1, safe_batch_size),
+                    adapter_ids=resolved,
+                ).detach().float().cpu().tolist()
+            except torch.cuda.OutOfMemoryError:
+                if safe_batch_size <= 1:
                     raise
-                results[index] = _batch_error(exc)
+                safe_batch_size = max(1, safe_batch_size // 2)
+                logger.warning("CUDA OOM while embedding; retrying at %d", safe_batch_size)
+                torch.cuda.empty_cache()
 
-        for group in grouped.values():
-            try:
-                batch_result = self._predict_payload_group(group)
-            except _REQUEST_ERRORS as exc:
-                if not isolate_errors or len(group) == 1:
-                    if not isolate_errors:
-                        raise
-                    batch_result = [_batch_error(exc)]
-                else:
-                    # An invalid schema discovered by a processor must not
-                    # poison otherwise valid requests in the same Ray batch.
-                    batch_result = []
-                    for item in group:
-                        try:
-                            batch_result.extend(self._predict_payload_group([item]))
-                        except _REQUEST_ERRORS as item_exc:
-                            batch_result.append(_batch_error(item_exc))
-            for local_index, (original_index, _) in enumerate(group):
-                results[original_index] = batch_result[local_index]
-        return [item or {} for item in results]
+    def _resolve_adapter(self, adapter_id: str | None) -> str | None:
+        return self.ensure_adapter_loaded(adapter_id)
 
-    def predict_embedding_payloads(
-        self,
-        payloads: list[dict[str, Any]],
-        *,
-        isolate_errors: bool = False,
-    ) -> list[dict[str, Any]]:
-        """Validate and embed HTTP rows with adaptive OOM-safe minibatches."""
-        results: list[dict[str, Any] | None] = [None] * len(payloads)
-        valid: list[tuple[int, dict[str, Any]]] = []
-        for index, payload in enumerate(payloads):
-            try:
-                if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
-                    raise TypeError("JSON body must contain a string 'text'")
-                if len(payload["text"]) > self.config.max_text_chars:
-                    raise OverflowError(
-                        f"text exceeds max_text_chars={self.config.max_text_chars}"
-                    )
-                unknown = set(payload) - {"text", "adapter_id"}
-                if unknown:
-                    raise ValueError(
-                        f"Unsupported embedding fields: {', '.join(sorted(unknown))}"
-                    )
-                item = dict(payload)
-                item["adapter_id"] = self.ensure_adapter_loaded(item.get("adapter_id"))
-                valid.append((index, item))
-            except _REQUEST_ERRORS as exc:
-                if not isolate_errors:
-                    raise
-                results[index] = _batch_error(exc)
+    def analyze(self, body: Any) -> dict[str, Any]:
+        """``POST /v1/analyze``. Raises ``APIError`` for a rejected request."""
+        return self.engine.analyze(body)
 
-        if valid:
-            texts = [item["text"] for _, item in valid]
-            adapter_ids = [item.get("adapter_id") for _, item in valid]
-            safe_batch_size = min(
-                len(valid),
-                self.batch_size_fn(self.observed_seq_len([item for _, item in valid])),
-            )
-            while True:
-                try:
-                    embeddings = self.model.embed_text(
-                        texts,
-                        batch_size=safe_batch_size,
-                        adapter_ids=adapter_ids,
-                    ).detach().cpu().tolist()
-                    break
-                except torch.cuda.OutOfMemoryError:
-                    if safe_batch_size <= 1:
-                        raise
-                    next_size = max(1, safe_batch_size // 2)
-                    logger.warning(
-                        "CUDA OOM at embedding batch size %d; retrying at %d",
-                        safe_batch_size,
-                        next_size,
-                    )
-                    safe_batch_size = next_size
-                    torch.cuda.empty_cache()
-            for (original_index, _), embedding in zip(valid, embeddings, strict=True):
-                results[original_index] = {"embedding": embedding}
-        return [item or {} for item in results]
+    def analyze_many(self, bodies: list[Any]) -> list[dict[str, Any] | APIError]:
+        """Independent analyze requests sharing model forwards."""
+        return self.engine.analyze_many(bodies)
+
+    def analyze_batch(self, body: Any) -> dict[str, Any]:
+        """``POST /v1/analyze/batch``. Raises ``APIError`` for a bad envelope."""
+        return self.engine.analyze_batch(body)
+
+    def capabilities(self, model_id: str | None = None) -> dict[str, Any]:
+        if model_id is not None and model_id not in self.capabilities_info.model_ids():
+            raise APIError("MODEL_NOT_FOUND", f"Model {model_id!r} is not served here", "/model")
+        return self.capabilities_info.to_dict()
+
+    def models(self) -> dict[str, Any]:
+        info = self.capabilities_info
+        return {"data": [{"id": info.model, "aliases": list(info.aliases)}]}
 
     def health(self) -> dict[str, Any]:
         return {
@@ -618,162 +421,28 @@ class GLiFormerServer:
             "device": self.config.device,
             "cuda_available": torch.cuda.is_available(),
             "polylora": self.config.enable_polylora,
-            "embedding": getattr(self.model.config, "embedding_config", None) is not None,
             "sequence_packing": self.packing_config is not None,
             "max_batch_size": self.batch_size_fn(),
-        }
-
-    def metadata(self) -> dict[str, Any]:
-        task_arguments = {
-            "ner": "entities",
-            "classification": "classes",
-            "open_relex": "relations",
-            "joint_relex": "joint_relations",
-            "structuring": "structures",
-            "embedding": None,
-        }
-        tasks = [
-            name for name in task_arguments
-            if getattr(self.model.config, f"{name}_config", None) is not None
-        ]
-        return {
-            "model": self.config.model,
-            "model_variant": getattr(self.model.config, "model_variant", None),
-            "tasks": tasks,
-            "task_arguments": {
-                name: argument for name, argument in task_arguments.items() if name in tasks
-            },
-            "polylora": self.adapter_cache_status(),
-            "sequence_packing": {
-                "requested": self.config.enable_sequence_packing,
-                "enabled": self.packing_config is not None,
-                "max_length": (
-                    self.packing_config.max_length
-                    if self.packing_config is not None else None
-                ),
-            },
-            "limits": {
-                "max_batch_size": self.config.max_batch_size,
-                "max_model_len": self.config.max_model_len,
-                "max_text_chars": self.config.max_text_chars,
-                "max_labels": self.config.max_labels,
-            },
+            "task_types": list(self.capabilities_info.task_types),
         }
 
 
-async def _read_limited_body(request, max_bytes: int) -> bytes:
-    """Read an ASGI request incrementally without buffering an oversized body."""
-    body = bytearray()
-    async for chunk in request.stream():
-        if not chunk:
-            continue
-        if len(body) + len(chunk) > max_bytes:
-            raise OverflowError(f"Request exceeds {max_bytes} bytes")
-        body.extend(chunk)
-    return bytes(body)
+def build_app(get_server, analyze_one, max_request_bytes: int):
+    """FastAPI app of the analyze API; see ``gliformer.serve.http.build_app``."""
+    from .http import build_app as _build_app
+
+    return _build_app(get_server, analyze_one, max_request_bytes)
 
 
 def build_deployment(config: GLiFormerServeConfig):
     """Build a Ray Serve deployment without importing Ray for library users."""
     try:
-        from ray import serve
-        from starlette.responses import JSONResponse
+        import ray.serve  # noqa: F401
     except ImportError as exc:
         raise ImportError("Serving requires `pip install 'gliformer[serve]'`") from exc
+    from .http import build_ray_deployment
 
-    @serve.deployment(
-        num_replicas=config.num_replicas,
-        ray_actor_options={
-            "num_gpus": config.num_gpus_per_replica,
-            "num_cpus": config.num_cpus_per_replica,
-        },
-        max_ongoing_requests=config.max_ongoing_requests,
-        max_queued_requests=config.queue_capacity,
-    )
-    class GLiFormerDeployment:
-        def __init__(self, serve_config: GLiFormerServeConfig):
-            self.server = GLiFormerServer(serve_config)
-            self._infer.set_max_batch_size(self.server.batch_size_fn())
-
-        @serve.batch(
-            max_batch_size=config.max_batch_size,
-            batch_wait_timeout_s=max(config.batch_wait_timeout_ms, 0.0) / 1000.0,
-        )
-        async def _infer(self, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            self._infer.set_max_batch_size(
-                self.server.batch_size_fn(self.server.observed_seq_len(payloads))
-            )
-            return self.server.predict_payloads(payloads, isolate_errors=True)
-
-        @serve.batch(
-            max_batch_size=config.max_batch_size,
-            batch_wait_timeout_s=max(config.batch_wait_timeout_ms, 0.0) / 1000.0,
-        )
-        async def _embed(self, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            self._embed.set_max_batch_size(
-                self.server.batch_size_fn(self.server.observed_seq_len(payloads))
-            )
-            return self.server.predict_embedding_payloads(
-                payloads,
-                isolate_errors=True,
-            )
-
-        async def predict(self, text: str, adapter_id: str | None = None, **tasks):
-            payload = {"text": text, **tasks}
-            if adapter_id is not None:
-                payload["adapter_id"] = adapter_id
-            result = await self._infer(payload)
-            if result.get(_BATCH_ERROR_KEY):
-                error = result["error"]
-                if result["status"] == 404:
-                    raise KeyError(error)
-                raise ValueError(error)
-            return result
-
-        async def __call__(self, request):
-            path = request.url.path.rstrip("/")
-            if request.method == "GET" and (
-                path.endswith("/health") or path.endswith("/ready")
-            ):
-                return JSONResponse(self.server.health())
-            if request.method == "GET" and path.endswith("/metadata"):
-                return JSONResponse(self.server.metadata())
-            if request.method == "GET" and request.url.path.rstrip("/").endswith("adapter-cache"):
-                try:
-                    return JSONResponse(
-                        self.server.adapter_cache_status(request.query_params.get("adapter_id"))
-                    )
-                except (KeyError, ValueError) as exc:
-                    return JSONResponse({"error": str(exc)}, status_code=404)
-            if request.method != "POST":
-                return JSONResponse({"error": "Use POST for inference"}, status_code=405)
-            try:
-                content_length = request.headers.get("content-length")
-                if content_length and int(content_length) > config.max_request_bytes:
-                    return JSONResponse(
-                        {"error": f"Request exceeds {config.max_request_bytes} bytes"},
-                        status_code=413,
-                    )
-                raw_body = await _read_limited_body(request, config.max_request_bytes)
-                payload = json.loads(raw_body)
-                if path.endswith("/embeddings"):
-                    result = await self._embed(payload)
-                else:
-                    result = await self._infer(payload)
-                if result.get(_BATCH_ERROR_KEY):
-                    return JSONResponse(
-                        {"error": result["error"]},
-                        status_code=result["status"],
-                    )
-                return JSONResponse(result)
-            except OverflowError as exc:
-                return JSONResponse({"error": str(exc)}, status_code=413)
-            except KeyError as exc:
-                return JSONResponse({"error": str(exc)}, status_code=404)
-            except (TypeError, ValueError) as exc:
-                return JSONResponse({"error": str(exc)}, status_code=400)
-
-    return GLiFormerDeployment.bind(config)
+    return build_ray_deployment(config, GLiFormerServer)
 
 
 def serve(config: GLiFormerServeConfig, blocking: bool = False):
@@ -842,10 +511,10 @@ def shutdown() -> None:
 
 
 class GLiFormerFactory:
-    """Lifecycle-managed synchronous/async facade over Ray Serve.
+    """Lifecycle-managed in-process facade over the Ray Serve deployment.
 
-    List inputs are dispatched concurrently as individual Ray requests so the
-    deployment batcher, rather than the caller, controls physical batches.
+    ``analyze`` / ``analyze_batch`` take the same bodies as the HTTP routes
+    and go through the deployment's dynamic batcher.
     """
 
     def __init__(self, model: str | None = None, *, config=None, **kwargs) -> None:
@@ -863,93 +532,51 @@ class GLiFormerFactory:
     def handle(self):
         return self._handle
 
-    def predict(self, texts: str | list[str], **tasks):
-        single = isinstance(texts, str)
-        items = [texts] if single else list(texts)
-        request_tasks = self._tasks_for_items(tasks, len(items))
-        refs = [
-            self._handle.predict.remote(text, **item_tasks)
-            for text, item_tasks in zip(items, request_tasks, strict=True)
-        ]
-        values = [ref.result() for ref in refs]
-        return values[0] if single else values
+    @property
+    def model_id(self) -> str:
+        return self.config.model_id or self.config.model
 
-    def predict_requests(self, requests: list[dict[str, Any]]):
-        request_tasks = self._validate_request_items(requests)
-        refs = [
-            self._handle.predict.remote(item.pop("text"), **item)
-            for item in request_tasks
-        ]
-        return [ref.result() for ref in refs]
+    def _body(self, input: Any, tasks: dict[str, Any], options: dict[str, Any] | None, model: str | None) -> dict[str, Any]:
+        body: dict[str, Any] = {"model": model or self.model_id, "input": input, "tasks": tasks}
+        if options:
+            body["options"] = options
+        return body
 
-    async def predict_async(self, texts: str | list[str], **tasks):
-        import asyncio
-
-        single = isinstance(texts, str)
-        items = [texts] if single else list(texts)
-        request_tasks = self._tasks_for_items(tasks, len(items))
-        values = list(await asyncio.gather(
-            *(
-                self._handle.predict.remote(text, **item_tasks)
-                for text, item_tasks in zip(items, request_tasks, strict=True)
+    @staticmethod
+    def _unwrap(response: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(response, dict) and "error" in response and "results" not in response and "items" not in response:
+            error = response["error"]
+            raise APIError(
+                error.get("code", "INTERNAL"),
+                error.get("message", ""),
+                error.get("path"),
+                error.get("details"),
             )
-        ))
-        return values[0] if single else values
+        return response
 
-    async def predict_requests_async(self, requests: list[dict[str, Any]]):
-        import asyncio
+    def analyze(self, input: Any = None, tasks: dict[str, Any] | None = None, *, options=None, model=None, body=None):
+        """Run one analyze request; raises ``APIError`` when it is rejected."""
+        request = body if body is not None else self._body(input, tasks or {}, options, model)
+        return self._unwrap(self._handle.handle_analyze.remote(request).result())
 
-        request_tasks = self._validate_request_items(requests)
-        return list(await asyncio.gather(*(
-            self._handle.predict.remote(item.pop("text"), **item)
-            for item in request_tasks
-        )))
+    def analyze_batch(self, items: list[dict[str, Any]], *, options=None, model=None):
+        body: dict[str, Any] = {"model": model or self.model_id, "items": items}
+        if options:
+            body["options"] = options
+        return self._unwrap(self._handle.handle_analyze_batch.remote(body).result())
 
-    @staticmethod
-    def _validate_request_items(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        validated = []
-        for index, request in enumerate(requests):
-            if not isinstance(request, dict):
-                raise TypeError(f"requests[{index}] must be an object")
-            if not isinstance(request.get("text"), str):
-                raise TypeError(f"requests[{index}] must contain a string 'text'")
-            validated.append(dict(request))
-        return validated
+    async def analyze_async(self, input: Any = None, tasks: dict[str, Any] | None = None, *, options=None, model=None, body=None):
+        request = body if body is not None else self._body(input, tasks or {}, options, model)
+        return self._unwrap(await self._handle.handle_analyze.remote(request))
 
-    @staticmethod
-    def _tasks_for_items(tasks: dict[str, Any], count: int) -> list[dict[str, Any]]:
-        tasks = dict(tasks)
-        per_text_tasks = tasks.pop("per_text_tasks", None)
-        expanded = [dict(tasks) for _ in range(count)]
-        if per_text_tasks is not None:
-            if len(per_text_tasks) != count:
-                raise ValueError(f"per_text_tasks must have length {count}")
-            if any(not isinstance(item, dict) for item in per_text_tasks):
-                raise TypeError("Every per_text_tasks item must be an object")
-            for index, item_tasks in enumerate(per_text_tasks):
-                if "text" in item_tasks:
-                    raise ValueError("per_text_tasks cannot override text")
-                expanded[index].update(item_tasks)
-        for key, value in tasks.items():
-            if isinstance(value, PerText):
-                for index, item_value in enumerate(value.expand(count, key)):
-                    expanded[index][key] = item_value
-        adapter_ids = tasks.get("adapter_id")
-        if isinstance(adapter_ids, list):
-            if len(adapter_ids) != count:
-                raise ValueError(f"adapter_id list must have length {count}")
-            for index, adapter_id in enumerate(adapter_ids):
-                expanded[index]["adapter_id"] = adapter_id
-        for key in ("entities", "classes", "relations"):
-            value = tasks.get(key)
-            if isinstance(value, PerText):
-                continue
-            if isinstance(value, list) and value and isinstance(value[0], (list, dict)):
-                if len(value) != count:
-                    raise ValueError(f"Per-text {key} must have length {count}")
-                for index, item_value in enumerate(value):
-                    expanded[index][key] = item_value
-        return expanded
+    async def analyze_batch_async(self, items: list[dict[str, Any]], *, options=None, model=None):
+        body: dict[str, Any] = {"model": model or self.model_id, "items": items}
+        if options:
+            body["options"] = options
+        return self._unwrap(await self._handle.handle_analyze_batch.remote(body))
+
+    def capabilities(self) -> dict[str, Any]:
+        return self._handle.handle_capabilities.remote().result()
 
     def shutdown(self) -> None:
         if self._closed:

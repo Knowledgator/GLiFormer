@@ -2,157 +2,20 @@ import asyncio
 import signal
 import sys
 import types
-from types import SimpleNamespace
 
 import pytest
 import torch
+from fastapi.testclient import TestClient
 
 import gliformer.serve.server as serve_module
-from gliformer.serve import (
-    GLiFormerFactory,
-    GLiFormerServeConfig,
-    GLiFormerServer,
-    PerText,
-)
-from gliformer.serve.server import _read_limited_body
+from gliformer.serve import APIError, GLiFormerServeConfig, build_app
+from gliformer.serve.http import _read_limited_body
 
-
-class FakeGLiFormer:
-    def __init__(self):
-        self.config = SimpleNamespace(model_variant="text")
-        self.model = SimpleNamespace(
-            token_rep_layer=SimpleNamespace(
-                bert_layer=SimpleNamespace(model=SimpleNamespace())
-            )
-        )
-        self.calls = []
-
-    def eval(self):
-        return self
-
-    def compile(self):
-        self.compiled = True
-
-    def create_inference_collator(self, return_tokens=True):
-        return {"return_tokens": return_tokens}
-
-    def inference(self, texts, **kwargs):
-        self.calls.append((list(texts), kwargs))
-        return {
-            key: [{"text": text, "task": key} for text in texts]
-            for key in ("entities", "classes", "relations", "joint_relations", "structures")
-            if kwargs.get(key) is not None
-        }
-
-    def inference_requests(self, requests, **kwargs):
-        self.calls.append(([item["text"] for item in requests], kwargs))
-        task_names = {
-            "entities": "entities",
-            "classes": "classes",
-            "relations": "relations",
-            "joint_relations": "joint_relations",
-            "structures": "structures",
-        }
-        return [
-            {
-                output: {"text": request["text"], "task": output}
-                for field, output in task_names.items()
-                if request.get(field) is not None
-            }
-            for request in requests
-        ]
-
-    def embed_text(self, texts, **kwargs):
-        import torch
-
-        self.calls.append((list(texts), {"embed_text": True, **kwargs}))
-        return torch.tensor([[float(index), 1.0] for index, _ in enumerate(texts)])
-
-
-def make_server(**overrides):
-    model = FakeGLiFormer()
-    config = GLiFormerServeConfig(device="cpu", dtype="float32", **overrides)
-    return GLiFormerServer(config, model=model), model
-
-
-def test_predict_routes_requested_tasks():
-    server, model = make_server()
-    result = server.predict(
-        ["one", "two"],
-        entities=["person"],
-        classes=["positive", "negative"],
-    )
-
-    assert set(result) == {"entities", "classes"}
-    assert model.calls[0][1]["adapter_ids"] is None
-    assert model.calls[0][1]["inference_collator"] == {"return_tokens": True}
-
-
-def test_unknown_adapter_is_rejected_when_polylora_is_disabled():
-    server, _ = make_server()
-    with pytest.raises(KeyError, match="Unknown LoRA adapter"):
-        server.predict("text", entities=["person"], adapter_ids="tenant-a")
-
-
-def test_different_tasks_and_schemas_share_one_physical_batch():
-    server, model = make_server()
-    result = server.predict_payloads(
-        [
-            {"text": "a", "entities": ["person"]},
-            {"text": "b", "classes": ["positive"]},
-            {"text": "c", "entities": ["organization"]},
-        ]
-    )
-
-    assert [call[0] for call in model.calls] == [["a", "b", "c"]]
-    assert [result[0]["entities"]["text"], result[2]["entities"]["text"]] == ["a", "c"]
-
-
-def test_different_decode_controls_share_one_physical_batch():
-    server, model = make_server()
-    server.predict_payloads(
-        [
-            {"text": "a", "entities": ["person"], "threshold": 0.2},
-            {
-                "text": "b",
-                "classes": ["positive"],
-                "threshold": 0.9,
-                "multi_label": True,
-                "decoder_kwargs": {"custom_control": "second"},
-            },
-        ]
-    )
-
-    assert len(model.calls) == 1
-    assert model.calls[0][0] == ["a", "b"]
+from .fakes import FakeGLiFormer, body, make_server
 
 
 def test_route_prefix_is_normalized():
     assert GLiFormerServeConfig(route_prefix="api").route_prefix == "/api"
-
-
-def test_streaming_body_reader_stops_before_buffering_oversized_request():
-    class Request:
-        chunks_read = 0
-
-        async def stream(self):
-            for chunk in (b"1234", b"5678", b"must-not-be-read"):
-                self.chunks_read += 1
-                yield chunk
-
-    request = Request()
-    with pytest.raises(OverflowError, match="Request exceeds 7 bytes"):
-        asyncio.run(_read_limited_body(request, 7))
-    assert request.chunks_read == 2
-
-
-def test_streaming_body_reader_preserves_valid_payload():
-    class Request:
-        async def stream(self):
-            yield b'{"text":'
-            yield b'"hello"}'
-
-    assert asyncio.run(_read_limited_body(Request(), 64)) == b'{"text":"hello"}'
 
 
 def test_config_exports_model_loading_environment():
@@ -230,17 +93,13 @@ def test_compile_warmup_uses_heterogeneous_serving_path():
         precompiled_batch_sizes=[3],
         warmup_iterations=1,
     )
-    model.config.ner_config = {}
-    model.config.classification_config = {}
-    model.config.open_relex_config = None
     model.config.joint_relex_config = None
-    model.config.structuring_config = {"enabled": True}
 
     server._compile_and_warmup()
 
     assert model.compiled is True
-    texts, kwargs = model.calls[0]
-    assert texts == [
+    rows, kwargs = model.calls[0]
+    assert [row["text"] for row in rows] == [
         "GLiFormer serving warmup sample 0.",
         "GLiFormer serving warmup sample 1.",
         "GLiFormer serving warmup sample 2.",
@@ -282,14 +141,6 @@ def test_sequence_packing_falls_back_for_unverified_backbone(caplog):
     assert "unverified backbone" in caplog.text
 
 
-def test_observed_length_counts_nested_task_schemas():
-    server, _ = make_server(calibration_min_seq_len=1, max_model_len=100)
-    length = server.observed_seq_len(
-        [{"text": "one two", "structures": {"person record": ["full name", "age"]}}]
-    )
-    assert length == 7
-
-
 def test_health_reports_loaded_server_state():
     server, _ = make_server()
     health = server.health()
@@ -298,190 +149,149 @@ def test_health_reports_loaded_server_state():
     assert health["polylora"] is False
 
 
-def test_metadata_reports_model_variant_limits_and_adapter_state():
-    server, _ = make_server(max_batch_size=7)
-    metadata = server.metadata()
-    assert metadata["model_variant"] == "text"
-    assert metadata["limits"]["max_batch_size"] == 7
-    assert metadata["polylora"]["enabled"] is False
-    assert metadata["sequence_packing"] == {
-        "requested": False,
-        "enabled": False,
-        "max_length": None,
-    }
+def test_streaming_body_reader_stops_before_buffering_oversized_request():
+    class Request:
+        chunks_read = 0
+
+        async def stream(self):
+            for chunk in (b"1234", b"5678", b"must-not-be-read"):
+                self.chunks_read += 1
+                yield chunk
+
+    request = Request()
+    with pytest.raises(OverflowError, match="Request exceeds 7 bytes"):
+        asyncio.run(_read_limited_body(request, 7))
+    assert request.chunks_read == 2
 
 
-def test_embedding_is_json_serializable_and_uses_batched_api():
-    server, model = make_server()
-    result = server.predict(["one", "two"], embed=True)
-    assert result == {"embedding": [[0.0, 1.0], [1.0, 1.0]]}
-    assert model.calls[0][1]["adapter_ids"] is None
-
-
-def test_embedding_payloads_isolate_errors_and_preserve_order():
-    server, _ = make_server()
-    results = server.predict_embedding_payloads(
-        [
-            {"text": "one"},
-            {"text": "bad", "entities": ["not-allowed"]},
-            {"text": "two"},
-        ],
-        isolate_errors=True,
-    )
-    assert results[0] == {"embedding": [0.0, 1.0]}
-    assert results[1]["status"] == 400
-    assert results[2] == {"embedding": [1.0, 1.0]}
-
-
-def test_embedding_cuda_oom_retries_with_smaller_minibatches(monkeypatch):
-    server, model = make_server(max_batch_size=4)
-    batch_sizes = []
-
-    def embed_text(texts, **kwargs):
-        batch_sizes.append(kwargs["batch_size"])
-        if kwargs["batch_size"] > 1:
-            raise torch.cuda.OutOfMemoryError("synthetic")
-        return torch.ones(len(texts), 2)
-
-    monkeypatch.setattr(model, "embed_text", embed_text)
-    results = server.predict_embedding_payloads(
-        [{"text": "one"}, {"text": "two"}]
-    )
-    assert batch_sizes == [2, 1]
-    assert results == [
-        {"embedding": [1.0, 1.0]},
-        {"embedding": [1.0, 1.0]},
-    ]
-
-
-def test_payload_validation_rejects_unknown_fields_and_missing_tasks():
-    server, _ = make_server()
-    with pytest.raises(ValueError, match="Unsupported request fields"):
-        server.validate_payload({"text": "hello", "entities": ["x"], "unsafe": True})
-    with pytest.raises(ValueError, match="task schema"):
-        server.validate_payload({"text": "hello"})
-    with pytest.raises(ValueError, match="Unsupported request fields"):
-        server.validate_payload({
-            "text": "hello",
-            "structures": {"record": ["field"]},
-            "return_anchor_diagnostics": True,
-        })
-
-
-def test_batch_validation_errors_are_isolated_from_valid_requests():
-    server, model = make_server()
-    results = server.predict_payloads(
-        [
-            {"text": "bad"},
-            {"text": "Alice", "entities": ["person"]},
-            {"text": "unknown", "entities": ["person"], "adapter_id": "missing"},
-        ],
-        isolate_errors=True,
-    )
-    assert results[0]["status"] == 400
-    assert results[1]["entities"]["text"] == "Alice"
-    assert results[2]["status"] == 404
-    assert model.calls[0][0] == ["Alice"]
-
-
-def test_processor_error_falls_back_to_individual_requests(monkeypatch):
-    server, model = make_server()
-    original = model.inference_requests
-
-    def inference_requests(requests, **kwargs):
-        if any(request["text"] == "bad" for request in requests):
-            if len(requests) > 1:
-                raise ValueError("one schema is invalid")
-            if requests[0]["text"] == "bad":
-                raise ValueError("bad schema")
-        return original(requests, **kwargs)
-
-    monkeypatch.setattr(model, "inference_requests", inference_requests)
-    results = server.predict_payloads(
-        [
-            {"text": "good", "entities": ["person"]},
-            {"text": "bad", "entities": ["person"]},
-        ],
-        isolate_errors=True,
-    )
-    assert results[0]["entities"]["text"] == "good"
-    assert results[1]["status"] == 400
-
-
-def test_payload_validation_caps_simple_label_schemas():
-    server, _ = make_server(max_labels=2)
-    payload = server.validate_payload(
-        {"text": "hello", "entities": ["a", "b", "c"], "classes": {"x": [], "y": [], "z": []}}
-    )
-    assert payload["entities"] == ["a", "b"]
-    assert list(payload["classes"]) == ["x", "y"]
-
-
-def test_factory_expands_per_text_schemas_and_adapters():
-    tasks = GLiFormerFactory._tasks_for_items(
-        {
-            "entities": [["person"], ["location"]],
-            "adapter_id": ["legal", "finance"],
-            "threshold": 0.4,
-        },
-        2,
-    )
-    assert tasks == [
-        {"entities": ["person"], "adapter_id": "legal", "threshold": 0.4},
-        {"entities": ["location"], "adapter_id": "finance", "threshold": 0.4},
-    ]
-
-
-def test_factory_expands_complex_per_text_tasks():
-    tasks = GLiFormerFactory._tasks_for_items(
-        {
-            "threshold": 0.4,
-            "per_text_tasks": [
-                {"joint_relations": {"employment": {"entities": ["person"]}}},
-                {"structures": {"employee": ["name"]}},
-            ],
-        },
-        2,
-    )
-    assert tasks == [
-        {
-            "threshold": 0.4,
-            "joint_relations": {"employment": {"entities": ["person"]}},
-        },
-        {"threshold": 0.4, "structures": {"employee": ["name"]}},
-    ]
-
-
-def test_factory_expands_explicit_per_text_complex_schemas():
-    tasks = GLiFormerFactory._tasks_for_items(
-        {
-            "joint_relations": PerText([{"employment": {}}, None]),
-            "structures": PerText([None, {"employee": ["name"]}]),
-        },
-        2,
-    )
-    assert tasks == [
-        {"joint_relations": {"employment": {}}, "structures": None},
-        {"joint_relations": None, "structures": {"employee": ["name"]}},
-    ]
+def test_config_validates_thresholds_and_label_template():
+    with pytest.raises(ValueError):
+        GLiFormerServeConfig(default_thresholds={"span": 1.5})
+    with pytest.raises(ValueError):
+        GLiFormerServeConfig(label_template="{name}")
+    assert GLiFormerServeConfig().route_prefix == "/v1"
 
 
 def test_cuda_oom_retries_with_smaller_model_batch(monkeypatch):
     server, model = make_server(max_batch_size=2)
     batch_sizes = []
+    original = model.inference_requests
 
     def inference_requests(requests, **kwargs):
         batch_sizes.append(kwargs["batch_size"])
         if kwargs["batch_size"] > 1:
             raise torch.cuda.OutOfMemoryError("synthetic")
-        return [{"ner": [{"text": request["text"]}]} for request in requests]
+        return original(requests, **kwargs)
 
     monkeypatch.setattr(model, "inference_requests", inference_requests)
-    result = server.predict_payloads(
-        [
-            {"text": "one", "entities": ["item"]},
-            {"text": "two", "entities": ["item"]},
-        ]
-    )
+    outcomes = server.analyze_many([
+        body("Alice", {"p": {"type": "span", "labels": ["person"]}}),
+        body("Bob", {"p": {"type": "span", "labels": ["person"]}}),
+    ])
     assert batch_sizes == [2, 1]
-    assert [item["ner"][0]["text"] for item in result] == ["one", "two"]
+    assert [item["results"]["p"]["value"][0]["text"] for item in outcomes] == ["Alice", "Bob"]
+
+
+def test_rows_request_group_indices_and_reuse_the_collator():
+    server, model = make_server()
+    server.analyze(body("Alice", {"p": {"type": "span", "labels": ["person"]}}))
+    _, kwargs = model.calls[0]
+    assert kwargs["return_group_index"] is True
+    assert kwargs["inference_collator"] == {"return_tokens": True}
+
+
+def test_adapter_ids_reach_rows_and_embeddings(monkeypatch):
+    server, model = make_server()
+    monkeypatch.setattr(server, "ensure_adapter_loaded", lambda adapter_id: adapter_id)
+    server.analyze(body("Alice", {
+        "p": {"type": "span", "labels": ["person"]},
+        "v": {"type": "embedding"},
+    }, adapter_id="legal"))
+    rows, _ = model.calls[0]
+    assert rows[0]["adapter_id"] == "legal"
+    assert model.calls[1][1]["adapter_ids"] == ["legal"]
+
+
+# -- HTTP -------------------------------------------------------------------------
+
+
+def http_client(**overrides):
+    server, model = make_server(**overrides)
+
+    async def analyze_one(request_body):
+        return server.analyze_many([request_body])[0]
+
+    app = build_app(lambda: server, analyze_one, server.config.max_request_bytes)
+    return TestClient(app), server, model
+
+
+def test_http_analyze_and_errors():
+    client, _, _ = http_client(max_request_bytes=500)
+    ok = client.post("/analyze", json=body("Alice", {"p": {"type": "span", "labels": ["person"]}}))
+    assert ok.status_code == 200
+    assert ok.json()["results"]["p"]["value"][0]["source"] == ""
+
+    missing = client.post("/analyze", json={"model": "nope", "input": "x", "tasks": {"t": {"type": "span"}}})
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "MODEL_NOT_FOUND"
+
+    invalid = client.post("/analyze", json=body("x", {"t": {"type": "classify"}}))
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["path"] == "/tasks/t/labels"
+
+    broken = client.post("/analyze", content=b"{", headers={"content-type": "application/json"})
+    assert broken.status_code == 422 and broken.json()["error"]["code"] == "INVALID_REQUEST"
+
+    large = client.post("/analyze", json=body("x" * 600, {"t": {"type": "span"}}))
+    assert large.status_code == 413 and large.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
+
+
+def test_http_batch_models_capabilities_health():
+    client, _, _ = http_client()
+    batch = client.post("/analyze/batch", json={
+        "model": "test/gliformer",
+        "items": [
+            {"id": "a", "input": "Alice", "tasks": {"p": {"type": "span", "labels": ["person"]}}},
+            "not an object",
+        ],
+    })
+    assert batch.status_code == 200
+    items = batch.json()["items"]
+    assert items[0]["id"] == "a" and items[0]["results"]["p"]["value"]
+    assert items[1]["error"]["path"] == "/items/1"
+
+    bad_batch = client.post("/analyze/batch", json={"model": "test/gliformer", "items": []})
+    assert bad_batch.status_code == 422
+
+    assert client.get("/models").json() == {"data": [{"id": "test/gliformer", "aliases": []}]}
+    capabilities = client.get("/models/test/gliformer/capabilities")
+    assert capabilities.status_code == 200 and capabilities.json()["model"] == "test/gliformer"
+    assert client.get("/models/other/capabilities").status_code == 404
+    assert client.get("/health").json()["status"] == "ok"
+    assert client.get("/ready").status_code == 200
+    assert client.get("/adapter-cache").json()["enabled"] is False
+
+
+def test_unexpected_exceptions_become_internal_errors(monkeypatch):
+    client, server, _ = http_client()
+    monkeypatch.setattr(server, "models", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    client = TestClient(client.app, raise_server_exceptions=False)
+    response = client.get("/models")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "INTERNAL"
+
+
+def test_api_error_serialization():
+    error = APIError("INPUT_TOO_LONG", "too long", "/input", {"tokens": 9})
+    assert error.status == 413
+    assert error.to_dict() == {"error": {
+        "code": "INPUT_TOO_LONG", "message": "too long", "path": "/input", "details": {"tokens": 9},
+    }}
+    assert error.with_prefix("/items/3").path == "/items/3/input"
+    with pytest.raises(ValueError):
+        APIError("NOPE", "x")
+
+
+def test_health_lists_task_types():
+    server, _ = make_server(FakeGLiFormer(embedding=False))
+    assert "embedding" not in server.health()["task_types"]

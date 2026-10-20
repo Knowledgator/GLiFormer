@@ -30,6 +30,16 @@ def _parse_str_list(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_thresholds(value: str) -> dict[str, float]:
+    thresholds = {"classify": 0.5, "span": 0.5, "relation": 0.5, "json": 0.5}
+    for item in _parse_str_list(value):
+        name, sep, number = item.partition("=")
+        if not sep:
+            raise argparse.ArgumentTypeError("thresholds must look like 'span=0.4,classify=0.5'")
+        thresholds[name.strip()] = float(number)
+    return thresholds
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Start GLiFormer Ray Serve deployment",
@@ -41,6 +51,17 @@ def main() -> None:
         "--model",
         default="knowledgator/gliformer-base-v1",
         help="Hugging Face model id or local model directory",
+    )
+    model_group.add_argument(
+        "--model-id",
+        default=None,
+        help="Public model ID reported by the API (defaults to --model)",
+    )
+    model_group.add_argument(
+        "--model-alias",
+        action="append",
+        default=[],
+        help="Extra name accepted in the request 'model' field; repeatable",
     )
     model_group.add_argument(
         "--device", default="cuda", help="Model device (cuda, cuda:N, or cpu)"
@@ -66,15 +87,36 @@ def main() -> None:
         "--max-labels", type=int, default=-1, help="Maximum labels per simple task (-1 unlimited)"
     )
     limits_group.add_argument(
-        "--max-text-chars", type=int, default=1_000_000, help="Maximum request text length"
+        "--max-input-chars", type=int, default=1_000_000,
+        help="Maximum rendered input length in characters",
     )
     limits_group.add_argument(
-        "--max-request-bytes", type=int, default=2_000_000, help="Maximum HTTP body size"
+        "--max-request-bytes", type=int, default=10_000_000, help="Maximum HTTP body size"
+    )
+    limits_group.add_argument(
+        "--max-tasks", type=int, default=32, help="Maximum tasks per request (0 unlimited)"
+    )
+    limits_group.add_argument(
+        "--max-batch-items", type=int, default=256,
+        help="Maximum items per /analyze/batch request (0 unlimited)",
     )
 
-    threshold_group = parser.add_argument_group("Thresholds")
-    threshold_group.add_argument(
-        "--default-threshold", type=float, default=0.5, help="Default decoding threshold"
+    api_group = parser.add_argument_group("Analyze API")
+    api_group.add_argument(
+        "--default-thresholds",
+        type=_parse_thresholds,
+        default={"classify": 0.5, "span": 0.5, "relation": 0.5, "json": 0.5},
+        help="Per-type cutoffs used when a task sets no threshold, e.g. 'span=0.4,classify=0.5'",
+    )
+    api_group.add_argument(
+        "--label-template",
+        default="{title}",
+        help="Label text shown to the model, e.g. '{title}: {description}'",
+    )
+    api_group.add_argument(
+        "--render-task-names",
+        action="store_true",
+        help="Show task names to the model as group names",
     )
 
     replica_group = parser.add_argument_group("Replica Configuration")
@@ -125,7 +167,7 @@ def main() -> None:
 
     server_group = parser.add_argument_group("Server Configuration")
     server_group.add_argument(
-        "--route-prefix", default="/gliformer", help="Ray Serve HTTP route prefix"
+        "--route-prefix", default="/v1", help="HTTP route prefix of the analyze API"
     )
     server_group.add_argument("--port", type=int, default=8000, help="HTTP listen port")
     server_group.add_argument(
@@ -237,15 +279,21 @@ def main() -> None:
 
     config = GLiFormerServeConfig(
         model=args.model,
+        model_id=args.model_id,
+        model_aliases=args.model_alias,
         device=args.device,
         dtype=args.dtype,
         quantization=args.quantization,
         max_model_len=args.max_model_len,
         max_span_width=args.max_span_width,
         max_labels=args.max_labels,
-        max_text_chars=args.max_text_chars,
+        max_input_chars=args.max_input_chars,
         max_request_bytes=args.max_request_bytes,
-        default_threshold=args.default_threshold,
+        max_tasks=args.max_tasks,
+        max_batch_items=args.max_batch_items,
+        default_thresholds=args.default_thresholds,
+        label_template=args.label_template,
+        render_task_names=args.render_task_names,
         num_replicas=args.num_replicas,
         num_gpus_per_replica=num_gpus,
         num_cpus_per_replica=args.num_cpus_per_replica,
@@ -290,7 +338,7 @@ def main() -> None:
     print(f"Max batch size: {config.max_batch_size}")
     print(f"Precompiled batch sizes: {config.precompiled_batch_sizes}")
     print(f"Replicas: {config.num_replicas}")
-    print(f"Endpoint: http://0.0.0.0:{config.http_port}{config.route_prefix}")
+    print(f"Endpoint: POST http://0.0.0.0:{config.http_port}{config.route_prefix}/analyze")
     print(f"Compilation: {'enabled' if config.enable_compilation else 'disabled'}")
     print(f"Sequence packing: {'enabled' if config.enable_sequence_packing else 'disabled'}")
     print(f"FlashDeBERTa: {'enabled' if config.enable_flashdeberta else 'disabled'}")

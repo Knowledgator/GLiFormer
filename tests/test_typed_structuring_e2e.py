@@ -47,8 +47,9 @@ OUTPUTS = [
 ]
 
 
+@pytest.mark.parametrize("quantity_head", ["histogram", "regression"])
 @pytest.mark.parametrize("multi_level", [True, False])
-def test_typed_structuring_trains_and_decodes(multi_level):
+def test_typed_structuring_trains_and_decodes(multi_level, quantity_head):
     from gliformer import GLiFormer
     from gliformer.processing.collator import resolve_gliformer_collator_class
 
@@ -64,6 +65,7 @@ def test_typed_structuring_trains_and_decodes(multi_level):
         "structuring_config": {
             "multi_level": multi_level,
             "typed_fields": True,
+            "typed_quantity_head": quantity_head,
             "typed_num_bins": 32,
             "typed_readout_heads": 4,
             "anchor_layer": {"type": "fixed_transformer", "params": {"num_slots": 2}},

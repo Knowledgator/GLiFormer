@@ -590,8 +590,35 @@ class BaseGLiFormer(BaseGLiNER):
                     joint_relations=request.get("joint_relations"),
                     structures=request.get("structures"),
                 )
+            self._apply_request_prompts(item, request)
             input_x.append(item)
         return input_x
+
+    @staticmethod
+    def _apply_request_prompts(item: Dict[str, Any], request: Dict[str, Any]) -> None:
+        """Apply a row's ``prompt`` and per-group ``group_prompts``.
+
+        ``prompt`` behaves like ``inference(prompt=...)``: it becomes the
+        description of every entity/classification group and the structuring
+        prompt. ``group_prompts`` maps a group key (the key used in
+        ``entities``/``classes``/``joint_relations``) to ``{"name": ...,
+        "description": ...}``; ``name`` replaces the rendered group name
+        (``None`` renders no name) and ``description`` sets the group text.
+        """
+        prompt = request.get("prompt")
+        group_prompts = request.get("group_prompts") or {}
+        for group in (*item.get("extraction", ()), *item.get("classification", ())):
+            key = group.get("name")
+            override = group_prompts.get(key) if key is not None else None
+            if override:
+                if "description" in override:
+                    group["description"] = override["description"]
+                if "name" in override:
+                    group["name"] = override["name"]
+            if prompt:
+                group.setdefault("description", prompt)
+        if prompt and request.get("structures") is not None:
+            item.setdefault("prompt", prompt)
 
     def _build_pdf_inference_input(
         self,
@@ -1011,12 +1038,19 @@ class BaseGLiFormer(BaseGLiNER):
         inference_collator: Optional[Any] = None,
         objectness_threshold: Optional[float] = None,
         preserve_empty_records: bool = False,
+        return_group_index: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """Infer heterogeneous text/task schemas in shared model forwards.
 
         Task presence, schemas, adapters, and decoding controls may differ per
         row while the compatible rows share model forwards.
+
+        Besides the ``inference()`` task arguments, a row may carry
+        ``prompt``, ``group_prompts`` (see ``_apply_request_prompts``),
+        ``reference_date`` and ``decoder_kwargs``. With
+        ``return_group_index=True`` every entity and relation carries the
+        index of the extraction group it was decoded from.
         """
         if not requests:
             return []
@@ -1129,6 +1163,7 @@ class BaseGLiFormer(BaseGLiNER):
                 return_anchor_diagnostics=valid_requests[valid_index].get(
                     "return_anchor_diagnostics", False
                 ),
+                return_group_index=return_group_index,
             )
             requested_tasks = {
                 "ner": "entities",
@@ -1539,6 +1574,7 @@ class BaseGLiFormer(BaseGLiNER):
         ] = None,
         structuring_dedup: bool = True,
         return_anchor_diagnostics: bool = False,
+        **extra,
     ) -> Dict[str, List]:
         """Map decoded results back to original text indices and char positions."""
         return self.decoder.map_results(
@@ -1552,6 +1588,7 @@ class BaseGLiFormer(BaseGLiNER):
             structures=structures,
             structuring_dedup=structuring_dedup,
             return_anchor_diagnostics=return_anchor_diagnostics,
+            **extra,
         )
 
     # ── Per-task convenience methods ───────────────────────────────────

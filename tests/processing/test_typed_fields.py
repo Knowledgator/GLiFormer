@@ -275,3 +275,73 @@ class TestJsonSchema:
             "a": {"$type": "date"}
         }
         assert lookup_group_types(None, names=("x",)) == {}
+
+
+class TestRealWorldTemporalSpans:
+    """Spans as the decoder sees them: word tokens re-joined with spaces."""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("September 30 , 2024", "2024-09-30"),
+            ("Sept 9, 2024", "2024-09-09"),
+            ("14 - OCT - 2024", "2024-10-14"),
+            ("18 januari 2023", "2023-01-18"),
+            ("3. März 2024", "2024-03-03"),
+            ("Monday, 3 March 2024", "2024-03-03"),
+            ("2024-10-28T19", "2024-10-28"),
+        ],
+    )
+    def test_dates(self, text, expected):
+        spec = TypedFieldSpec(type="date")
+        assert spec.decode(spec.parse_text(text)) == expected
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("11 : 20 AM", "11:20"),
+            ("10 : 11 : 45", "10:11:45"),
+            ("14 : 30 EST", "14:30"),
+            ("16 : 10 PM", "16:10"),
+            ("2025-02-14T03 : 11 : 00 . 102Z", "03:11"),
+        ],
+    )
+    def test_times(self, text, expected):
+        spec = TypedFieldSpec(type="time")
+        assert spec.decode(spec.parse_text(text)) == expected
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("2024-10-22 09 : 14 : 02", "2024-10-22T09:14:02"),
+            ("14 January 2025 06 : 15", "2025-01-14T06:15:00"),
+            ("11 : 42 : 10 EST on November 3 , 2024", "2024-11-03T11:42:10"),
+            ("2024-11-03T11:42:10-05:00", "2024-11-03T11:42:10"),
+        ],
+    )
+    def test_datetimes_keep_wall_clock(self, text, expected):
+        spec = TypedFieldSpec(type="datetime")
+        assert spec.decode(spec.parse_text(text)) == expected
+
+    def test_context_supplies_missing_information(self):
+        context = "Rebooted on November 3, 2024. Failure logged at 11:42:10 EST; doors at 3:00 PM."
+        datetime_spec = TypedFieldSpec(type="datetime")
+        start = context.index("11:42")
+        assert datetime_spec.decode(
+            datetime_spec.parse_in_context("11 : 42 : 10 EST", context, start)
+        ) == "2024-11-03T11:42:10"
+        time_spec = TypedFieldSpec(type="time")
+        assert time_spec.decode(
+            time_spec.parse_in_context("3 : 00", context, context.index("3:00"))
+        ) == "15:00"
+
+    def test_day_first_detection_and_option(self):
+        spec = TypedFieldSpec(type="date")
+        context = "Received 25/03/2024, shipped 05/11/2024."
+        assert spec.decode(spec.parse_in_context("05/11/2024", context)) == "2024-11-05"
+        assert spec.decode(spec.parse_text("05/11/2024")) == "2024-05-11"
+        day_first = TypedFieldSpec.from_value({"$type": "date", "$dayfirst": True})
+        assert day_first.decode(day_first.parse_text("05/11/2024")) == "2024-11-05"
+        # Training accepts whichever order reproduces the gold value.
+        anchor = find_anchor("Meeting 05/11/2024.", spec, spec.encode("2024-11-05"))
+        assert anchor["x"] == spec.encode("2024-11-05")

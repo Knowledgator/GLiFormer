@@ -52,6 +52,44 @@ def unflatten_by_batch_origin(results: list, batch_origin: torch.Tensor, batch_s
     return output
 
 
+def apply_task_controls(kwargs: dict, task_controls, task_name: str) -> dict:
+    """Override decoder controls (``threshold``, ``multi_label``, ...) for one task.
+
+    ``task_controls`` maps task names to control overrides, e.g.
+    ``{"classification": {"threshold": -1.0, "multi_label": True}}``. It may
+    also be a B-aligned list of such mappings (``None`` entries keep the base
+    controls of that row).
+    """
+    if not task_controls:
+        return kwargs
+    if isinstance(task_controls, dict):
+        overrides = task_controls.get(task_name) or {}
+        return {**kwargs, **overrides} if overrides else kwargs
+    rows = list(task_controls)
+    keys = {
+        key
+        for row in rows
+        if row
+        for key in (row.get(task_name) or {})
+    }
+    if not keys:
+        return kwargs
+    merged = dict(kwargs)
+    for key in keys:
+        base = kwargs.get(key)
+        values = []
+        for index, row in enumerate(rows):
+            overrides = (row or {}).get(task_name) or {}
+            if key in overrides:
+                values.append(overrides[key])
+            elif isinstance(base, (list, tuple)):
+                values.append(base[index] if index < len(base) else None)
+            else:
+                values.append(base)
+        merged[key] = values
+    return merged
+
+
 class GLiFormerDecoder:
     """General decoder that delegates to per-task decoders for post-processing.
 
@@ -128,9 +166,11 @@ class GLiFormerDecoder:
         Returns:
             Dict mapping task name to decoded predictions.
         """
+        task_controls = kwargs.pop("task_controls", None)
         results = {}
         for name, decoder in self.task_decoders.items():
-            decoded = decoder.decode(model_output, classes_mapping=classes_mapping, **kwargs)
+            task_kwargs = apply_task_controls(kwargs, task_controls, name)
+            decoded = decoder.decode(model_output, classes_mapping=classes_mapping, **task_kwargs)
             if decoded is not None and decoded != []:
                 results[name] = decoded
         return results

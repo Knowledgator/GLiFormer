@@ -118,6 +118,7 @@ class NERDecoder(SpanDecoder):
         num_original: int,
         **kwargs,
     ) -> List[List[Dict]]:
+        return_group_index = bool(kwargs.get("return_group_index", False))
         output = [[] for _ in range(num_original)]
 
         for valid_i, per_text_groups in enumerate(task_results):
@@ -128,12 +129,14 @@ class NERDecoder(SpanDecoder):
 
             entities = []
             groups = per_text_groups if isinstance(per_text_groups, list) else [per_text_groups]
-            for group in groups:
+            for group_index, group in enumerate(groups):
                 if not isinstance(group, list):
                     group = [group]
                 for span in group:
                     mapped = self._map_span(span, start_map, end_map, text)
                     if mapped is not None:
+                        if return_group_index:
+                            mapped = {**mapped, "group_index": group_index}
                         entities.append(mapped)
 
             output[orig_i] = entities
