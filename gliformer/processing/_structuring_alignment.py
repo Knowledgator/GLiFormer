@@ -73,8 +73,11 @@ def _get_path(target: dict, path: tuple[str, ...]) -> object:
 
 def _field_value(field: dict, start_map, end_map, text: str) -> object:
     if "value" in field:
-        # Typed (class/quantity) fields carry their decoded value directly.
-        return deepcopy(field["value"])
+        # Typed (class/quantity) fields carry their decoded value directly;
+        # anchored quantities are re-parsed from the original text.
+        from .structuring_decoder import resolve_typed_field_value
+
+        return deepcopy(resolve_typed_field_value(field, start_map, end_map, text))
     start = int(field.get("start", 0))
     end = int(field.get("end", start))
     if 0 <= start < len(start_map) and 0 <= end < len(end_map):

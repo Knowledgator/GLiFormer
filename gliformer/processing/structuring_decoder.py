@@ -26,6 +26,45 @@ from .typed_fields import (
 )
 
 
+class _AnchoredQuantity:
+    """Decode a quantity relative to the value parsed from its anchor span.
+
+    Returns ``None`` when the anchor text cannot be parsed: an offset from an
+    unknown origin would be an arbitrary value, not a prediction.
+    """
+
+    def __init__(self, spec, probs, offsets):
+        self.spec = spec
+        self.probs = probs
+        self.offsets = offsets
+
+    def __call__(self, anchor_text, context=None, span_start=None):
+        origin = self.spec.parse_in_context(anchor_text or "", context, span_start)
+        if origin is None:
+            return None
+        return decode_quantity(self.spec, self.probs, self.offsets, origin=origin)
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def resolve_typed_field_value(field, start_map, end_map, text):
+    """Typed value of a decoded field, re-parsing its anchor from ``text``."""
+
+    decoder = field.get("decode_from_anchor")
+    if decoder is not None and text:
+        start, end = field.get("anchor_start", -1), field.get("anchor_end", -1)
+        if 0 <= start < len(start_map) and 0 <= end < len(end_map):
+            value = decoder(
+                text[start_map[start]:end_map[end]],
+                context=text,
+                span_start=start_map[start],
+            )
+            if value is not None:
+                return value
+    return field.get("value")
+
+
 @dataclass(frozen=True)
 class StructuringDecodeContext:
     """Validated batch/mask state shared by both structuring decoders."""
@@ -397,37 +436,50 @@ class StructuringDecoder(SpanDecoder):
                 if present <= presence_threshold:
                     continue
                 mode = int(origin_mode[group_idx, anchor, slot].item()) if origin_mode is not None else 0
-                origin = None
-                if not spec.bounded:
-                    if mode == ORIGIN_ANCHOR and anchor_entity is not None and span_idx is not None:
-                        entity = int(anchor_entity[group_idx, anchor, slot].item())
-                        if entity >= 0:
-                            anchor_text = self.resolve_span_text(
-                                texts,
-                                text_idx,
-                                int(span_idx[group_idx, entity, 0].item()),
-                                int(span_idx[group_idx, entity, 1].item()),
-                            )
-                            origin = spec.parse_text(anchor_text or "")
-                    if origin is None and mode in (ORIGIN_ANCHOR, ORIGIN_REFERENCE):
-                        origin = spec.reference_origin(reference_date)
-                    if origin is None:
-                        origin = spec.default_origin()
                 horizon = min(spec.horizon, probs.shape[3])
                 step_probs = probs[group_idx, anchor, slot, :horizon].tolist()
                 step_offsets = offsets[group_idx, anchor, slot, :horizon].tolist()
-                value = decode_quantity(
-                    spec,
-                    step_probs,
-                    step_offsets,
-                    origin=origin,
+                field = {"field": label, "score": present}
+                entity = (
+                    int(anchor_entity[group_idx, anchor, slot].item())
+                    if anchor_entity is not None else -1
                 )
-                entry["fields"].append({
-                    "field": label,
-                    "value": value,
-                    "text": str(value),
-                    "score": present,
-                })
+                if (
+                    not spec.bounded
+                    and mode == ORIGIN_ANCHOR
+                    and entity >= 0
+                    and span_idx is not None
+                ):
+                    start = int(span_idx[group_idx, entity, 0].item())
+                    end = int(span_idx[group_idx, entity, 1].item())
+                    decode_from_anchor = _AnchoredQuantity(spec, step_probs, step_offsets)
+                    # Tokens joined with spaces are a fallback; reconstruction
+                    # re-parses the anchor from the original text.
+                    value = decode_from_anchor(
+                        self.resolve_span_text(texts, text_idx, start, end)
+                    )
+                    field.update({
+                        "anchor_start": start,
+                        "anchor_end": end,
+                        "decode_from_anchor": decode_from_anchor,
+                    })
+                else:
+                    origin = None
+                    if not spec.bounded:
+                        if mode in (ORIGIN_ANCHOR, ORIGIN_REFERENCE):
+                            origin = spec.reference_origin(reference_date)
+                        if origin is None and not spec.temporal:
+                            origin = spec.default_origin()
+                    # An unbounded date/time with neither a span nor a
+                    # reference date has no usable origin; say so instead of
+                    # inventing a value around the default epoch.
+                    value = (
+                        None
+                        if origin is None and not spec.bounded
+                        else decode_quantity(spec, step_probs, step_offsets, origin=origin)
+                    )
+                field.update({"value": value, "text": "" if value is None else str(value)})
+                entry["fields"].append(field)
         return anchor_entries
 
     @staticmethod
@@ -691,6 +743,9 @@ class StructuringDecoder(SpanDecoder):
             if key not in target or target[key] is None:
                 target[key] = value
                 continue
+            if value is None:
+                # An empty field on another root adds nothing to a filled one.
+                continue
             existing = target[key]
             if isinstance(existing, dict) and isinstance(value, dict):
                 cls._merge_nested_result(existing, value)
@@ -898,7 +953,10 @@ class StructuringDecoder(SpanDecoder):
         if not isinstance(field, dict) or "field" not in field:
             return None
         if "value" in field:
-            return {"field": field["field"], "value": field["value"]}
+            return {
+                "field": field["field"],
+                "value": resolve_typed_field_value(field, start_map, end_map, text),
+            }
         st = field.get("start", 0)
         ed = field.get("end", 0)
         if st < len(start_map) and ed < len(end_map):

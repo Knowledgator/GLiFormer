@@ -340,7 +340,7 @@ class _HierarchyNormalizer:
         canonical_path = node_path + local_path
         label = self._field_label(group, canonical_path, node_path)
         shape = {"kind": "scalar", "typed": spec.kind}
-        if spec.kind == CLASS_KIND:
+        if spec.kind == CLASS_KIND and spec.multi:
             shape["empty"] = []
         if label not in group["field_paths"]:
             group["field_paths"][label] = list(canonical_path)

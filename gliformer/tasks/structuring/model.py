@@ -1461,7 +1461,7 @@ class StructuringHead(NERHead):
                     membership_logits,
                     entity_mask,
                     quantity_field_idx,
-                    float(threshold),
+                    float(getattr(self._typed_config(), "typed_anchor_threshold", 0.1)),
                 )
                 anchor_present = anchor_present & ~bounded[:, None, :]
                 origin = torch.where(

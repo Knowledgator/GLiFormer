@@ -1687,6 +1687,8 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     typed_presence_loss_coef: float = 1.0
     typed_class_threshold: float = 0.5
     typed_presence_threshold: float = 0.5
+    # Minimum field x membership probability for a span to anchor a quantity.
+    typed_anchor_threshold: float = 0.1
     # Training-time prompt augmentation for typed fields.
     typed_description_dropout: float = 0.3
     typed_shuffle_options: bool = True
@@ -1717,6 +1719,7 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
         for name in (
             "typed_class_threshold",
             "typed_presence_threshold",
+            "typed_anchor_threshold",
             "typed_description_dropout",
         ):
             value = float(getattr(self, name))

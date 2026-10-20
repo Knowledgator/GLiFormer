@@ -28,6 +28,7 @@ targets and decodes predictions.
 
 from __future__ import annotations
 
+import contextvars
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -116,6 +117,7 @@ SPEC_OPTION_KEYS = frozenset(
         "quantiles",
         "items",
         "base",
+        "dayfirst",
     }
 )
 DESCRIPTOR_OPTION_KEYS = frozenset(f"${key}" for key in SPEC_OPTION_KEYS)
@@ -222,7 +224,7 @@ DATE_RE = re.compile(
     re.IGNORECASE,
 )
 TIME_RE = re.compile(
-    r"\b\d{1,2}(?::\d{2}){1,2}(?:\s?[AaPp]\.?[Mm]\b)?(?!\d)"
+    r"(?<![\d:.])\d{1,2}(?::\d{2}){1,2}(?:\.\d+)?(?:\s?[AaPp]\.?[Mm]\b)?(?!\d)"
     r"|\b\d{1,2}\s?[AaPp]\.?[Mm]\b",
 )
 DATETIME_RE = re.compile(
@@ -247,6 +249,16 @@ _DATE_FORMATS = (
     "%m-%d-%Y",
     "%B %Y",
     "%b %Y",
+    "%d-%b-%Y",
+    "%d-%B-%Y",
+    "%d-%b-%y",
+    "%Y.%m.%d",
+    "%d %b %y",
+    "%b-%d-%Y",
+    "%A %d %B %Y",
+    "%A %B %d %Y",
+    "%a %d %b %Y",
+    "%a %b %d %Y",
 )
 
 
@@ -317,6 +329,8 @@ class TypedFieldSpec:
     stats: tuple[str, ...] = ()
     items: str | None = None
     base: str | None = None
+    # Day/month order of ambiguous numeric dates; None detects per document.
+    dayfirst: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -434,6 +448,7 @@ class TypedFieldSpec:
             ("$interval", self.interval),
             ("$items", self.items),
             ("$base", self.base),
+            ("$dayfirst", self.dayfirst),
         ):
             if value is not None:
                 result[key] = value
@@ -504,6 +519,7 @@ class TypedFieldSpec:
             stats=tuple(stats or ()),
             items=values.get("items"),
             base=values.get("base"),
+            dayfirst=values.get("dayfirst"),
             extra=extra,
         )
 
@@ -573,10 +589,61 @@ class TypedFieldSpec:
             return decode_value(x, "datetime")
         return decode_value(x, "time")
 
-    def parse_text(self, text: str) -> float | None:
+    def parse_text(self, text: str, *, dayfirst: bool | None = None) -> float | None:
         """Parse a span copied from the text into the real line."""
 
-        return parse_text_value(text, self.value_type, unit=self.unit)
+        return parse_text_value(
+            text,
+            self.value_type,
+            unit=self.unit,
+            dayfirst=self.dayfirst if self.dayfirst is not None else dayfirst,
+        )
+
+    def parse_in_context(
+        self,
+        span_text: str,
+        context: str | None = None,
+        span_start: int | None = None,
+    ) -> float | None:
+        """Parse an anchor span using its document for missing information.
+
+        The document decides day/month order, and a datetime anchor that
+        holds only a clock time takes the date written closest to it.
+        """
+
+        dayfirst = self.dayfirst if self.dayfirst is not None else detect_dayfirst(context)
+        if (
+            context
+            and span_start is not None
+            and self.value_type in {"time", "datetime"}
+            and not re.search(r"[AaPp]\.?[Mm]\b", span_text)
+        ):
+            # A span that stopped before its meridiem: "3:00" + " PM".
+            length = len(span_text)
+            if context[span_start:span_start + length] != span_text:
+                length = len(detokenize_span(span_text))
+            span_end = span_start + length
+            meridiem = re.match(r"\s?([AaPp]\.?[Mm])\b", context[span_end:span_end + 6])
+            if meridiem and re.search(r"\d:\d{2}\s*$|\d\s*$", span_text):
+                span_text = f"{span_text} {meridiem.group(1)}"
+        value = self.parse_text(span_text, dayfirst=dayfirst)
+        if value is not None or self.value_type != "datetime" or not context:
+            return value
+        seconds = parse_text_value(span_text, "time")
+        if seconds is None:
+            return None
+        position = span_start if span_start is not None else context.find(span_text)
+        best = None
+        for match in DATE_RE.finditer(context):
+            day = parse_text_value(match.group(0), "date", dayfirst=dayfirst)
+            if day is None:
+                continue
+            distance = abs(match.start() - max(position, 0))
+            if best is None or distance < best[0]:
+                best = (distance, day)
+        if best is None:
+            return None
+        return best[1] * 86400.0 + seconds
 
     # -- normalization -------------------------------------------------------
 
@@ -693,7 +760,9 @@ def _coerce_datetime(value: Any) -> datetime | None:
     else:
         return None
     if result.tzinfo is not None:
-        result = result.astimezone(timezone.utc).replace(tzinfo=None)
+        # Keep the wall-clock time the text shows ("11:42 EST" stays 11:42);
+        # converting to UTC would make written times and labels disagree.
+        result = result.replace(tzinfo=None)
     return result
 
 
@@ -782,14 +851,109 @@ def _unit_seconds(unit: str | None) -> float | None:
     return _SECONDS.get(str(unit).strip().lower())
 
 
+_FOREIGN_MONTHS = {
+    # German, Dutch, French, Spanish, Italian, Portuguese -> English.
+    "januar": "January", "januari": "January", "janvier": "January", "enero": "January",
+    "gennaio": "January", "janeiro": "January", "jänner": "January",
+    "februar": "February", "februari": "February", "février": "February", "fevrier": "February",
+    "febrero": "February", "febbraio": "February", "fevereiro": "February",
+    "märz": "March", "maerz": "March", "maart": "March", "mars": "March", "marzo": "March",
+    "março": "March", "marco": "March",
+    "april": "April", "avril": "April", "abril": "April", "aprile": "April",
+    "mai": "May", "mei": "May", "mayo": "May", "maggio": "May", "maio": "May",
+    "juni": "June", "juin": "June", "junio": "June", "giugno": "June", "junho": "June",
+    "juli": "July", "juillet": "July", "julio": "July", "luglio": "July", "julho": "July",
+    "august": "August", "augustus": "August", "août": "August", "aout": "August",
+    "agosto": "August",
+    "september": "September", "septembre": "September", "septiembre": "September",
+    "settembre": "September", "setembro": "September",
+    "oktober": "October", "octobre": "October", "octubre": "October", "ottobre": "October",
+    "outubro": "October",
+    "november": "November", "novembre": "November", "noviembre": "November",
+    "novembro": "November",
+    "dezember": "December", "december": "December", "décembre": "December",
+    "decembre": "December", "diciembre": "December", "dicembre": "December",
+    "dezembro": "December",
+}
+_FOREIGN_MONTH_RE = re.compile(
+    r"\b(" + "|".join(sorted(map(re.escape, _FOREIGN_MONTHS), key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+_ISO_DATE_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
+
+
 def _parse_date_text(text: str) -> date | None:
+    parsed = _parse_date_exact(text)
+    if parsed is not None:
+        return parsed
+    # A date inside a longer span: "2024-10-28T19:00", "Mon, 3 March 2024".
+    match = _ISO_DATE_RE.search(text)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            pass
+    normalized = _FOREIGN_MONTH_RE.sub(lambda m: _FOREIGN_MONTHS[m.group(1).lower()], text)
+    for candidate in DATE_RE.finditer(normalized):
+        if candidate.group(0).strip() != text.strip():
+            parsed = _parse_date_exact(candidate.group(0))
+            if parsed is not None:
+                return parsed
+    if normalized != text:
+        return _parse_date_exact(normalized)
+    return None
+
+
+# Day-first preference for ambiguous numeric dates ("05/11/2024"); set for
+# one parse by ``parse_text_value(..., dayfirst=...)``.
+_DAYFIRST: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "gliformer_typed_dayfirst", default=None
+)
+_MONTH_FIRST_FORMATS = ("%m/%d/%Y", "%m-%d-%Y")
+_DAY_FIRST_FORMATS = ("%d/%m/%Y", "%d-%m-%Y")
+_NUMERIC_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})(?!\d)")
+
+
+def detect_dayfirst(text: str | None) -> bool | None:
+    """Day/month order of a document's numeric dates, when it is decidable.
+
+    ``True`` if some date can only be day-first (``25/03/2024``), ``False``
+    if some date can only be month-first (``03/25/2024``), else ``None``.
+    """
+
+    if not text:
+        return None
+    day_first = month_first = False
+    for match in _NUMERIC_DATE_RE.finditer(text):
+        first, second = int(match.group(1)), int(match.group(2))
+        if first > 12 >= second:
+            day_first = True
+        elif second > 12 >= first:
+            month_first = True
+    if day_first != month_first:
+        return day_first
+    return None
+
+
+def _date_formats() -> tuple[str, ...]:
+    if not _DAYFIRST.get():
+        return _DATE_FORMATS
+    ordered = [fmt for fmt in _DATE_FORMATS if fmt not in _DAY_FIRST_FORMATS]
+    position = min(ordered.index(fmt) for fmt in _MONTH_FIRST_FORMATS)
+    return tuple(ordered[:position] + list(_DAY_FIRST_FORMATS) + ordered[position:])
+
+
+def _parse_date_exact(text: str) -> date | None:
+    text = _FOREIGN_MONTH_RE.sub(lambda m: _FOREIGN_MONTHS[m.group(1).lower()], text)
     cleaned = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", text.strip())
     cleaned = re.sub(r"\bof\s+", "", cleaned)
-    cleaned = cleaned.replace("Sept", "Sep").replace(".", " ") if not re.fullmatch(
+    cleaned = re.sub(r"\bSept\b", "Sep", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace(".", " ") if not re.fullmatch(
         r"\d{1,2}\.\d{1,2}\.\d{4}", cleaned
     ) else cleaned
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,")
-    for fmt in _DATE_FORMATS:
+    cleaned = re.sub(r"\s+", " ", cleaned).replace(" ,", ",").strip(" ,")
+    cleaned = re.sub(r"^(\w+),\s", r"\1 ", cleaned)  # "Monday, 3 March 2024"
+    for fmt in _date_formats():
         try:
             return datetime.strptime(cleaned, fmt).date()
         except ValueError:
@@ -805,7 +969,7 @@ def _parse_date_text(text: str) -> date | None:
 
 def _parse_time_text(text: str) -> float | None:
     match = re.fullmatch(
-        r"\s*(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*([AaPp])?\.?(?:[Mm]\.?)?\s*",
+        r"\s*(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?(?:\.\d+)?\s*([AaPp])?\.?(?:[Mm]\.?)?\s*",
         text,
     )
     if not match or (match.group(2) is None and match.group(4) is None):
@@ -814,8 +978,10 @@ def _parse_time_text(text: str) -> float | None:
     minutes = int(match.group(2) or 0)
     seconds = int(match.group(3) or 0)
     meridiem = (match.group(4) or "").lower()
+    if meridiem and hours > 12:
+        meridiem = ""  # "16:10 PM": the 24-hour clock already says it
     if meridiem:
-        if not 1 <= hours <= 12:
+        if hours < 1:
             return None
         hours = hours % 12 + (12 if meridiem == "p" else 0)
     if hours > 23 or minutes > 59 or seconds > 59:
@@ -823,13 +989,48 @@ def _parse_time_text(text: str) -> float | None:
     return hours * 3600.0 + minutes * 60.0 + seconds
 
 
-def parse_text_value(text: str, value_type: str, *, unit: str | None = None) -> float | None:
-    """Parse free text (a tagged span) into a float of ``value_type``."""
+def detokenize_span(text: str) -> str:
+    """Undo word-splitting inside numbers, dates and times.
+
+    Decoded spans are rebuilt by joining word tokens with spaces, so
+    "11:20", "2024-10-28" and "14-OCT-2024" arrive as "11 : 20",
+    "2024 - 10 - 28" and "14 - OCT - 2024".
+    """
+
+    text = re.sub(r"(?<=\d)\s*([:/])\s*(?=\d)", r"\1", text)
+    text = re.sub(r"(?<=\w)\s*-\s*(?=\w)", "-", text)
+    text = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", text)
+    text = re.sub(r"(?<=\d)\s*T\s*(?=\d)", "T", text)
+    return text
+
+
+def parse_text_value(
+    text: str,
+    value_type: str,
+    *,
+    unit: str | None = None,
+    dayfirst: bool | None = None,
+) -> float | None:
+    """Parse free text (a tagged span) into a float of ``value_type``.
+
+    ``dayfirst`` resolves numeric dates such as ``05/11/2024``; ``None``
+    keeps month-first order.
+    """
+
+    token = _DAYFIRST.set(dayfirst)
+    try:
+        return _parse_text_value(text, value_type, unit=unit)
+    finally:
+        _DAYFIRST.reset(token)
+
+
+def _parse_text_value(text: str, value_type: str, *, unit: str | None = None) -> float | None:
 
     if not isinstance(text, str) or not text.strip():
         return None
     # Span text rebuilt from words can carry spaces around punctuation
     # ("March 3 , 2024", "$ 1 , 250"); undo that before parsing.
+    text = detokenize_span(text)
     text = re.sub(r"\s+([,.;:)%])", r"\1", text.strip())
     text = re.sub(r"([($])\s+", r"\1", text)
     text = re.sub(r"(\d),\s+(\d{3})\b", r"\1,\2", text)
@@ -857,22 +1058,35 @@ def parse_text_value(text: str, value_type: str, *, unit: str | None = None) -> 
         parsed = _parse_date_text(text)
         return float((parsed - _EPOCH_DATE).days) if parsed else None
     if value_type == "datetime":
+        try:
+            iso = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            iso = None
+        if iso is not None:
+            return float((iso.replace(tzinfo=None) - _EPOCH_DATETIME).total_seconds())
+        # A date and a clock time written apart in one span.
+        time_match = TIME_RE.search(text)
+        seconds = _parse_time_text(time_match.group(0)) if time_match else None
+        if seconds is not None:
+            remainder = text[: time_match.start()] + " " + text[time_match.end():]
+            day = _parse_date_text(remainder.strip(" ,;"))
+            if day is not None:
+                base = datetime.combine(day, clock_time()) - _EPOCH_DATETIME
+                return base.total_seconds() + seconds
         parsed = _coerce_datetime(text)
         if parsed is not None:
             return float((parsed - _EPOCH_DATETIME).total_seconds())
-        date_match = DATE_RE.search(text)
-        time_match = TIME_RE.search(text)
-        if date_match and time_match:
-            day = _parse_date_text(date_match.group(0))
-            seconds = _parse_time_text(time_match.group(0))
-            if day is not None and seconds is not None:
-                base = datetime.combine(day, clock_time()) - _EPOCH_DATETIME
-                return base.total_seconds() + seconds
         return None
     if value_type == "time":
         seconds = _parse_time_text(text)
         if seconds is not None:
             return seconds
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            moment = None
+        if moment is not None and ("T" in text or ":" in text):
+            return moment.hour * 3600.0 + moment.minute * 60.0 + moment.second
         match = TIME_RE.search(text)
         return _parse_time_text(match.group(0)) if match else None
     raise ValueError(f"Unsupported quantity type {value_type!r}")
@@ -969,12 +1183,21 @@ def find_anchor(
             evidence_regions.append((start, start + len(snippet)))
             start = text.find(snippet, start + 1)
 
+    detected = spec.dayfirst if spec.dayfirst is not None else detect_dayfirst(text)
+    orders = (detected,) if detected is not None else (None, True)
+
     def candidates(regions):
         for region_start, region_end in regions:
             region = text[region_start:region_end]
             for start, end in candidate_spans(region, value_type):
                 span_text = region[start:end]
-                parsed = spec.parse_text(span_text)
+                parsed = None
+                for dayfirst in orders:
+                    parsed = spec.parse_text(span_text, dayfirst=dayfirst)
+                    if matches(parsed):
+                        break
+                if parsed is None:
+                    parsed = spec.parse_in_context(span_text, text, region_start + start)
                 if parsed is not None:
                     yield span_text, region_start + start, region_start + end, parsed
 

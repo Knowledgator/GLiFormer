@@ -391,6 +391,9 @@ def select_inference_anchors(
     """Best tagged span per (slot, quantity field), or ``-1``.
 
     ``field_logits`` ``(G, E, C)``, ``membership_logits`` ``(G, A, E)``.
+    A span qualifies when field probability times membership probability
+    exceeds ``threshold``. Training always conditions anchored fields on a
+    span, so a weak anchor is a better origin than none.
     Returns entity indices ``(G, A, Cq)`` and their presence mask.
     """
 
@@ -407,9 +410,7 @@ def select_inference_anchors(
     )  # (G, E, Cq)
     member_probs = torch.sigmoid(membership_logits)  # (G, A, E)
     scores = member_probs.unsqueeze(-1) * field_probs.unsqueeze(1)  # (G, A, E, Cq)
-    member_ok = member_probs.gt(threshold).unsqueeze(-1)
-    field_ok = field_probs.gt(threshold).unsqueeze(1)
-    valid = member_ok & field_ok & entity_mask.bool()[:, None, :, None]
+    valid = scores.gt(threshold) & entity_mask.bool()[:, None, :, None]
     scores = scores.masked_fill(~valid, -1.0)
     best_score, best = scores.max(dim=2)  # (G, A, Cq)
     present = best_score.gt(0)
