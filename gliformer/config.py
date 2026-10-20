@@ -2105,6 +2105,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         vision_min_pixels: Optional[int] = None,
         vision_max_pixels: Optional[int] = None,
         freeze_native_vision: bool = True,
+        preserve_word_spaces: bool = False,
         **kwargs,
     ):
         # Load-only aliases for checkpoints written while the entity-first
@@ -2669,6 +2670,8 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.vision_min_pixels = vision_min_pixels
         self.vision_max_pixels = vision_max_pixels
         self.freeze_native_vision = freeze_native_vision
+        # Changes what the backbone reads, so a checkpoint must keep the value it was trained with.
+        self.preserve_word_spaces = preserve_word_spaces
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -2821,6 +2824,7 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "max_types",
         "max_len",
         "words_splitter_type",
+        "preserve_word_spaces",
         "num_rnn_layers",
         "fuse_layers",
         "embed_ent_token",

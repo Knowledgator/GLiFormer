@@ -28,6 +28,7 @@ from ..tasks.open_relex.processor import OpenRelexProcessor
 from ..tasks.structuring.processor import StructuringProcessor
 from ..tasks.vision.processor import VisionProcessor
 from ..utils import pair_2d
+from .word_spacing import restore_word_spaces, tokenizer_drops_word_spaces
 from .mappings import (
     BatchClassesMapping,
     CatClassMapping,
@@ -398,8 +399,20 @@ class TextProcessingMixin:
             ]
         return [self._preprocess_text_only(item) for item in batch_list]
 
+    def _restores_word_spaces(self) -> bool:
+        if not getattr(self.config, "preserve_word_spaces", False):
+            return False
+        if not hasattr(self, "_tokenizer_drops_word_spaces"):
+            self._tokenizer_drops_word_spaces = tokenizer_drops_word_spaces(self.transformer_tokenizer)
+        return self._tokenizer_drops_word_spaces
+
     def tokenize_inputs(self, texts, classes_mapping, **kwargs):
         input_texts, prompt_lengths = self.prepare_inputs(texts, classes_mapping, **kwargs)
+        if self._restores_word_spaces():
+            input_texts = [
+                words[:prompt_length] + restore_word_spaces(words[prompt_length:])
+                for words, prompt_length in zip(input_texts, prompt_lengths)
+            ]
 
         # ``max_len`` is also the encoder's sequence budget.  Capping the
         # word list alone is insufficient: a single word can expand to many

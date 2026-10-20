@@ -47,6 +47,7 @@ from .processing.collator import (
     GLiFormerVisionDataCollator,
     resolve_gliformer_collator_class,
 )
+from .processing.word_spacing import SpaceAwareWordsSplitter
 from .processing.schema import (
     GLiFormerSchema,
     build_structuring_output_formatter,
@@ -214,6 +215,8 @@ class BaseGLiFormer(BaseGLiNER):
 
         if words_splitter is None:
             words_splitter = WordsSplitter(config.words_splitter_type)
+        if getattr(config, "preserve_word_spaces", False):
+            words_splitter = SpaceAwareWordsSplitter(words_splitter)
 
         processor_cls = resolve_gliformer_processor_class(config)
         self.data_processor = processor_cls(
@@ -680,6 +683,7 @@ class BaseGLiFormer(BaseGLiNER):
         return_anchor_diagnostics: bool = False,
         inference_collator: Optional[Any] = None,
         images: Optional[Any] = None,
+        prompt: Optional[Union[str, List[Optional[str]]]] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -693,6 +697,11 @@ class BaseGLiFormer(BaseGLiNER):
                 text-only row) that the text is read together with. Needs a
                 model whose processor loads images, e.g.
                 ``vision_encoder_type='native'``.
+            prompt: Optional instruction, one for all texts or one per text,
+                placed in front of the labels of every entity and
+                classification group, the way training rows carry it in a
+                group's ``description``, and in front of every structuring
+                schema, the way training rows carry it in their ``prompt``.
             entities: NER entity types. ``List[str]`` for single group,
                 ``Dict[str, List[str]]`` for named groups.
             classes: Classification labels. Same format as entities.
@@ -750,6 +759,10 @@ class BaseGLiFormer(BaseGLiNER):
                 images = [images]
             if len(images) != num_original:
                 raise ValueError(f"images must contain one entry per text: expected {num_original}, got {len(images)}")
+        if prompt is None or isinstance(prompt, str):
+            prompt = [prompt] * num_original
+        elif len(prompt) != num_original:
+            raise ValueError(f"prompt must be one string or one per text: expected {num_original}, got {len(prompt)}")
 
         # Filter empty texts
         valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
@@ -797,10 +810,14 @@ class BaseGLiFormer(BaseGLiNER):
             joint_relations,
             structures,
         )
-        if images is not None:
-            for item, orig_idx in zip(input_x, valid_to_orig_idx):
-                if images[orig_idx] is not None:
-                    item["image"] = images[orig_idx]
+        for item, orig_idx in zip(input_x, valid_to_orig_idx):
+            if images is not None and images[orig_idx] is not None:
+                item["image"] = images[orig_idx]
+            if prompt[orig_idx]:
+                for group in (*item.get("extraction", ()), *item.get("classification", ())):
+                    group.setdefault("description", prompt[orig_idx])
+                if structures is not None:
+                    item.setdefault("prompt", prompt[orig_idx])
 
         # Create collator (inference mode: no labels)
         collator = inference_collator or self.create_inference_collator(return_tokens=True)

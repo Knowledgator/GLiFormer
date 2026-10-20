@@ -883,7 +883,10 @@ def build_model(model_cfg: dict, train_cfg: dict):
     prev_path = train_cfg.get("prev_path")
     if prev_path and str(prev_path).lower() not in ("none", "null", ""):
         print(f"Loading pretrained model from: {prev_path}")
-        model = GLiFormer.from_pretrained(prev_path)
+        model = GLiFormer.from_pretrained(
+            prev_path,
+            _attn_implementation=model_cfg.get("_attn_implementation"),
+        )
         validate_checkpoint_architecture(model, model_cfg)
         applied = apply_checkpoint_config_overrides(model, model_cfg)
         if applied:
@@ -975,6 +978,7 @@ def main(cfg_path: str, resume_from_checkpoint: str | bool | None = None):
             0.0,
         ),
         label_augmentation=train_cfg.get("label_augmentation"),
+        save_only_model=True,
         **training_kwargs,
     )
 
