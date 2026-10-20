@@ -372,6 +372,20 @@ class StructuringOutputFormatter:
         if isinstance(ft, _UnionFieldType):
             return self._convert_union_value(value, ft, schema_name, field_name)
 
+        typed = getattr(ft, "typed", None)
+        if typed is not None and typed.kind != "span":
+            # Class and quantity heads already return typed JSON values.
+            text_like = isinstance(value, str) or (
+                isinstance(value, dict) and "text" in value
+            )
+            if (
+                not text_like
+                or typed.kind == "class"
+                or typed.type in {"estimate", "forecast"}
+                or typed.value_type in {"time", "duration"}
+            ):
+                return value
+
         if ft.type_name == "list":
             return self._convert_list_value(value, ft)
 

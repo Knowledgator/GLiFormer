@@ -237,6 +237,25 @@ class StructuringDecoder(_BaseStructuringDecoder):
                         )
                     ),
                 })
+            if group_context and group_context.get("mapping") is not None:
+                anchor_entries = self._attach_typed_fields(
+                    anchor_entries,
+                    model_output,
+                    group_idx=batch_idx,
+                    text_idx=text_idx,
+                    struct_item=group_context.get("mapping"),
+                    reference_date=self._reference_date(classes_mapping, text_idx),
+                    texts=texts,
+                    span_idx=span_idx,
+                    objectness_logits=objectness_logits,
+                    class_threshold=resolve_batch_control(
+                        kwargs.get("typed_class_threshold"), text_idx, None
+                    ),
+                    presence_threshold=resolve_batch_control(
+                        kwargs.get("typed_presence_threshold"), text_idx, None
+                    ),
+                    output_mode=group_context.get("output_mode"),
+                )
             flat_results.append(
                 self._finalize_anchor_group(
                     anchor_entries,
@@ -254,6 +273,12 @@ class StructuringDecoder(_BaseStructuringDecoder):
             context.batch_origin,
             context.batch_size,
         )
+
+    def _reference_date(self, classes_mapping, text_idx):
+        mappings = self._task_structuring_mappings(classes_mapping) or []
+        if 0 <= text_idx < len(mappings):
+            return getattr(mappings[text_idx], "reference_date", None)
+        return None
 
 
 __all__ = ["StructuringDecoder"]

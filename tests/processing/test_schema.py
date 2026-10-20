@@ -585,7 +585,9 @@ def test_advanced_template_field_options_apply_defaults_and_enums():
     assert schema.to_inference_kwargs() == {
         "structures": {
             "mission": {
-                "fields": {"status": "", "mass": "", "scores": []},
+                # Typed (class/quantity) fields travel as their descriptor so
+                # a typed-field checkpoint can recover the type at the leaf.
+                "fields": {"status": "", "mass": {"$type": "number"}, "scores": []},
                 "children": {},
                 "required_fields": ["mass"],
             }

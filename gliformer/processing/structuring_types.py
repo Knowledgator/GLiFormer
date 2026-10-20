@@ -13,6 +13,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TypedDict
 
+from .typed_fields import (
+    DESCRIPTOR_OPTION_KEYS,
+    TypedFieldSpec,
+    normalize_typed_name,
+)
+
 
 class _MissingType:
     def __repr__(self) -> str:
@@ -53,9 +59,24 @@ TYPE_NAME_ALIASES = {
     "boolean": "bool",
     "date": "date",
     "datetime": "datetime",
+    "date-time": "datetime",
     "list": "list",
     "array": "list",
+    # Typed-head field types. They have no span-text converter; values come
+    # from the class and quantity heads and pass through formatting.
+    "class": "class",
+    "enum": "class",
+    "choice": "class",
+    "time": "time",
+    "duration": "duration",
+    "estimate": "estimate",
+    "forecast": "forecast",
 }
+
+# Types that only make sense with the typed heads, even without descriptors.
+TYPED_ONLY_TYPE_NAMES = frozenset(
+    {"class", "time", "duration", "estimate", "forecast"}
+)
 
 
 def normalize_type_name(type_name: str) -> str:
@@ -85,6 +106,7 @@ class FieldType:
         choices: list[Any] | tuple[Any, ...] | None = None,
         nullable: bool = False,
         description: str | None = None,
+        typed: TypedFieldSpec | None = None,
     ):
         self.type_name = (
             normalize_type_name(type_name)
@@ -99,6 +121,8 @@ class FieldType:
         self.choices = tuple(choices) if choices is not None else None
         self.nullable = bool(nullable)
         self.description = description
+        # Typed-head description (class options, bounds, statistics, ...).
+        self.typed = typed
         self.date_formats = date_formats or [
             "%Y-%m-%d",
             "%d/%m/%Y",
@@ -154,7 +178,7 @@ FIELD_DESCRIPTOR_KEYS = frozenset(
         "$nullable",
         "$description",
     }
-)
+) | DESCRIPTOR_OPTION_KEYS
 TEMPLATE_REQUIRED_KEY = "$required"
 
 
@@ -197,7 +221,24 @@ ListNodeFactory = Callable[[list[Any]], SchemaNode]
 
 def _is_field_descriptor(spec: Mapping[Any, Any]) -> bool:
     keys = set(spec)
-    return bool(keys & {"$type", "$items", "$enum"})
+    return bool(keys & {"$type", "$items", "$enum", "$options"})
+
+
+def _typed_from_descriptor(spec: Mapping[str, Any]) -> TypedFieldSpec | None:
+    """Typed-head spec for an explicit ``$type``/``$options`` descriptor."""
+
+    if "$type" not in spec and "$options" not in spec:
+        return None
+    try:
+        return TypedFieldSpec.from_value(
+            {
+                key: value
+                for key, value in spec.items()
+                if key not in {"$required", "$default", "$nullable"}
+            }
+        )
+    except ValueError as exc:
+        raise TypeError(f"Invalid typed structuring field: {exc}") from exc
 
 
 def _infer_enum_type(values: list[Any]) -> str:
@@ -267,6 +308,11 @@ def _configured_scalar_node(
             str(description) if description is not None else None
         )
         node.description = field_type.description
+    typed = _typed_from_descriptor(spec)
+    if typed is not None:
+        field_type.typed = typed
+        if typed.options and field_type.choices is None:
+            field_type.choices = tuple(typed.options)
     node.type_spec = field_type
     return node
 
@@ -312,6 +358,8 @@ def _schema_node_from_field_descriptor(
         return _configured_scalar_node(node, spec)
 
     raw_type = spec.get("$type")
+    if raw_type is None and "$options" in spec:
+        raw_type = "class"
     if raw_type is None:
         raw_type = _infer_enum_type(enum_values)
     node = schema_node_from_spec(
@@ -561,9 +609,33 @@ def schema_node_exemplar(node: SchemaNode) -> Any:
                 node.item or SchemaNode(NodeKind.SCALAR, type_spec="str")
             )
         ]
+    typed = schema_node_typed_spec(node)
+    if typed is not None and typed.kind != "span":
+        # The descriptor travels through the wire envelope so the processor
+        # can recover the class/quantity type at the leaf.
+        return typed.to_dict()
     if isinstance(node.type_spec, FieldType) and node.type_spec.type_name == "list":
         return []
     return ""
+
+
+def schema_node_typed_spec(node: SchemaNode) -> TypedFieldSpec | None:
+    """Typed-head spec of a scalar node (explicit or implied by its type)."""
+
+    if node.kind != NodeKind.SCALAR:
+        return None
+    type_spec = node.type_spec
+    typed = getattr(type_spec, "typed", None)
+    if typed is not None:
+        return typed
+    type_name = (
+        type_spec.type_name if isinstance(type_spec, FieldType) else type_spec
+    )
+    if isinstance(type_name, str) and normalize_typed_name(type_name) in (
+        TYPED_ONLY_TYPE_NAMES - {"class"}
+    ):
+        return TypedFieldSpec(type=type_name)
+    return None
 
 
 def parse_component_spec(
@@ -644,4 +716,5 @@ __all__ = [
     "schema_node_exemplar",
     "schema_node_from_descriptor",
     "schema_node_from_spec",
+    "schema_node_typed_spec",
 ]

@@ -15,8 +15,15 @@ from ._structuring_alignment import (
     make_multi_level_group_result,
     resolve_structuring_decoder,
 )
+from ._structuring_hierarchy import typed_field_layout
 from .structuring_processor import MULTI_LEVEL_ROOT_KEY
 from .structuring_types import is_structuring_descriptor
+from .typed_fields import (
+    ORIGIN_ANCHOR,
+    ORIGIN_REFERENCE,
+    TypedFieldSpec,
+    decode_quantity,
+)
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,14 @@ class StructuringDecoder(SpanDecoder):
         )
         self.anchor_relations_threshold = float(
             getattr(struct_cfg, "anchor_relations_threshold", 0.5)
+            if struct_cfg is not None else 0.5
+        )
+        self.typed_class_threshold = float(
+            getattr(struct_cfg, "typed_class_threshold", 0.5)
+            if struct_cfg is not None else 0.5
+        )
+        self.typed_presence_threshold = float(
+            getattr(struct_cfg, "typed_presence_threshold", 0.5)
             if struct_cfg is not None else 0.5
         )
         self.component = resolve_structuring_decoder(
@@ -247,6 +262,199 @@ class StructuringDecoder(SpanDecoder):
             id_to_fields=id_to_fields,
             multi_level_contexts=multi_level_contexts,
         )
+
+    def _attach_typed_fields(
+        self,
+        anchor_entries,
+        model_output,
+        *,
+        group_idx,
+        text_idx,
+        struct_item,
+        reference_date,
+        texts,
+        span_idx,
+        objectness_logits,
+        class_threshold=None,
+        presence_threshold=None,
+        output_mode=None,
+    ):
+        """Replace typed fields' anchor spans with decoded typed values.
+
+        Class and quantity values are attached to anchors that are records:
+        anchors with decoded spans or reliable presence. When no anchor of a
+        group qualifies (a schema of only typed fields), the most confident
+        active anchor carries them.
+        """
+
+        if struct_item is None:
+            return anchor_entries
+        self._convert_typed_list_items(anchor_entries, struct_item)
+        class_fields, quantity_fields = typed_field_layout(struct_item)
+        if not class_fields and not quantity_fields:
+            return anchor_entries
+        typed_labels = {label for label, _, _ in (*class_fields, *quantity_fields)}
+        class_logits = getattr(model_output, "structuring_typed_class_logits", None)
+        none_logits = getattr(model_output, "structuring_typed_class_none_logits", None)
+        probs = getattr(model_output, "structuring_typed_quantity_probs", None)
+        offsets = getattr(model_output, "structuring_typed_quantity_offsets", None)
+        presence = getattr(model_output, "structuring_typed_quantity_presence_logits", None)
+        anchor_entity = getattr(model_output, "structuring_typed_quantity_anchor_entity", None)
+        origin_mode = getattr(model_output, "structuring_typed_quantity_origin", None)
+        class_threshold = (
+            self.typed_class_threshold if class_threshold is None else float(class_threshold)
+        )
+        presence_threshold = (
+            self.typed_presence_threshold
+            if presence_threshold is None
+            else float(presence_threshold)
+        )
+
+        for entry in anchor_entries:
+            entry["fields"] = [
+                field for field in entry["fields"]
+                if field.get("field") not in typed_labels
+            ]
+        carriers = [
+            entry for entry in anchor_entries
+            if entry["fields"] or entry.get("presence_is_reliable")
+        ]
+        def confidence(entry):
+            if objectness_logits is None:
+                return (len(entry["fields"]), -entry["anchor_index"])
+            return (
+                float(objectness_logits[group_idx, entry["anchor_index"]].item()),
+                len(entry["fields"]),
+            )
+
+        if not carriers and anchor_entries:
+            carriers = [max(anchor_entries, key=confidence)]
+
+        # A raw object root is a single record: when several slots look like
+        # it, only the most confident one carries its typed values; otherwise
+        # merging the roots would turn every typed scalar into a list.
+        root_labels = set()
+        if output_mode == "object":
+            hierarchy = list(getattr(struct_item, "hierarchy", None) or [])
+            root_nodes = [node for node in hierarchy if not node.get("path")]
+            root_labels = {
+                field.get("label") if isinstance(field, dict) else field
+                for node in root_nodes
+                for field in node.get("fields") or []
+            } if hierarchy else typed_labels
+        root_carrier = max(carriers, key=confidence) if carriers and root_labels else None
+
+        def carries(entry, label):
+            return label not in root_labels or entry is root_carrier
+
+        for entry in carriers:
+            anchor = int(entry["anchor_index"])
+            if class_logits is not None:
+                for slot, (label, _field_id, spec) in enumerate(class_fields):
+                    if slot >= class_logits.shape[2]:
+                        break
+                    if not carries(entry, label):
+                        continue
+                    count = min(len(spec.options), class_logits.shape[3])
+                    logits = class_logits[group_idx, anchor, slot, :count].float()
+                    if spec.multi:
+                        scores = torch.sigmoid(logits)
+                        chosen = [
+                            spec.options[index]
+                            for index in range(count)
+                            if float(scores[index]) > class_threshold
+                        ]
+                        score = float(scores.max()) if count else 0.0
+                        value = chosen
+                    else:
+                        none = (
+                            none_logits[group_idx, anchor, slot].float().reshape(1)
+                            if none_logits is not None
+                            else logits.new_full((1,), -1e4)
+                        )
+                        scores = torch.softmax(torch.cat([logits, none]), dim=-1)
+                        best = int(scores.argmax())
+                        score = float(scores[best])
+                        value = spec.options[best] if best < count else None
+                    entry["fields"].append({
+                        "field": label,
+                        "value": value,
+                        "text": "" if value is None else str(value),
+                        "score": score,
+                    })
+            if probs is None:
+                continue
+            for slot, (label, _field_id, spec) in enumerate(quantity_fields):
+                if slot >= probs.shape[2]:
+                    break
+                if not carries(entry, label):
+                    continue
+                present = (
+                    float(torch.sigmoid(presence[group_idx, anchor, slot]).item())
+                    if presence is not None
+                    else 1.0
+                )
+                if present <= presence_threshold:
+                    continue
+                mode = int(origin_mode[group_idx, anchor, slot].item()) if origin_mode is not None else 0
+                origin = None
+                if not spec.bounded:
+                    if mode == ORIGIN_ANCHOR and anchor_entity is not None and span_idx is not None:
+                        entity = int(anchor_entity[group_idx, anchor, slot].item())
+                        if entity >= 0:
+                            anchor_text = self.resolve_span_text(
+                                texts,
+                                text_idx,
+                                int(span_idx[group_idx, entity, 0].item()),
+                                int(span_idx[group_idx, entity, 1].item()),
+                            )
+                            origin = spec.parse_text(anchor_text or "")
+                    if origin is None and mode in (ORIGIN_ANCHOR, ORIGIN_REFERENCE):
+                        origin = spec.reference_origin(reference_date)
+                    if origin is None:
+                        origin = spec.default_origin()
+                horizon = min(spec.horizon, probs.shape[3])
+                step_probs = probs[group_idx, anchor, slot, :horizon].tolist()
+                step_offsets = offsets[group_idx, anchor, slot, :horizon].tolist()
+                value = decode_quantity(
+                    spec,
+                    step_probs,
+                    step_offsets,
+                    origin=origin,
+                )
+                entry["fields"].append({
+                    "field": label,
+                    "value": value,
+                    "text": str(value),
+                    "score": present,
+                })
+        return anchor_entries
+
+    @staticmethod
+    def _convert_typed_list_items(anchor_entries, struct_item):
+        """Parse spans of number/date list fields into typed item values."""
+
+        field_types = getattr(struct_item, "field_types", None) or {}
+        item_specs = {}
+        for label, raw in field_types.items():
+            spec = TypedFieldSpec.from_value(raw)
+            if spec.type == "list" and spec.items in {
+                "number", "date", "time", "datetime", "duration",
+            }:
+                item_specs[label] = TypedFieldSpec(
+                    type=spec.items, unit=spec.unit, integer=spec.integer,
+                    decimals=spec.decimals,
+                )
+        if not item_specs:
+            return
+        for entry in anchor_entries:
+            for field in entry["fields"]:
+                item_spec = item_specs.get(field.get("field"))
+                if item_spec is None or "value" in field:
+                    continue
+                parsed = item_spec.parse_text(str(field.get("text", "")))
+                if parsed is not None:
+                    field["value"] = item_spec.decode(parsed)
 
     def _spans_to_fields(self, spans, texts, batch_idx):
         """Convert Span objects to field dicts with text."""
@@ -689,6 +897,8 @@ class StructuringDecoder(SpanDecoder):
     def _map_field_to_value(field, start_map, end_map, text):
         if not isinstance(field, dict) or "field" not in field:
             return None
+        if "value" in field:
+            return {"field": field["field"], "value": field["value"]}
         st = field.get("start", 0)
         ed = field.get("end", 0)
         if st < len(start_map) and ed < len(end_map):

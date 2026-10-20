@@ -1665,11 +1665,64 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     objectness_focal_loss_alpha: Optional[float] = None
     objectness_focal_loss_gamma: Optional[float] = None
     objectness_focal_loss_prob_margin: Optional[float] = None
+    # Typed fields: class fields choose from ``[OPTION]`` labels rendered in
+    # the prompt; quantity fields (number, duration, date, time, datetime,
+    # estimate, forecast) are read from one histogram-plus-offset head.
+    # Off by default so existing checkpoints load without new parameters.
+    typed_fields: bool = False
+    option_token_index: int = -1
+    # True: use the ``[OPTION]`` marker embedding (bidirectional encoders).
+    # False: use the last token of the option label (causal decoders).
+    embed_option_token: bool = True
+    # Token ids that end an option label for ``embed_option_token=False``;
+    # filled by ``set_class_indices``.
+    typed_boundary_token_indices: Optional[list[int]] = None
+    # Histogram resolution over the unit interval of a quantity.
+    typed_num_bins: int = 256
+    typed_readout_heads: int = 8
+    typed_max_horizon: int = 64
+    typed_class_loss_coef: float = 1.0
+    typed_quantity_loss_coef: float = 1.0
+    typed_point_loss_coef: float = 1.0
+    typed_presence_loss_coef: float = 1.0
+    typed_class_threshold: float = 0.5
+    typed_presence_threshold: float = 0.5
+    # Training-time prompt augmentation for typed fields.
+    typed_description_dropout: float = 0.3
+    typed_shuffle_options: bool = True
+    typed_class_focal_loss_alpha: Optional[float] = None
+    typed_class_focal_loss_gamma: Optional[float] = None
 
     def __post_init__(self):
         super().__post_init__()
         if not isinstance(self.reuse_ner_head, bool):
             raise TypeError("reuse_ner_head must be a boolean")
+        self.typed_fields = bool(self.typed_fields)
+        if int(self.typed_num_bins) < 2:
+            raise ValueError("typed_num_bins must be at least 2")
+        self.typed_num_bins = int(self.typed_num_bins)
+        if not 1 <= int(self.typed_max_horizon) <= 1024:
+            raise ValueError("typed_max_horizon must be in [1, 1024]")
+        self.typed_max_horizon = int(self.typed_max_horizon)
+        for name in (
+            "typed_class_loss_coef",
+            "typed_quantity_loss_coef",
+            "typed_point_loss_coef",
+            "typed_presence_loss_coef",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            setattr(self, name, value)
+        for name in (
+            "typed_class_threshold",
+            "typed_presence_threshold",
+            "typed_description_dropout",
+        ):
+            value = float(getattr(self, name))
+            if not 0 <= value <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+            setattr(self, name, value)
         if self.assignment_loss_coef is None:
             self.assignment_loss_coef = float(self.span_loss_coef)
         if (
@@ -2032,6 +2085,8 @@ class GLiFormerConfig(BaseGLiNERConfig):
         structuring_child_token: str = "<<CHILD>>",
         structuring_end_token: str = "<<END>>",
         obj_token: str = "[OBJECT]",
+        # Marks one option of a typed structuring class field.
+        option_token: str = "[OPTION]",
         # Descriptive aliases for the marker-token parameters above. The
         # shorter names remain the serialized/public compatibility surface.
         entity_token: Optional[str] = None,
@@ -2654,6 +2709,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.child_token = child_token
         self.structuring_child_token = structuring_child_token
         self.structuring_end_token = structuring_end_token
+        self.option_token = option_token
         self.obj_token = obj_token
         self.obj_token_index = obj_token_index
         self.embed_obj_token = embed_obj_token
@@ -2856,6 +2912,7 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "child_token",
         "structuring_child_token",
         "structuring_end_token",
+        "option_token",
         "obj_token",
         "per_task_parents",
         "ner_parent_token",

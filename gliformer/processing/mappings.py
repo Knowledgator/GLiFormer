@@ -47,6 +47,9 @@ class StructuringItemMapping:
     # anchor's object type before applying parent→child relation scores.
     hierarchy: list[HierarchyNodeSpec] = field(default_factory=list)
     multi_level: bool = False
+    # label -> typed descriptor (``TypedFieldSpec.to_dict()``) for typed
+    # fields. Fields absent here are ordinary span (text) fields.
+    field_types: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -58,6 +61,9 @@ class StructuringClassMapping:
     # hierarchy results are unwrapped by shared structuring formatting.
     output_mode: OutputMode | str = "schemas"
     multi_level: bool = False
+    # Request reference date/datetime (ISO string) used as the origin of
+    # unanchored temporal quantities.
+    reference_date: Optional[str] = None
 
 
 @dataclass

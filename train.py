@@ -894,6 +894,15 @@ def build_model(model_cfg: dict, train_cfg: dict):
                 "Applied checkpoint-safe task overrides: "
                 + ", ".join(applied)
             )
+        structuring_cfg = model_cfg.get("structuring_config")
+        if isinstance(structuring_cfg, Mapping) and structuring_cfg.get("typed_fields"):
+            typed_settings = {
+                name: value
+                for name, value in structuring_cfg.items()
+                if name.startswith("typed_") or name == "embed_option_token"
+            }
+            if model.enable_typed_structuring(**typed_settings):
+                print("Added typed structuring fields ([OPTION] token and typed head)")
         return model
     print("Initializing model from config...")
     return GLiFormer.load_from_config(model_cfg)

@@ -47,6 +47,16 @@ _VARIANT_MODALITIES = {
     "omni": ("text", "vision", "audio"),
 }
 
+
+def _typed_structuring_kwargs(kwargs):
+    """Typed structuring tensors travel through ``**kwargs`` to the head."""
+
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key.startswith("structuring_typed_")
+    }
+
 _SET_PREDICTION_COUNT_KEYS = {
     "object_detection": "object_detection_count",
     "segmentation": "segmentation_count",
@@ -2095,6 +2105,25 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             ),
             structuring_span_idx=struct_out.extra.get("span_idx"),
             structuring_span_mask=struct_out.extra.get("span_mask"),
+            structuring_typed_class_logits=struct_out.extra.get("typed_class_logits"),
+            structuring_typed_class_none_logits=struct_out.extra.get(
+                "typed_class_none_logits"
+            ),
+            structuring_typed_quantity_probs=struct_out.extra.get(
+                "typed_quantity_probs"
+            ),
+            structuring_typed_quantity_offsets=struct_out.extra.get(
+                "typed_quantity_offsets"
+            ),
+            structuring_typed_quantity_presence_logits=struct_out.extra.get(
+                "typed_quantity_presence_logits"
+            ),
+            structuring_typed_quantity_anchor_entity=struct_out.extra.get(
+                "typed_quantity_anchor_entity"
+            ),
+            structuring_typed_quantity_origin=struct_out.extra.get(
+                "typed_quantity_origin"
+            ),
             embedding_logits=emb_out.logits,
             image_classification_logits=image_cls_out.logits,
             image_classification_batch_origin=flat_inputs_map["image_classification"].batch_origin if "image_classification" in flat_inputs_map else None,
@@ -2370,6 +2399,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             embedding_encodings=embedding_encodings,
             embedding_encoding_mask=embedding_encoding_mask,
             threshold=threshold, adjacency_threshold=adjacency_threshold,
+            **_typed_structuring_kwargs(kwargs),
         )
 
         # ── 2-3. Execute heads and collect outputs ─────────────────────
@@ -2590,6 +2620,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             embedding_encodings=embedding_encodings,
             embedding_encoding_mask=embedding_encoding_mask,
             threshold=threshold, adjacency_threshold=adjacency_threshold,
+            **_typed_structuring_kwargs(kwargs),
         )
         final_loss, head_outputs = self._execute_forward_heads(
             shared=shared,

@@ -60,6 +60,17 @@ class GLiFormerTextOutput(GLiFormerBaseOutput):
     structuring_anchor_relation_scores: Optional[torch.FloatTensor] = None
     structuring_span_idx: Optional[torch.LongTensor] = None
     structuring_span_mask: Optional[torch.Tensor] = None
+    # Typed fields, per (group, record slot, typed field):
+    # class logits (G, A, Cc, Kc) and single-choice "none" logits (G, A, Cc);
+    # quantity histograms/in-bin offsets (G, A, Cq, H, K), presence logits,
+    # chosen anchor entity (-1 for none) and origin mode (G, A, Cq).
+    structuring_typed_class_logits: Optional[torch.FloatTensor] = None
+    structuring_typed_class_none_logits: Optional[torch.FloatTensor] = None
+    structuring_typed_quantity_probs: Optional[torch.FloatTensor] = None
+    structuring_typed_quantity_offsets: Optional[torch.FloatTensor] = None
+    structuring_typed_quantity_presence_logits: Optional[torch.FloatTensor] = None
+    structuring_typed_quantity_anchor_entity: Optional[torch.LongTensor] = None
+    structuring_typed_quantity_origin: Optional[torch.LongTensor] = None
 
     embedding_logits: Optional[torch.FloatTensor] = None
 

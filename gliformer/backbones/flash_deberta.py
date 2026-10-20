@@ -204,6 +204,24 @@ def flash_attention_bias(
     return flash_with_bias(query, key, value, bias, False, sm_scale)
 
 
+@functools.lru_cache(maxsize=1)
+def disentangled_takes_tables() -> bool:
+    """Whether the installed disentangled kernel takes position tables.
+
+    flashdeberta 0.0.8 changed ``flash_attention_with_disentangled`` to take
+    the projected relative embeddings ``(1, H, 2 * att_span, D)`` and form the
+    c2p/p2c scores itself; 0.0.7 took the scores ``(B, H, L, 2 * att_span)``.
+    """
+    try:
+        from importlib.metadata import version
+
+        from packaging.version import Version
+
+        return Version(version("flashdeberta")) >= Version("0.0.8")
+    except Exception:  # pragma: no cover - depends on the environment
+        return True
+
+
 def flash_attention_disentangled(
     query: torch.Tensor,
     key: torch.Tensor,

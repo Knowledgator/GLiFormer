@@ -312,6 +312,8 @@ class BaseGLiFormer(BaseGLiNER):
 
         if self.config.structuring_config is not None:
             tokens.append(self.config.child_token)
+            if getattr(self.config.structuring_config, "typed_fields", False):
+                tokens.append(getattr(self.config, "option_token", "[OPTION]"))
             if getattr(self.config.structuring_config, "multi_level", False):
                 tokens.extend(
                     [
@@ -389,6 +391,22 @@ class BaseGLiFormer(BaseGLiNER):
             child_idx = _idx(self.config.child_token)
             self.config.structuring_config.child_token_index = child_idx
             self.config.child_token_index = child_idx
+            if getattr(self.config.structuring_config, "typed_fields", False):
+                self.config.structuring_config.option_token_index = _idx(
+                    getattr(self.config, "option_token", "[OPTION]")
+                )
+                boundary_tokens = [
+                    self.config.sep_token,
+                    self.config.struct_parent_token,
+                    self.config.structuring_child_token,
+                    self.config.structuring_end_token,
+                ]
+                unknown = tok.convert_tokens_to_ids(tok.unk_token) if tok.unk_token else None
+                self.config.structuring_config.typed_boundary_token_indices = [
+                    index
+                    for index in (_idx(token) for token in boundary_tokens if token)
+                    if index is not None and index != unknown
+                ]
 
         if (self.config.image_classification_config is not None
                 or self.config.object_detection_config is not None
@@ -410,7 +428,9 @@ class BaseGLiFormer(BaseGLiNER):
             if getattr(token_rep_layer, "resizes_labels_encoder_only", False):
                 self.config.vocab_size = new_num_tokens
             else:
+                old_num_tokens = int(self.config.vocab_size or 0)
                 model_embeds = token_rep_layer.resize_token_embeddings(new_num_tokens, None)
+                self._init_option_token_embedding(model_embeds, old_num_tokens)
                 self.config.vocab_size = model_embeds.num_embeddings
                 if hasattr(self.config, "encoder_config") and self.config.encoder_config is not None:
                     self.config.encoder_config.vocab_size = model_embeds.num_embeddings
@@ -418,6 +438,82 @@ class BaseGLiFormer(BaseGLiNER):
                     text_config = getattr(self.config.encoder_config, "text_config", None)
                     if text_config is not None:
                         text_config.vocab_size = model_embeds.num_embeddings
+
+    def enable_typed_structuring(self, **settings) -> bool:
+        """Add typed structuring fields to a loaded checkpoint.
+
+        Checkpoints trained before typed fields existed have no ``[OPTION]``
+        token and no typed head. This registers the token (its embedding row
+        starts as a copy of ``[FIELD]``), builds the typed head from
+        ``settings`` (any ``typed_*`` structuring option and
+        ``embed_option_token``), and rebuilds the structuring processor.
+        Returns ``True`` when the model changed.
+        """
+
+        struct_cfg = self.config.structuring_config
+        heads = getattr(self.model, "heads", {})
+        if struct_cfg is None or "structuring" not in heads:
+            raise ValueError("Typed fields need a model with a structuring head")
+        head = heads["structuring"]
+        already = bool(getattr(struct_cfg, "typed_fields", False)) and hasattr(head, "typed_head")
+        for name, value in settings.items():
+            if name.startswith("typed_") or name == "embed_option_token":
+                if name != "typed_fields":
+                    setattr(struct_cfg, name, value)
+        if already:
+            return False
+
+        struct_cfg.typed_fields = True
+        option_token = getattr(self.config, "option_token", None) or "[OPTION]"
+        self.config.option_token = option_token
+        tokenizer = self.data_processor.transformer_tokenizer
+        if option_token not in tokenizer.get_vocab():
+            tokenizer.add_tokens([option_token], special_tokens=True)
+        # Sets the option/boundary indices, grows the embedding table, and
+        # initializes the new row from [FIELD].
+        self.resize_embeddings()
+
+        parameter = next(head.parameters())
+        head._initialize_typed_fields(
+            struct_cfg,
+            int(self.config.hidden_size),
+            float(getattr(self.config, "dropout", 0.0)),
+        )
+        head.typed_head.to(device=parameter.device, dtype=parameter.dtype)
+
+        processor = self.data_processor
+        old = processor.task_processors.get("structuring")
+        if old is not None:
+            processor.task_processors["structuring"] = type(old)(
+                self.config,
+                tokenizer,
+                getattr(processor, "words_splitter", None),
+            )
+        return True
+
+    def _init_option_token_embedding(self, embeddings, old_num_tokens: int) -> None:
+        """Start a newly added ``[OPTION]`` row from the ``[FIELD]`` row.
+
+        Options are field-like prompt markers; copying an existing trained
+        marker avoids a random row when typed fields are enabled on top of an
+        existing checkpoint.
+        """
+
+        struct_cfg = self.config.structuring_config
+        if struct_cfg is None or not getattr(struct_cfg, "typed_fields", False):
+            return
+        weight = getattr(embeddings, "weight", None)
+        option_idx = int(getattr(struct_cfg, "option_token_index", -1))
+        child_idx = int(getattr(struct_cfg, "child_token_index", -1))
+        if (
+            weight is None
+            or option_idx < old_num_tokens
+            or not 0 <= option_idx < weight.shape[0]
+            or not 0 <= child_idx < weight.shape[0]
+        ):
+            return
+        with torch.no_grad():
+            weight[option_idx].copy_(weight[child_idx])
 
     def _build_inference_input(
         self,
@@ -460,6 +556,8 @@ class BaseGLiFormer(BaseGLiNER):
         task_processors = self.data_processor.task_processors.values()
         for tokens, request in zip(all_tokens, requests, strict=True):
             item: Dict[str, Any] = {"tokenized_text": tokens}
+            if request.get("reference_date") is not None:
+                item["reference_date"] = str(request["reference_date"])
             for processor in task_processors:
                 processor.contribute_inference_input(
                     item,
@@ -684,6 +782,7 @@ class BaseGLiFormer(BaseGLiNER):
         inference_collator: Optional[Any] = None,
         images: Optional[Any] = None,
         prompt: Optional[Union[str, List[Optional[str]]]] = None,
+        reference_date: Optional[Union[str, List[Optional[str]]]] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -702,6 +801,10 @@ class BaseGLiFormer(BaseGLiNER):
                 classification group, the way training rows carry it in a
                 group's ``description``, and in front of every structuring
                 schema, the way training rows carry it in their ``prompt``.
+            reference_date: Optional ISO date/datetime, one for all texts or
+                one per text. Typed date/datetime fields that are not read
+                from a span in the text are predicted relative to it (for
+                example "next Friday" in a dated letter).
             entities: NER entity types. ``List[str]`` for single group,
                 ``Dict[str, List[str]]`` for named groups.
             classes: Classification labels. Same format as entities.
@@ -763,6 +866,13 @@ class BaseGLiFormer(BaseGLiNER):
             prompt = [prompt] * num_original
         elif len(prompt) != num_original:
             raise ValueError(f"prompt must be one string or one per text: expected {num_original}, got {len(prompt)}")
+        if reference_date is None or not isinstance(reference_date, (list, tuple)):
+            reference_date = [reference_date] * num_original
+        elif len(reference_date) != num_original:
+            raise ValueError(
+                "reference_date must be one value or one per text: "
+                f"expected {num_original}, got {len(reference_date)}"
+            )
 
         # Filter empty texts
         valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
@@ -818,6 +928,8 @@ class BaseGLiFormer(BaseGLiNER):
                     group.setdefault("description", prompt[orig_idx])
                 if structures is not None:
                     item.setdefault("prompt", prompt[orig_idx])
+            if structures is not None and reference_date[orig_idx] is not None:
+                item["reference_date"] = str(reference_date[orig_idx])
 
         # Create collator (inference mode: no labels)
         collator = inference_collator or self.create_inference_collator(return_tokens=True)

@@ -71,7 +71,10 @@ def _get_path(target: dict, path: tuple[str, ...]) -> object:
     return cursor
 
 
-def _field_value(field: dict, start_map, end_map, text: str) -> str:
+def _field_value(field: dict, start_map, end_map, text: str) -> object:
+    if "value" in field:
+        # Typed (class/quantity) fields carry their decoded value directly.
+        return deepcopy(field["value"])
     start = int(field.get("start", 0))
     end = int(field.get("end", start))
     if 0 <= start < len(start_map) and 0 <= end < len(end_map):
@@ -793,6 +796,8 @@ class _AnchorAlignment:
                     (
                         _shape_array([], int(shape.get("rank", 1)))
                         if shape.get("kind") == "array"
+                        else deepcopy(shape["empty"])
+                        if "empty" in shape
                         else None
                     ),
                 )

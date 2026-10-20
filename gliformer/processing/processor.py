@@ -447,7 +447,21 @@ class TextProcessingMixin:
 
         label_enc = self.prepare_all_label_encoder_inputs(classes_mapping)
         tokenized_inputs.update(label_enc)
+        tokenized_inputs.update(self.prepare_all_typed_inputs(classes_mapping))
         return tokenized_inputs
+
+    def prepare_all_typed_inputs(self, classes_mapping):
+        """Label-free typed-field tensors (option indices, field kinds)."""
+
+        result = {}
+        if classes_mapping is None:
+            return result
+        use_labels_encoder = getattr(self, "labels_tokenizer", None) is not None
+        for proc in getattr(self, "task_processors", {}).values():
+            prepare = getattr(proc, "prepare_typed_inputs", None)
+            if prepare is not None:
+                result.update(prepare(classes_mapping, use_labels_encoder=use_labels_encoder))
+        return result
 
 
 class VisionProcessingMixin:

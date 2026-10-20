@@ -1,5 +1,6 @@
 """Shared tensor machinery for entity-first structuring."""
 
+import json
 import random
 from copy import deepcopy
 
@@ -12,9 +13,14 @@ from ._structuring_hierarchy import (
     MULTI_LEVEL_ROOT_KEY,
     NODE_ID_KEY,
     NODE_KEEP_KEY,
+    STRUCTURING_TYPES_KEY,
+    TYPED_ANCHORS_KEY,
+    TYPED_UNRESOLVED_KEY,
+    TYPED_VALUES_KEY,
     StructuringProcessorComponent,
     is_internal_instance_key,
     resolve_structuring_processor,
+    typed_field_layout,
 )
 from .label_augmentation import AugmentableLabelGroup
 from .mappings import (
@@ -22,6 +28,17 @@ from .mappings import (
     StructuringClassMapping,
     StructuringItemMapping,
 )
+from .typed_fields import (
+    QUANTITY_KIND,
+    TypedFieldSpec,
+    build_quantity_target,
+    find_anchor,
+    is_typed_descriptor,
+    lookup_group_types,
+)
+
+STRUCTURING_EVIDENCE_KEY = "structuring_evidence"
+_TYPED_PREPARED_FLAG = "_gliformer_structuring_typed_prepared"
 
 
 class StructuringProcessor(SpanProcessor):
@@ -47,6 +64,10 @@ class StructuringProcessor(SpanProcessor):
         self.task_config = getattr(config, self.config_attr, None)
         if self.task_config is None:
             raise ValueError(f"{self.config_attr} is required for {self.task_name}")
+        self.typed_enabled = bool(getattr(self.task_config, "typed_fields", False))
+        self.option_token = getattr(config, "option_token", "[OPTION]")
+        self.typed_num_bins = int(getattr(self.task_config, "typed_num_bins", 256))
+        self._typed_spec_cache = {}
 
         # Resolve the processing strategy independently of the prediction
         # slot width. Gold records remain a compact rectangular target axis;
@@ -73,6 +94,7 @@ class StructuringProcessor(SpanProcessor):
             data_key=self.data_key,
             schema_key=self.schema_key,
             meta_key=self.meta_key,
+            typed_fields=self.typed_enabled,
         )
         self.multi_level = bool(
             getattr(self.component, "multi_level", configured_multi_level)
@@ -163,6 +185,9 @@ class StructuringProcessor(SpanProcessor):
         enforce_limit=False,
     ):
         if instance.get(NODE_KEEP_KEY, False) and not enforce_limit:
+            return True
+        if instance.get(TYPED_VALUES_KEY):
+            # Class/quantity supervision does not depend on a visible span.
             return True
         for key, value in instance.items():
             if is_internal_instance_key(key):
@@ -278,6 +303,7 @@ class StructuringProcessor(SpanProcessor):
         for item in batch_list:
             self._ensure_task_payload(item)
             self.component.normalize_item(item)
+            self._prepare_typed_instances(item)
             structuring_data = item.get(self.data_key, {})
             structuring_schema = item.get(self.schema_key) or {}
             multi_meta = item.get(self.meta_key) or {}
@@ -300,6 +326,12 @@ class StructuringProcessor(SpanProcessor):
                 schema_field_names = self._structure_fields(
                     structuring_schema.get(data_key, [])
                 )
+                if not schema_field_names and not self.multi_level:
+                    # Declared typed fields describe the schema: keep their
+                    # order so training prompts match inference prompts.
+                    schema_field_names = list(
+                        self._raw_group_types(item, data_key, schema_name)
+                    )
                 for field_name in schema_field_names:
                     if field_name not in seen:
                         field_names.append(field_name)
@@ -311,6 +343,25 @@ class StructuringProcessor(SpanProcessor):
                         if field_name not in seen:
                             field_names.append(field_name)
                             seen.add(field_name)
+                raw_types = self._raw_group_types(item, data_key, schema_name)
+                typed_names = [
+                    *raw_types,
+                    *(
+                        label
+                        for instance in instances
+                        for label in (instance.get(TYPED_VALUES_KEY) or {})
+                    ),
+                ]
+                for field_name in typed_names:
+                    if field_name not in seen and (
+                        field_name in raw_types
+                    ):
+                        field_names.append(field_name)
+                        seen.add(field_name)
+                field_types = self._mapping_field_types(
+                    raw_types,
+                    training=shuffle_labels,
+                )
                 if shuffle_labels:
                     random.shuffle(field_names)
                 field_class_to_id = {name: idx for idx, name in enumerate(field_names)}
@@ -335,13 +386,344 @@ class StructuringProcessor(SpanProcessor):
                     data_key=data_key,
                     hierarchy=deepcopy(group_meta.get('hierarchy') or []),
                     multi_level=bool(group_meta),
+                    field_types=field_types,
                 ))
+            reference = item.get("reference_date")
             structuring_mapping.append(StructuringClassMapping(
                 items=item_mappings,
                 output_mode=multi_meta.get('output_mode', 'schemas'),
                 multi_level=bool(multi_meta),
+                reference_date=str(reference) if reference is not None else None,
             ))
         return structuring_mapping
+
+    # -- typed fields -------------------------------------------------------
+
+    def _spec(self, raw):
+        """Cached :class:`TypedFieldSpec` for a descriptor dictionary."""
+
+        if isinstance(raw, TypedFieldSpec):
+            return raw
+        key = json.dumps(raw, sort_keys=True, default=str)
+        spec = self._typed_spec_cache.get(key)
+        if spec is None:
+            spec = TypedFieldSpec.from_value(raw)
+            if len(self._typed_spec_cache) > 4096:
+                self._typed_spec_cache.clear()
+            self._typed_spec_cache[key] = spec
+        return spec
+
+    def _raw_group_types(self, item, data_key, schema_name=None):
+        """Typed descriptors (label -> dict) declared for one schema group."""
+
+        if not self.typed_enabled:
+            return {}
+        multi_meta = item.get(self.meta_key) or {}
+        for group in multi_meta.get('groups', []):
+            if group.get('data_key') == data_key:
+                return {
+                    label: (spec.to_dict() if isinstance(spec, TypedFieldSpec) else spec)
+                    for label, spec in (group.get('field_types') or {}).items()
+                }
+        raw = lookup_group_types(
+            item.get(STRUCTURING_TYPES_KEY),
+            names=tuple(
+                name for name in (schema_name, data_key, MULTI_LEVEL_ROOT_KEY)
+                if name is not None
+            ),
+        )
+        return {
+            str(label): self._spec(spec).to_dict()
+            for label, spec in raw.items()
+        }
+
+    def _mapping_field_types(self, raw_types, *, training):
+        """Copy typed descriptors, applying training-time prompt augmentation."""
+
+        result = {}
+        dropout = float(getattr(self.task_config, "typed_description_dropout", 0.0))
+        shuffle_options = bool(getattr(self.task_config, "typed_shuffle_options", False))
+        for label, raw in raw_types.items():
+            spec = dict(raw)
+            if training:
+                if spec.get("$description") and random.random() < dropout:
+                    spec.pop("$description", None)
+                if shuffle_options and spec.get("$options"):
+                    options = list(spec["$options"])
+                    random.shuffle(options)
+                    spec["$options"] = options
+            result[label] = spec
+        return result
+
+    def _prepare_typed_instances(self, item):
+        """Move class/quantity values of flat records beside their spans.
+
+        Multi-level normalization already stores typed values under
+        ``TYPED_VALUES_KEY``; flat records still carry them as ordinary keys.
+        """
+
+        if not self.typed_enabled or self.multi_level or item.get(_TYPED_PREPARED_FLAG):
+            return
+        structuring = item.get(self.data_key)
+        if not isinstance(structuring, dict):
+            return
+        for data_key, instances in structuring.items():
+            if not isinstance(instances, list):
+                continue
+            typed_labels = {
+                label
+                for label, raw in self._raw_group_types(item, data_key, data_key).items()
+                if self._spec(raw).kind != "span"
+            }
+            for instance in instances:
+                if not isinstance(instance, dict):
+                    continue
+                for label in typed_labels:
+                    # Label items are rebuilt after span resolution; by then a
+                    # quantity key holds its anchor span, not the gold value.
+                    if label not in instance or label in (
+                        instance.get(TYPED_VALUES_KEY) or {}
+                    ):
+                        continue
+                    value = instance.pop(label)
+                    if not is_typed_descriptor(value):
+                        instance.setdefault(TYPED_VALUES_KEY, {})[label] = value
+        item[_TYPED_PREPARED_FLAG] = True
+
+    def _group_evidence(self, item, data_key, schema_name):
+        evidence = item.get(STRUCTURING_EVIDENCE_KEY)
+        if not isinstance(evidence, dict):
+            return {}
+        for name in (schema_name, data_key, MULTI_LEVEL_ROOT_KEY):
+            group = evidence.get(name)
+            if isinstance(group, dict):
+                return group
+        return evidence
+
+    def _attach_quantity_anchors(self, item, text):
+        """Tag the span a quantity was read from as that field's span target.
+
+        A value copied from the text becomes an anchor with zero offset; the
+        quantity head then only has to learn the offset from it.
+        """
+
+        structuring = item.get(self.data_key, {})
+        multi_meta = item.get(self.meta_key) or {}
+        names = {
+            group.get('data_key'): group.get('name')
+            for group in multi_meta.get('groups', [])
+        }
+        for data_key, instances in structuring.items():
+            schema_name = names.get(data_key, data_key)
+            specs = {
+                label: self._spec(raw)
+                for label, raw in self._raw_group_types(item, data_key, schema_name).items()
+            }
+            if not specs:
+                continue
+            evidence = self._group_evidence(item, data_key, schema_name)
+            for instance in instances:
+                if not isinstance(instance, dict):
+                    continue
+                for label, gold in (instance.get(TYPED_VALUES_KEY) or {}).items():
+                    spec = specs.get(label)
+                    if (
+                        spec is None
+                        or spec.kind != QUANTITY_KIND
+                        or spec.bounded
+                        or spec.horizon > 1
+                    ):
+                        continue
+                    anchor = None
+                    explicit = gold.get("anchor") if isinstance(gold, dict) else None
+                    point = (
+                        gold.get("value", gold.get("median"))
+                        if isinstance(gold, dict)
+                        else gold
+                    )
+                    target_x = spec.encode(point) if not isinstance(point, list) else None
+                    if isinstance(explicit, dict) and "start" in explicit and "end" in explicit:
+                        start, end = int(explicit["start"]), int(explicit["end"])
+                        anchor_text = text[start:end]
+                        anchor_x = spec.parse_text(anchor_text)
+                        if anchor_x is not None:
+                            anchor = {
+                                "text": anchor_text,
+                                "start": start,
+                                "end": end,
+                                "x": anchor_x,
+                            }
+                    elif target_x is not None:
+                        snippets = evidence.get(label, ()) if isinstance(evidence, dict) else ()
+                        anchor = find_anchor(
+                            text,
+                            spec,
+                            target_x,
+                            snippets=snippets if isinstance(snippets, list) else (),
+                        )
+                    if anchor is not None:
+                        instance[label] = {
+                            "text": anchor["text"],
+                            "start": anchor["start"],
+                            "end": anchor["end"],
+                        }
+                        instance.setdefault(TYPED_ANCHORS_KEY, {})[label] = float(anchor["x"])
+                    elif target_x is not None:
+                        unresolved = instance.setdefault(TYPED_UNRESOLVED_KEY, [])
+                        if label not in unresolved:
+                            unresolved.append(label)
+
+    def _attach_list_item_spans(self, item, text):
+        """Ground number/date items of typed list fields on their source spans.
+
+        Lists such as ``{"$type": "list", "$items": "date"}`` hold normalized
+        values ("2024-03-03") that rarely occur verbatim. Each item is mapped
+        to the span it was read from; items without one mark the field so its
+        span loss is not trained as "nothing here".
+        """
+
+        structuring = item.get(self.data_key, {})
+        multi_meta = item.get(self.meta_key) or {}
+        names = {
+            group.get('data_key'): group.get('name')
+            for group in multi_meta.get('groups', [])
+        }
+        for data_key, instances in structuring.items():
+            schema_name = names.get(data_key, data_key)
+            list_specs = {}
+            for label, raw in self._raw_group_types(item, data_key, schema_name).items():
+                spec = self._spec(raw)
+                if spec.type == "list" and spec.items in {
+                    "number", "date", "time", "datetime", "duration",
+                }:
+                    list_specs[label] = TypedFieldSpec(
+                        type=spec.items, unit=spec.unit, integer=spec.integer,
+                        decimals=spec.decimals,
+                    )
+            if not list_specs:
+                continue
+            for instance in instances:
+                if not isinstance(instance, dict):
+                    continue
+                for label, item_spec in list_specs.items():
+                    values = instance.get(label)
+                    if not isinstance(values, list):
+                        continue
+                    grounded = []
+                    missing = False
+                    cursor = 0
+                    for value in values:
+                        if isinstance(value, dict) or (
+                            isinstance(value, str) and value and value in text
+                        ):
+                            grounded.append(value)
+                            continue
+                        target_x = item_spec.encode(value)
+                        anchor = (
+                            find_anchor(text[cursor:], item_spec, target_x, allow_offset=False)
+                            if target_x is not None
+                            else None
+                        )
+                        if anchor is None:
+                            missing = True
+                            continue
+                        grounded.append({
+                            "text": anchor["text"],
+                            "start": cursor + anchor["start"],
+                            "end": cursor + anchor["end"],
+                        })
+                        cursor += anchor["end"]
+                    instance[label] = grounded
+                    if missing:
+                        unresolved = instance.setdefault(TYPED_UNRESOLVED_KEY, [])
+                        if label not in unresolved:
+                            unresolved.append(label)
+
+    def typed_layout(self, struct_item):
+        """Class and quantity fields of one group in prompt order.
+
+        Returns ``(class_fields, quantity_fields)``; each entry is
+        ``(label, field_id, TypedFieldSpec)``.
+        """
+
+        if not self.typed_enabled:
+            return [], []
+        return typed_field_layout(struct_item, spec_factory=self._spec)
+
+    def prepare_typed_inputs(self, classes_mapping, use_labels_encoder=False):
+        """Label-free tensors the typed heads need at training and inference."""
+
+        if not self.typed_enabled:
+            return {}
+        mapping_list = self._mapping_list(classes_mapping)
+        layouts = [
+            (batch_idx, *self.typed_layout(struct_item))
+            for _flat, batch_idx, _group, struct_item in self._flat_structuring_iter(
+                classes_mapping
+            )
+        ]
+        if not any(class_fields or quantity_fields for _, class_fields, quantity_fields in layouts):
+            return {}
+        total_groups = len(layouts)
+        batch_size = len(mapping_list)
+        max_class = max((len(c) for _, c, _ in layouts), default=0)
+        max_options = max(
+            (len(spec.options) for _, c, _ in layouts for _, _, spec in c),
+            default=0,
+        )
+        max_quantity = max((len(q) for _, _, q in layouts), default=0)
+        tensors = {}
+        if max_class > 0 and max_options > 0:
+            class_field_idx = torch.zeros(total_groups, max_class, dtype=torch.long)
+            class_field_mask = torch.zeros(total_groups, max_class, dtype=torch.bool)
+            class_multi = torch.zeros(total_groups, max_class, dtype=torch.bool)
+            option_index = torch.zeros(total_groups, max_class, max_options, dtype=torch.long)
+            option_mask = torch.zeros(total_groups, max_class, max_options, dtype=torch.bool)
+            option_count = torch.zeros(batch_size, dtype=torch.long)
+            for group_idx, (batch_idx, class_fields, _) in enumerate(layouts):
+                for slot, (_label, field_id, spec) in enumerate(class_fields):
+                    class_field_idx[group_idx, slot] = field_id
+                    class_field_mask[group_idx, slot] = not use_labels_encoder
+                    class_multi[group_idx, slot] = spec.multi
+                    for option_slot in range(len(spec.options)):
+                        option_index[group_idx, slot, option_slot] = option_count[batch_idx]
+                        option_mask[group_idx, slot, option_slot] = not use_labels_encoder
+                        option_count[batch_idx] += 1
+            if use_labels_encoder:
+                option_count.zero_()
+            tensors.update({
+                "structuring_typed_class_field_idx": class_field_idx,
+                "structuring_typed_class_field_mask": class_field_mask,
+                "structuring_typed_class_multi": class_multi,
+                "structuring_typed_option_index": option_index,
+                "structuring_typed_option_mask": option_mask,
+                "structuring_typed_option_count": option_count,
+            })
+        if max_quantity > 0:
+            quantity_field_idx = torch.zeros(total_groups, max_quantity, dtype=torch.long)
+            quantity_field_mask = torch.zeros(total_groups, max_quantity, dtype=torch.bool)
+            quantity_horizon = torch.ones(total_groups, max_quantity, dtype=torch.long)
+            quantity_bounded = torch.zeros(total_groups, max_quantity, dtype=torch.bool)
+            quantity_reference = torch.zeros(total_groups, max_quantity, dtype=torch.bool)
+            for group_idx, (batch_idx, _, quantity_fields) in enumerate(layouts):
+                reference = getattr(mapping_list[batch_idx], "reference_date", None)
+                for slot, (_label, field_id, spec) in enumerate(quantity_fields):
+                    quantity_field_idx[group_idx, slot] = field_id
+                    quantity_field_mask[group_idx, slot] = True
+                    quantity_horizon[group_idx, slot] = spec.horizon
+                    quantity_bounded[group_idx, slot] = spec.bounded
+                    quantity_reference[group_idx, slot] = (
+                        not spec.bounded
+                        and spec.reference_origin(reference) is not None
+                    )
+            tensors.update({
+                "structuring_typed_quantity_field_idx": quantity_field_idx,
+                "structuring_typed_quantity_field_mask": quantity_field_mask,
+                "structuring_typed_quantity_horizon": quantity_horizon,
+                "structuring_typed_quantity_bounded": quantity_bounded,
+                "structuring_typed_quantity_reference": quantity_reference,
+            })
+        return tensors
 
     @staticmethod
     def _hierarchy_field_label(field):
@@ -448,10 +830,17 @@ class StructuringProcessor(SpanProcessor):
                     continue
                 data_key = struct_item.data_key or struct_item.name
                 positives = list(dict.fromkeys(
-                    field_name
-                    for instance in structuring_data.get(data_key, [])
-                    for field_name in instance
-                    if not is_internal_instance_key(field_name)
+                    [
+                        field_name
+                        for instance in structuring_data.get(data_key, [])
+                        for field_name in instance
+                        if not is_internal_instance_key(field_name)
+                    ]
+                    + [
+                        field_name
+                        for instance in structuring_data.get(data_key, [])
+                        for field_name in (instance.get(TYPED_VALUES_KEY) or {})
+                    ]
                 ))
 
                 def apply_labels(labels, struct_item=struct_item):
@@ -483,6 +872,7 @@ class StructuringProcessor(SpanProcessor):
                 field_token=self.child_token,
                 sep_token=self.sep_token,
                 use_labels_encoder=use_labels_encoder,
+                option_token=self.option_token if self.typed_enabled else None,
             ))
         return prompt
 
@@ -578,6 +968,12 @@ class StructuringProcessor(SpanProcessor):
         tokens_with_spans, _ = self._tokenize_text(item)
         if tokens_with_spans is None:
             return
+        if self.typed_enabled:
+            self._prepare_typed_instances(item)
+            if not text and item.get("tokenized_text"):
+                text = " ".join(item["tokenized_text"])
+            self._attach_quantity_anchors(item, text)
+            self._attach_list_item_spans(item, text)
 
         for schema_name, instances in list(structuring.items()):
             used_spans_by_field = {}
@@ -617,10 +1013,21 @@ class StructuringProcessor(SpanProcessor):
                             instance[field_name] = normalized[0]
                         else:
                             instance.pop(field_name, None)
+                anchors = instance.get(TYPED_ANCHORS_KEY)
+                if anchors:
+                    for label in list(anchors):
+                        if label not in instance:
+                            # The anchor text could not be mapped to tokens.
+                            anchors.pop(label)
+                            unresolved = instance.setdefault(TYPED_UNRESOLVED_KEY, [])
+                            if label not in unresolved:
+                                unresolved.append(label)
                 if any(
                     not is_internal_instance_key(key)
                     for key in instance
-                ) or instance.get(NODE_KEEP_KEY, False):
+                ) or instance.get(NODE_KEEP_KEY, False) or instance.get(
+                    TYPED_VALUES_KEY
+                ):
                     resolved_instances.append(instance)
             structuring[schema_name] = resolved_instances
         item[self.resolved_flag] = True
@@ -702,6 +1109,7 @@ class StructuringProcessor(SpanProcessor):
             else None
         )
 
+        group_instances = {}
         for flat_idx, batch_idx, _group_idx, struct_item in self._flat_structuring_iter(classes_mapping):
             structuring_batch_idx[flat_idx] = batch_idx
             structuring_data = batch_list[batch_idx].get(self.data_key, {})
@@ -726,6 +1134,7 @@ class StructuringProcessor(SpanProcessor):
                 enforce_limit=enforce_limit,
             )
             instances = sorted(instances, key=self._instance_sort_key)
+            group_instances[flat_idx] = (instances[:max_instances], item_limit)
             field_to_id = struct_item.field_class_to_id.class_to_id
             structuring_mask[flat_idx] = True
             structuring_count[flat_idx] = len(instances)
@@ -806,6 +1215,166 @@ class StructuringProcessor(SpanProcessor):
             result[self._tensor_key("relation_group_mask")] = (
                 structuring_relation_group_mask
             )
+        if self.typed_enabled:
+            result.update(self._create_typed_labels(
+                classes_mapping,
+                group_instances,
+                total_groups=total_groups,
+                max_instances=max_instances,
+                max_fields=max_fields,
+            ))
+        return result
+
+    @staticmethod
+    def _class_gold_labels(gold):
+        if gold is None:
+            return []
+        if isinstance(gold, (list, tuple)):
+            return [str(value) for value in gold if value is not None]
+        return [str(gold)]
+
+    def _create_typed_labels(
+        self,
+        classes_mapping,
+        group_instances,
+        *,
+        total_groups,
+        max_instances,
+        max_fields,
+    ):
+        """Targets for class and quantity fields on the gold-record axis.
+
+        Shapes (G groups, R gold records, Cc/Cq typed fields, Kc options,
+        H horizon steps, P quantile points):
+
+        * ``typed_class_targets``   (G, R, Cc, Kc) multi-hot option targets
+        * ``typed_class_unit_mask`` (G, R, Cc) record/field pairs with a label
+        * ``typed_quantity_levels`` / ``typed_quantity_values``
+          (G, R, Cq, H, P) quantile levels and their unit-space values
+        * ``typed_quantity_point``  (G, R, Cq, H) unit-space point value
+        * ``typed_quantity_presence`` (G, R, Cq) 1 present, 0 null
+        * ``typed_quantity_origin`` (G, R, Cq) absolute/reference/anchor mode
+        * ``typed_bio_field_mask``  (G, C) false where a value may sit in the
+          text in a form the codec could not find (do not train "no span")
+        """
+
+        mapping_list = self._mapping_list(classes_mapping)
+        layouts = {}
+        field_maps = {}
+        for flat_idx, batch_idx, _group, struct_item in self._flat_structuring_iter(
+            classes_mapping
+        ):
+            layouts[flat_idx] = (batch_idx, *self.typed_layout(struct_item))
+            field_maps[flat_idx] = struct_item.field_class_to_id.class_to_id
+        max_class = max((len(c) for _, c, _ in layouts.values()), default=0)
+        max_options = max(
+            (len(spec.options) for _, c, _ in layouts.values() for _, _, spec in c),
+            default=0,
+        )
+        max_quantity = max((len(q) for _, _, q in layouts.values()), default=0)
+        max_horizon = max(
+            (spec.horizon for _, _, q in layouts.values() for _, _, spec in q),
+            default=1,
+        )
+
+        bio_field_mask = torch.ones(total_groups, max(max_fields, 1), dtype=torch.bool)
+        class_targets = torch.zeros(
+            total_groups, max_instances, max(max_class, 1), max(max_options, 1)
+        )
+        class_unit_mask = torch.zeros(
+            total_groups, max_instances, max(max_class, 1), dtype=torch.bool
+        )
+        quantity_entries = []
+        max_points = 1
+
+        for flat_idx, (instances, item_limit) in group_instances.items():
+            batch_idx, class_fields, quantity_fields = layouts[flat_idx]
+            reference = getattr(mapping_list[batch_idx], "reference_date", None)
+            for inst_idx, instance in enumerate(instances):
+                typed_values = instance.get(TYPED_VALUES_KEY) or {}
+                for label in instance.get(TYPED_UNRESOLVED_KEY) or ():
+                    field_id = field_maps[flat_idx].get(label)
+                    if field_id is not None and field_id < bio_field_mask.shape[1]:
+                        bio_field_mask[flat_idx, field_id] = False
+                for slot, (label, _field_id, spec) in enumerate(class_fields):
+                    if label not in typed_values:
+                        continue
+                    gold = self._class_gold_labels(typed_values[label])
+                    option_ids = {option: index for index, option in enumerate(spec.options)}
+                    known = [option_ids[value] for value in gold if value in option_ids]
+                    if gold and not known:
+                        continue
+                    class_unit_mask[flat_idx, inst_idx, slot] = True
+                    for option_id in known:
+                        class_targets[flat_idx, inst_idx, slot, option_id] = 1.0
+                for slot, (label, _field_id, spec) in enumerate(quantity_fields):
+                    if label not in typed_values:
+                        continue
+                    gold = typed_values[label]
+                    anchor_x = None
+                    anchor = instance.get(label)
+                    if (
+                        label in (instance.get(TYPED_ANCHORS_KEY) or {})
+                        and isinstance(anchor, dict)
+                        and 0 <= anchor.get("start", -1) <= anchor.get("end", -1) < item_limit
+                    ):
+                        anchor_x = instance[TYPED_ANCHORS_KEY][label]
+                    mode, origin = spec.resolve_origin(anchor_x, reference)
+                    target = build_quantity_target(
+                        gold,
+                        spec,
+                        origin_mode=mode,
+                        origin=origin,
+                    )
+                    if target is None:
+                        continue
+                    max_points = max(
+                        max_points,
+                        max((len(points) for points in target.points), default=1),
+                    )
+                    quantity_entries.append((flat_idx, inst_idx, slot, target))
+
+        result = {
+            "structuring_typed_bio_field_mask": bio_field_mask,
+        }
+        if max_class > 0 and max_options > 0:
+            result["structuring_typed_class_targets"] = class_targets
+            result["structuring_typed_class_unit_mask"] = class_unit_mask
+        if max_quantity > 0:
+            shape = (total_groups, max_instances, max_quantity)
+            levels = torch.zeros(*shape, max_horizon, max_points)
+            values = torch.zeros(*shape, max_horizon, max_points)
+            point_mask = torch.zeros(*shape, max_horizon, max_points, dtype=torch.bool)
+            point_value = torch.zeros(*shape, max_horizon)
+            point_value_mask = torch.zeros(*shape, max_horizon, dtype=torch.bool)
+            presence = torch.zeros(*shape)
+            presence_mask = torch.zeros(*shape, dtype=torch.bool)
+            origin_mode = torch.zeros(*shape, dtype=torch.long)
+            for flat_idx, inst_idx, slot, target in quantity_entries:
+                presence_mask[flat_idx, inst_idx, slot] = True
+                origin_mode[flat_idx, inst_idx, slot] = target.origin_mode
+                if not target.present:
+                    continue
+                presence[flat_idx, inst_idx, slot] = 1.0
+                for step, points in enumerate(target.points[:max_horizon]):
+                    for point_idx, (level, u) in enumerate(points[:max_points]):
+                        levels[flat_idx, inst_idx, slot, step, point_idx] = level
+                        values[flat_idx, inst_idx, slot, step, point_idx] = u
+                        point_mask[flat_idx, inst_idx, slot, step, point_idx] = True
+                    point_u = target.point_u[step]
+                    if point_u is not None:
+                        point_value[flat_idx, inst_idx, slot, step] = point_u
+                        point_value_mask[flat_idx, inst_idx, slot, step] = True
+            result.update({
+                "structuring_typed_quantity_levels": levels,
+                "structuring_typed_quantity_values": values,
+                "structuring_typed_quantity_point_mask": point_mask,
+                "structuring_typed_quantity_point": point_value,
+                "structuring_typed_quantity_point_value_mask": point_value_mask,
+                "structuring_typed_quantity_presence": presence,
+                "structuring_typed_quantity_presence_mask": presence_mask,
+                "structuring_typed_quantity_origin": origin_mode,
+            })
         return result
 
     def create_span_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):

@@ -67,6 +67,29 @@ class NERHead(AnchoredSpanExtractionHead):
             mask = mask[:, :target_length]
         return tensor, mask
 
+    @staticmethod
+    def _apply_field_loss_mask(child_mask, field_loss_mask):
+        """Drop (row, field) cells whose targets are known to be incomplete.
+
+        ``field_loss_mask`` is ``(BN, C)`` and true where the field's BIO
+        labels can be trusted. Missing columns default to trusted.
+        """
+
+        if field_loss_mask is None or child_mask is None:
+            return child_mask
+        field_loss_mask = field_loss_mask.to(device=child_mask.device)
+        width = child_mask.shape[1]
+        if field_loss_mask.shape[1] < width:
+            field_loss_mask = torch.nn.functional.pad(
+                field_loss_mask.to(torch.bool),
+                (0, width - field_loss_mask.shape[1]),
+                value=True,
+            )
+        field_loss_mask = field_loss_mask[:, :width]
+        if field_loss_mask.shape[0] != child_mask.shape[0]:
+            return child_mask
+        return child_mask * field_loss_mask.to(child_mask.dtype)
+
     def _bio_loss(
         self,
         scores,
@@ -142,9 +165,14 @@ class NERHead(AnchoredSpanExtractionHead):
                 )
             )
             # NER has A=1 with all-ones anchor_mask → equivalent to word × child masking.
+            loss_child_mask = self._apply_field_loss_mask(
+                child_mask,
+                batch.get("ner_field_loss_mask"),
+            )
             loss = self._bio_loss(
                 scores=scores, labels=ner_labels.unsqueeze(1),
-                anchor_mask=anchor_mask, word_mask=word_mask, child_mask=child_mask,
+                anchor_mask=anchor_mask, word_mask=word_mask,
+                child_mask=loss_child_mask,
                 base_loss_fn=loss_fn,
             )
             if span_labels is not None and span_logits_out is not None:

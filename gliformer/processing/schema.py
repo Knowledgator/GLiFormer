@@ -29,6 +29,7 @@ from .structuring_types import (
     schema_node_exemplar,
     schema_node_from_descriptor,
     schema_node_from_spec,
+    schema_node_typed_spec,
 )
 
 _MISSING = MISSING
@@ -582,6 +583,12 @@ def _node_to_descriptor(
         ):
             # Primitive lists are scalar nodes, but their array shape must
             # survive serialization so decoding retains every field value.
+            preserve_field_shapes = True
+        elif (
+            (typed := schema_node_typed_spec(child)) is not None
+            and typed.kind != "span"
+        ):
+            # Typed fields serialize as descriptor exemplars.
             preserve_field_shapes = True
 
     required = _descriptor_required_fields(node)
