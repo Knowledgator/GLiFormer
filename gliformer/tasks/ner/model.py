@@ -152,7 +152,12 @@ class NERHead(AnchoredSpanExtractionHead):
                 logits, A=1, span_idx=span_idx, span_mask=span_mask,
                 threshold=threshold, labels=ner_labels,
             )
-            span_rep = self.span_rep_layer(words_embedding, span_idx)
+            span_rep = self._pool_spans(
+                self.span_rep_layer,
+                words_embedding,
+                span_idx,
+                self._span_token_source(self.span_rep_layer, shared, flat_inputs, batch),
+            )
             span_logits_out = torch.einsum("BND,BCD->BNC", span_rep, flat_inputs.child_embedding)
 
         loss = None

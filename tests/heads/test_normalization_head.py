@@ -74,7 +74,7 @@ def _labels():
 @pytest.mark.parametrize("encoder", ["pooled", "token_attention"])
 def test_supervised_temporal_loss_backpropagates(encoder):
     head = _head(span_encoder=encoder).train()
-    out = head(_shared(), {}, **_labels(), normalization_words_mask=_words_mask())
+    out = head(_shared(), {}, **_labels(), span_token_words=_words_mask())
     assert torch.isfinite(out.loss) and torch.isfinite(out.extra["temporal_loss"])
     out.loss.backward()
     grads = [p.grad for p in head.temporal.parameters()]

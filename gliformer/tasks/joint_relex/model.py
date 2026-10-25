@@ -13,7 +13,6 @@ import torch
 from gliner.modeling.layers import create_projection_layer
 from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from gliner.modeling.multitask.triples_layers import TriplesScoreLayer
-from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import (
     build_all_entity_pairs,
     build_entity_pairs,
@@ -23,6 +22,7 @@ from gliner.modeling.utils import (
 from torch.nn import functional as F
 
 from ...layers import AnchorModeling, AnchorPairRelationsLayer
+from ...layers.span_pooling import build_span_pooler
 from .. import TaskHeadOutput
 from ..losses import binary_focal_or_bce
 from ..matcher import batched_masked_assignment
@@ -99,11 +99,11 @@ class JointRelexHead(NERHead):
         # Owned mode combines NER and relation losses internally; reused mode
         # contributes relation loss only because NER is already a separate task.
         self.loss_coef = 1.0
-        self.rel_span_rep_layer = SpanRepLayer(
-            span_mode="token_level",
-            hidden_size=hidden_size,
+        self.rel_span_rep_layer = build_span_pooler(
+            rel_cfg,
+            hidden_size,
+            dropout,
             max_width=getattr(config, "max_width", 12),
-            dropout=dropout,
         )
 
         # Like GLiNER, the adjacency representation layer is optional.  The
@@ -229,10 +229,10 @@ class JointRelexHead(NERHead):
             **batch,
         )
 
-    def _pool_entity_spans(self, words_embedding, span_idx, span_mask):
-        """Represent entity spans with GLiNER-relex's token-level SpanRepLayer."""
+    def _pool_entity_spans(self, words_embedding, span_idx, span_mask, token_source=None):
+        """Represent entity spans with the configured span pooler."""
         span_idx = span_idx * span_mask.unsqueeze(-1).long()
-        span_rep = self.rel_span_rep_layer(words_embedding, span_idx)
+        span_rep = self._pool_spans(self.rel_span_rep_layer, words_embedding, span_idx, token_source)
         span_rep = span_rep * span_mask.unsqueeze(-1).to(span_rep.dtype)
         return span_rep, span_mask.to(torch.long)
 
@@ -1332,6 +1332,9 @@ class JointRelexHead(NERHead):
         )
         target_span_rep, target_span_mask = self._pool_entity_spans(
             words_embedding, span_idx, span_mask,
+            token_source=self._span_token_source(
+                self.rel_span_rep_layer, shared, flat_inputs, batch,
+            ),
         )
         rel_labels, rel_pair_mask = self._remap_relation_targets(
             batch.get("rel_labels"), batch.get("rel_pair_mask"),

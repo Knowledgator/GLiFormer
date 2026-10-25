@@ -6,11 +6,11 @@ import math
 
 import torch
 import torch.nn.functional as F
-from gliner.modeling.span_rep import SpanRepLayer
 from torch import nn
 from gliner.modeling.utils import extract_spans_from_tokens
 
 from ...layers.mlp import create_mlp
+from ...layers.span_pooling import build_span_pooler
 from ...layers.structuring_relations import (
     initialize_anchor_relations,
     maybe_anchor_relation_loss,
@@ -174,11 +174,11 @@ class StructuringHead(NERHead):
         # As in joint relation extraction, the second stage always needs a
         # token-level representation for each selected entity regardless of
         # whether the generic NER auxiliary span loss is enabled.
-        self.entity_span_rep_layer = SpanRepLayer(
-            span_mode="token_level",
-            hidden_size=hidden_size,
+        self.entity_span_rep_layer = build_span_pooler(
+            task_cfg,
+            hidden_size,
+            dropout,
             max_width=getattr(config, "max_width", 12),
-            dropout=dropout,
         )
 
         self.use_anchor_objectness = task_cfg.anchor_objectness
@@ -401,8 +401,8 @@ class StructuringHead(NERHead):
             )
         return anchors, anchor_mask
 
-    def _pool_entity_spans(self, words_embedding, span_idx, span_mask):
-        """Represent selected entities through the relex token span layer."""
+    def _pool_entity_spans(self, words_embedding, span_idx, span_mask, token_source=None):
+        """Represent selected entities through the configured span pooler."""
 
         if words_embedding.shape[1] == 0:
             return words_embedding.new_zeros(
@@ -411,9 +411,11 @@ class StructuringHead(NERHead):
                 words_embedding.shape[-1],
             )
         safe_span_idx = span_idx * span_mask.unsqueeze(-1).long()
-        representations = self.entity_span_rep_layer(
+        representations = self._pool_spans(
+            self.entity_span_rep_layer,
             words_embedding,
             safe_span_idx,
+            token_source,
         )
         return representations * span_mask.unsqueeze(-1).to(
             representations.dtype
@@ -998,6 +1000,9 @@ class StructuringHead(NERHead):
             words_embedding,
             entity_span_idx,
             entity_mask,
+            token_source=self._span_token_source(
+                self.entity_span_rep_layer, shared, flat_inputs, batch,
+            ),
         )
         record_anchors, anchor_mask = self._record_anchors(
             flat_inputs,

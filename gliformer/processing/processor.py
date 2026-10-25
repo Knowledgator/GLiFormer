@@ -18,6 +18,7 @@ from gliner.data_processing import BaseProcessor, WordsSplitter
 from PIL import Image
 from transformers import AutoImageProcessor, AutoProcessor
 
+from ..layers.span_pooling import config_needs_token_map
 from ..tasks.audio.processor import AudioProcessor
 from ..tasks.classification.processor import ClassificationProcessor
 from ..tasks.count.processor import CountProcessor
@@ -456,6 +457,12 @@ class TextProcessingMixin:
         tokenized_inputs = self._as_tokenized_mapping(tokenizer_output)
         words_mask = torch.tensor(words_masks)
         tokenized_inputs["words_mask"] = words_mask
+        if config_needs_token_map(self.config):
+            # ``words_mask`` marks only the subwords ``subtoken_pooling``
+            # keeps; span poolers that read subwords need all of them.
+            tokenized_inputs["token_words_mask"] = torch.tensor(
+                self.prepare_word_mask(texts, tokenizer_output, prompt_lengths, token_level=True)
+            )
         # Prompt and source share the transformer's token budget. The largest
         # 1-based source-word id is therefore the exact number of source words
         # that survived subtoken truncation (and is zero for prompt-only rows).

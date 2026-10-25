@@ -26,6 +26,7 @@ from torch import nn
 
 from .. import TaskHead, TaskHeadOutput
 from ...layers.mlp import create_mlp
+from ...layers.span_pooling import SpanTokenSource, gather_span_tokens
 from .numbers import build_number_heads
 from .values import IGNORE, NULL, YEAR_DIGITS
 
@@ -145,31 +146,22 @@ class SpanEncoder(nn.Module):
             raise ValueError(
                 "span_encoder='token_attention' needs subword states aligned with the text rows"
             )
-        return self._attend_tokens(vectors, start, end, token_embeds, token_words)
+        return self._attend_tokens(vectors, words, start, end, token_embeds, token_words)
 
-    def _attend_tokens(self, vectors, start, end, token_embeds, token_words):
+    def _attend_tokens(self, vectors, words, start, end, token_embeds, token_words):
         batch, spans, dim = vectors.shape
         if spans == 0:
             return vectors
-        length = token_embeds.shape[1]
-        words = token_words.long()  # 1-based word id per subword, 0 elsewhere
-        inside = (words[:, None, :] >= (start + 1)[..., None]) & (
-            words[:, None, :] <= (end + 1)[..., None]
-        )  # (B, S, T)
-        keep = min(self.max_tokens, length)
-        order = torch.arange(length, 0, -1, device=words.device, dtype=torch.float32)
-        _, positions = (inside.float() * order).topk(keep, dim=-1)  # earliest first
-        valid = inside.gather(-1, positions)
-        tokens = token_embeds.gather(
-            1, positions.reshape(batch, spans * keep, 1).expand(-1, -1, dim),
-        ).reshape(batch * spans, keep, dim)
-        padding = ~valid.reshape(batch * spans, keep)
-        # A span whose subwords were all cut off still needs one key.
-        padding[padding.all(dim=-1), 0] = False
+        span_idx = torch.stack([start, end], dim=-1)
+        tokens, valid = gather_span_tokens(
+            words, span_idx, self.max_tokens, SpanTokenSource(token_embeds, token_words),
+        )
+        keep = tokens.shape[2]
         query = (self.queries[None].to(vectors.dtype) + vectors.reshape(batch * spans, 1, dim))
+        tokens = tokens.reshape(batch * spans, keep, dim).to(vectors.dtype)
         attended, _ = self.attention(
-            query, tokens.to(vectors.dtype), tokens.to(vectors.dtype),
-            key_padding_mask=padding, need_weights=False,
+            query, tokens, tokens,
+            key_padding_mask=~valid.reshape(batch * spans, keep), need_weights=False,
         )
         mixed = self.token_proj(attended.reshape(batch, spans, -1))
         return self.norm(vectors + mixed)
@@ -340,7 +332,7 @@ class NormalizationHead(TaskHead):
             word_mask,
             span_idx,
             token_embeds=shared.token_embeds,
-            token_words=batch.get("normalization_words_mask"),
+            token_words=batch.get("span_token_words"),
         )
         temporal = self.temporal(vectors)
         extra["temporal"] = temporal

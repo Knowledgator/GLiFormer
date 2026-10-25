@@ -451,6 +451,15 @@ class BaseHeadConfig(AnchorHeadConfig):
     # objective, which is only comparable to a mean-reduced token loss after
     # scaling ``span_loss_coef`` by that cell count.
     span_loss_reduction: str = "mean"  # "sum" | "mean"
+    # How a span becomes a vector (gliformer/layers/span_pooling.py):
+    # "marker" (start/end MLPs, the historical layer), "mean" (mean of the
+    # span's subword states, then a projection) or "tokens" (keeps up to
+    # ``span_max_tokens`` subword states per span; ``span_pooler_queries``
+    # learned queries attend over them on top of the marker vector).
+    span_pooler: str = "marker"
+    span_max_tokens: int = 32
+    span_pooler_queries: int = 4
+    span_pooler_heads: int = 8
 
     def __post_init__(self):
         super().__post_init__()
@@ -458,6 +467,14 @@ class BaseHeadConfig(AnchorHeadConfig):
         if value not in {"sum", "mean"}:
             raise ValueError("span_loss_reduction must be 'sum' or 'mean'")
         self.span_loss_reduction = value
+        pooler = str(self.span_pooler or "marker").lower()
+        if pooler not in {"marker", "mean", "tokens"}:
+            raise ValueError("span_pooler must be 'marker', 'mean' or 'tokens'")
+        self.span_pooler = pooler
+        for name in ("span_max_tokens", "span_pooler_queries", "span_pooler_heads"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be at least 1")
+            setattr(self, name, int(getattr(self, name)))
 
 
 @dataclass

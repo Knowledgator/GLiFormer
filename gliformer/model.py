@@ -58,8 +58,10 @@ _VARIANT_MODALITIES = {
 def _extra_head_kwargs(kwargs, words_mask=None):
     """Typed structuring and normalization tensors travel through ``**kwargs``.
 
-    The normalization head also gets ``words_mask`` (the source word id of
-    each subword) to read a span's subword states.
+    Heads that read a span's subword states get ``span_token_words``: the
+    source unit id of every subword. The processor sends ``token_words_mask``
+    when a head needs it (``words_mask`` marks only the subwords that
+    ``subtoken_pooling`` keeps, e.g. the first one of each word).
     """
 
     extra = {
@@ -67,8 +69,11 @@ def _extra_head_kwargs(kwargs, words_mask=None):
         for key, value in kwargs.items()
         if key.startswith(("structuring_typed_", "normalization_"))
     }
-    if words_mask is not None:
-        extra["normalization_words_mask"] = words_mask
+    token_words = kwargs.get("token_words_mask")
+    if token_words is None:
+        token_words = words_mask
+    if token_words is not None:
+        extra["span_token_words"] = token_words
     return extra
 
 _SET_PREDICTION_COUNT_KEYS = {
