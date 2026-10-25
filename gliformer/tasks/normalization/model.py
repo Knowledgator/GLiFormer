@@ -7,9 +7,10 @@ The head works on spans of the input text:
 * at inference, on every span the ``ner`` and ``structuring`` heads picked
   (``normalization_config.span_sources``).
 
-Each span becomes one vector (``span_encoder``): ``pooled`` mixes the start,
-end and mean word states; ``token_attention`` adds learned queries that read
-the span's subword tokens.  Number heads (``number.heads``: regression,
+Each span becomes one vector through a shared span pooler
+(``span_encoder``: ``marker``, ``mean`` or ``tokens``).  With ``token_queries`` every output (the number, each
+significant digit, each calendar component) has its own learned query that
+reads the span's subword states (kept by the ``tokens`` pooler).  Number heads (``number.heads``: regression,
 bins, sci_digits) read a number from it; calendar classifiers read date, time
 and datetime components, each with a "null" class for components that are
 not written.  Numbers are decoded in the forward pass (in eval mode), since
@@ -19,14 +20,16 @@ for the calendar classifiers) carry padded labels and add no loss.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn.functional as F
 from gliner.modeling.utils import extract_spans_from_tokens
 from torch import nn
 
-from .. import TaskHead, TaskHeadOutput
 from ...layers.mlp import create_mlp
-from ...layers.span_pooling import SpanTokenSource, gather_span_tokens
+from ...layers.span_pooling import SpanTokenSource, build_span_pooler, gather_span_tokens
+from .. import TaskHead, TaskHeadOutput
 from .numbers import build_number_heads
 from .values import IGNORE, NULL, YEAR_DIGITS
 
@@ -91,80 +94,48 @@ def _masked_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor | No
     )
 
 
-class SpanEncoder(nn.Module):
-    """One vector per span from word (and optionally subword) states."""
+class SpanTokenQueries(nn.Module):
+    """One learned query per output, reading the span's subword states.
 
-    def __init__(
-        self,
-        hidden_size: int,
-        dropout: float,
-        *,
-        mode: str = "pooled",
-        queries: int = 4,
-        heads: int = 8,
-        max_tokens: int = 32,
-    ):
+    Each query starts as its learned embedding plus the span vector, then
+    goes through pre-norm transformer decoder layers: self-attention among
+    the span's queries (the digits see each other) and cross-attention over
+    the span's subwords. Returns ``(B, S, Q, D)``, normalized.
+    """
+
+    def __init__(self, hidden_size: int, dropout: float, names, *, heads: int = 8, layers: int = 2):
         super().__init__()
-        self.mode = mode
-        self.max_tokens = int(max_tokens)
-        self.pooled = create_mlp(
-            input_dim=3 * hidden_size,
-            intermediate_dims=[hidden_size],
-            output_dim=hidden_size,
-            dropout=dropout,
-            activation="gelu",
-        )
-        if mode == "token_attention":
-            if heads < 1 or hidden_size % heads:
-                heads = 1
-            self.queries = nn.Parameter(torch.randn(int(queries), hidden_size) * 0.02)
-            self.attention = nn.MultiheadAttention(
-                hidden_size, heads, dropout=dropout, batch_first=True,
+        if heads < 1 or hidden_size % heads:
+            heads = 1
+        self.names = list(names)
+        self.index = {name: slot for slot, name in enumerate(self.names)}
+        self.queries = nn.Parameter(torch.randn(len(self.names), hidden_size) * 0.02)
+        self.token_norm = nn.LayerNorm(hidden_size)
+        self.layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                hidden_size, heads, dim_feedforward=2 * hidden_size, dropout=dropout,
+                activation="gelu", batch_first=True, norm_first=True,
             )
-            self.token_proj = nn.Linear(int(queries) * hidden_size, hidden_size)
-            self.norm = nn.LayerNorm(hidden_size)
+            for _ in range(int(layers))
+        ])
+        self.norm = nn.LayerNorm(hidden_size)
 
-    @staticmethod
-    def _gather(states: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-        """``(B, W, D)`` at ``(B, S)`` positions -> ``(B, S, D)``."""
-
-        return states.gather(1, index.unsqueeze(-1).expand(-1, -1, states.shape[-1]))
-
-    def forward(self, words, word_mask, span_idx, *, token_embeds=None, token_words=None):
-        width = words.shape[1]
-        start = span_idx[..., 0].clamp(0, max(width - 1, 0))
-        end = span_idx[..., 1].clamp(0, max(width - 1, 0))
-        end = torch.maximum(end, start)
-        masked = words * word_mask.unsqueeze(-1).to(words.dtype)
-        cumulative = F.pad(masked.cumsum(dim=1), (0, 0, 1, 0))
-        total = self._gather(cumulative, end + 1) - self._gather(cumulative, start)
-        mean = total / (end - start + 1).unsqueeze(-1).to(words.dtype)
-        vectors = self.pooled(torch.cat([self._gather(words, start), self._gather(words, end), mean], -1))
-        if self.mode != "token_attention":
-            return vectors
-        if token_embeds is None or token_words is None or token_embeds.shape[0] != words.shape[0]:
-            raise ValueError(
-                "span_encoder='token_attention' needs subword states aligned with the text rows"
-            )
-        return self._attend_tokens(vectors, words, start, end, token_embeds, token_words)
-
-    def _attend_tokens(self, vectors, words, start, end, token_embeds, token_words):
+    def forward(self, vectors, tokens, token_mask):
         batch, spans, dim = vectors.shape
-        if spans == 0:
-            return vectors
-        span_idx = torch.stack([start, end], dim=-1)
-        tokens, valid = gather_span_tokens(
-            words, span_idx, self.max_tokens, SpanTokenSource(token_embeds, token_words),
-        )
         keep = tokens.shape[2]
-        query = (self.queries[None].to(vectors.dtype) + vectors.reshape(batch * spans, 1, dim))
-        tokens = tokens.reshape(batch * spans, keep, dim).to(vectors.dtype)
-        attended, _ = self.attention(
-            query, tokens, tokens,
-            key_padding_mask=~valid.reshape(batch * spans, keep), need_weights=False,
-        )
-        mixed = self.token_proj(attended.reshape(batch, spans, -1))
-        return self.norm(vectors + mixed)
+        hidden = self.queries[None].to(vectors.dtype) + vectors.reshape(batch * spans, 1, dim)
+        memory = self.token_norm(tokens.reshape(batch * spans, keep, dim).to(vectors.dtype))
+        padding = ~token_mask.reshape(batch * spans, keep)
+        for layer in self.layers:
+            hidden = layer(hidden, memory, memory_key_padding_mask=padding)
+        return self.norm(hidden).reshape(batch, spans, len(self.names), dim)
+
+    def take(self, reads, name):
+        return reads[..., self.index[name], :]
+
+    def take_prefix(self, reads, prefix):
+        slots = [slot for name, slot in self.index.items() if name.startswith(prefix)]
+        return reads[..., slots, :] if slots else None
 
 
 class TemporalClassifier(nn.Module):
@@ -191,13 +162,19 @@ class TemporalClassifier(nn.Module):
             name: nn.Linear(hidden_size, classes) for name, (classes, _) in _COMPONENT_LAYOUT.items()
         })
 
-    def forward(self, vectors: torch.Tensor) -> dict[str, torch.Tensor]:
-        hidden = self.hidden(vectors)
-        logits = {"year": self.year(hidden)}
+    def forward(self, vectors: torch.Tensor, parts: dict[str, torch.Tensor] | None = None) -> dict[str, torch.Tensor]:
+        """``parts`` (token queries) gives each component its own vector."""
+
+        if parts is None:
+            hidden = self.hidden(vectors)
+            per_part = dict.fromkeys(("year", *self.components), hidden)
+        else:
+            per_part = {name: self.hidden(parts[name]) for name in ("year", *self.components)}
+        logits = {"year": self.year(per_part["year"])}
         if self.year_digits:
-            logits["year_digits"] = self.digits(hidden).unflatten(-1, (YEAR_DIGITS, 10))
+            logits["year_digits"] = self.digits(per_part["year"]).unflatten(-1, (YEAR_DIGITS, 10))
         for name, layer in self.components.items():
-            logits[name] = layer(hidden)
+            logits[name] = layer(per_part[name])
         return logits
 
     def loss(self, logits: dict[str, torch.Tensor], codes: dict[str, torch.Tensor]) -> torch.Tensor | None:
@@ -225,14 +202,29 @@ class NormalizationHead(TaskHead):
         cfg = config.normalization_config
         self.cfg = cfg
         self.loss_coef = float(cfg.loss_coef)
-        self.span_encoder = SpanEncoder(
+        self.span_pooler = build_span_pooler(
+            SimpleNamespace(
+                span_pooler=cfg.span_encoder,
+                span_max_tokens=cfg.max_span_tokens,
+                span_pooler_queries=cfg.span_queries,
+                span_pooler_heads=cfg.span_attention_heads,
+            ),
             hidden_size,
             dropout,
-            mode=cfg.span_encoder,
-            queries=cfg.span_queries,
-            heads=cfg.span_attention_heads,
-            max_tokens=cfg.max_span_tokens,
+            max_width=cfg.max_span_width,
         )
+        self.token_queries = None
+        if cfg.token_queries:
+            names = ["number", "year", *_COMPONENT_LAYOUT]
+            if "sci_digits" in cfg.number.heads:
+                names += [f"digit_{position}" for position in range(cfg.number.sci_digits.digits)]
+            self.token_queries = SpanTokenQueries(
+                hidden_size,
+                dropout,
+                names,
+                heads=cfg.span_attention_heads,
+                layers=cfg.token_query_layers,
+            )
         self.temporal = TemporalClassifier(
             hidden_size,
             dropout,
@@ -304,12 +296,27 @@ class NormalizationHead(TaskHead):
         # Keeps every parameter in the graph for DDP when a batch has no target.
         return sum(parameter.sum() for parameter in self.parameters()) * 0.0 + reference.sum() * 0.0
 
+    @staticmethod
+    def _token_source(shared, words, batch):
+        """Subword states of the text rows, or ``None`` (the unit states are used)."""
+
+        tokens = getattr(shared, "token_embeds", None)
+        token_words = batch.get("span_token_words")
+        if tokens is None or token_words is None or tokens.dim() != 3:
+            return None
+        if tokens.shape[0] != words.shape[0] or token_words.shape != tokens.shape[:2]:
+            return None
+        return SpanTokenSource(tokens, token_words.to(tokens.device))
+
+    def _encode_spans(self, shared, words, span_idx, batch):
+        """Span vectors, plus the span's subword states when the pooler keeps them."""
+
+        source = self._token_source(shared, words, batch) if self.span_pooler.uses_tokens else None
+        output = self.span_pooler.encode(words, span_idx, token_source=source)
+        return output.vectors, output.tokens, output.token_mask
+
     def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
         words = shared.words_embedding
-        word_mask = shared.mask
-        if word_mask is None:
-            word_mask = torch.ones(words.shape[:2], dtype=torch.bool, device=words.device)
-        word_mask = word_mask.bool()
         batch_size, width = words.shape[:2]
         span_idx = batch.get("normalization_span_idx")
         supervised = span_idx is not None
@@ -327,16 +334,26 @@ class NormalizationHead(TaskHead):
             loss = self._unused_parameters_loss(words) if (self.training and supervised) else None
             return TaskHeadOutput(loss=loss, extra=extra)
 
-        vectors = self.span_encoder(
-            words,
-            word_mask,
-            span_idx,
-            token_embeds=shared.token_embeds,
-            token_words=batch.get("span_token_words"),
-        )
-        temporal = self.temporal(vectors)
+        vectors, tokens, token_mask = self._encode_spans(shared, words, span_idx, batch)
+        parts = number_vectors = digit_vectors = None
+        if self.token_queries is not None:
+            if tokens is None:
+                tokens, token_mask = gather_span_tokens(
+                    words, span_idx, self.cfg.max_span_tokens, self._token_source(shared, words, batch),
+                )
+            reads = self.token_queries(vectors, tokens, token_mask)
+            parts = {name: self.token_queries.take(reads, name) for name in ("year", *_COMPONENT_LAYOUT)}
+            number_vectors = self.token_queries.take(reads, "number")
+            digit_vectors = self.token_queries.take_prefix(reads, "digit_")
+        temporal = self.temporal(vectors, parts)
         extra["temporal"] = temporal
-        number_outputs = {kind: head(vectors) for kind, head in self.number_heads.items()}
+        number_outputs = {
+            kind: head(
+                vectors if number_vectors is None else number_vectors,
+                **({"digit_vectors": digit_vectors} if kind == "sci_digits" and digit_vectors is not None else {}),
+            )
+            for kind, head in self.number_heads.items()
+        }
 
         loss = None
         if supervised:
@@ -374,7 +391,7 @@ class NormalizationHead(TaskHead):
 
 __all__ = [
     "NormalizationHead",
-    "SpanEncoder",
+    "SpanTokenQueries",
     "TemporalClassifier",
     "component_targets",
     "year_digit_targets",

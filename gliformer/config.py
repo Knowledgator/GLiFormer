@@ -2004,6 +2004,9 @@ class NormalizationNumberConfig:
             self.sci_digits = NormalizationSciDigitsConfig(**self.sci_digits)
 
 
+NORMALIZATION_SPAN_ENCODERS = ("marker", "mean", "tokens")
+
+
 @dataclass
 class NormalizationHeadConfig:
     """Span-level normalization head: reads values from spans.
@@ -2015,12 +2018,19 @@ class NormalizationHeadConfig:
     """
 
     loss_coef: float = 1.0
-    # "pooled": start, end and mean word states. "token_attention": learned
-    # queries attend over the span's subword tokens (finer digit detail).
-    span_encoder: str = "pooled"
+    # How a span becomes a vector: one of the shared span poolers
+    # (gliformer/layers/span_pooling.py), "marker", "mean" or "tokens";
+    # "tokens" also keeps the span's subword states for ``token_queries``.
+    span_encoder: str = "tokens"
     span_queries: int = 4
     span_attention_heads: int = 8
     max_span_tokens: int = 32
+    # Token queries: every output (each significant digit, each calendar
+    # component, the number value) gets its own learned query, and the
+    # queries read the span's subword states through ``token_query_layers``
+    # transformer decoder layers. Off: every output reads the one span vector.
+    token_queries: bool = True
+    token_query_layers: int = 2
     max_span_width: int = 16
     # Labelled spans per text in training; spans read per text at inference
     # (the structuring decoder can only take values of spans the head read).
@@ -2043,10 +2053,11 @@ class NormalizationHeadConfig:
         if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
             raise ValueError("loss_coef must be finite and non-negative")
         self.span_encoder = str(self.span_encoder).lower()
-        if self.span_encoder not in {"pooled", "token_attention"}:
-            raise ValueError("span_encoder must be 'pooled' or 'token_attention'")
+        if self.span_encoder not in NORMALIZATION_SPAN_ENCODERS:
+            raise ValueError(f"span_encoder must be one of {list(NORMALIZATION_SPAN_ENCODERS)}")
+        self.token_queries = bool(self.token_queries)
         for name in (
-            "span_queries", "span_attention_heads", "max_span_tokens",
+            "span_queries", "span_attention_heads", "max_span_tokens", "token_query_layers",
             "max_span_width", "max_spans", "max_inference_spans",
         ):
             value = int(getattr(self, name))

@@ -71,9 +71,10 @@ def _labels():
     }
 
 
-@pytest.mark.parametrize("encoder", ["pooled", "token_attention"])
-def test_supervised_temporal_loss_backpropagates(encoder):
-    head = _head(span_encoder=encoder).train()
+@pytest.mark.parametrize("token_queries", [True, False])
+@pytest.mark.parametrize("encoder", ["marker", "mean", "tokens"])
+def test_supervised_temporal_loss_backpropagates(encoder, token_queries):
+    head = _head(span_encoder=encoder, token_queries=token_queries).train()
     out = head(_shared(), {}, **_labels(), span_token_words=_words_mask())
     assert torch.isfinite(out.loss) and torch.isfinite(out.extra["temporal_loss"])
     out.loss.backward()
@@ -82,10 +83,40 @@ def test_supervised_temporal_loss_backpropagates(encoder):
     assert out.extra["temporal"]["year"].shape == (B, 2, 400 + 2)
 
 
-def test_token_attention_needs_subword_word_ids():
-    head = _head(span_encoder="token_attention")
-    with pytest.raises(ValueError, match="token_attention"):
-        head(_shared(), {}, **_labels())
+@pytest.mark.parametrize("encoder", ["tokens", "marker"])
+def test_token_queries_give_each_digit_and_component_its_own_read(encoder):
+    head = _head(
+        span_encoder=encoder, token_queries=True, number={"heads": ["sci_digits", "bins"]},
+    ).train()
+    names = head.token_queries.names
+    assert names[:2] == ["number", "year"] and names[-1] == "digit_4"
+    out = head(_shared(), {}, **_labels(), span_token_words=_words_mask())
+    assert torch.isfinite(out.loss)
+    out.loss.backward()
+    # The queries read subword states: their gradients are not zero.
+    assert head.token_queries.queries.grad.abs().sum() > 0
+    assert all(p.grad is not None for p in head.parameters())
+
+    head.eval()
+    with torch.no_grad():
+        out = head(_shared(), {}, **_labels(), span_token_words=_words_mask())
+    assert out.extra["number"]["sci_digits"].shape == (B, 2)
+
+
+def test_token_queries_fall_back_to_unit_states_without_a_subword_map():
+    head = _head(span_encoder="tokens", token_queries=True).eval()
+    with torch.no_grad():
+        out = head(_shared(), {}, **_labels())
+    assert out.extra["temporal"]["month"].shape == (B, 2, 13)
+
+
+def test_shared_pooler_encoders_need_the_subword_map():
+    from gliformer.layers.span_pooling import config_needs_token_map
+
+    assert config_needs_token_map(_config())
+    assert not config_needs_token_map(_config(span_encoder="marker", token_queries=False))
+    assert config_needs_token_map(_config(span_encoder="tokens"))
+    assert config_needs_token_map(_config(span_encoder="marker", token_queries=True))
 
 
 def test_batch_without_targets_keeps_parameters_attached():
@@ -182,6 +213,7 @@ def test_out_of_range_years_come_from_the_digit_head():
 
 @pytest.mark.parametrize("bad", [
     {"span_encoder": "lstm"},
+    {"span_encoder": "token_attention"},
     {"span_sources": ["vision"]},
     {"temporal": {"year_range": None, "year_digits": False}},
     {"max_spans": 0},

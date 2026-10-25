@@ -258,4 +258,9 @@ def config_needs_token_map(config) -> bool:
         if head_cfg is not None and str(getattr(head_cfg, "span_pooler", "marker")).lower() in TOKEN_POOLERS:
             return True
     normalization = getattr(config, "normalization_config", None)
-    return normalization is not None and getattr(normalization, "span_encoder", "pooled") == "token_attention"
+    if normalization is None:
+        return False
+    return (
+        getattr(normalization, "span_encoder", "tokens") in TOKEN_POOLERS
+        or bool(getattr(normalization, "token_queries", False))
+    )

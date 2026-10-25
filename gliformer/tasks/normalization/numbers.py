@@ -68,7 +68,10 @@ class _FP32Module(nn.Module):
     def _fp32(fn, *args):
         device_type = args[0].device.type if args[0].device.type in {"cuda", "cpu"} else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            return fn(*(arg.float() if torch.is_floating_point(arg) else arg for arg in args))
+            return fn(*(
+                arg.float() if isinstance(arg, torch.Tensor) and torch.is_floating_point(arg) else arg
+                for arg in args
+            ))
 
 
 def _trunk(hidden_size: int, dropout: float) -> nn.Module:
@@ -99,7 +102,7 @@ class RegressionNumberHead(_FP32Module):
         self.value = nn.Linear(hidden_size, 1)
         self.state = nn.Linear(hidden_size, 3) if self.transform == "log10" else None
 
-    def forward(self, vectors):
+    def forward(self, vectors, **_):
         return self._fp32(self._forward, vectors)
 
     def _forward(self, vectors):
@@ -190,7 +193,7 @@ class BinsNumberHead(_FP32Module):
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
 
-    def forward(self, vectors):
+    def forward(self, vectors, **_):
         return self._fp32(self._forward, vectors)
 
     def _forward(self, vectors):
@@ -342,41 +345,63 @@ class SciDigitsNumberHead(_FP32Module):
                 self.coefficient_out[-1].weight.mul_(0.01)
                 self.coefficient_out[-1].bias.zero_()
 
-    def forward(self, vectors):
-        return self._fp32(self._forward, vectors)
+    def forward(self, vectors, digit_vectors=None):
+        """``digit_vectors`` ``(..., digits, D)``: one vector per digit (token queries)."""
 
-    def _forward(self, vectors):
+        return self._fp32(self._forward, vectors, digit_vectors)
+
+    def _forward(self, vectors, digit_vectors=None):
         features = self.trunk(vectors)
-        return {
+        outputs = {
             "state_logits": self.state(features),
             "exp_logits": self.exponent(features),
             "features": features,
         }
+        if digit_vectors is not None:
+            outputs["digit_features"] = digit_vectors
+        return outputs
+
+    @staticmethod
+    def _digit_inputs(outputs, select=None):
+        """The (features, digit_features) the digit layers read, optionally masked."""
+
+        features = outputs["features"]
+        digit_features = outputs.get("digit_features")
+        if select is not None:
+            features = features[select]
+            digit_features = None if digit_features is None else digit_features[select]
+        return features, digit_features
 
     # -- digits ---------------------------------------------------------------
 
-    def _base(self, features, exp_index):
-        index = exp_index.clamp(0, self.num_exponents - 1)
-        return self.digit_in(features) + self.exponent_embedding(index)
+    def _base(self, features, exp_index, digit_features=None):
+        """``(..., num_digits, width)``: the input of every digit position."""
 
-    def _teacher_digit_logits(self, features, exp_index, digits):
+        index = exp_index.clamp(0, self.num_exponents - 1)
+        exponent = self.exponent_embedding(index).unsqueeze(-2)
+        if digit_features is not None:
+            return self.digit_in(digit_features) + exponent
+        base = self.digit_in(features).unsqueeze(-2) + exponent
+        return base.expand(*base.shape[:-2], self.num_digits, base.shape[-1])
+
+    def _teacher_digit_logits(self, features, exp_index, digits, digit_features=None):
         """``(..., num_digits, 10)`` logits with the gold digits fed in."""
 
-        base = self._base(features, exp_index)
+        base = self._base(features, exp_index, digit_features)
         positions = torch.arange(self.num_digits, device=features.device)
         previous = self.digit_previous(positions * 10 + digits.clamp(0, 9))
         prefix = torch.cumsum(previous, dim=-2) - previous  # digits before each position
-        logits = self.digit_out(base.unsqueeze(-2) + self.digit_position.weight + prefix)
+        logits = self.digit_out(base + self.digit_position.weight + prefix)
         logits = logits.clone()
         logits[..., 0, 0] = -1e4  # the first significant digit is never 0
         return logits
 
-    def _greedy_digits(self, features, exp_index):
-        base = self._base(features, exp_index)
-        prefix = torch.zeros_like(base)
+    def _greedy_digits(self, features, exp_index, digit_features=None):
+        base = self._base(features, exp_index, digit_features)
+        prefix = torch.zeros_like(base[..., 0, :])
         digits, probs = [], []
         for position in range(self.num_digits):
-            logits = self.digit_out(base + self.digit_position.weight[position] + prefix)
+            logits = self.digit_out(base[..., position, :] + self.digit_position.weight[position] + prefix)
             if position == 0:
                 logits = logits.clone()
                 logits[..., 0] = -1e4
@@ -386,10 +411,10 @@ class SciDigitsNumberHead(_FP32Module):
             prefix = prefix + self.digit_previous(position * 10 + digit)
         return torch.stack(digits, dim=-1), torch.stack(probs, dim=-1)
 
-    def _coefficient(self, features, exp_index, digits):
+    def _coefficient(self, features, exp_index, digits, digit_features=None):
         """Multiplier in ``[10^-r, 10^r]`` for the given digits."""
 
-        base = self._base(features, exp_index)
+        base = self._base(features, exp_index, digit_features).mean(-2)
         positions = torch.arange(self.num_digits, device=features.device)
         hidden = base + self.digit_previous(positions * 10 + digits.clamp(0, 9)).sum(-2)
         raw = self.coefficient_out(hidden).squeeze(-1)
@@ -410,17 +435,22 @@ class SciDigitsNumberHead(_FP32Module):
         stats = {"out_of_range": (mask & (states != SIGN_ZERO) & (exp_class < 0)).sum().detach()}
         use = exp_class >= 0
         if use.any():
-            features = outputs["features"][use]
+            features, digit_features = self._digit_inputs(outputs, use)
             gold_exp = exp_class[use]
             terms.append(F.cross_entropy(outputs["exp_logits"][use], gold_exp))
-            digit_logits = self._fp32(self._teacher_digit_logits, features, gold_exp, digits[use])
+            digit_logits = self._fp32(
+                self._teacher_digit_logits, features, gold_exp, digits[use], digit_features,
+            )
             terms.append(F.cross_entropy(digit_logits.reshape(-1, 10), digits[use].reshape(-1)))
             if self.use_coefficient and self.coefficient_loss_coef > 0:
                 # Trained on the head's own greedy digits: c fixes what the
                 # digits it would decode got wrong.
                 with torch.no_grad():
-                    greedy, _ = self._fp32(self._greedy_digits, features.detach(), gold_exp)
-                coefficient = self._fp32(self._coefficient, features, gold_exp, greedy)
+                    greedy, _ = self._fp32(
+                        self._greedy_digits, features.detach(), gold_exp,
+                        None if digit_features is None else digit_features.detach(),
+                    )
+                coefficient = self._fp32(self._coefficient, features, gold_exp, greedy, digit_features)
                 significand = values[use].abs() / torch.pow(10.0, (gold_exp + self.exp_low).double())
                 estimate = self._digits_value(greedy) * coefficient.double()
                 relative = ((estimate - significand).abs() / significand).float()
@@ -435,11 +465,12 @@ class SciDigitsNumberHead(_FP32Module):
         exp_probs = torch.softmax(outputs["exp_logits"].float(), dim=-1)
         state_conf, state = state_probs.max(dim=-1)
         exp_conf, exp_index = exp_probs.max(dim=-1)
-        digits, digit_probs = self._fp32(self._greedy_digits, outputs["features"], exp_index)
+        features, digit_features = self._digit_inputs(outputs)
+        digits, digit_probs = self._fp32(self._greedy_digits, features, exp_index, digit_features)
         significand = self._digits_value(digits)
         if self.use_coefficient and self.apply_coefficient:
             significand = significand * self._fp32(
-                self._coefficient, outputs["features"], exp_index, digits,
+                self._coefficient, features, exp_index, digits, digit_features,
             ).double()
         magnitude = significand * torch.pow(10.0, (exp_index + self.exp_low).double())
         values = torch.where(state == SIGN_NEGATIVE, -magnitude, magnitude)

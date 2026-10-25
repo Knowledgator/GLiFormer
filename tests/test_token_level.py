@@ -276,7 +276,12 @@ def test_typed_structuring_with_normalization_trains_in_token_mode():
             "anchor_objectness": True,
             "represent_spans": False,
         },
-        normalization_config={"span_encoder": "token_attention", "parser": {"enabled": True}},
+        normalization_config={
+            "span_encoder": "tokens",
+            "token_queries": True,
+            "number": {"heads": ["sci_digits"]},
+            "parser": {"enabled": True},
+        },
     )
     types = {
         "title": {"$type": "text"},
@@ -292,6 +297,11 @@ def test_typed_structuring_with_normalization_trains_in_token_mode():
     ]
     batch, losses = _train(model, rows, steps=4, lr=3e-4)
     assert batch["normalization_span_mask"].any()
+    # Every subword of a unit is mapped, prompt and special tokens are not.
+    token_words = batch["token_words_mask"]
+    assert token_words.shape == batch["input_ids"].shape
+    assert int(token_words.max()) == int(batch["text_lengths"].max())
+    assert (token_words > 0).sum() >= (batch["words_mask"] > 0).sum()
     assert all(torch.isfinite(torch.tensor(losses)))
 
     schema = dict(types)

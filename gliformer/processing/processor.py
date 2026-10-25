@@ -568,6 +568,9 @@ class TextProcessingMixin:
 
             mask_values = []
             word_ids = []
+            # Every subword of a unit (``words_mask`` keeps only the ones
+            # ``subtoken_pooling`` selects, e.g. the first byte piece).
+            token_values = [unit + 1 if 0 <= unit < kept else 0 for unit in id_units]
             for position, unit in enumerate(id_units):
                 if unit < 0 or unit >= kept:
                     mask_values.append(0)
@@ -584,26 +587,29 @@ class TextProcessingMixin:
             input_ids = [*prefix, *row_prompt, *text_ids, *suffix]
             words_mask = [0] * (len(prefix) + len(row_prompt)) + mask_values + [0] * len(suffix)
             word_ids = [None] * (len(prefix) + len(row_prompt)) + word_ids + [None] * len(suffix)
-            rows.append((input_ids, words_mask, word_ids, kept))
+            token_values = [0] * (len(prefix) + len(row_prompt)) + token_values + [0] * len(suffix)
+            rows.append((input_ids, words_mask, word_ids, kept, token_values))
 
-        width = max((len(ids) for ids, _, _, _ in rows), default=0)
+        width = max((len(row[0]) for row in rows), default=0)
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
             pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
         left = getattr(tokenizer, "padding_side", "right") == "left"
-        batch_ids, batch_attention, batch_words, batch_word_ids = [], [], [], []
-        for ids, words_mask, word_ids, _ in rows:
+        batch_ids, batch_attention, batch_words, batch_word_ids, batch_tokens = [], [], [], [], []
+        for ids, words_mask, word_ids, _, token_values in rows:
             pad = width - len(ids)
             if left:
                 batch_ids.append([pad_id] * pad + ids)
                 batch_attention.append([0] * pad + [1] * len(ids))
                 batch_words.append([0] * pad + words_mask)
                 batch_word_ids.append([None] * pad + word_ids)
+                batch_tokens.append([0] * pad + token_values)
             else:
                 batch_ids.append(ids + [pad_id] * pad)
                 batch_attention.append([1] * len(ids) + [0] * pad)
                 batch_words.append(words_mask + [0] * pad)
                 batch_word_ids.append(word_ids + [None] * pad)
+                batch_tokens.append(token_values + [0] * pad)
 
         tokenized_inputs = _TokenUnitInputs(
             input_ids=torch.tensor(batch_ids, dtype=torch.long),
@@ -613,8 +619,10 @@ class TextProcessingMixin:
         if "token_type_ids" in getattr(tokenizer, "model_input_names", ()):
             tokenized_inputs["token_type_ids"] = torch.zeros_like(tokenized_inputs["input_ids"])
         tokenized_inputs["words_mask"] = torch.tensor(batch_words, dtype=torch.long)
+        if config_needs_token_map(self.config):
+            tokenized_inputs["token_words_mask"] = torch.tensor(batch_tokens, dtype=torch.long)
         tokenized_inputs["text_lengths"] = torch.tensor(
-            [[kept] for _, _, _, kept in rows], dtype=torch.long,
+            [[row[3]] for row in rows], dtype=torch.long,
         ).reshape(len(rows), 1)
         return tokenized_inputs
 

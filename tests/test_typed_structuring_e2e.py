@@ -134,8 +134,11 @@ def test_enable_typed_structuring_adds_the_option_scorer():
     loss.backward()
 
 
-@pytest.mark.parametrize("encoder", ["pooled", "token_attention"])
-def test_normalization_head_trains_and_reads_spans(encoder):
+@pytest.mark.parametrize("normalization", [
+    {"span_encoder": "marker", "token_queries": False},
+    {"number": {"heads": ["bins", "sci_digits"]}},
+])
+def test_normalization_head_trains_and_reads_spans(normalization):
     from gliformer import GLiFormer
 
     torch.manual_seed(0)
@@ -155,7 +158,7 @@ def test_normalization_head_trains_and_reads_spans(encoder):
             "anchor_objectness": True,
             "represent_spans": False,
         },
-        "normalization_config": {"span_encoder": encoder, "parser": {"enabled": True}},
+        "normalization_config": {**normalization, "parser": {"enabled": True}},
     }).float()
     batch = _batch(model, True)
     assert batch["normalization_span_mask"].any()
