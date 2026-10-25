@@ -11,6 +11,7 @@ from ...processing.mappings import (
     ExtractionClassMapping,
     ExtractionItemMapping,
 )
+from ...processing.token_units import TOKEN_UNIT_MARKER
 from ..span_processor import SpanProcessor
 
 
@@ -170,7 +171,10 @@ class NERProcessor(SpanProcessor):
         if not item.get('extraction'):
             return
         text = item.get('text', '')
-        has_tokenized_text = bool(item.get('tokenized_text'))
+        # Token-unit rows were rewritten to character offsets when their
+        # units were made; their tokenized_text is a cache, not a word grid.
+        token_units = item.get(TOKEN_UNIT_MARKER) == "token"
+        has_tokenized_text = bool(item.get('tokenized_text')) and not token_units
         if has_tokenized_text:
             tokens = list(item.get('tokenized_text') or [])
             tokens_with_spans = self._align_tokens_to_text(tokens, text) if text else None
@@ -192,6 +196,7 @@ class NERProcessor(SpanProcessor):
             # character-resolution path.
             legacy_token_offsets = (
                 not has_tokenized_text
+                and not token_units
                 and self._uses_legacy_token_offsets(
                     ner, tokens_with_spans, num_tokens=len(tokens)
                 )

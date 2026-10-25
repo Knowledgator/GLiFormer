@@ -43,6 +43,13 @@ def _normalize_model_variant(value: Optional[str]) -> str:
     return value or "text"
 
 
+def _subtoken_pooling(config) -> str:
+    """Pooling the processor built ``words_mask`` for (it marks subtokens to match)."""
+
+    pooling = getattr(config, "subtoken_pooling", "first")
+    return pooling if isinstance(pooling, str) else "first"
+
+
 _VARIANT_MODALITIES = {
     "omni": ("text", "vision", "audio"),
 }
@@ -1207,6 +1214,7 @@ class BaseGLiFormerModel(BaseModel):
             words_embedding, mask = extract_word_embeddings(
                 token_embeds, words_mask, attention_mask,
                 batch_size, max_text_length, embed_dim, text_lengths,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
             labels_embeds = labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
@@ -1220,6 +1228,7 @@ class BaseGLiFormerModel(BaseModel):
                 extract_prompt_features_and_word_embeddings(
                     self.config.class_token_index, token_embeds, input_ids, attention_mask,
                     text_lengths, words_mask, self.config.embed_ent_token,
+                    subtoken_pooling=_subtoken_pooling(self.config),
                 )
             )
             words_embedding = self._apply_word_rnn(words_embedding, mask)
@@ -3238,6 +3247,7 @@ class GLiFormerLayoutModel(_GLiFormerJointForwardModel):
             words_embedding, mask = extract_word_embeddings(
                 token_embeds, words_mask, attention_mask,
                 batch_size, max_text_length, embed_dim, text_lengths,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
             labels_embeds = labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
@@ -3256,6 +3266,7 @@ class GLiFormerLayoutModel(_GLiFormerJointForwardModel):
             extract_prompt_features_and_word_embeddings(
                 self.config.class_token_index, token_embeds, input_ids, attention_mask,
                 text_lengths, words_mask, self.config.embed_ent_token,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
         )
         words_embedding, mask = self._append_layout_extra_tokens(token_embeds, input_ids, words_embedding, mask)
@@ -3397,6 +3408,7 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
             words_embedding, mask = extract_word_embeddings(
                 token_embeds, words_mask, attention_mask,
                 batch_size, max_text_length, embed_dim, text_lengths,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
             labels_embeds = labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
@@ -3427,6 +3439,7 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
             extract_prompt_features_and_word_embeddings(
                 self.config.class_token_index, token_embeds, input_ids, attention_mask,
                 text_lengths, words_mask, self.config.embed_ent_token,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
         )
         words_embedding = self._apply_word_rnn(words_embedding, mask)

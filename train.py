@@ -146,6 +146,7 @@ _GLOBAL_ARCHITECTURE_FIELDS = {
     "hidden_size",
     "dropout",
     "subtoken_pooling",
+    "text_unit",
     "span_mode",
     "max_width",
     "backbone_type",
@@ -902,7 +903,11 @@ def build_model(model_cfg: dict, train_cfg: dict):
                 if name.startswith("typed_") or name == "embed_option_token"
             }
             if model.enable_typed_structuring(**typed_settings):
-                print("Added typed structuring fields ([OPTION] token and typed head)")
+                print("Added typed structuring fields ([OPTION] token and option scorer)")
+        normalization_cfg = model_cfg.get("normalization_config")
+        if isinstance(normalization_cfg, Mapping):
+            if model.enable_normalization(normalization_cfg):
+                print("Added a normalization head (initialized from scratch)")
         return model
     print("Initializing model from config...")
     return GLiFormer.load_from_config(model_cfg)

@@ -18,7 +18,8 @@ class GLiFormerServeConfig:
     dtype: str = "bfloat16"
     quantization: str | None = None
     max_model_len: int = 2048
-    max_span_width: int = 12
+    # None keeps the checkpoint's ``max_width`` (counted in its text units).
+    max_span_width: int | None = None
     max_labels: int = -1
     max_input_chars: int = 1_000_000
     max_request_bytes: int = 10_000_000

@@ -48,6 +48,13 @@ from .processing.collator import (
     resolve_gliformer_collator_class,
 )
 from .processing.word_spacing import SpaceAwareWordsSplitter
+from .processing.token_units import (
+    TOKEN_UNIT_MARKER,
+    TokenSplitter,
+    is_token_level,
+    snaps_to_words,
+    word_snapped_maps,
+)
 from .processing.schema import (
     GLiFormerSchema,
     build_structuring_output_formatter,
@@ -213,10 +220,14 @@ class BaseGLiFormer(BaseGLiNER):
             if variant in {"vision", "audio"}:
                 labels_tokenizer = tokenizer
 
-        if words_splitter is None:
-            words_splitter = WordsSplitter(config.words_splitter_type)
-        if getattr(config, "preserve_word_spaces", False):
-            words_splitter = SpaceAwareWordsSplitter(words_splitter)
+        if is_token_level(config):
+            if words_splitter is None:
+                words_splitter = TokenSplitter(tokenizer)
+        else:
+            if words_splitter is None:
+                words_splitter = WordsSplitter(config.words_splitter_type)
+            if getattr(config, "preserve_word_spaces", False):
+                words_splitter = SpaceAwareWordsSplitter(words_splitter)
 
         processor_cls = resolve_gliformer_processor_class(config)
         self.data_processor = processor_cls(
@@ -564,6 +575,7 @@ class BaseGLiFormer(BaseGLiNER):
         relations=None,
         joint_relations=None,
         structures=None,
+        texts: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build ``input_x`` dicts for the collator from label arguments.
 
@@ -573,8 +585,9 @@ class BaseGLiFormer(BaseGLiNER):
         """
         input_x = []
         task_processors = self.data_processor.task_processors.values()
-        for tokens in all_tokens:
+        for row, tokens in enumerate(all_tokens):
             item: Dict[str, Any] = {"tokenized_text": tokens}
+            self._attach_source_text(item, texts, row)
             for processor in task_processors:
                 processor.contribute_inference_input(
                     item,
@@ -591,12 +604,14 @@ class BaseGLiFormer(BaseGLiNER):
         self,
         all_tokens: List[List[str]],
         requests: List[Dict[str, Any]],
+        texts: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build one collator batch whose rows may use different task schemas."""
         input_x = []
         task_processors = self.data_processor.task_processors.values()
-        for tokens, request in zip(all_tokens, requests, strict=True):
+        for row, (tokens, request) in enumerate(zip(all_tokens, requests, strict=True)):
             item: Dict[str, Any] = {"tokenized_text": tokens}
+            self._attach_source_text(item, texts, row)
             if request.get("reference_date") is not None:
                 item["reference_date"] = str(request["reference_date"])
             for processor in task_processors:
@@ -611,6 +626,14 @@ class BaseGLiFormer(BaseGLiNER):
             self._apply_request_prompts(item, request)
             input_x.append(item)
         return input_x
+
+    def _attach_source_text(self, item: Dict[str, Any], texts: Optional[List[str]], row: int) -> None:
+        """Token-unit rows carry their text: units are encoded from it."""
+
+        if texts is None or not is_token_level(self.config):
+            return
+        item["text"] = texts[row]
+        item[TOKEN_UNIT_MARKER] = "token"
 
     @staticmethod
     def _apply_request_prompts(item: Dict[str, Any], request: Dict[str, Any]) -> None:
@@ -697,14 +720,20 @@ class BaseGLiFormer(BaseGLiNER):
         all_start_token_idx_to_text_idx = []
         all_end_token_idx_to_text_idx = []
 
+        snap = snaps_to_words(self.config)
         for text in texts:
             tokens = []
             start_token_idx_to_text_idx = []
             end_token_idx_to_text_idx = []
-            for token, start, end in self.data_processor.words_splitter(text):
+            units = list(self.data_processor.words_splitter(text))
+            for token, start, end in units:
                 tokens.append(token)
                 start_token_idx_to_text_idx.append(start)
                 end_token_idx_to_text_idx.append(end)
+            if snap:
+                # span_boundary="word": a unit span reads as the words it touches.
+                words = list(self.data_processor.word_splitter(text))
+                start_token_idx_to_text_idx, end_token_idx_to_text_idx = word_snapped_maps(units, words)
             all_tokens.append(tokens)
             all_start_token_idx_to_text_idx.append(start_token_idx_to_text_idx)
             all_end_token_idx_to_text_idx.append(end_token_idx_to_text_idx)
@@ -987,6 +1016,7 @@ class BaseGLiFormer(BaseGLiNER):
             relations,
             joint_relations,
             structures,
+            texts=valid_texts,
         )
         for item, orig_idx in zip(input_x, valid_to_orig_idx):
             if images is not None and images[orig_idx] is not None:
@@ -1142,7 +1172,9 @@ class BaseGLiFormer(BaseGLiNER):
             key: collapse(values) for key, values in row_decoder_controls.items()
         }
         all_tokens, all_start_maps, all_end_maps = self.prepare_inputs(valid_texts)
-        input_x = self._build_heterogeneous_inference_input(all_tokens, valid_requests)
+        input_x = self._build_heterogeneous_inference_input(
+            all_tokens, valid_requests, texts=valid_texts,
+        )
         collator = inference_collator or self.create_inference_collator(return_tokens=True)
         batches = (
             collator(input_x[offset:offset + batch_size])
@@ -1287,6 +1319,10 @@ class BaseGLiFormer(BaseGLiNER):
             if not tokens:
                 continue
             text, start_map, end_map = self._pdf_tokens_to_text_and_maps(tokens)
+            if is_token_level(self.config):
+                # Words are split into units with the row's boxes; spans index units.
+                _, start_map, end_map = self.prepare_inputs([text])
+                start_map, end_map = start_map[0], end_map[0]
             item["text"] = text
             valid_items.append(item)
             valid_to_orig_idx.append(idx)

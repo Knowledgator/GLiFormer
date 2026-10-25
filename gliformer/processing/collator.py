@@ -12,6 +12,7 @@ from .label_augmentation import (
     BatchLabelAugmenter,
     LabelAugmentationConfig,
 )
+from .token_units import is_token_level, unit_pieces_batch
 from .processor import (
     BaseGLiFormerProcessor,
     GLiFormerAudioProcessor,
@@ -132,7 +133,10 @@ class BaseGLiFormerDataCollator(ABC):
         if self.return_classes_mapping and "classes_mapping" not in model_input:
             model_input["classes_mapping"] = raw_batch.get("classes_mapping")
         if self.return_tokens:
-            model_input["tokens"] = raw_batch.get("tokens")
+            tokens = raw_batch.get("tokens")
+            if is_token_level(self.config):
+                tokens = unit_pieces_batch(tokens, raw_batch.get("text"))
+            model_input["tokens"] = tokens
         if self.return_id_to_classes:
             model_input["id_to_classes"] = raw_batch.get("id_to_classes")
         if self.return_entities:

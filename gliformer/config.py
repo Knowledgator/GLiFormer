@@ -1,6 +1,7 @@
 import copy
 import dataclasses
 import math
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
@@ -10,6 +11,10 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from . import backbones as _layout_backbones  # noqa: F401 - registers custom AutoConfig entries
 from .backbones import get_backbone, normalize_backbone_type
+
+# Units a GLiFormer model can index text by (see ``GLiFormerConfig.text_unit``).
+TEXT_UNITS = ("word", "token")
+SPAN_BOUNDARIES = ("free", "word")
 
 
 _FIXED_WIDTH_ANCHOR_MODES = frozenset({
@@ -2429,6 +2434,8 @@ class GLiFormerConfig(BaseGLiNERConfig):
         vision_max_pixels: Optional[int] = None,
         freeze_native_vision: bool = True,
         preserve_word_spaces: bool = False,
+        text_unit: str = "word",
+        span_boundary: str = "free",
         **kwargs,
     ):
         # Load-only aliases for checkpoints written while the entity-first
@@ -3015,6 +3022,28 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.freeze_native_vision = freeze_native_vision
         # Changes what the backbone reads, so a checkpoint must keep the value it was trained with.
         self.preserve_word_spaces = preserve_word_spaces
+        # Unit every span head works on: "word" (splitter words, subwords
+        # pooled per word) or "token" (each backbone subword is a position).
+        # Both change what the heads were trained on, so they are
+        # checkpoint-bound.
+        text_unit = str(text_unit).lower()
+        if text_unit not in TEXT_UNITS:
+            raise ValueError(f"text_unit must be one of {list(TEXT_UNITS)}, got {text_unit!r}.")
+        span_boundary = str(span_boundary).lower()
+        if span_boundary not in SPAN_BOUNDARIES:
+            raise ValueError(
+                f"span_boundary must be one of {list(SPAN_BOUNDARIES)}, got {span_boundary!r}."
+            )
+        if text_unit == "token" and preserve_word_spaces:
+            warnings.warn(
+                "preserve_word_spaces has no effect with text_unit='token': "
+                "the text is encoded from the raw string.",
+                stacklevel=2,
+            )
+        self.text_unit = text_unit
+        # Token mode only: "word" widens gold and predicted spans to whole
+        # words, so no span starts or ends inside a word.
+        self.span_boundary = span_boundary
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -3169,6 +3198,8 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "max_len",
         "words_splitter_type",
         "preserve_word_spaces",
+        "text_unit",
+        "span_boundary",
         "num_rnn_layers",
         "fuse_layers",
         "embed_ent_token",

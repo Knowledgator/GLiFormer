@@ -231,6 +231,10 @@ class GLiFormerServer:
         return min(observed, maximum)
 
     def observed_seq_len(self, texts: list[str]) -> int:
+        if getattr(getattr(self.model, "config", None), "text_unit", "word") == "token":
+            # Token-unit models see one position per subword, not per word.
+            observed = max([self.config.calibration_min_seq_len, *(self._count_tokens(text) for text in texts)])
+            return min(observed, self.config.max_model_len)
         return self.observed_seq_len_of(
             texts, self.config.calibration_min_seq_len, self.config.max_model_len,
         )

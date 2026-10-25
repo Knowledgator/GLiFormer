@@ -162,13 +162,13 @@ def test_long_input_runs_spans_over_windows_and_rejects_whole_input_tasks():
 # -- json ---------------------------------------------------------------------------
 
 
-def test_json_labels_map_titles_back_to_ids_and_parse_formats():
+def test_json_labels_map_titles_back_to_ids_and_report_unnormalized_values():
     server, model = make_server()
     model.struct_values = {
         "Invoice number": "INV-42",
         "Issue date": "October 1, 2026",
         "Total": "$1,234.50",
-        "Due": "TBD",
+        "Due": "2026-10-31",
         "Paid": "already paid",
     }
     text = "Invoice INV-42, issued October 1, 2026. Total $1,234.50. Due TBD. Already paid."
@@ -180,12 +180,15 @@ def test_json_labels_map_titles_back_to_ids_and_parse_formats():
         "paid": {"title": "Paid", "type": "boolean"},
         "missing": {"title": "Missing"},
     }}}, include_evidence=True))["results"]["inv"]
+    # Span text is not parsed: only values the model normalized come back.
     assert result["value"] == {
-        "invoice_id": "INV-42", "issued": "2026-10-01", "total": 1234.5,
-        "due": None, "paid": True, "missing": None,
+        "invoice_id": "INV-42", "issued": None, "total": None,
+        "due": "2026-10-31", "paid": True, "missing": None,
     }
-    assert result["unparsed"] == {"/due": {"text": "TBD", "start": 61, "end": 64, "source": ""}}
-    assert result["evidence"]["/issued"] == [{"text": "October 1, 2026", "start": 23, "end": 38, "source": ""}]
+    assert result["unparsed"] == {
+        "/issued": {"text": "October 1, 2026", "start": 23, "end": 38, "source": ""},
+        "/total": {"text": "$1,234.50", "start": 46, "end": 55, "source": ""},
+    }
     row = model.calls[0][0][0]
     assert row["structures"] == {"$root": {
         "Invoice number": "str", "Issue date": "str", "Total": "str",
@@ -201,19 +204,19 @@ def test_typed_checkpoint_gets_format_descriptors_and_predicted_fields():
     result = analyze(server, "x", {"j": {"type": "json", "labels": {
         "total": {"title": "Total", "type": "text", "format": "integer"},
         "kind": {"title": "Kind", "type": "options", "options": {"flat": {"title": "Flat"}, "house": {"title": "House"}}},
-        "rooms": {"title": "Rooms", "type": "integer", "minimum": 0, "maximum": 10},
+        "rooms": {"title": "Rooms", "type": "integer"},
         "tags": {"title": "Tags", "type": "options", "options": ["a", "b"], "multi": True},
     }}})["j"]
     assert result["value"] == {"total": 300, "kind": "flat", "rooms": 2, "tags": ["a"]}
     structures = model.calls[0][0][0]["structures"]["$root"]
-    assert structures["Total"] == {"$type": "text", "$format": "number", "$integer": True}
+    assert structures["Total"] == {"$type": "number", "$integer": True}
     assert structures["Kind"] == {"$type": "class", "$options": ["Flat", "House"], "$multi": False}
-    assert structures["Rooms"] == {"$type": "number", "$integer": True, "$min": 0, "$max": 10}
+    assert structures["Rooms"] == {"$type": "number", "$integer": True}
 
 
 def test_predicted_types_need_typed_heads():
     server, _ = make_server()
-    error = error_of(server, body("x", {"j": {"type": "json", "labels": {"p": {"type": "estimate", "minimum": 1, "maximum": 2}}}}))
+    error = error_of(server, body("x", {"j": {"type": "json", "labels": {"p": {"type": "number"}}}}))
     assert error.code == "UNSUPPORTED_LABEL_TYPE"
     assert error.path == "/tasks/j/labels/p/type"
     assert error.details["supported"] == ["text", "boolean"]
@@ -223,6 +226,7 @@ def test_predicted_types_need_typed_heads():
     ({"type": "number", "format": "date"}, "/tasks/j/labels/f/format"),
     ({"type": "text", "format": "weekday"}, "/tasks/j/labels/f/format"),
     ({"type": "text", "minimum": 3}, "/tasks/j/labels/f/minimum"),
+
     ({"type": "boolean", "format": "date"}, "/tasks/j/labels/f/format"),
     ({"type": "colour"}, "/tasks/j/labels/f/type"),
 ])
@@ -268,9 +272,9 @@ def test_json_schema_maps_strings_numbers_and_records():
     assert template["employees"] == [{
         "!name": "str",
         "role": {"$type": "class", "$options": ["engineer", "designer"], "$multi": False},
-        "since": {"$type": "text", "$format": "number", "$integer": True},
+        "since": {"$type": "number", "$integer": True},
     }]
-    assert template["founded"] == {"$type": "text", "$format": "date"}
+    assert template["founded"] == {"$type": "date"}
     # Without typed heads the enum needs the class head.
     error = error_of(server, body("x", {"o": {"type": "json", "schema": schema}}))
     assert error.code == "UNSUPPORTED_LABEL_TYPE"
@@ -289,7 +293,8 @@ def test_json_schema_without_enum_runs_on_plain_checkpoint():
             "flag": {"type": "boolean"},
         },
     }}})["o"]["value"]
-    assert value == {"company": "Acme", "employees": [{"name": "Alice"}], "count": 12, "flag": None}
+    # The plain checkpoint returns span text, which is not parsed into a number.
+    assert value == {"company": "Acme", "employees": [{"name": "Alice"}], "count": None, "flag": None}
 
 
 def test_json_task_needs_exactly_one_declaration():
@@ -298,13 +303,11 @@ def test_json_task_needs_exactly_one_declaration():
         assert error_of(server, body("x", {"j": task})).code == "INVALID_REQUEST"
 
 
-def test_score_with_scale_needs_typed_heads_and_snaps_to_step():
-    server, _ = make_server()
+def test_score_with_scale_is_not_supported():
+    typed_server, _ = make_server(FakeGLiFormer(typed=True))
     task = {"type": "score", "instruction": "Urgency?", "scale": {"min": 1, "max": 5, "step": 1}}
-    assert error_of(server, body("x", {"u": task})).code == "UNSUPPORTED_LABEL_TYPE"
-    typed_server, model = make_server(FakeGLiFormer(typed=True))
-    model.struct_values = {"score": 3.7}
-    assert analyze(typed_server, "x", {"u": task})["u"] == {"type": "score", "value": 4, "scale": {"min": 1, "max": 5, "step": 1}}
+    error = error_of(typed_server, body("x", {"u": task}))
+    assert error.code == "INVALID_REQUEST"
 
 
 # -- retrieval ----------------------------------------------------------------------
@@ -470,7 +473,8 @@ def test_capabilities_reflect_heads():
     assert capabilities["limits"]["max_labels_per_task"] is None
     assert server.capabilities("alias")["model"] == "test/gliformer"
     typed, _ = make_server(FakeGLiFormer(typed=True, embedding=False))
-    assert "estimate" in typed.capabilities()["json_field_types"]
+    assert "number" in typed.capabilities()["json_field_types"]
+    assert "estimate" not in typed.capabilities()["json_field_types"]
     assert "rank" not in typed.capabilities()["task_types"]
 
 
@@ -484,3 +488,22 @@ def test_render_task_names_option():
     server, model = make_server(render_task_names=True)
     analyze(server, "x", {"intent": {"type": "classify", "labels": ["a"]}})
     assert model.calls[0][0][0]["group_prompts"]["c0"]["name"] == "intent"
+
+
+def test_normalized_values_carry_their_span_as_evidence():
+    server, model = make_server(FakeGLiFormer(typed=True))
+    text = "Founded in 2019 by Ada. Launched May 2024."
+    model.struct_values = {
+        "Founded": {"value": 2019, "text": "2019"},
+        "Launch": {"value": "2024-05", "text": "May 2024"},
+    }
+    result = server.analyze(body(text, {"j": {"type": "json", "labels": {
+        "founded": {"title": "Founded", "type": "integer"},
+        "launch": {"title": "Launch", "type": "date"},
+    }}}, include_evidence=True))["results"]["j"]
+    assert result["value"] == {"founded": 2019, "launch": "2024-05"}
+    assert result["evidence"]["/founded"] == [{"text": "2019", "start": 11, "end": 15, "source": ""}]
+    assert result["evidence"]["/launch"][0]["text"] == "May 2024"
+    assert "unparsed" not in result
+    # The server asks the model for value spans on every json row.
+    assert model.calls[0][0][0]["decoder_kwargs"] == {"value_spans": True}

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 import torch
 
 from .. import TaskProcessor
+from ...processing.token_units import is_token_level
 from ...processing._structuring_hierarchy import (
     TYPED_ANCHORS_KEY,
     is_internal_instance_key,
@@ -81,6 +82,14 @@ class NormalizationProcessor(TaskProcessor):
             raise ValueError("normalization_config is required for normalization")
         parser_cfg = self.task_config.parser
         self.parser = NormalizationParser.from_config(parser_cfg) if parser_cfg.enabled else None
+        self.words_splitter = words_splitter
+        # The parser reads words. In token mode it runs on the configured
+        # word splitter and its spans are mapped onto the token units.
+        self.word_splitter = None
+        if is_token_level(config):
+            from gliner.data_processing import WordsSplitter
+
+            self.word_splitter = WordsSplitter(config.words_splitter_type)
         # Set by the data processor: the structuring processor whose resolved
         # records hold the gold value spans.
         self.structuring_processor = None
@@ -164,12 +173,46 @@ class NormalizationProcessor(TaskProcessor):
         target.codes = component_codes(parts, family)
         return target
 
+    def _units_with_spans(self, item):
+        structuring = self.structuring_processor
+        if structuring is not None:
+            units, _ = structuring._tokenize_text(item)
+            return units
+        text = item.get("text") or ""
+        if not text or self.words_splitter is None:
+            return None
+        return list(self.words_splitter(text))
+
+    def _parsed_spans(self, item):
+        """Parser hits as ``(parsed, start_unit, end_unit)``."""
+
+        if self.word_splitter is None:
+            for parsed in self.parser.find(self._words(item)):
+                yield parsed, parsed.start, parsed.end
+            return
+        text = item.get("text") or ""
+        units = self._units_with_spans(item)
+        if not text or not units:
+            return
+        from ..span_processor import SpanProcessor
+
+        words = list(self.word_splitter(text))
+        starts, ends = SpanProcessor._build_token_char_maps(units)
+        for parsed in self.parser.find([word for word, _, _ in words]):
+            if not (0 <= parsed.start <= parsed.end < len(words)):
+                continue
+            span = SpanProcessor._match_to_token_range(
+                words[parsed.start][1], words[parsed.end][2], units, starts, ends,
+            )
+            if span is not None:
+                yield parsed, span[0], span[1]
+
     def _silver_targets(self, item) -> list[SpanTarget]:
         if self.parser is None:
             return []
         targets = []
-        for parsed in self.parser.find(self._words(item)):
-            target = SpanTarget(parsed.start, parsed.end, number=parsed.number)
+        for parsed, start, end in self._parsed_spans(item):
+            target = SpanTarget(start, end, number=parsed.number)
             if parsed.family in TEMPORAL_FAMILIES and parsed.parts is not None:
                 target.family = parsed.family
                 target.codes = component_codes(parsed.parts, parsed.family)

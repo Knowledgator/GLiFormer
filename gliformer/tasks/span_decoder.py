@@ -339,5 +339,12 @@ class SpanDecoder(TaskDecoder):
         if texts is None or batch_idx >= len(texts):
             return ""
         tokens = texts[batch_idx]
+        # Token units carry their source text; joining subwords with spaces
+        # would split words apart.
+        span_text = getattr(tokens, "span_text", None)
+        if span_text is not None:
+            text = span_text(start, end)
+            if text is not None:
+                return text
         span_tokens = tokens[start:end + 1]
         return " ".join(span_tokens)

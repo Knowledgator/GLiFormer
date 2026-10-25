@@ -81,7 +81,8 @@ def main() -> None:
         "--max-model-len", type=int, default=2048, help="Maximum input sequence length"
     )
     limits_group.add_argument(
-        "--max-span-width", type=int, default=12, help="Maximum extracted span width"
+        "--max-span-width", type=int, default=None,
+        help="Maximum extracted span width (default: the checkpoint's max_width)"
     )
     limits_group.add_argument(
         "--max-labels", type=int, default=-1, help="Maximum labels per simple task (-1 unlimited)"

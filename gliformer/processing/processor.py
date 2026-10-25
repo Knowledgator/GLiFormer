@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from gliner.data_processing import BaseProcessor
+from gliner.data_processing import BaseProcessor, WordsSplitter
 from PIL import Image
 from transformers import AutoImageProcessor, AutoProcessor
 
@@ -30,6 +30,15 @@ from ..tasks.structuring.processor import StructuringProcessor
 from ..tasks.vision.processor import VisionProcessor
 from ..utils import pair_2d
 from .word_spacing import restore_word_spaces, tokenizer_drops_word_spaces
+from .token_units import (
+    TOKEN_UNIT_MARKER,
+    TokenSplitter,
+    WordIndexConverter,
+    aligned_word_grid,
+    is_token_level,
+    joined_word_grid,
+    unit_word_ids,
+)
 from .mappings import (
     BatchClassesMapping,
     CatClassMapping,
@@ -356,6 +365,16 @@ class TorchAudioProcessor:
         return values
 
 
+class _TokenUnitInputs(dict):
+    """Token-mode model inputs; ``word_ids`` maps positions to prompt words and text units."""
+
+    def set_word_ids(self, word_ids):
+        self._word_ids = word_ids
+
+    def word_ids(self, batch_index=0):
+        return self._word_ids[batch_index]
+
+
 class TextProcessingMixin:
     """Text tokenization and word-level preprocessing."""
 
@@ -409,6 +428,10 @@ class TextProcessingMixin:
         return self._tokenizer_drops_word_spaces
 
     def tokenize_inputs(self, texts, classes_mapping, **kwargs):
+        if is_token_level(self.config):
+            tokenized_inputs = self._tokenize_token_units(texts, classes_mapping, **kwargs)
+            return self._add_prompt_side_inputs(tokenized_inputs, classes_mapping, texts)
+        kwargs.pop("source_texts", None)
         input_texts, prompt_lengths = self.prepare_inputs(texts, classes_mapping, **kwargs)
         if self._restores_word_spaces():
             input_texts = [
@@ -447,9 +470,145 @@ class TextProcessingMixin:
             )
         )
 
+        return self._add_prompt_side_inputs(tokenized_inputs, classes_mapping, texts)
+
+    def _add_prompt_side_inputs(self, tokenized_inputs, classes_mapping, texts):
         label_enc = self.prepare_all_label_encoder_inputs(classes_mapping)
         tokenized_inputs.update(label_enc)
         tokenized_inputs.update(self.prepare_all_typed_inputs(classes_mapping, texts))
+        return tokenized_inputs
+
+    def _special_token_frame(self):
+        """Special ids the tokenizer puts before and after one sequence."""
+
+        frame = getattr(self, "_token_unit_frame", None)
+        if frame is not None:
+            return frame
+        tokenizer = self.transformer_tokenizer
+        probe = ["probe"]
+        framed = list(tokenizer(probe, is_split_into_words=True)["input_ids"])
+        bare = list(tokenizer(probe, is_split_into_words=True, add_special_tokens=False)["input_ids"])
+        frame = ([], [])
+        for start in range(len(framed) - len(bare) + 1):
+            if framed[start:start + len(bare)] == bare:
+                frame = (framed[:start], framed[start + len(bare):])
+                break
+        self._token_unit_frame = frame
+        return frame
+
+    def _tokenize_token_units(self, texts, classes_mapping, **kwargs):
+        """Encode rows whose text units are backbone subwords.
+
+        The prompt is encoded word by word as in word mode; the text ids come
+        from encoding the raw source text once, so subword pieces are never
+        re-tokenized. ``words_mask`` numbers the units 1..T and the shared
+        ``max_len`` budget truncates the text at a unit boundary.
+        """
+        source_texts = kwargs.pop("source_texts", None)
+        if source_texts is None or len(source_texts) != len(texts):
+            raise ValueError("text_unit='token' needs the source text of every row.")
+        tokenizer = self.transformer_tokenizer
+        splitter = self.words_splitter
+        prompts, prompt_lengths = self.prepare_inputs(
+            [[] for _ in texts], classes_mapping, **kwargs,
+        )
+        prompt_ids = tokenizer(
+            prompts, is_split_into_words=True, add_special_tokens=False,
+        )["input_ids"]
+        prefix, suffix = self._special_token_frame()
+        max_len = int(self.config.max_len)
+        pooling = getattr(self.config, "subtoken_pooling", "first")
+
+        rows = []
+        for row, pieces in enumerate(texts):
+            pieces = list(pieces)
+            encoding = splitter.encode(source_texts[row] or "")
+            if encoding.pieces[: len(pieces)] == pieces:
+                text_ids = list(encoding.input_ids)
+                id_units = list(encoding.id_units)
+                first_ids = list(encoding.unit_first_id)
+                num_units = len(pieces)
+            elif not encoding.units and len(pieces) <= 1:
+                # Empty text: one placeholder unit, like the word-mode "[PAD]".
+                placeholder = tokenizer.pad_token_id
+                if placeholder is None:
+                    placeholder = tokenizer.unk_token_id or 0
+                text_ids, id_units, first_ids, num_units = [placeholder], [0], [0], 1
+            else:
+                raise ValueError(
+                    "Token units of a row do not match its text; rows must be split "
+                    "with the processor's TokenSplitter."
+                )
+            row_prompt = list(prompt_ids[row])
+            budget = max_len - len(prefix) - len(suffix)
+            if len(row_prompt) > budget:
+                row_prompt = row_prompt[: max(budget, 0)]
+            available = max(budget - len(row_prompt), 0)
+
+            def id_count(count):
+                return len(text_ids) if count >= len(first_ids) else (first_ids[count] if count > 0 else 0)
+
+            low, high = 0, num_units
+            while low < high:
+                middle = (low + high + 1) // 2
+                if id_count(middle) <= available:
+                    low = middle
+                else:
+                    high = middle - 1
+            kept = low
+            text_ids = text_ids[: id_count(kept)]
+            id_units = id_units[: len(text_ids)]
+
+            mask_values = []
+            word_ids = []
+            for position, unit in enumerate(id_units):
+                if unit < 0 or unit >= kept:
+                    mask_values.append(0)
+                    word_ids.append(None)
+                    continue
+                word_ids.append(prompt_lengths[row] + unit)
+                if pooling in {"mean", "max"}:
+                    selected = True
+                elif pooling == "last":
+                    selected = position + 1 >= len(id_units) or id_units[position + 1] != unit
+                else:
+                    selected = position == first_ids[unit]
+                mask_values.append(unit + 1 if selected else 0)
+            input_ids = [*prefix, *row_prompt, *text_ids, *suffix]
+            words_mask = [0] * (len(prefix) + len(row_prompt)) + mask_values + [0] * len(suffix)
+            word_ids = [None] * (len(prefix) + len(row_prompt)) + word_ids + [None] * len(suffix)
+            rows.append((input_ids, words_mask, word_ids, kept))
+
+        width = max((len(ids) for ids, _, _, _ in rows), default=0)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        left = getattr(tokenizer, "padding_side", "right") == "left"
+        batch_ids, batch_attention, batch_words, batch_word_ids = [], [], [], []
+        for ids, words_mask, word_ids, _ in rows:
+            pad = width - len(ids)
+            if left:
+                batch_ids.append([pad_id] * pad + ids)
+                batch_attention.append([0] * pad + [1] * len(ids))
+                batch_words.append([0] * pad + words_mask)
+                batch_word_ids.append([None] * pad + word_ids)
+            else:
+                batch_ids.append(ids + [pad_id] * pad)
+                batch_attention.append([1] * len(ids) + [0] * pad)
+                batch_words.append(words_mask + [0] * pad)
+                batch_word_ids.append(word_ids + [None] * pad)
+
+        tokenized_inputs = _TokenUnitInputs(
+            input_ids=torch.tensor(batch_ids, dtype=torch.long),
+            attention_mask=torch.tensor(batch_attention, dtype=torch.long),
+        )
+        tokenized_inputs.set_word_ids(batch_word_ids)
+        if "token_type_ids" in getattr(tokenizer, "model_input_names", ()):
+            tokenized_inputs["token_type_ids"] = torch.zeros_like(tokenized_inputs["input_ids"])
+        tokenized_inputs["words_mask"] = torch.tensor(batch_words, dtype=torch.long)
+        tokenized_inputs["text_lengths"] = torch.tensor(
+            [[kept] for _, _, _, kept in rows], dtype=torch.long,
+        ).reshape(len(rows), 1)
         return tokenized_inputs
 
     def prepare_all_typed_inputs(self, classes_mapping, texts=None):
@@ -983,7 +1142,10 @@ class LayoutProcessingMixin:
         has_layout = False
         has_page_ids = False
         for item in batch_list:
-            words, bboxes, page_ids = self._extract_layout_words_bboxes_and_pages(item)
+            if is_token_level(self.config):
+                words, bboxes, page_ids = self._token_unit_layout(item)
+            else:
+                words, bboxes, page_ids = self._extract_layout_words_bboxes_and_pages(item)
             if words is None or bboxes is None:
                 word_bboxes.append(None)
                 word_page_ids.append(None)
@@ -1018,6 +1180,47 @@ class LayoutProcessingMixin:
             fields["word_page_ids"] = word_page_ids
             fields["page_input_mask"] = torch.tensor(page_input_mask, dtype=torch.bool)
         return fields
+
+    _UNIT_LAYOUT_KEY = "_gliformer_unit_layout"
+
+    def _token_unit_layout(self, item):
+        """Layout boxes and pages per token unit (token mode).
+
+        Boxes are given per word; every unit takes the box of the word that
+        holds it. The result is cached on the item because its
+        ``tokenized_text`` holds units from then on.
+        """
+        cached = item.get(self._UNIT_LAYOUT_KEY)
+        if cached is not None:
+            return cached
+        words, bboxes, page_ids = self._extract_layout_words_bboxes_and_pages(item)
+        if words is None or bboxes is None:
+            return words, bboxes, page_ids
+        if len(words) != len(bboxes):
+            raise ValueError(
+                f"Layout words and bboxes must have the same length, got {len(words)} and {len(bboxes)}."
+            )
+        if item.get(TOKEN_UNIT_MARKER) == "token":
+            raise ValueError("Layout row was split into token units before its boxes were attached.")
+        item.setdefault("tokenized_text", words)
+        item.setdefault("text", " ".join(words))
+        unit_words = self._ensure_token_units(item)
+        if unit_words is None:
+            raise ValueError("Layout words do not line up with the row text.")
+        units = list(item["tokenized_text"])
+        unit_boxes = []
+        unit_pages = [] if page_ids is not None else None
+        previous = 0
+        for word_index in unit_words:
+            if word_index is None:
+                word_index = previous
+            previous = word_index
+            unit_boxes.append(bboxes[word_index] if word_index < len(bboxes) else [0, 0, 0, 0])
+            if unit_pages is not None:
+                unit_pages.append(page_ids[word_index] if word_index < len(page_ids) else 0)
+        result = (units, unit_boxes, unit_pages)
+        item[self._UNIT_LAYOUT_KEY] = result
+        return result
 
     def _augment_label_item(self, item, batch, batch_idx):
         if batch.get("image_batch_idx") is not None:
@@ -1093,6 +1296,15 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
 
     def __init__(self, config, tokenizer, words_splitter,
                  labels_tokenizer: Optional[object] = None):
+        # Word grid of the configured splitter. In token mode it still reads
+        # word-index annotations and widens spans to words.
+        self.word_splitter = None
+        if is_token_level(config):
+            if isinstance(words_splitter, TokenSplitter):
+                pass
+            elif tokenizer is not None:
+                words_splitter = TokenSplitter(tokenizer)
+            self.word_splitter = WordsSplitter(config.words_splitter_type)
         super().__init__(config, tokenizer, words_splitter)
         self.labels_tokenizer = labels_tokenizer
 
@@ -1370,6 +1582,100 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             if empty:
                 results.update(empty)
         return results
+
+    # ── Token-level units ───────────────────────────────────────────────
+
+    def _ensure_token_units(self, item):
+        """Re-split ``item`` into backbone subword units (token mode only).
+
+        Word-index annotations (legacy NER triplets, pre-resolved spans) are
+        first rewritten as character offsets on the item's word grid, then
+        ``tokenized_text`` becomes the unit pieces. Returns the word index of
+        every unit when the item carried pre-split words (layout boxes are
+        given per word), else None.
+        """
+        if not is_token_level(self.config) or not isinstance(item, dict):
+            return None
+        if item.get(TOKEN_UNIT_MARKER) == "token":
+            return None
+        text = item.get("text")
+        words = item.get("tokenized_text")
+        words = [str(word) for word in words] if words else None
+        if not text:
+            if not words:
+                return None
+            text, grid = joined_word_grid(words)
+            item["text"] = text
+        else:
+            grid = aligned_word_grid(words, text) if words else None
+        self._convert_word_annotations(item, text, grid, has_word_tokens=bool(words))
+        units = list(self.words_splitter(text))
+        item["tokenized_text"] = [piece for piece, _, _ in units]
+        item[TOKEN_UNIT_MARKER] = "token"
+        return unit_word_ids(units, grid) if grid is not None else None
+
+    def _require_grid(self, grid, what):
+        if grid is None:
+            raise ValueError(
+                f"text_unit='token' cannot read {what}: they are word indices and the "
+                "row's tokenized_text does not line up with its text. Give character "
+                "offsets or mention text instead."
+            )
+        return WordIndexConverter(grid)
+
+    def _convert_ner_groups(self, groups, text, grid, word_indexed):
+        """Rewrite word-index NER entities of extraction groups as character offsets."""
+
+        fallback_grid = None
+        for group in groups:
+            if not isinstance(group, dict) or not group.get("ner"):
+                continue
+            group_grid = grid
+            indexed = word_indexed
+            if not indexed:
+                # Same detection the word-mode NER resolver applies.
+                if fallback_grid is None:
+                    fallback_grid = list(self.word_splitter(text))
+                indexed = NERProcessor._uses_legacy_token_offsets(
+                    group["ner"], fallback_grid, num_tokens=len(fallback_grid),
+                )
+                group_grid = fallback_grid
+            if not indexed:
+                continue
+            converter = self._require_grid(group_grid, "NER spans")
+            group["ner"] = [converter.ner_entity(entity) for entity in group["ner"]]
+
+    def _convert_word_annotations(self, item, text, grid, *, has_word_tokens):
+        extraction_resolved = bool(item.pop("_gliformer_extraction_spans_resolved", False))
+        self._convert_ner_groups(
+            item.get("extraction") or [], text, grid,
+            word_indexed=extraction_resolved or has_word_tokens,
+        )
+
+        open_relex = self.task_processors.get("open_relex")
+        groups = item.get("open_relex")
+        if isinstance(groups, list) and groups:
+            item_resolved = bool(item.pop(OpenRelexProcessor.resolved_flag, False))
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                group_resolved = bool(group.pop(OpenRelexProcessor.resolved_group_flag, False))
+                resolved = item_resolved or group_resolved
+                if open_relex is not None and open_relex._is_extraction_group(group):
+                    self._convert_ner_groups(
+                        [group], text, grid, word_indexed=resolved or has_word_tokens,
+                    )
+                elif resolved:
+                    converter = self._require_grid(grid, "resolved relation endpoints")
+                    group["relations"] = converter.span_dicts(group.get("relations", []))
+        else:
+            item.pop(OpenRelexProcessor.resolved_flag, None)
+
+        structuring = self.task_processors.get("structuring")
+        flag = getattr(structuring, "resolved_flag", "_gliformer_structuring_spans_resolved")
+        if item.pop(flag, False) and item.get("structuring"):
+            converter = self._require_grid(grid, "resolved structuring spans")
+            item["structuring"] = converter.span_dicts(item["structuring"])
 
     # ── Tokenization ────────────────────────────────────────────────────
 
@@ -1683,6 +1989,7 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
                 # offsets a second time.
                 "tokenized_text": batch["tokens"][i],
                 "_gliformer_extraction_spans_resolved": True,
+                TOKEN_UNIT_MARKER: getattr(self.config, "text_unit", "word"),
                 "classification": batch["classification"][i],
                 "extraction": batch["extraction"][i],
                 "embedding": batch["embedding"][i],
@@ -1717,6 +2024,7 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
 
     def collate_raw_batch(self, batch_list, **kwargs):
         for item in batch_list:
+            self._ensure_token_units(item)
             self._canonicalize_structuring_tokens(item)
             for proc in self.task_processors.values():
                 proc.resolve_spans(item)
@@ -1765,6 +2073,8 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             tokenize_kwargs["layout_input_mask"] = batch["layout_input_mask"]
         if batch.get("page_input_mask") is not None:
             tokenize_kwargs["page_input_mask"] = batch["page_input_mask"]
+        if is_token_level(self.config):
+            tokenize_kwargs["source_texts"] = batch["text"]
         tokenized_input = self.tokenize_inputs(batch["tokens"], classes_mapping, **tokenize_kwargs)
         tokenized_input["classes_mapping"] = classes_mapping
 

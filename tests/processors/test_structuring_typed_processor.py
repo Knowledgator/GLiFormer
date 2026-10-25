@@ -3,7 +3,6 @@
 from dataclasses import asdict
 
 import pytest
-import torch
 
 from gliformer.config import StructuringHeadConfig
 from gliformer.processing._structuring_hierarchy import (
@@ -13,7 +12,6 @@ from gliformer.processing._structuring_hierarchy import (
 )
 from gliformer.processing.mappings import BatchClassesMapping
 from gliformer.processing.schema import normalize_structuring_schemas
-from gliformer.processing.typed_fields import ORIGIN_ABSOLUTE, ORIGIN_ANCHOR
 from gliformer.tasks.structuring.processor import StructuringProcessor
 from tests.conftest import FakeWordsSplitter, make_config
 
@@ -28,18 +26,16 @@ TYPES = {
     },
     "price": {"$type": "number", "$unit": "USD"},
     "posted": {"$type": "date"},
-    "due": {"$type": "date", "$stats": ["value", "p10", "p90"]},
+    "due": {"$type": "date"},
     "total": {"$type": "number"},
-    "fair_price": {"$type": "estimate", "$min": 1, "$max": 5000, "$scale": "log"},
 }
 OUTPUT = {
     "title": "Sony headphones",
     "category": ["electronics"],
     "price": 250,
     "posted": "2024-03-03",
-    "due": {"value": "2024-03-17", "p10": "2024-03-10", "p90": "2024-03-24"},
+    "due": "2024-03-17",  # derived, not written in the text
     "total": 999,  # computed, not written in the text
-    "fair_price": {"value": 230, "median": 230, "p10": 180, "p90": 300},
 }
 
 
@@ -49,7 +45,6 @@ def _processor(multi_level=True, typed=True, **overrides):
             StructuringHeadConfig(
                 multi_level=multi_level,
                 typed_fields=typed,
-                typed_num_bins=32,
                 typed_description_dropout=0.0,
                 typed_shuffle_options=False,
                 **overrides,
@@ -85,21 +80,24 @@ def _labels(processor, rows):
 
 
 @pytest.mark.parametrize("multi_level", [True, False])
-def test_typed_values_move_beside_spans_and_anchor(multi_level):
+def test_class_values_move_aside_and_value_fields_become_spans(multi_level):
     processor = _processor(multi_level=multi_level)
     row = _row(multi_level)
     processor.get_classes_mapping([row])
     processor.resolve_spans(row)
     instance = next(iter(row["structuring"].values()))[0]
-    values = instance[TYPED_VALUES_KEY]
-    assert values["category"] == ["electronics"]
-    assert "fair_price" in values and "fair_price" not in instance
-    # Read values become their field's span; derived dates anchor nearby.
+    assert instance[TYPED_VALUES_KEY] == {"category": ["electronics"]}
+    # Values written in the text become their field's span; the gold value
+    # is kept as the span's normalization target.
     assert instance["price"]["text"] == "250"
     assert instance["posted"]["text"] == "March 3, 2024"
-    assert instance["due"]["text"] == "March 3, 2024"
-    assert set(instance[TYPED_ANCHORS_KEY]) == {"price", "posted", "due"}
-    assert instance[TYPED_UNRESOLVED_KEY] == ["total"]
+    # Gold values are kept per field and span text, as written in the data.
+    assert instance[TYPED_ANCHORS_KEY] == {
+        "price": {"250": 250}, "posted": {"March 3, 2024": "2024-03-03"},
+    }
+    # Derived values have no span: they are neither targets nor negatives.
+    assert "due" not in instance and "total" not in instance
+    assert sorted(instance[TYPED_UNRESOLVED_KEY]) == ["due", "total"]
 
 
 @pytest.mark.parametrize("multi_level", [True, False])
@@ -116,32 +114,14 @@ def test_typed_tensors(multi_level):
     assert inputs["structuring_typed_option_count"].tolist() == [3]
     assert labels["structuring_typed_class_targets"][0, 0, 0].tolist() == [1.0, 0.0, 0.0]
     assert labels["structuring_typed_class_unit_mask"].all()
+    assert not any("quantity" in key for key in (*labels, *inputs))
 
-    quantity_ids = inputs["structuring_typed_quantity_field_idx"][0].tolist()
-    order = [label for label, fid in sorted(field_to_id.items(), key=lambda kv: kv[1])
-             if fid in quantity_ids]
-    slots = {label: quantity_ids.index(field_to_id[label]) for label in order}
-    origin = labels["structuring_typed_quantity_origin"][0, 0]
-    assert origin[slots["price"]] == ORIGIN_ANCHOR
-    assert origin[slots["due"]] == ORIGIN_ANCHOR
-    assert origin[slots["fair_price"]] == ORIGIN_ABSOLUTE
-    assert inputs["structuring_typed_quantity_bounded"][0, slots["fair_price"]]
-    assert labels["structuring_typed_quantity_presence"].eq(1).all()
-
-    # Anchored reads have zero offset: u is the centre of the asinh map.
-    point = labels["structuring_typed_quantity_point"][0, 0, :, 0]
-    assert point[slots["price"]].item() == pytest.approx(0.5)
-    assert point[slots["due"]].item() > 0.5
-    # Interval labels supervise three quantile points.
-    point_mask = labels["structuring_typed_quantity_point_mask"][0, 0]
-    assert point_mask[slots["fair_price"], 0].sum() == 3
-
-    # The computed total may be written differently; do not train "no span".
+    # Derived values may be written differently; do not train "no span".
     bio = labels["structuring_typed_bio_field_mask"][0]
-    assert not bio[field_to_id["total"]]
+    assert not bio[field_to_id["total"]] and not bio[field_to_id["due"]]
     assert bio[field_to_id["price"]] and bio[field_to_id["category"]]
 
-    # The anchor spans are the quantity fields' span targets.
+    # Grounded values are the value fields' span targets.
     span = labels["structuring_labels"][0, 0, :, field_to_id["posted"], 2]
     assert span.nonzero().flatten().tolist() == [3, 4, 5]
 
@@ -155,7 +135,8 @@ def test_prompt_renders_types_descriptions_and_options():
         "[OPTION] electronics", "[OPTION] furniture", "[OPTION] toys",
     ]
     assert "[CHILD] title : item name" in prompt
-    assert "[CHILD] fair_price ( estimate , 1 - 5000 , log )" in prompt
+    assert "[CHILD] price ( number , USD )" in prompt
+    assert "[CHILD] posted ( date )" in prompt
 
 
 def test_inference_schema_recovers_types_from_descriptors():
@@ -180,7 +161,7 @@ def test_inference_schema_recovers_types_from_descriptors():
     assert inputs["structuring_typed_option_mask"][0].tolist() == [
         [True, True, True], [True, True, False],
     ]
-    assert inputs["structuring_typed_quantity_reference"].tolist() == [[True]]
+    assert field_types["posted"] == {"$type": "date"}
 
 
 def test_typed_fields_disabled_keeps_span_behaviour():
@@ -211,8 +192,9 @@ def test_label_items_rebuilt_after_resolution_keep_gold_values():
     }
     processor.resolve_spans(rebuilt)
     instance = next(iter(rebuilt["structuring"].values()))[0]
-    assert instance[TYPED_VALUES_KEY]["price"] == 250
-    assert instance[TYPED_ANCHORS_KEY]["price"] == 250.0
+    assert instance[TYPED_VALUES_KEY]["category"] == ["electronics"]
+    assert instance["price"]["text"] == "250"
+    assert instance[TYPED_ANCHORS_KEY]["price"] == {"250": 250}
 
 
 def test_list_items_are_grounded_on_source_spans():
@@ -228,15 +210,3 @@ def test_list_items_are_grounded_on_source_spans():
     texts = [value["text"] for value in instance["dates"]]
     assert texts == ["2024-01-05", "February 5, 2024", "March 9, 2024"]
     assert TYPED_UNRESOLVED_KEY not in instance
-
-
-def test_quantity_targets_are_masked_when_value_is_uninterpretable():
-    processor = _processor()
-    row = _row()
-    row["structuring"]["$root"]["fair_price"] = "about a lot"
-    _mapping, _classes, labels, inputs = _labels(processor, [row])
-    ids = inputs["structuring_typed_quantity_field_idx"][0].tolist()
-    field_to_id = _mapping[0].items[0].field_class_to_id.class_to_id
-    slot = ids.index(field_to_id["fair_price"])
-    assert not labels["structuring_typed_quantity_presence_mask"][0, 0, slot]
-    assert torch.is_tensor(labels["structuring_typed_quantity_levels"])
