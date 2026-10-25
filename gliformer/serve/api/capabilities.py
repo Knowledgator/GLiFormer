@@ -7,7 +7,7 @@ from typing import Any
 
 TEXT_FORMATS = ("number", "integer", "duration", "date", "time", "datetime")
 PREDICTED_FIELD_TYPES = (
-    "options", "number", "integer", "duration", "date", "time", "datetime", "estimate",
+    "options", "number", "integer", "duration", "date", "time", "datetime",
 )
 BASE_FIELD_TYPES = ("text", "boolean")
 ALL_TASK_TYPES = (

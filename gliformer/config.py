@@ -1666,9 +1666,10 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     objectness_focal_loss_gamma: Optional[float] = None
     objectness_focal_loss_prob_margin: Optional[float] = None
     # Typed fields: class fields choose from ``[OPTION]`` labels rendered in
-    # the prompt; quantity fields (number, duration, date, time, datetime,
-    # estimate, forecast) are read from one histogram-plus-offset head.
-    # Off by default so existing checkpoints load without new parameters.
+    # the prompt and are scored by the structuring head. Number, duration,
+    # date, time and datetime fields are span fields; their values are read
+    # by the normalization head. Off by default so plain configs need no
+    # ``[OPTION]`` token.
     typed_fields: bool = False
     option_token_index: int = -1
     # True: use the ``[OPTION]`` marker embedding (bidirectional encoders).
@@ -1677,30 +1678,9 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     # Token ids that end an option label for ``embed_option_token=False``;
     # filled by ``set_class_indices``.
     typed_boundary_token_indices: Optional[list[int]] = None
-    # Histogram resolution over the unit interval of a quantity.
-    typed_num_bins: int = 256
     typed_readout_heads: int = 8
-    typed_max_horizon: int = 64
     typed_class_loss_coef: float = 1.0
-    typed_quantity_loss_coef: float = 1.0
-    typed_point_loss_coef: float = 1.0
-    typed_presence_loss_coef: float = 1.0
     typed_class_threshold: float = 0.5
-    typed_presence_threshold: float = 0.5
-    # Minimum field x membership probability for a span to anchor a quantity.
-    typed_anchor_threshold: float = 0.1
-    # Quantity head: "regression" (number decomposition, calendar components,
-    # year-anchor pointer, quantile offsets) or "histogram" (anchor + binned
-    # offset; the default so earlier typed checkpoints keep loading).
-    typed_quantity_head: str = "histogram"
-    # Quantile-offset loss weight of the regression head.
-    typed_quantile_loss_coef: float = 0.5
-    # Numbers/years in the input given to the regression head as memory.
-    typed_max_mentions: int = 64
-    # Split-conformal widening of predicted intervals per family, fitted on
-    # held-out data: {"number": log10 units, "date": days, "time": minutes,
-    # "datetime": minutes}.
-    typed_conformal: Optional[dict[str, float]] = None
     # Training-time prompt augmentation for typed fields.
     typed_description_dropout: float = 0.3
     typed_shuffle_options: bool = True
@@ -1712,32 +1692,15 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
         if not isinstance(self.reuse_ner_head, bool):
             raise TypeError("reuse_ner_head must be a boolean")
         self.typed_fields = bool(self.typed_fields)
-        self.typed_quantity_head = str(self.typed_quantity_head).lower()
-        if self.typed_quantity_head not in {"histogram", "regression"}:
-            raise ValueError("typed_quantity_head must be 'histogram' or 'regression'")
-        if int(self.typed_num_bins) < 2:
-            raise ValueError("typed_num_bins must be at least 2")
-        self.typed_num_bins = int(self.typed_num_bins)
-        if not 1 <= int(self.typed_max_horizon) <= 1024:
-            raise ValueError("typed_max_horizon must be in [1, 1024]")
-        self.typed_max_horizon = int(self.typed_max_horizon)
-        for name in (
-            "typed_class_loss_coef",
-            "typed_quantity_loss_coef",
-            "typed_point_loss_coef",
-            "typed_presence_loss_coef",
-            "typed_quantile_loss_coef",
-        ):
-            value = float(getattr(self, name))
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"{name} must be finite and non-negative")
-            setattr(self, name, value)
-        for name in (
-            "typed_class_threshold",
-            "typed_presence_threshold",
-            "typed_anchor_threshold",
-            "typed_description_dropout",
-        ):
+        self.typed_shuffle_options = bool(self.typed_shuffle_options)
+        if int(self.typed_readout_heads) < 1:
+            raise ValueError("typed_readout_heads must be positive")
+        self.typed_readout_heads = int(self.typed_readout_heads)
+        value = float(self.typed_class_loss_coef)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("typed_class_loss_coef must be finite and non-negative")
+        self.typed_class_loss_coef = value
+        for name in ("typed_class_threshold", "typed_description_dropout"):
             value = float(getattr(self, name))
             if not 0 <= value <= 1:
                 raise ValueError(f"{name} must be in [0, 1]")
@@ -1794,6 +1757,290 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
                     "anchor_objectness_threshold must be finite and in [0, 1]"
                 )
             self.anchor_objectness_threshold = threshold
+
+
+@dataclass
+class NormalizationParserConfig:
+    """Rule-based parser that adds silver-labelled spans to training inputs.
+
+    Off by default. It never produces model outputs.
+    """
+
+    enabled: bool = False
+    numbers: bool = True
+    dates: bool = True
+    times: bool = True
+    # English number words ("one hundred and five") become spans too.
+    number_words: bool = False
+    max_mentions: int = 64
+
+    def __post_init__(self):
+        for name in ("enabled", "numbers", "dates", "times", "number_words"):
+            setattr(self, name, bool(getattr(self, name)))
+        self.max_mentions = int(self.max_mentions)
+        if self.max_mentions < 1:
+            raise ValueError("parser max_mentions must be positive")
+
+
+@dataclass
+class NormalizationTemporalConfig:
+    """Calendar classifiers for date, time and datetime spans.
+
+    Years in ``year_range`` are classes (plus "out of range" and "null");
+    ``year_digits`` adds an era + 4-digit head that reads out-of-range years.
+    ``year_range: null`` leaves every year to the digit head. Month, day,
+    hour, minute and second each get a class per value plus "null".
+    """
+
+    year_range: Optional[list[int]] = dataclasses.field(
+        default_factory=lambda: [1800, 2199]
+    )
+    year_digits: bool = True
+    loss_coef: float = 1.0
+
+    def __post_init__(self):
+        if self.year_range is not None:
+            first, last = (int(value) for value in self.year_range)
+            if first > last:
+                raise ValueError("temporal year_range must be [first, last] with first <= last")
+            self.year_range = [first, last]
+        self.year_digits = bool(self.year_digits)
+        if self.year_range is None and not self.year_digits:
+            raise ValueError("temporal needs year_range or year_digits")
+        if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
+            raise ValueError("temporal loss_coef must be finite and non-negative")
+        self.loss_coef = float(self.loss_coef)
+
+    def year_bounds(self) -> tuple[int, int]:
+        """Class range; an empty range (0, -1) when every year is digits."""
+
+        if self.year_range is None:
+            return 0, -1
+        return int(self.year_range[0]), int(self.year_range[1])
+
+
+@dataclass
+class NormalizationRegressionConfig:
+    """Number read as one regressed value.
+
+    ``asinh``: z = asinh(y / scale), any sign. ``log10``: a sign/zero class
+    plus z = log10(|y| / scale). ``loss``: ``huber`` (``huber_delta``) or ``l1``
+    on z.
+    """
+
+    transform: str = "asinh"
+    scale: float = 1.0
+    loss: str = "huber"
+    huber_delta: float = 1.0
+
+    def __post_init__(self):
+        self.transform = str(self.transform).lower()
+        if self.transform not in {"asinh", "log10"}:
+            raise ValueError("regression transform must be 'asinh' or 'log10'")
+        self.loss = str(self.loss).lower()
+        if self.loss not in {"huber", "l1"}:
+            raise ValueError("regression loss must be 'huber' or 'l1'")
+        for name in ("scale", "huber_delta"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"regression {name} must be finite and positive")
+            setattr(self, name, value)
+
+
+@dataclass
+class NormalizationBinsConfig:
+    """Number read as one class over fixed bins of a transformed value.
+
+    ``asinh`` or ``log10`` (with a zero class and a sign) of y / scale;
+    ``count`` uniform bins on ``range`` or explicit ``edges``. ``unbounded``
+    support adds two tail classes (half-normal, ``tail_scale``); ``finite``
+    skips values outside the edges. Decoded as the distribution's median.
+    """
+
+    transform: str = "asinh"
+    scale: float = 1.0
+    # 2048 bins on [-32, 32] cover |y| up to ~4e13 (asinh); a value can be
+    # off by up to half a bin, about 1.6% for large numbers.
+    count: int = 2048
+    range: list[float] = dataclasses.field(default_factory=lambda: [-32.0, 32.0])
+    edges: Optional[list[float]] = None
+    support: str = "unbounded"
+    tail_scale: float = 1.0
+
+    def __post_init__(self):
+        self.transform = str(self.transform).lower()
+        if self.transform not in {"asinh", "log10"}:
+            raise ValueError("bins transform must be 'asinh' or 'log10'")
+        self.support = str(self.support).lower()
+        if self.support not in {"unbounded", "finite"}:
+            raise ValueError("bins support must be 'unbounded' or 'finite'")
+        for name in ("scale", "tail_scale"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"bins {name} must be finite and positive")
+            setattr(self, name, value)
+        self.count = int(self.count)
+        if self.count < 2:
+            raise ValueError("bins count must be at least 2")
+        low, high = (float(value) for value in self.range)
+        if not (math.isfinite(low) and math.isfinite(high) and low < high):
+            raise ValueError("bins range must be two finite values, low < high")
+        self.range = [low, high]
+        if self.edges is not None:
+            edges = [float(value) for value in self.edges]
+            if len(edges) < 3 or any(right <= left for left, right in zip(edges, edges[1:])):
+                raise ValueError("bins edges must be at least 3 strictly increasing values")
+            self.edges = edges
+
+
+@dataclass
+class NormalizationSciDigitsConfig:
+    """Number read as sign x digits x coefficient x 10^exponent.
+
+    A sign/zero class, an exponent class over ``exp_range``, and ``digits``
+    significant digits as 10-way classes (each conditioned on the exponent and
+    the digits before it). With ``coefficient``, a regressed multiplier
+    c = 10^(``coefficient_log10_range`` * tanh(.)) scales the digits; it is
+    trained on the head's own greedy digits and applied at decode when
+    ``apply_coefficient``. Exponents outside the range get only the sign loss.
+    """
+
+    exp_range: list[int] = dataclasses.field(default_factory=lambda: [-10, 15])
+    digits: int = 5
+    hidden: int = 256
+    coefficient: bool = True
+    coefficient_log10_range: float = 0.5
+    apply_coefficient: bool = True
+    coefficient_loss_coef: float = 1.0
+
+    def __post_init__(self):
+        low, high = (int(value) for value in self.exp_range)
+        if low > high:
+            raise ValueError("sci_digits exp_range must be [low, high] with low <= high")
+        self.exp_range = [low, high]
+        self.digits = int(self.digits)
+        if not 1 <= self.digits <= 15:
+            raise ValueError("sci_digits digits must be in [1, 15]")
+        self.hidden = int(self.hidden)
+        if self.hidden < 1:
+            raise ValueError("sci_digits hidden must be positive")
+        self.coefficient = bool(self.coefficient)
+        self.apply_coefficient = bool(self.apply_coefficient)
+        for name in ("coefficient_log10_range", "coefficient_loss_coef"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"sci_digits {name} must be finite and non-negative")
+            setattr(self, name, value)
+
+
+NUMBER_HEAD_KINDS = ("regression", "bins", "sci_digits")
+
+
+@dataclass
+class NormalizationNumberConfig:
+    """Number heads of the normalization head.
+
+    ``heads`` lists one or more of ``regression``, ``bins``, ``sci_digits``;
+    all listed heads train together, and ``decode_with`` (default: the first)
+    gives the decoded number. An empty list reads no numbers.
+    """
+
+    heads: list[str] = dataclasses.field(default_factory=lambda: ["bins"])
+    decode_with: Optional[str] = None
+    loss_coef: float = 1.0
+    regression: NormalizationRegressionConfig | dict = dataclasses.field(
+        default_factory=NormalizationRegressionConfig
+    )
+    bins: NormalizationBinsConfig | dict = dataclasses.field(
+        default_factory=NormalizationBinsConfig
+    )
+    sci_digits: NormalizationSciDigitsConfig | dict = dataclasses.field(
+        default_factory=NormalizationSciDigitsConfig
+    )
+
+    def __post_init__(self):
+        self.heads = list(dict.fromkeys(str(kind).lower() for kind in self.heads))
+        unknown = set(self.heads) - set(NUMBER_HEAD_KINDS)
+        if unknown:
+            raise ValueError(
+                f"Unknown number heads {sorted(unknown)}; use {list(NUMBER_HEAD_KINDS)}"
+            )
+        if self.decode_with is not None:
+            self.decode_with = str(self.decode_with).lower()
+            if self.decode_with not in self.heads:
+                raise ValueError("number decode_with must be one of the listed heads")
+        elif self.heads:
+            self.decode_with = self.heads[0]
+        if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
+            raise ValueError("number loss_coef must be finite and non-negative")
+        self.loss_coef = float(self.loss_coef)
+        if isinstance(self.regression, dict):
+            self.regression = NormalizationRegressionConfig(**self.regression)
+        if isinstance(self.bins, dict):
+            self.bins = NormalizationBinsConfig(**self.bins)
+        if isinstance(self.sci_digits, dict):
+            self.sci_digits = NormalizationSciDigitsConfig(**self.sci_digits)
+
+
+@dataclass
+class NormalizationHeadConfig:
+    """Span-level normalization head: reads values from spans.
+
+    At inference the head reads every span the ``span_sources`` heads
+    picked (``structuring`` entity spans, ``ner`` spans). During training it
+    reads labelled spans: gold value fields of the structuring data, plus
+    parser spans when ``parser.enabled``.
+    """
+
+    loss_coef: float = 1.0
+    # "pooled": start, end and mean word states. "token_attention": learned
+    # queries attend over the span's subword tokens (finer digit detail).
+    span_encoder: str = "pooled"
+    span_queries: int = 4
+    span_attention_heads: int = 8
+    max_span_tokens: int = 32
+    max_span_width: int = 16
+    # Labelled spans per text in training; spans read per text at inference
+    # (the structuring decoder can only take values of spans the head read).
+    max_spans: int = 64
+    max_inference_spans: int = 512
+    span_sources: list[str] = dataclasses.field(
+        default_factory=lambda: ["structuring", "ner"]
+    )
+    temporal: NormalizationTemporalConfig | dict = dataclasses.field(
+        default_factory=NormalizationTemporalConfig
+    )
+    number: NormalizationNumberConfig | dict = dataclasses.field(
+        default_factory=NormalizationNumberConfig
+    )
+    parser: NormalizationParserConfig | dict = dataclasses.field(
+        default_factory=NormalizationParserConfig
+    )
+
+    def __post_init__(self):
+        if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
+            raise ValueError("loss_coef must be finite and non-negative")
+        self.span_encoder = str(self.span_encoder).lower()
+        if self.span_encoder not in {"pooled", "token_attention"}:
+            raise ValueError("span_encoder must be 'pooled' or 'token_attention'")
+        for name in (
+            "span_queries", "span_attention_heads", "max_span_tokens",
+            "max_span_width", "max_spans", "max_inference_spans",
+        ):
+            value = int(getattr(self, name))
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        self.span_sources = [str(source) for source in self.span_sources]
+        unknown = set(self.span_sources) - {"structuring", "ner"}
+        if unknown:
+            raise ValueError(f"Unknown span_sources {sorted(unknown)}; use 'structuring', 'ner'")
+        if isinstance(self.temporal, dict):
+            self.temporal = NormalizationTemporalConfig(**self.temporal)
+        if isinstance(self.number, dict):
+            self.number = NormalizationNumberConfig(**self.number)
+        if isinstance(self.parser, dict):
+            self.parser = NormalizationParserConfig(**self.parser)
 
 
 @dataclass
@@ -1856,6 +2103,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         "structuring": "structuring_config",
         "count": "count_config",
         "embedding": "embedding_config",
+        "normalization": "normalization_config",
     }
 
     @staticmethod
@@ -1876,8 +2124,6 @@ class GLiFormerConfig(BaseGLiNERConfig):
         """Discard retired matcher policies tied to a specific anchor strategy."""
 
         config.pop("position_bucket_matcher_cost", None)
-        # The year-anchor pointer was removed; the year is always regressed.
-        config.pop("typed_year_mode", None)
 
     @staticmethod
     def _canonicalize_head_type(
@@ -2046,6 +2292,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         structuring_config: Optional[dict] = None,
         count_config: Optional[dict] = None,
         embedding_config: Optional[dict] = None,
+        normalization_config: Optional[dict] = None,
         # Shared layers across tasks (None = each task creates its own)
         shared_anchor_modeling: Optional[str | dict[str, Any]] = None,
         shared_anchor_refinement: Optional[str | dict[str, Any]] = None,
@@ -2526,6 +2773,25 @@ class GLiFormerConfig(BaseGLiNERConfig):
         else:
             self.count_config = count_config
 
+        # Normalization (span values)
+        if isinstance(normalization_config, dict):
+            self.normalization_config = NormalizationHeadConfig(**normalization_config)
+        elif dataclasses.is_dataclass(normalization_config) and not isinstance(
+            normalization_config, NormalizationHeadConfig
+        ):
+            self.normalization_config = NormalizationHeadConfig(
+                **dataclasses.asdict(normalization_config)
+            )
+        else:
+            self.normalization_config = normalization_config
+        if self.normalization_config is not None and (
+            self.structuring_config is None and self.ner_config is None
+        ):
+            raise ValueError(
+                "normalization_config needs a structuring_config or ner_config "
+                "(the heads whose spans it reads)"
+            )
+
         # Embedding
         if isinstance(embedding_config, dict):
             embedding_config.setdefault("loss_coef", embedding_loss_coef)
@@ -2871,6 +3137,7 @@ _TEXT_CONFIG_FIELDS = (
     "structuring_config",
     "count_config",
     "embedding_config",
+    "normalization_config",
 )
 _VISION_CONFIG_FIELDS = (
     "image_classification_config",
@@ -2961,6 +3228,7 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "structuring_config",
         "count_config",
         "embedding_config",
+        "normalization_config",
         "relations_layer",
         "classifier_layer",
         "groups_layer",

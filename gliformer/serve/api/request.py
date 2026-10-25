@@ -28,7 +28,7 @@ COMMON_TASK_FIELDS = frozenset({"type", "instruction"})
 TASK_FIELDS: dict[str, frozenset[str]] = {
     "classify": frozenset({"threshold", "labels", "multi_label"}),
     "boolean": frozenset({"threshold", "labels"}),
-    "score": frozenset({"threshold", "labels", "order", "scale"}),
+    "score": frozenset({"threshold", "labels", "order"}),
     "span": frozenset({"threshold", "labels", "flat"}),
     "relation": frozenset({"threshold", "labels", "entity_labels", "flat"}),
     "json": frozenset({"labels", "schema"}),
@@ -63,7 +63,6 @@ class TaskSpec:
     labels: list[Label] | None = None
     multi_label: bool = False
     order: list[str] | None = None
-    scale: dict[str, float] | None = None
     entity_labels: list[Label] | None = None
     flat: bool = True
     fields: FieldNode | None = None
@@ -312,33 +311,8 @@ class RequestParser:
         task.labels = labels
 
     def parse_score(self, task: TaskSpec, raw: dict[str, Any], path: str) -> None:
-        has_scale = raw.get("scale") is not None
-        has_labels = raw.get("labels") is not None or raw.get("order") is not None
-        if has_scale == has_labels:
-            raise invalid("A 'score' task needs exactly one of 'scale' or 'labels' + 'order'", path)
-        if has_scale:
-            scale = raw["scale"]
-            if not isinstance(scale, dict) or set(scale) - {"min", "max", "step"}:
-                raise invalid("'scale' must be {min, max, step?}", f"{path}/scale")
-            for key in ("min", "max"):
-                if not isinstance(scale.get(key), (int, float)) or isinstance(scale.get(key), bool):
-                    raise invalid(f"'scale.{key}' must be a number", f"{path}/scale/{key}")
-            if scale["min"] >= scale["max"]:
-                raise invalid("'scale.min' must be below 'scale.max'", f"{path}/scale")
-            step = scale.get("step")
-            if step is not None and (not isinstance(step, (int, float)) or step <= 0):
-                raise invalid("'scale.step' must be a positive number", f"{path}/scale/step")
-            if raw.get("threshold") is not None:
-                raise invalid("'threshold' is not valid with 'scale'", f"{path}/threshold")
-            if not self.capabilities.typed_heads:
-                raise APIError(
-                    "UNSUPPORTED_LABEL_TYPE",
-                    "'score' with 'scale' needs typed structuring heads.",
-                    f"{path}/scale",
-                    {"model": self.capabilities.model},
-                )
-            task.scale = {key: scale[key] for key in ("min", "max", "step") if key in scale}
-            return
+        if raw.get("labels") is None and raw.get("order") is None:
+            raise invalid("A 'score' task needs 'labels' + 'order'", path)
         task.labels = self.labels(raw.get("labels"), f"{path}/labels")
         if not task.labels or len(task.labels) < 2:
             raise invalid("An ordinal 'score' needs at least two labels", f"{path}/labels")

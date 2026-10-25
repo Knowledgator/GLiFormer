@@ -21,7 +21,7 @@ from .render import Location, RenderedInput
 
 FIELD_TYPES = (
     "text", "boolean", "options", "number", "integer", "duration",
-    "date", "time", "datetime", "estimate",
+    "date", "time", "datetime",
 )
 TEXT_FORMATS = ("number", "integer", "duration", "date", "time", "datetime")
 NUMERIC_FORMATS = ("number", "integer", "duration")
@@ -31,18 +31,16 @@ TYPE_PROPS: dict[str, frozenset[str]] = {
     "text": frozenset({"format", "decimals", "unit", "dayfirst"}),
     "boolean": frozenset(),
     "options": frozenset({"options", "multi"}),
-    "number": frozenset({"minimum", "maximum", "step", "decimals", "unit", "scale"}),
-    "integer": frozenset({"minimum", "maximum", "step", "unit", "scale"}),
-    "duration": frozenset({"minimum", "maximum", "step", "decimals", "unit", "scale"}),
-    "date": frozenset({"minimum", "maximum"}),
-    "time": frozenset({"minimum", "maximum"}),
-    "datetime": frozenset({"minimum", "maximum"}),
-    "estimate": frozenset({
-        "minimum", "maximum", "step", "scale", "unit", "base", "stats", "quantiles",
-    }),
+    "number": frozenset({"decimals", "unit"}),
+    "integer": frozenset({"unit"}),
+    "duration": frozenset({"decimals", "unit"}),
+    "date": frozenset({"dayfirst"}),
+    "time": frozenset(),
+    "datetime": frozenset({"dayfirst"}),
 }
 FIELD_PROPS = frozenset({"type"}).union(*TYPE_PROPS.values())
-ESTIMATE_BASES = ("number", "duration", "date", "datetime")
+# Value fields read their value from the normalization head.
+VALUE_FIELD_TYPES = ("number", "integer", "duration", "date", "time", "datetime")
 
 
 @dataclass
@@ -132,19 +130,6 @@ def validate_field_props(
             )
         if "dayfirst" in props and fmt not in DATE_FORMATS:
             raise invalid("'dayfirst' needs format 'date' or 'datetime'", f"{where}/dayfirst")
-    for key in ("minimum", "maximum"):
-        if key in props:
-            value = props[key]
-            temporal = field_type in ("date", "time", "datetime") or (
-                field_type == "estimate" and props.get("base") in ("date", "datetime")
-            )
-            if not (_number(value) or (temporal and isinstance(value, str))):
-                raise invalid(f"'{key}' must be a number", f"{where}/{key}")
-    if "minimum" in props and "maximum" in props and _number(props["minimum"]) and _number(props["maximum"]):
-        if props["minimum"] > props["maximum"]:
-            raise invalid("'minimum' must not exceed 'maximum'", where)
-    if "step" in props and not (_number(props["step"]) and props["step"] > 0):
-        raise invalid("'step' must be a positive number", f"{where}/step")
     if "decimals" in props and not (
         isinstance(props["decimals"], int) and not isinstance(props["decimals"], bool)
         and props["decimals"] >= 0
@@ -154,8 +139,6 @@ def validate_field_props(
         raise invalid("'unit' must be a string", f"{where}/unit")
     if "dayfirst" in props and not isinstance(props["dayfirst"], bool):
         raise invalid("'dayfirst' must be a boolean", f"{where}/dayfirst")
-    if "scale" in props and props["scale"] not in ("linear", "log"):
-        raise invalid("'scale' must be 'linear' or 'log'", f"{where}/scale")
     if "multi" in props and not isinstance(props["multi"], bool):
         raise invalid("'multi' must be a boolean", f"{where}/multi")
     if field_type == "options":
@@ -168,25 +151,9 @@ def validate_field_props(
             raise invalid("'options' must list at least one choice", f"{where}/options")
         node.options = options
         props["options"] = [option.id for option in options]
-    if field_type == "estimate":
-        if "minimum" not in props or "maximum" not in props:
-            raise invalid("Fields of type 'estimate' need 'minimum' and 'maximum'", where)
-        if "base" in props and props["base"] not in ESTIMATE_BASES:
-            raise invalid(
-                f"'base' must be one of {', '.join(ESTIMATE_BASES)}", f"{where}/base"
-            )
-        if "stats" in props and not (
-            isinstance(props["stats"], list) and all(isinstance(s, str) for s in props["stats"])
-        ):
-            raise invalid("'stats' must be a list of strings", f"{where}/stats")
-        if "quantiles" in props and not (
-            isinstance(props["quantiles"], list)
-            and all(_number(q) and 0 < q < 1 for q in props["quantiles"])
-        ):
-            raise invalid("'quantiles' must be numbers between 0 and 1", f"{where}/quantiles")
     node.props = props
     try:
-        _typed_spec(node)
+        TypedFieldSpec.from_value(scalar_descriptor(node, typed=True, show_description=False))
     except (TypeError, ValueError) as exc:
         raise invalid(str(exc), where) from exc
 
@@ -366,19 +333,12 @@ class _SchemaResolver:
             raw["type"] = "boolean"
         else:
             raise invalid(f"Unsupported JSON Schema type {schema_type!r}", f"{where}/type")
-        predicted = raw["type"] in ("number", "integer", "duration", "estimate")
-        bounded = predicted or raw["type"] in ("date", "time", "datetime")
-        if bounded:
-            for source, target in (("minimum", "minimum"), ("maximum", "maximum")):
-                if source in schema:
-                    raw[target] = schema[source]
-        if predicted:
-            if "multipleOf" in schema:
-                raw["step"] = schema["multipleOf"]
-            for source, target in (("x-step", "step"), ("x-scale", "scale"), ("x-unit", "unit")):
-                if source in schema:
-                    raw[target] = schema[source]
-        elif raw["type"] == "text" and raw.get("format") in NUMERIC_FORMATS and "x-unit" in schema:
+        # Range constraints (minimum, maximum, multipleOf) are not used: values
+        # are read from the text, not predicted inside a range.
+        numeric = raw["type"] in ("number", "integer", "duration") or (
+            raw["type"] == "text" and raw.get("format") in NUMERIC_FORMATS
+        )
+        if numeric and "x-unit" in schema:
             raw["unit"] = schema["x-unit"]
         return FieldNode(
             kind="scalar", key=key, model_name=model_name, path=where,
@@ -407,57 +367,46 @@ def _validate_tree(node: FieldNode, capabilities: Capabilities) -> None:
 # -- model template ---------------------------------------------------------------
 
 
-def _typed_spec(node: FieldNode) -> TypedFieldSpec | None:
-    """Spec used to parse ``text`` + ``format`` values (``None`` otherwise)."""
-    fmt = node.props.get("format")
-    if node.type != "text" or fmt is None:
-        return None
-    base = "number" if fmt in ("number", "integer") else fmt
-    return TypedFieldSpec(
-        type=base,
-        integer=fmt == "integer",
-        unit=node.props.get("unit"),
-        decimals=node.props.get("decimals"),
-        dayfirst=node.props.get("dayfirst"),
-    )
+def value_type(node: FieldNode) -> str | None:
+    """Value type of a scalar field: number/integer/duration/date/time/datetime.
+
+    ``text`` fields with a ``format`` are value fields too.
+    """
+
+    if node.type == "text":
+        return node.props.get("format")
+    return node.type if node.type in VALUE_FIELD_TYPES else None
 
 
 def scalar_descriptor(node: FieldNode, *, typed: bool, show_description: bool) -> Any:
     props = node.props
     description = node.description if show_description else None
-    if node.type == "text":
-        fmt = props.get("format")
-        if not typed or (fmt is None and description is None):
+    kind = value_type(node)
+    if kind is not None:
+        if not typed and description is None:
             return "str"
-        descriptor: dict[str, Any] = {"$type": "text"}
-        if fmt is not None:
-            descriptor["$format"] = "number" if fmt == "integer" else fmt
-            if fmt == "integer":
-                descriptor["$integer"] = True
+        descriptor: dict[str, Any] = {"$type": "number" if kind == "integer" else kind}
+        if kind == "integer":
+            descriptor["$integer"] = True
         for key in ("unit", "decimals", "dayfirst"):
             if key in props:
                 descriptor[f"${key}"] = props[key]
+        if not typed:
+            descriptor = {"$type": "text"}
+    elif node.type == "text":
+        if not typed or description is None:
+            return "str"
+        descriptor = {"$type": "text"}
     elif node.type == "boolean":
         if not typed or description is None:
             return "bool"
         descriptor = {"$type": "bool"}
-    elif node.type == "options":
+    else:
         descriptor = {
             "$type": "class",
             "$options": [option.text for option in node.options or []],
             "$multi": bool(props.get("multi", False)),
         }
-    else:
-        descriptor = {"$type": "number" if node.type == "integer" else node.type}
-        if node.type == "integer":
-            descriptor["$integer"] = True
-        for key, target in (
-            ("minimum", "$min"), ("maximum", "$max"), ("step", "$step"),
-            ("decimals", "$decimals"), ("unit", "$unit"), ("scale", "$scale"),
-            ("base", "$base"), ("stats", "$stats"), ("quantiles", "$quantiles"),
-        ):
-            if key in props:
-                descriptor[target] = props[key]
     if description is not None:
         descriptor["$description"] = description
     return descriptor
@@ -496,6 +445,12 @@ def model_template(root: FieldNode, *, typed: bool, show_description: bool) -> d
 
 # -- output -------------------------------------------------------------------------
 
+# Normalized date/time values: "2024-05", "2024-05-18", "14:30", "2024-05-18T14:30:00".
+_ISO_VALUE = re.compile(
+    r"-?\d{4}(-\d{2}(-\d{2})?)?(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?"
+    r"|--\d{2}-\d{2}|\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?"
+)
+
 _NEGATIVE = re.compile(
     r"^\s*(no|false|n|0|none|never|nope|negative)\b|\b(not|never|unpaid|without|"
     r"declined|denied|refused|cancelled|canceled|failed)\b|n't\b",
@@ -509,7 +464,7 @@ def span_to_bool(text: str) -> bool:
 
 
 def _clean_numbers(value: Any, decimals: int | None = None) -> Any:
-    """Integral floats become ints, recursively (estimate statistics, series)."""
+    """Integral floats become ints, recursively."""
     if isinstance(value, float):
         return _clean_number(value, decimals=decimals)
     if isinstance(value, dict):
@@ -584,25 +539,20 @@ class JsonShaper:
             raw = next((item for item in raw if item not in (None, "")), None)
         if raw is None or raw == "":
             return None
+        if value_type(node) is not None:
+            return self.value_field(node, raw, where)
         if node.type == "text":
-            spec = _typed_spec(node)
-            if spec is None:
-                text = str(raw)
-                self.add_evidence(where, text)
-                return text
-            return self.formatted(node, spec, raw, where)
+            text = str(raw)
+            self.add_evidence(where, text)
+            return text
         if node.type == "boolean":
             if isinstance(raw, bool):
                 return raw
             text = str(raw)
             self.add_evidence(where, text)
             return span_to_bool(text)
-        if node.type == "options":
-            ids = self.options_ids(node, [raw])
-            return ids[0] if ids else None
-        if node.type == "integer" and isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            return _clean_number(raw, integer=True)
-        return _clean_numbers(raw, node.props.get("decimals"))
+        ids = self.options_ids(node, [raw])
+        return ids[0] if ids else None
 
     def options_ids(self, node: FieldNode, items: list[Any]) -> list[str]:
         by_text = {option.text: option.id for option in node.options or []}
@@ -616,38 +566,34 @@ class JsonShaper:
                 ids.append(label_id)
         return ids
 
-    def formatted(self, node: FieldNode, spec: TypedFieldSpec, raw: Any, where: str) -> Any:
-        fmt = node.props["format"]
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            value = _clean_number(float(raw), integer=fmt == "integer", decimals=node.props.get("decimals"))
-            if self.want_evidence:
-                self.add_parsed_evidence(where, spec, value)
+    def value_field(self, node: FieldNode, raw: Any, where: str) -> Any:
+        """Value of a number/date field, as normalized by the model.
+
+        Span text is not parsed here: a field the model returned only as text
+        is reported under ``unparsed`` with its location and has no value.
+        """
+
+        kind = value_type(node)
+        span_text = None
+        if isinstance(raw, dict) and "value" in raw:
+            span_text = raw.get("text")
+            raw = raw["value"]
+        value = None
+        if kind in NUMERIC_FORMATS:
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                value = _clean_number(
+                    float(raw), integer=kind == "integer", decimals=node.props.get("decimals"),
+                )
+        elif isinstance(raw, str) and _ISO_VALUE.fullmatch(raw.strip()):
+            value = raw.strip()
+        if value is not None:
+            if isinstance(span_text, str) and span_text:
+                self.add_evidence(where, span_text)
             return value
         text = str(raw)
         location = self.first_location(text)
-        span_start = None
-        if location is not None:
-            leaf = next(leaf for leaf in self.rendered.leaves if leaf.pointer == location.source)
-            span_start = leaf.start + location.start
-        try:
-            parsed = spec.parse_in_context(text, self.rendered.text, span_start)
-            value = None if parsed is None else spec.decode(parsed)
-        except (ValueError, OverflowError, TypeError):
-            value = None
-        if value is None:
-            entry: dict[str, Any] = {"text": text}
-            if location is not None:
-                entry = location.to_dict()
-            self.unparsed[where] = entry
-            return None
-        if isinstance(value, float):
-            value = _clean_number(value, integer=fmt == "integer", decimals=node.props.get("decimals"))
-        if location is not None:
-            self.add_evidence(where, text, location)
-        elif self.want_evidence:
-            # The model returned an already-normalized value ("2026-10-01").
-            self.add_parsed_evidence(where, spec, value)
-        return value
+        self.unparsed[where] = location.to_dict() if location is not None else {"text": text}
+        return None
 
     def first_location(self, text: str) -> Location | None:
         found = self.rendered.find(text)
@@ -660,35 +606,6 @@ class JsonShaper:
         if location is not None:
             self.evidence.setdefault(where, []).append(location.to_dict())
 
-    def add_parsed_evidence(self, where: str, spec: TypedFieldSpec, value: Any) -> None:
-        """Locate a value the model already parsed by re-parsing nearby words."""
-        leaves = [(leaf, list(re.finditer(r"\S+", leaf.text))) for leaf in self.rendered.leaves]
-        for size in range(1, 7):  # shortest matching span first
-            for leaf, words in leaves:
-                for first in range(len(words) - size + 1):
-                    last = first + size - 1
-                    start, end = words[first].start(), words[last].end()
-                    candidate = leaf.text[start:end].strip(".,;:!?()[]\"'")
-                    if not candidate:
-                        continue
-                    try:
-                        parsed = spec.parse_text(candidate)
-                    except (ValueError, OverflowError, TypeError):
-                        parsed = None
-                    if parsed is None:
-                        continue
-                    decoded = spec.decode(parsed)
-                    if isinstance(decoded, float):
-                        decoded = _clean_number(decoded, integer=bool(spec.integer), decimals=spec.decimals)
-                    if decoded == value:
-                        offset = leaf.text.find(candidate, start)
-                        self.evidence.setdefault(where, []).append({
-                            "text": candidate,
-                            "start": offset,
-                            "end": offset + len(candidate),
-                            "source": leaf.pointer,
-                        })
-                        return
 
 
 def _escape(token: str) -> str:

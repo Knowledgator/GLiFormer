@@ -126,6 +126,10 @@ class GLiFormerDecoder:
             if hasattr(StructuringDecoder, 'from_config'):
                 self.task_decoders["structuring"] = StructuringDecoder.from_config(config)
 
+        if getattr(config, "normalization_config", None) is not None:
+            from ..tasks.normalization.decoder import NormalizationDecoder
+            self.task_decoders["normalization"] = NormalizationDecoder.from_config(config)
+
         if config.embedding_config is not None:
             from ..tasks.embedding.decoder import EmbeddingDecoder
             if hasattr(EmbeddingDecoder, 'from_config'):

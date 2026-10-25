@@ -60,19 +60,18 @@ class GLiFormerTextOutput(GLiFormerBaseOutput):
     structuring_anchor_relation_scores: Optional[torch.FloatTensor] = None
     structuring_span_idx: Optional[torch.LongTensor] = None
     structuring_span_mask: Optional[torch.Tensor] = None
-    # Typed fields, per (group, record slot, typed field):
-    # class logits (G, A, Cc, Kc) and single-choice "none" logits (G, A, Cc);
-    # quantity histograms/in-bin offsets (G, A, Cq, H, K), presence logits,
-    # chosen anchor entity (-1 for none) and origin mode (G, A, Cq).
+    # Class fields, per (group, record slot, class field): option logits
+    # (G, A, Cc, Kc) and single-choice "none" logits (G, A, Cc).
     structuring_typed_class_logits: Optional[torch.FloatTensor] = None
     structuring_typed_class_none_logits: Optional[torch.FloatTensor] = None
-    structuring_typed_quantity_probs: Optional[torch.FloatTensor] = None
-    structuring_typed_quantity_offsets: Optional[torch.FloatTensor] = None
-    structuring_typed_quantity_presence_logits: Optional[torch.FloatTensor] = None
-    structuring_typed_quantity_anchor_entity: Optional[torch.LongTensor] = None
-    structuring_typed_quantity_origin: Optional[torch.LongTensor] = None
-    # Regression quantity head outputs (dict of tensors keyed by component).
-    structuring_typed_regression: Optional[dict] = None
+    # Normalization head, per text row: spans read (B, S, 2) inclusive word
+    # indices, their mask (B, S), and calendar logits by component.
+    normalization_span_idx: Optional[torch.LongTensor] = None
+    normalization_span_mask: Optional[torch.Tensor] = None
+    normalization_temporal: Optional[dict] = None
+    # Decoded numbers (B, S) float64 and their confidence, per number head.
+    normalization_number: Optional[dict] = None
+    normalization_number_confidence: Optional[dict] = None
 
     embedding_logits: Optional[torch.FloatTensor] = None
 

@@ -440,11 +440,11 @@ class BaseGLiFormer(BaseGLiNER):
                         text_config.vocab_size = model_embeds.num_embeddings
 
     def enable_typed_structuring(self, **settings) -> bool:
-        """Add typed structuring fields to a loaded checkpoint.
+        """Add class fields to a loaded checkpoint.
 
         Checkpoints trained before typed fields existed have no ``[OPTION]``
-        token and no typed head. This registers the token (its embedding row
-        starts as a copy of ``[FIELD]``), builds the typed head from
+        token and no option scorer. This registers the token (its embedding
+        row starts as a copy of ``[FIELD]``), builds the option scorer from
         ``settings`` (any ``typed_*`` structuring option and
         ``embed_option_token``), and rebuilds the structuring processor.
         Returns ``True`` when the model changed.
@@ -455,32 +455,13 @@ class BaseGLiFormer(BaseGLiNER):
         if struct_cfg is None or "structuring" not in heads:
             raise ValueError("Typed fields need a model with a structuring head")
         head = heads["structuring"]
-        already = bool(getattr(struct_cfg, "typed_fields", False)) and hasattr(head, "typed_head")
         for name, value in settings.items():
             if name.startswith("typed_") or name == "embed_option_token":
+                if not hasattr(struct_cfg, name):
+                    raise ValueError(f"Unknown structuring option {name!r}")
                 if name != "typed_fields":
                     setattr(struct_cfg, name, value)
-        if already:
-            wants_regression = (
-                str(getattr(struct_cfg, "typed_quantity_head", "histogram")) == "regression"
-            )
-            if wants_regression and not hasattr(head, "typed_regression_head"):
-                # Upgrade an earlier typed checkpoint to the regression head;
-                # its class head and readout are kept.
-                from .tasks.structuring.typed_regression import TypedRegressionModule
-
-                parameter = next(head.typed_head.parameters())
-                head.typed_regression = True
-                head.typed_regression_head = TypedRegressionModule(
-                    int(self.config.hidden_size),
-                    float(getattr(self.config, "dropout", 0.0)),
-                    max_horizon=int(getattr(struct_cfg, "typed_max_horizon", 64)),
-                ).to(device=parameter.device, dtype=parameter.dtype)
-                head.typed_quantile_loss_coef = float(
-                    getattr(struct_cfg, "typed_quantile_loss_coef", 0.5)
-                )
-                self._rebuild_structuring_processor()
-                return True
+        if bool(getattr(struct_cfg, "typed_fields", False)) and hasattr(head, "option_query"):
             return False
 
         struct_cfg.typed_fields = True
@@ -499,9 +480,43 @@ class BaseGLiFormer(BaseGLiNER):
             int(self.config.hidden_size),
             float(getattr(self.config, "dropout", 0.0)),
         )
-        head.typed_head.to(device=parameter.device, dtype=parameter.dtype)
+        for module in head._option_modules():
+            module.to(device=parameter.device, dtype=parameter.dtype)
 
         self._rebuild_structuring_processor()
+        return True
+
+    def enable_normalization(self, settings: Optional[Dict[str, Any]] = None) -> bool:
+        """Add a normalization head to a loaded checkpoint.
+
+        ``settings`` is a ``normalization_config`` mapping. The head starts
+        from scratch; its processor and decoder are registered with it.
+        Returns ``True`` when the model changed, ``False`` when the checkpoint
+        already has a normalization head.
+        """
+
+        from .config import NormalizationHeadConfig
+        from .tasks.normalization.model import NormalizationHead
+        from .tasks.normalization.processor import NormalizationProcessor
+
+        heads = self.model.heads
+        if "normalization" in heads:
+            return False
+        if self.config.structuring_config is None and self.config.ner_config is None:
+            raise ValueError("A normalization head needs a model with a structuring or NER head")
+        self.config.normalization_config = NormalizationHeadConfig(**dict(settings or {}))
+        head = NormalizationHead.from_config(self.config)
+        parameter = next(self.model.parameters())
+        heads["normalization"] = head.to(device=parameter.device, dtype=parameter.dtype)
+        processor = self.data_processor
+        normalization = NormalizationProcessor(
+            self.config,
+            processor.transformer_tokenizer,
+            getattr(processor, "words_splitter", None),
+        )
+        normalization.structuring_processor = processor.task_processors.get("structuring")
+        processor.task_processors["normalization"] = normalization
+        self.decoder = self.decoder_class(self.config)
         return True
 
     def _rebuild_structuring_processor(self):
@@ -513,6 +528,9 @@ class BaseGLiFormer(BaseGLiNER):
                 processor.transformer_tokenizer,
                 getattr(processor, "words_splitter", None),
             )
+            normalization = processor.task_processors.get("normalization")
+            if normalization is not None:
+                normalization.structuring_processor = processor.task_processors["structuring"]
 
     def _init_option_token_embedding(self, embeddings, old_num_tokens: int) -> None:
         """Start a newly added ``[OPTION]`` row from the ``[FIELD]`` row.
@@ -1422,7 +1440,9 @@ class BaseGLiFormer(BaseGLiNER):
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     v = v.to(device)
-                    if v.is_floating_point() and model_dtype is not None:
+                    # float64 inputs carry exact values (copied numbers, bin
+                    # targets) and must not be rounded to the model's dtype.
+                    if v.is_floating_point() and v.dtype != torch.float64 and model_dtype is not None:
                         v = v.to(dtype=model_dtype)
                     model_batch[k] = v
                 else:

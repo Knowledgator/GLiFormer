@@ -40,14 +40,15 @@ MULTI_LEVEL_META_KEY = "_gliformer_structuring_multi_level"
 MULTI_LEVEL_ROOT_KEY = "$root"
 NODE_ID_KEY = "__gliformer_multi_level_node_id__"
 NODE_KEEP_KEY = "__gliformer_multi_level_keep__"
-# Gold values of class/quantity fields. They are not text spans, so they live
+# Gold values of class fields. They are not text spans, so they live
 # beside the span annotations instead of being grounded in the text.
 TYPED_VALUES_KEY = "__gliformer_typed_values__"
-# Parsed anchor value (float) per quantity label whose anchor span was found.
+# Gold value (float) per value-field label (number, date, ...) whose source
+# span was found in the text; normalization targets for that span.
 TYPED_ANCHORS_KEY = "__gliformer_typed_anchors__"
-# Quantity labels whose value may be written in the text in a form the codec
-# could not find. Their span-tagging loss is masked instead of trained as
-# "no span here".
+# Value-field labels whose gold value may be written in the text in a form
+# the parser could not find. Their span-tagging loss is masked instead of
+# trained as "no span here".
 TYPED_UNRESOLVED_KEY = "__gliformer_typed_unresolved__"
 INTERNAL_INSTANCE_KEYS = frozenset({
     NODE_ID_KEY,
@@ -335,7 +336,7 @@ class _HierarchyNormalizer:
         value: object,
         spec: TypedFieldSpec,
     ) -> None:
-        """Register a class/quantity field whose value is not a text span."""
+        """Register a class field, whose value is not a text span."""
 
         canonical_path = node_path + local_path
         label = self._field_label(group, canonical_path, node_path)
@@ -982,7 +983,7 @@ class StructuringProcessorComponent:
                     name: spec.to_dict()
                     for name, child in node.fields.items()
                     if (spec := typed_spec_for_schema_node(child)) is not None
-                    and spec.kind != SPAN_KIND
+                    and (spec.kind != SPAN_KIND or spec.value_type is not None)
                 }
                 if group_types:
                     types[schema_name] = group_types
@@ -1053,31 +1054,27 @@ def prompt_field_order(struct_item) -> list[str]:
     ]
 
 
-def typed_field_layout(struct_item, spec_factory=None):
-    """Class and quantity fields of one schema group, in prompt order.
+def class_field_layout(struct_item, spec_factory=None):
+    """Class fields of one schema group, in prompt order.
 
-    Returns ``(class_fields, quantity_fields)``; entries are
-    ``(label, field_id, TypedFieldSpec)``.  Processor tensors and decoding
-    both use this so typed field slots line up exactly.
+    Entries are ``(label, field_id, TypedFieldSpec)``.  Processor tensors and
+    decoding both use this so class field slots line up exactly.
     """
 
     field_types = getattr(struct_item, "field_types", None) or {}
     if not field_types:
-        return [], []
+        return []
     make_spec = spec_factory or TypedFieldSpec.from_value
     field_to_id = struct_item.field_class_to_id.class_to_id
-    class_fields, quantity_fields = [], []
+    class_fields = []
     for label in prompt_field_order(struct_item):
         raw = field_types.get(label)
         if raw is None or label not in field_to_id:
             continue
         spec = make_spec(raw)
-        entry = (label, field_to_id[label], spec)
         if spec.kind == CLASS_KIND:
-            class_fields.append(entry)
-        elif spec.kind != SPAN_KIND:
-            quantity_fields.append(entry)
-    return class_fields, quantity_fields
+            class_fields.append((label, field_to_id[label], spec))
+    return class_fields
 
 
 def render_field_prompt(
@@ -1157,6 +1154,6 @@ __all__ = [
     "prompt_field_order",
     "render_field_prompt",
     "resolve_structuring_processor",
-    "typed_field_layout",
+    "class_field_layout",
     "typed_spec_for_schema_node",
 ]

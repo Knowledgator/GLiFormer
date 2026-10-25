@@ -62,21 +62,18 @@ TYPE_NAME_ALIASES = {
     "date-time": "datetime",
     "list": "list",
     "array": "list",
-    # Typed-head field types. They have no span-text converter; values come
-    # from the class and quantity heads and pass through formatting.
+    # Typed-head field types. They have no span-text converter: class values
+    # come from the option scorer, time/duration values from the
+    # normalization head.
     "class": "class",
     "enum": "class",
     "choice": "class",
     "time": "time",
     "duration": "duration",
-    "estimate": "estimate",
-    "forecast": "forecast",
 }
 
 # Types that only make sense with the typed heads, even without descriptors.
-TYPED_ONLY_TYPE_NAMES = frozenset(
-    {"class", "time", "duration", "estimate", "forecast"}
-)
+TYPED_ONLY_TYPE_NAMES = frozenset({"class", "time", "duration"})
 
 
 def normalize_type_name(type_name: str) -> str:
@@ -121,7 +118,7 @@ class FieldType:
         self.choices = tuple(choices) if choices is not None else None
         self.nullable = bool(nullable)
         self.description = description
-        # Typed-head description (class options, bounds, statistics, ...).
+        # Typed-head description (class options, value type, unit, ...).
         self.typed = typed
         self.date_formats = date_formats or [
             "%Y-%m-%d",
@@ -610,9 +607,9 @@ def schema_node_exemplar(node: SchemaNode) -> Any:
             )
         ]
     typed = schema_node_typed_spec(node)
-    if typed is not None and (typed.kind != "span" or typed.format):
+    if typed is not None and (typed.kind != "span" or typed.value_type is not None):
         # The descriptor travels through the wire envelope so the processor
-        # can recover the class/quantity type at the leaf.
+        # can recover the class or value type at the leaf.
         return typed.to_dict()
     if isinstance(node.type_spec, FieldType) and node.type_spec.type_name == "list":
         return []

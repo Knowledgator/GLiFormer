@@ -71,13 +71,27 @@ def _get_path(target: dict, path: tuple[str, ...]) -> object:
     return cursor
 
 
+def field_value_with_span(field: dict, start_map, end_map, text: str) -> object:
+    """A decoded value, with its span's original text when it was asked for.
+
+    Values from the normalization head can carry their span
+    (``{"value": ..., "text": ...}``, decoder option ``value_spans``); the
+    text is replaced by the exact characters of the source.
+    """
+
+    value = deepcopy(field["value"])
+    if isinstance(value, dict) and "value" in value and "text" in value:
+        start, end = int(field.get("start", -1)), int(field.get("end", -1))
+        if 0 <= start < len(start_map) and 0 <= end < len(end_map):
+            value["text"] = text[start_map[start]:end_map[end]]
+            value["start"], value["end"] = start_map[start], end_map[end]
+    return value
+
+
 def _field_value(field: dict, start_map, end_map, text: str) -> object:
     if "value" in field:
-        # Typed (class/quantity) fields carry their decoded value directly;
-        # anchored quantities are re-parsed from the original text.
-        from .structuring_decoder import resolve_typed_field_value
-
-        return deepcopy(resolve_typed_field_value(field, start_map, end_map, text))
+        # Class and normalized fields carry their decoded value directly.
+        return field_value_with_span(field, start_map, end_map, text)
     start = int(field.get("start", 0))
     end = int(field.get("end", start))
     if 0 <= start < len(start_map) and 0 <= end < len(end_map):

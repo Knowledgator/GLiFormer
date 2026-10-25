@@ -1,29 +1,18 @@
-"""Typed structuring fields: specifications, value codecs, and targets.
+"""Typed structuring fields: specifications and value parsing.
 
-Structuring fields come in three kinds:
+Structuring fields come in two kinds:
 
-* ``span`` fields (``text`` and lists) are copied from the input by the
-  entity-first span tagger, exactly as before.
+* ``span`` fields are copied from the input by the entity-first span
+  tagger. Besides ``text``, ``list`` and ``bool`` this includes the value
+  types ``number``, ``duration``, ``date``, ``time`` and ``datetime``: the
+  structuring head tags their span and the normalization head reads the
+  value from it.
 * ``class`` fields choose labels from a closed option list.  Options are
   rendered in the prompt after their field as ``[OPTION] label`` markers and
   scored against a (record, field) representation.
-* ``quantity`` fields (numbers, durations, dates, times, datetimes, and their
-  estimate/forecast variants) are predicted by one distribution head.
 
-Every quantity is mapped to a real number ``x`` by a type codec, then to a
-unit coordinate ``u`` in ``[0, 1]``:
-
-* bounded fields (``$min``/``$max``) use a linear or log map of ``x``;
-* unbounded fields predict an offset ``x - origin`` through a symmetric
-  ``asinh`` map.  The origin is a span in the text tagged for the same field
-  (``anchor``), the request's reference date (``reference``), or a fixed
-  default (``absolute``).  A value copied from the text is simply an anchor
-  with a zero offset.
-
-The head predicts a histogram over ``num_bins`` bins of ``u`` plus an offset
-inside every bin, so any statistic (point value, median, any quantile) can be
-read from the same distribution.  This module is torch-free; it only builds
-targets and decodes predictions.
+The text parsers here ground gold values of value fields on the spans they
+were read from when training data is prepared.  This module is torch-free.
 """
 
 from __future__ import annotations
@@ -33,34 +22,23 @@ import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
 from datetime import time as clock_time
 from typing import Any
 
 SPAN_KIND = "span"
 CLASS_KIND = "class"
-QUANTITY_KIND = "quantity"
 
 # Integer codes shared by processor tensors and the head.
-FIELD_KIND_IDS = {SPAN_KIND: 0, CLASS_KIND: 1, QUANTITY_KIND: 2}
-
-ORIGIN_ABSOLUTE = 0
-ORIGIN_REFERENCE = 1
-ORIGIN_ANCHOR = 2
-ORIGIN_NAMES = {
-    ORIGIN_ABSOLUTE: "absolute",
-    ORIGIN_REFERENCE: "reference",
-    ORIGIN_ANCHOR: "anchor",
-}
+FIELD_KIND_IDS = {SPAN_KIND: 0, CLASS_KIND: 1}
 
 # Canonical type names after alias resolution.
-SPAN_TYPES = frozenset({"text", "list", "bool"})
+VALUE_TYPES = frozenset({"number", "duration", "date", "time", "datetime"})
+SPAN_TYPES = frozenset({"text", "list", "bool"}) | VALUE_TYPES
 CLASS_TYPES = frozenset({"class"})
-QUANTITY_BASE_TYPES = frozenset({"number", "duration", "date", "time", "datetime"})
-QUANTITY_TYPES = QUANTITY_BASE_TYPES | {"estimate", "forecast"}
 TEMPORAL_TYPES = frozenset({"date", "time", "datetime"})
-TYPED_NAMES = SPAN_TYPES | CLASS_TYPES | QUANTITY_TYPES
-
+TYPED_NAMES = SPAN_TYPES | CLASS_TYPES
 TYPE_ALIASES = {
     "str": "text",
     "string": "text",
@@ -87,8 +65,6 @@ TYPE_ALIASES = {
     "date_time": "datetime",
     "timestamp": "datetime",
     "duration": "duration",
-    "estimate": "estimate",
-    "forecast": "forecast",
     "list": "list",
     "array": "list",
 }
@@ -102,46 +78,20 @@ SPEC_OPTION_KEYS = frozenset(
         "labels",
         "enum",
         "multi",
-        "min",
-        "max",
-        "minimum",
-        "maximum",
-        "step",
-        "scale",
         "unit",
         "decimals",
         "integer",
-        "horizon",
-        "interval",
-        "stats",
-        "quantiles",
         "items",
-        "base",
         "dayfirst",
-        "signed",
-        "unit_scale",
+        "partial",
+        # ``{"$type": "text", "$format": "date"}`` is read as ``{"$type": "date"}``.
         "format",
     }
 )
 DESCRIPTOR_OPTION_KEYS = frozenset(f"${key}" for key in SPEC_OPTION_KEYS)
 
-DEFAULT_POINT_STATS = ("value",)
-DEFAULT_INTERVAL_STATS = ("value", "median", "p10", "p90")
-
-# Offsets are measured in these units before the asinh map.
-_UNBOUNDED_SCALE = {
-    # base type: (scale s, max |offset| / s)
-    "number": (1.0, 1e12),
-    "duration": (1.0, 1e9),
-    "date": (1.0, 200 * 365.25),  # days
-    "datetime": (60.0, 200 * 365.25 * 1440),  # seconds, scale one minute
-    "time": (60.0, 1440.0),  # seconds, scale one minute
-}
-
 _EPOCH_DATE = date(1970, 1, 1)
 _EPOCH_DATETIME = datetime(1970, 1, 1)
-# Used as the absolute origin of temporal fields when no reference exists.
-_DEFAULT_REFERENCE_DATE = date(2000, 1, 1)
 
 _SECONDS = {
     "s": 1.0,
@@ -199,12 +149,31 @@ _NUMBER_PATTERN = (
     r"(?<![\w.])[-+−]?(?:\d{1,3}(?:[,   ]\d{3})+|\d+)(?:\.\d+)?"
     r"|(?<![\w.])[-+−]?\.\d+"
 )
+_SUPERSCRIPTS = str.maketrans("⁻⁺⁰¹²³⁴⁵⁶⁷⁸⁹", "-+0123456789")
+# Scientific notation after the coefficient: "e-7", "E+11", "× 10^-6",
+# "x 10⁻⁸", "·10**3". Words rebuilt from a splitter can carry spaces
+# ("10 ^ - 6", "7.9E + 11"), so single spaces are allowed inside.
+_SCI_EXPONENT = (
+    r"(?:[eE]\s?(?P<exp>[-+−]?\s?\d{1,3})(?![\d\w])"
+    r"|\s?[×xX·*]\s?10\s?(?:(?:\^|\*\*)\s?(?P<exp_caret>[-+−]?\s?\d{1,3})(?!\d)"
+    r"|(?P<exp_sup>[⁻⁺]?\s?[⁰¹²³⁴⁵⁶⁷⁸⁹](?:\s?[⁰¹²³⁴⁵⁶⁷⁸⁹])*)))"
+)
 NUMBER_RE = re.compile(
     r"(?P<num>" + _NUMBER_PATTERN + r")"
-    r"(?:\s?(?P<mult>k|thousand|mn|million|millions|bn|billion|billions|"
-    r"trillion|[mbt])\b)?",
+    r"(?:" + _SCI_EXPONENT + r"|\s?(?P<mult>k|thousand|mn|million|millions|bn|billion|"
+    r"billions|trillion|[mbt])\b)?",
     re.IGNORECASE,
 )
+
+
+def number_match_exponent(match: re.Match) -> int | None:
+    """The written power of ten of a scientific-notation match, else None."""
+
+    groups = match.groupdict()
+    raw = groups.get("exp") or groups.get("exp_caret") or groups.get("exp_sup")
+    if raw is None:
+        return None
+    return int(re.sub(r"\s", "", raw.translate(_SUPERSCRIPTS)).replace("−", "-"))
 _UNIT_WORDS = "|".join(sorted(_SECONDS, key=len, reverse=True))
 DURATION_RE = re.compile(
     r"(?P<num>" + _NUMBER_PATTERN + r")\s?-?\s?(?P<unit>" + _UNIT_WORDS + r")\b",
@@ -272,75 +241,23 @@ def normalize_typed_name(type_name: Any) -> str:
     return TYPE_ALIASES.get(name, name)
 
 
-def stat_level(name: str) -> float | None:
-    """Return the quantile level of a statistic name, ``None`` for points."""
-
-    key = str(name).strip().lower()
-    if key in {"value", "point", "mean", "mode"}:
-        return None
-    if key == "median":
-        return 0.5
-    match = re.fullmatch(r"[pq](\d+(?:\.\d+)?)", key)
-    if match:
-        level = float(match.group(1)) / 100.0
-        if 0.0 < level < 1.0:
-            return level
-    raise ValueError(f"Unknown quantity statistic {name!r}")
-
-
-def quantile_stat_name(level: float) -> str:
-    """Name a quantile level the way targets and outputs spell it."""
-
-    if abs(level - 0.5) < 1e-9:
-        return "median"
-    percent = level * 100.0
-    if abs(percent - round(percent)) < 1e-9:
-        return f"p{int(round(percent))}"
-    return f"p{percent:g}"
-
-
-def _optional_float(value: Any, name: str) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise TypeError(f"{name} must be a number")
-    return float(value)
-
-
 @dataclass
 class TypedFieldSpec:
-    """Typed description of one structuring field.
-
-    ``type`` is the canonical public type.  ``estimate`` and ``forecast`` are
-    quantities over ``base`` (``number`` by default) with interval statistics
-    and, for forecasts, a horizon.
-    """
+    """Typed description of one structuring field."""
 
     type: str = "text"
     description: str | None = None
     options: tuple[str, ...] = ()
     multi: bool = True
-    minimum: Any = None
-    maximum: Any = None
-    step: float | None = None
-    scale: str | None = None
     unit: str | None = None
     decimals: int | None = None
     integer: bool = False
-    horizon: int = 1
-    interval: str | None = None
-    stats: tuple[str, ...] = ()
     items: str | None = None
-    base: str | None = None
     # Day/month order of ambiguous numeric dates; None detects per document.
     dayfirst: bool | None = None
-    # Regressed numbers that may be negative or cross zero use asinh space.
-    signed: bool = False
-    # Regressed numbers are predicted in this unit (e.g. 1e6 for millions).
-    number_scale: float | None = None
-    # Extraction fields (type "text") parse their span into this type:
-    # number, date, time, datetime, or duration.
-    format: str | None = None
+    # Dates/times may be written partially ("May 2024" -> "2024-05"); False
+    # asks for full values.
+    partial: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -359,93 +276,29 @@ class TypedFieldSpec:
             self.decimals = int(self.decimals)
             if not 0 <= self.decimals <= 12:
                 raise ValueError("decimals must be in [0, 12]")
-        self.step = _optional_float(self.step, "step")
-        if self.step is not None and self.step <= 0:
-            raise ValueError("step must be positive")
-        if self.scale is not None:
-            self.scale = str(self.scale).lower()
-            if self.scale not in {"linear", "log"}:
-                raise ValueError("scale must be 'linear' or 'log'")
-        self.horizon = int(self.horizon or 1)
-        if self.type == "forecast" and not 1 <= self.horizon <= 64:
-            raise ValueError("forecast horizon must be in [1, 64]")
-        if self.type != "forecast":
-            self.horizon = 1
-        if self.base is not None:
-            self.base = normalize_typed_name(self.base)
-            if self.base not in QUANTITY_BASE_TYPES:
-                raise ValueError(f"Unsupported quantity base {self.base!r}")
         if self.items is not None:
             self.items = normalize_typed_name(self.items)
-        self.signed = bool(self.signed)
-        if self.number_scale is not None:
-            self.number_scale = float(self.number_scale)
-            if not self.number_scale > 0:
-                raise ValueError("unit_scale must be positive")
-        if self.format is not None:
-            self.format = normalize_typed_name(self.format)
-            if self.type != "text":
-                raise ValueError("$format applies to extraction fields of type 'text'")
-            if self.format not in QUANTITY_BASE_TYPES:
-                raise ValueError(f"Unsupported extraction format {self.format!r}")
-        if self.type in QUANTITY_TYPES:
-            if not self.stats:
-                self.stats = (
-                    DEFAULT_INTERVAL_STATS
-                    if self.type in {"estimate", "forecast"}
-                    else DEFAULT_POINT_STATS
-                )
-            self.stats = tuple(dict.fromkeys(str(name).lower() for name in self.stats))
-            for name in self.stats:
-                stat_level(name)
-            if self.bounded:
-                low = self.encode(self.minimum)
-                high = self.encode(self.maximum)
-                if low is None or high is None or not low < high:
-                    raise ValueError("min must be below max")
-                if self.scale == "log" and low <= 0:
-                    raise ValueError("log scale needs a positive min")
-        else:
-            self.stats = ()
+        self.partial = bool(self.partial)
 
     # -- classification ----------------------------------------------------
 
     @property
     def kind(self) -> str:
-        if self.type in CLASS_TYPES:
-            return CLASS_KIND
-        if self.type in QUANTITY_TYPES:
-            return QUANTITY_KIND
-        return SPAN_KIND
+        return CLASS_KIND if self.type in CLASS_TYPES else SPAN_KIND
 
     @property
-    def value_type(self) -> str:
-        """Base type of a quantity: number, duration, date, time, datetime."""
+    def value_type(self) -> str | None:
+        """Normalized value type of the field or of its list items."""
 
-        if self.type in {"estimate", "forecast"}:
-            return self.base or "number"
-        return self.type
-
-    @property
-    def bounded(self) -> bool:
-        return (
-            self.kind == QUANTITY_KIND
-            and self.minimum is not None
-            and self.maximum is not None
-        )
+        if self.type in VALUE_TYPES:
+            return self.type
+        if self.type == "list" and self.items in VALUE_TYPES:
+            return self.items
+        return None
 
     @property
     def temporal(self) -> bool:
         return self.value_type in TEMPORAL_TYPES
-
-    @property
-    def point_stats(self) -> bool:
-        return any(stat_level(name) is None for name in self.stats)
-
-    @property
-    def quantile_levels(self) -> tuple[float, ...]:
-        levels = {stat_level(name) for name in self.stats}
-        return tuple(sorted(level for level in levels if level is not None))
 
     # -- serialization -----------------------------------------------------
 
@@ -460,35 +313,17 @@ class TypedFieldSpec:
             if not self.multi:
                 result["$multi"] = False
         for key, value in (
-            ("$min", self.minimum),
-            ("$max", self.maximum),
-            ("$step", self.step),
-            ("$scale", self.scale),
             ("$unit", self.unit),
             ("$decimals", self.decimals),
-            ("$interval", self.interval),
             ("$items", self.items),
-            ("$base", self.base),
             ("$dayfirst", self.dayfirst),
-            ("$unit_scale", self.number_scale),
-            ("$format", self.format),
         ):
             if value is not None:
                 result[key] = value
         if self.integer:
             result["$integer"] = True
-        if self.signed:
-            result["$signed"] = True
-        if self.type == "forecast":
-            result["$horizon"] = self.horizon
-        if self.kind == QUANTITY_KIND:
-            default = (
-                DEFAULT_INTERVAL_STATS
-                if self.type in {"estimate", "forecast"}
-                else DEFAULT_POINT_STATS
-            )
-            if tuple(self.stats) != default:
-                result["$stats"] = list(self.stats)
+        if not self.partial:
+            result["$partial"] = False
         return result
 
     @classmethod
@@ -515,12 +350,16 @@ class TypedFieldSpec:
         if type_name is None:
             type_name = "class" if options is not None else "text"
         type_name = normalize_typed_name(type_name)
-        quantiles = values.get("quantiles")
-        stats = values.get("stats")
-        if quantiles is not None:
-            stats = list(stats or ["value"]) + [
-                quantile_stat_name(float(level)) for level in quantiles
-            ]
+        fmt = values.get("format")
+        if fmt is not None:
+            # A text field with a format is a value field of that type.
+            if type_name != "text":
+                raise ValueError("$format applies to fields of type 'text'")
+            if str(fmt).strip().lower() in {"int", "integer"}:
+                values.setdefault("integer", True)
+            type_name = normalize_typed_name(fmt)
+            if type_name not in VALUE_TYPES:
+                raise ValueError(f"Unsupported $format {fmt!r}")
         integer = values.get("integer")
         if integer is None and str(spec.get("$type", spec.get("type", ""))).lower() in {
             "int",
@@ -532,22 +371,12 @@ class TypedFieldSpec:
             description=values.get("description"),
             options=tuple(options or ()) if type_name in CLASS_TYPES else (),
             multi=values.get("multi", True),
-            minimum=values.get("min", values.get("minimum")),
-            maximum=values.get("max", values.get("maximum")),
-            step=values.get("step"),
-            scale=values.get("scale"),
             unit=values.get("unit"),
             decimals=values.get("decimals"),
             integer=bool(integer),
-            horizon=values.get("horizon", 1),
-            interval=values.get("interval"),
-            stats=tuple(stats or ()),
             items=values.get("items"),
-            base=values.get("base"),
             dayfirst=values.get("dayfirst"),
-            signed=bool(values.get("signed", False)),
-            number_scale=values.get("unit_scale"),
-            format=values.get("format"),
+            partial=bool(values.get("partial", True)),
             extra=extra,
         )
 
@@ -557,69 +386,33 @@ class TypedFieldSpec:
         """Plain-word type description rendered after the field name."""
 
         if self.type == "text":
-            return f"( text , {self.format} )" if self.format else ""
+            return ""
         parts = [self.type if self.type != "list" else f"list of {self.items or 'text'}"]
         if self.kind == CLASS_KIND:
             parts.append("multiple" if self.multi else "single")
-        if self.kind == QUANTITY_KIND:
-            if self.type in {"estimate", "forecast"} and self.base:
-                parts.append(self.base)
+        if self.value_type in {"number", "duration"}:
             if self.unit:
                 parts.append(str(self.unit))
-            if self.bounded:
-                parts.append(f"{_plain(self.minimum)} - {_plain(self.maximum)}")
-            if self.step is not None:
-                parts.append(f"step {_plain(self.step)}")
-            if self.scale == "log":
-                parts.append("log")
             if self.integer:
                 parts.append("integer")
             elif self.decimals is not None:
                 parts.append(f"{self.decimals} decimals")
-            if self.type == "forecast":
-                interval = f" {self.interval}" if self.interval else ""
-                parts.append(f"{self.horizon}{interval} steps")
         return "( " + " , ".join(parts) + " )"
 
-    # -- codecs ------------------------------------------------------------
+    # -- parsing -----------------------------------------------------------
 
     def encode(self, value: Any) -> float | None:
         """Map a JSON value to the real line (``None`` when impossible)."""
 
+        if self.value_type is None:
+            return None
         return encode_value(value, self.value_type, unit=self.unit)
-
-    def decode(self, x: float) -> Any:
-        """Map a real number back to a typed JSON value with rounding."""
-
-        value_type = self.value_type
-        if value_type in {"number", "duration"}:
-            if self.bounded:
-                low, high = self.encode(self.minimum), self.encode(self.maximum)
-                x = min(max(x, low), high)
-                if self.step is not None:
-                    x = low + round((x - low) / self.step) * self.step
-                    x = min(max(x, low), high)
-            elif self.step is not None:
-                x = round(x / self.step) * self.step
-            if self.integer:
-                return int(round(x))
-            if self.decimals is not None:
-                return round(x, self.decimals)
-            if self.step is not None:
-                decimals = max(0, -int(math.floor(math.log10(self.step))) + 6)
-                x = round(x, decimals)
-            return _clean_float(x)
-        if value_type == "date":
-            if self.bounded:
-                x = min(max(x, self.encode(self.minimum)), self.encode(self.maximum))
-            return decode_value(x, "date")
-        if value_type == "datetime":
-            return decode_value(x, "datetime")
-        return decode_value(x, "time")
 
     def parse_text(self, text: str, *, dayfirst: bool | None = None) -> float | None:
         """Parse a span copied from the text into the real line."""
 
+        if self.value_type is None:
+            return None
         return parse_text_value(
             text,
             self.value_type,
@@ -633,12 +426,14 @@ class TypedFieldSpec:
         context: str | None = None,
         span_start: int | None = None,
     ) -> float | None:
-        """Parse an anchor span using its document for missing information.
+        """Parse a span using its document for missing information.
 
-        The document decides day/month order, and a datetime anchor that
+        The document decides day/month order, and a datetime span that
         holds only a clock time takes the date written closest to it.
         """
 
+        if self.value_type is None:
+            return None
         dayfirst = self.dayfirst if self.dayfirst is not None else detect_dayfirst(context)
         if (
             context
@@ -655,6 +450,12 @@ class TypedFieldSpec:
             if meridiem and re.search(r"\d:\d{2}\s*$|\d\s*$", span_text):
                 span_text = f"{span_text} {meridiem.group(1)}"
         value = self.parse_text(span_text, dayfirst=dayfirst)
+        if self.value_type == "number" and context and span_start is not None:
+            extended = _extend_number_span(span_text, context, span_start)
+            if extended is not None:
+                value = extended
+            if value is not None and value > 0:
+                value = _sign_from_context(value, span_text, context, span_start)
         if value is not None or self.value_type != "datetime" or not context:
             return value
         seconds = parse_text_value(span_text, "time")
@@ -672,98 +473,6 @@ class TypedFieldSpec:
         if best is None:
             return None
         return best[1] * 86400.0 + seconds
-
-    # -- normalization -------------------------------------------------------
-
-    def to_unit(self, x: float, origin: float | None) -> float:
-        """Map ``x`` (relative to ``origin`` when unbounded) into ``[0, 1]``."""
-
-        if self.bounded:
-            low, high = self.encode(self.minimum), self.encode(self.maximum)
-            if self.scale == "log":
-                x = max(x, low)
-                u = (math.log(x) - math.log(low)) / (math.log(high) - math.log(low))
-            else:
-                u = (x - low) / (high - low)
-            return min(max(u, 0.0), 1.0)
-        scale, limit = _UNBOUNDED_SCALE[self.value_type]
-        offset = x - (origin if origin is not None else 0.0)
-        radius = math.asinh(limit)
-        u = 0.5 + 0.5 * math.asinh(offset / scale) / radius
-        return min(max(u, 0.0), 1.0)
-
-    def from_unit(self, u: float, origin: float | None) -> float:
-        u = min(max(float(u), 0.0), 1.0)
-        if self.bounded:
-            low, high = self.encode(self.minimum), self.encode(self.maximum)
-            if self.scale == "log":
-                return math.exp(math.log(low) + u * (math.log(high) - math.log(low)))
-            return low + u * (high - low)
-        scale, limit = _UNBOUNDED_SCALE[self.value_type]
-        radius = math.asinh(limit)
-        offset = scale * math.sinh((2.0 * u - 1.0) * radius)
-        return (origin if origin is not None else 0.0) + offset
-
-    def default_origin(self) -> float:
-        """Absolute origin used when there is no anchor and no reference."""
-
-        value_type = self.value_type
-        if value_type == "date":
-            return float((_DEFAULT_REFERENCE_DATE - _EPOCH_DATE).days)
-        if value_type == "datetime":
-            return float(
-                (datetime.combine(_DEFAULT_REFERENCE_DATE, clock_time()) - _EPOCH_DATETIME)
-                .total_seconds()
-            )
-        return 0.0
-
-    def reference_origin(self, reference: Any) -> float | None:
-        """Encode a request reference date/datetime for this field."""
-
-        if reference is None or not self.temporal:
-            return None
-        value_type = self.value_type
-        if value_type == "time":
-            # Times of day are already absolute within a day.
-            return None
-        parsed = _coerce_datetime(reference)
-        if parsed is None:
-            return None
-        if value_type == "date":
-            return float((parsed.date() - _EPOCH_DATE).days)
-        return float((parsed - _EPOCH_DATETIME).total_seconds())
-
-    def resolve_origin(
-        self,
-        anchor_x: float | None,
-        reference: Any = None,
-    ) -> tuple[int, float | None]:
-        """Pick the origin mode and value for one prediction."""
-
-        if self.bounded:
-            return ORIGIN_ABSOLUTE, None
-        if anchor_x is not None:
-            return ORIGIN_ANCHOR, anchor_x
-        reference_x = self.reference_origin(reference)
-        if reference_x is not None:
-            return ORIGIN_REFERENCE, reference_x
-        return ORIGIN_ABSOLUTE, self.default_origin()
-
-
-def _plain(value: Any) -> str:
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value)
-
-
-def _clean_float(value: float) -> float:
-    """Drop floating-point noise beyond 10 significant digits."""
-
-    value = float(value)
-    if not math.isfinite(value) or value == 0.0:
-        return value
-    digits = 10 - int(math.floor(math.log10(abs(value)))) - 1
-    return float(round(value, max(digits, 0)))
 
 
 # -- value codecs ---------------------------------------------------------
@@ -839,25 +548,7 @@ def encode_value(value: Any, value_type: str, *, unit: str | None = None) -> flo
         return float((parsed - _EPOCH_DATETIME).total_seconds()) if parsed else None
     if value_type == "time":
         return _time_seconds(value)
-    raise ValueError(f"Unsupported quantity type {value_type!r}")
-
-
-def decode_value(x: float, value_type: str) -> Any:
-    """Decode a float to an ISO date, datetime, or time string."""
-
-    if value_type == "date":
-        return (_EPOCH_DATE + timedelta(days=int(round(x)))).isoformat()
-    if value_type == "datetime":
-        seconds = int(round(x))
-        return (_EPOCH_DATETIME + timedelta(seconds=seconds)).isoformat()
-    if value_type == "time":
-        seconds = int(round(x)) % 86400
-        hours, rest = divmod(seconds, 3600)
-        minutes, secs = divmod(rest, 60)
-        if secs:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-        return f"{hours:02d}:{minutes:02d}"
-    return _clean_float(float(x))
+    raise ValueError(f"Unsupported value type {value_type!r}")
 
 
 def _parse_number_match(match: re.Match) -> float | None:
@@ -867,10 +558,233 @@ def _parse_number_match(match: re.Match) -> float | None:
         number = float(raw)
     except ValueError:
         return None
+    exponent = number_match_exponent(match)
+    if exponent is not None:
+        try:
+            return float(Decimal(raw).scaleb(exponent))
+        except (InvalidOperation, ValueError):
+            return None
     multiplier = match.groupdict().get("mult")
     if multiplier:
         number *= _NUMBER_WORD_MULTIPLIERS.get(multiplier.lower(), 1.0)
     return number
+
+
+# -- number text beyond plain digits ------------------------------------------------
+
+_FRACTION_GLYPHS = {
+    "½": 0.5, "¼": 0.25, "¾": 0.75, "⅓": 1 / 3, "⅔": 2 / 3, "⅕": 0.2, "⅖": 0.4,
+    "⅗": 0.6, "⅘": 0.8, "⅙": 1 / 6, "⅚": 5 / 6, "⅛": 0.125, "⅜": 0.375, "⅝": 0.625,
+    "⅞": 0.875,
+}
+_GLYPH_CLASS = "[" + "".join(_FRACTION_GLYPHS) + "]"
+_FRACTION_NOUNS = {
+    "half": 1 / 2, "halves": 1 / 2, "third": 1 / 3, "thirds": 1 / 3, "quarter": 1 / 4,
+    "quarters": 1 / 4, "fourth": 1 / 4, "fourths": 1 / 4, "fifth": 1 / 5, "fifths": 1 / 5,
+    "eighth": 1 / 8, "eighths": 1 / 8,
+}
+_UNIT_WORDS_EN = {
+    word: index for index, word in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve thirteen "
+        "fourteen fifteen sixteen seventeen eighteen nineteen".split()
+    )
+}
+_TENS_WORDS_EN = {
+    word: 10 * (index + 2) for index, word in enumerate(
+        "twenty thirty forty fifty sixty seventy eighty ninety".split()
+    )
+}
+_SCALE_WORDS_EN = {"thousand": 1e3, "million": 1e6, "billion": 1e9, "trillion": 1e12}
+# Decimal comma: "1.382.216,45", "6.043,4", "285,8", "0,25". A lone comma
+# before exactly three digits ("1,286") stays an English thousands separator.
+_EUROPEAN_RE = re.compile(
+    r"(?<![\w.,])(?P<sign>[-+−]?)"
+    r"(?:(?P<grouped>\d{1,3}(?:[.   ]\d{3})+),(?P<gfrac>\d+)"
+    r"|(?P<plain>\d+),(?P<pfrac>\d{1,2}|\d{4,}))(?![\d,]|\.\d)"
+    r"|(?<![\w.,])(?P<sign2>[-+−]?)(?P<dotted>\d{1,3}(?:\.\d{3}){2,})(?![\d,.])"
+)
+_TAIL_FRACTION_RE = re.compile(
+    r"\s*(?:(?P<glyph>" + _GLYPH_CLASS + r")"
+    r"|\s(?P<num>\d{1,2})/(?P<den>\d{1,2})(?![\d/])"
+    r"|\s+and\s+(?P<count>a|an|one|two|three|four|five|seven)\s+"
+    r"(?P<noun>halves|half|thirds?|quarters?|fourths?|fifths?|eighths?)\b)",
+    re.IGNORECASE,
+)
+
+
+def _european_value(match: re.Match) -> float:
+    groups = match.groupdict()
+    if groups.get("dotted"):
+        number = float(groups["dotted"].replace(".", ""))
+        sign = groups.get("sign2")
+    else:
+        whole = groups.get("grouped") or groups.get("plain")
+        whole = re.sub(r"[.   ]", "", whole)
+        number = float(f"{whole}.{groups.get('gfrac') or groups.get('pfrac')}")
+        sign = groups.get("sign")
+    return -number if sign in {"-", "−"} else number
+
+
+def _parse_number_words(text: str) -> float | None:
+    """English number words: "five thousand thirty-three", "one and a half",
+    "minus twenty point five", "three quarters", "1.5 million" is not here."""
+
+    tokens = re.findall(r"[a-z]+", text.lower().replace("-", " "))
+    total = current = 0.0
+    started = negative = False
+    since_and = None  # count read after "and" (fractions: "two and three quarters")
+    decimals = None  # digits after "point"
+    pending_a = False
+    for index, token in enumerate(tokens):
+        following = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if not started and token in {"minus", "negative"}:
+            negative = True
+            continue
+        if decimals is not None:
+            if token in _UNIT_WORDS_EN and _UNIT_WORDS_EN[token] < 10:
+                decimals += str(_UNIT_WORDS_EN[token])
+                continue
+            if token in _SCALE_WORDS_EN and decimals:
+                total = (total + current + float(f"0.{decimals}")) * _SCALE_WORDS_EN[token]
+                current, decimals = 0.0, None
+                break
+            break
+        if token in _UNIT_WORDS_EN or token in _TENS_WORDS_EN:
+            value = _UNIT_WORDS_EN.get(token, _TENS_WORDS_EN.get(token))
+            current += value
+            if since_and is not None:
+                since_and += value
+            started = True
+        elif token in {"a", "an"} and (
+            following in {"hundred", "half", "quarter", "third", "fourth", "fifth", "eighth"}
+            or following in _SCALE_WORDS_EN
+        ):
+            # "a" is not added to the count read after "and": the fraction
+            # below counts it as one ("fifteen and a half" = 15.5).
+            pending_a = True
+            started = True
+        elif token == "hundred":  # bare "hundred and sixteen" is 116
+            current = (current or 1.0) * 100
+            started, pending_a = True, False
+        elif token in _SCALE_WORDS_EN and (started or pending_a):
+            total += (current or 1.0) * _SCALE_WORDS_EN[token]
+            current, pending_a = 0.0, False
+        elif token in _FRACTION_NOUNS and (started or pending_a):
+            fraction = _FRACTION_NOUNS[token]
+            if since_and is not None:
+                count = since_and or 1.0
+                current = current - since_and + count * fraction
+            else:
+                current = (current or 1.0) * fraction
+            started, pending_a = True, False
+            break
+        elif token == "and" and started:
+            since_and = 0.0
+        elif token == "point" and started:
+            decimals = ""
+        elif started:
+            break
+    if not started:
+        return None
+    value = total + current
+    if decimals:
+        value += float(f"0.{decimals}")
+    return -value if negative else value
+
+
+def _parse_number_text(text: str) -> float | None:
+    """A number written in ``text``: digits (English or European grouping,
+    scientific notation, k/M/bn), fractions, or English words. A value
+    wrapped in parentheses is negative, as in financial statements."""
+
+    stripped = text.strip()
+    wrapped = re.fullmatch(r"\(\s*([^()]+?)\s*\)", stripped)
+    if wrapped:
+        inner = _parse_number_text(wrapped.group(1))
+        return -abs(inner) if inner is not None else None
+    match = NUMBER_RE.search(text)
+    european = _EUROPEAN_RE.search(text)
+    if european and (match is None or european.start() <= match.start()):
+        return _european_value(european)
+    glyph = re.search(r"(?<![\d.])" + _GLYPH_CLASS, text)
+    if match is None or (glyph and glyph.start() < match.start()):
+        if glyph:
+            return _FRACTION_GLYPHS[glyph.group(0)]
+        return _parse_number_words(text)
+    slash = re.match(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?![\d/])", text[match.start():])
+    if slash and int(slash.group(2)) > 0 and not match.group("mult"):
+        return int(slash.group(1)) / int(slash.group(2))
+    words_first = re.search(r"[A-Za-z]+", text[:match.start()])
+    if words_first and _parse_number_words(text[:match.start()]) is not None:
+        return _parse_number_words(text)
+    value = _parse_number_match(match)
+    if value is None:
+        return None
+    if float(value).is_integer() and not match.group("mult") and number_match_exponent(match) is None:
+        tail = _TAIL_FRACTION_RE.match(text, match.end())
+        if tail:
+            if tail.group("glyph"):
+                fraction = _FRACTION_GLYPHS[tail.group("glyph")]
+            elif tail.group("num"):
+                fraction = int(tail.group("num")) / max(int(tail.group("den")), 1)
+                fraction = fraction if fraction < 1 else 0.0
+            else:
+                count = tail.group("count").lower()
+                count = 1 if count in {"a", "an", "one"} else _UNIT_WORDS_EN[count]
+                fraction = count * _FRACTION_NOUNS[tail.group("noun").lower()]
+            value = -(abs(value) + fraction) if value < 0 else value + fraction
+    return value
+
+
+
+def _sign_from_context(value: float, span_text: str, context: str, span_start: int) -> float:
+    """Negative when the copied span sits inside accounting parentheses,
+    "(395,327)" (either parenthesis may be inside the span or just outside
+    it), or right after a minus sign, "-12.5" / "−12.5"."""
+
+    span_end = span_start + len(span_text)
+    if context[span_start:span_end] != span_text:
+        return value
+    core = span_text.strip()
+    opens = core.startswith("(") or re.search(r"\(\s?[$€£]?$", context[max(0, span_start - 3):span_start])
+    closes = core.endswith(")") or re.match(r"\s?\)", context[span_end:span_end + 2])
+    if opens and closes:
+        digits = core.strip("()$€£ ")
+        if "%" in core or re.fullmatch(r"(?:19|20)\d{2}", digits):
+            return value  # "(5%)", "(2023)": an aside, not a negative
+        return -value
+    if re.search(r"(?:^|[\s:(=])[-−]$", context[max(0, span_start - 2):span_start]):
+        return -value
+    return value
+
+
+def _extend_number_span(span_text: str, context: str, span_start: int) -> float | None:
+    """Value of a number the span cut short: "4.6" in "4.6 × 10^-4", "1" in
+    "1½" / "1 and a quarter", "8.693" in "8.693,0". Multiplier words are not
+    pulled in ("5" stays 5 in "5 million"): the span chose to stop there."""
+
+    span_end = span_start + len(span_text)
+    if context[span_start:span_end] != span_text or not re.search(r"\d", span_text):
+        return None
+    first_digit = span_start + re.search(r"[-−+.]?\d", span_text).start()
+    window = context[first_digit:span_end + 32]
+    covered = span_end - first_digit
+    european = _EUROPEAN_RE.match(window)
+    if european and european.end() > covered:
+        return _european_value(european)
+    match = NUMBER_RE.match(window)
+    if match is None:
+        return None
+    if number_match_exponent(match) is not None and match.end() > covered:
+        return _parse_number_match(match)
+    if match.group("mult"):
+        return None
+    tail = _TAIL_FRACTION_RE.match(window, match.end())
+    if match.end() > covered and not tail:
+        return _parse_number_match(match)  # "1" of "1,286", "3" of "3.75"
+    if tail and tail.end() > covered:
+        return _parse_number_text(window[:tail.end()])
+    return None
 
 
 def _unit_seconds(unit: str | None) -> float | None:
@@ -1059,14 +973,16 @@ def _parse_text_value(text: str, value_type: str, *, unit: str | None = None) ->
     # Span text rebuilt from words can carry spaces around punctuation
     # ("March 3 , 2024", "$ 1 , 250"); undo that before parsing.
     text = detokenize_span(text)
+    if value_type == "number":
+        # "8.693 , 0" / "285 , 8": a comma split off inside one number.
+        text = re.sub(r"(?<=\d)\s+,\s+(?=\d)", ",", text)
     text = re.sub(r"\s+([,.;:)%])", r"\1", text.strip())
     text = re.sub(r"([($])\s+", r"\1", text)
     text = re.sub(r"(\d),\s+(\d{3})\b", r"\1,\2", text)
     text = re.sub(r"(\d)\.\s+(\d)", r"\1.\2", text)
     text = re.sub(r"\s+", " ", text)
     if value_type == "number":
-        match = NUMBER_RE.search(text)
-        return _parse_number_match(match) if match else None
+        return _parse_number_text(text)
     if value_type == "duration":
         target = _unit_seconds(unit)
         match = DURATION_RE.search(text)
@@ -1117,7 +1033,7 @@ def _parse_text_value(text: str, value_type: str, *, unit: str | None = None) ->
             return moment.hour * 3600.0 + moment.minute * 60.0 + moment.second
         match = TIME_RE.search(text)
         return _parse_time_text(match.group(0)) if match else None
-    raise ValueError(f"Unsupported quantity type {value_type!r}")
+    raise ValueError(f"Unsupported value type {value_type!r}")
 
 
 def candidate_spans(text: str, value_type: str) -> list[tuple[int, int]]:
@@ -1160,30 +1076,18 @@ def candidate_spans(text: str, value_type: str) -> list[tuple[int, int]]:
     return spans
 
 
-# Largest offset accepted from a non-matching temporal anchor.
-_MAX_ANCHOR_OFFSET = {
-    "date": 3 * 366.0,  # days
-    "datetime": 3 * 366.0 * 86400.0,  # seconds
-    "time": 86400.0,  # seconds
-}
-
-
 def find_anchor(
     text: str,
     spec: TypedFieldSpec,
     target_x: float,
     *,
     snippets: Iterable[str] = (),
-    allow_offset: bool = True,
 ) -> dict[str, Any] | None:
-    """Find the span a quantity is read or derived from.
+    """Find the span a value field's gold value was read from.
 
-    Evidence snippets are searched first, then the whole text.  A span whose
-    parsed value equals ``target_x`` is preferred (zero offset).  For dates
-    and times without an exact match, the closest parseable span becomes the
-    anchor, so "due two weeks after March 3" is learned as anchor + 14 days.
-    Returns ``{"text", "start", "end", "x"}`` with character offsets and the
-    anchor's own parsed value ``x``.
+    Evidence snippets are searched first, then the whole text.  Only a span
+    whose parsed value equals ``target_x`` qualifies.  Returns ``{"text",
+    "start", "end", "x"}`` with character offsets and the parsed value ``x``.
     """
 
     value_type = spec.value_type
@@ -1234,220 +1138,7 @@ def find_anchor(
         for span_text, start, end, parsed in candidates(regions):
             if matches(parsed):
                 return {"text": span_text, "start": start, "end": end, "x": parsed}
-
-    limit = _MAX_ANCHOR_OFFSET.get(value_type)
-    if not allow_offset or limit is None:
-        return None
-    for regions in (evidence_regions, whole):
-        best = None
-        for span_text, start, end, parsed in candidates(regions):
-            offset = abs(parsed - target_x)
-            if offset <= limit and (best is None or offset < best[0]):
-                best = (offset, span_text, start, end, parsed)
-        if best is not None:
-            _, span_text, start, end, parsed = best
-            return {"text": span_text, "start": start, "end": end, "x": parsed}
     return None
-
-
-# -- targets -------------------------------------------------------------
-
-
-def target_cdf(
-    points: Sequence[tuple[float, float]],
-    num_bins: int,
-) -> list[float]:
-    """Target CDF at the right edge of every bin.
-
-    ``points`` are ``(level, u)`` pairs.  One point (or one distinct ``u``)
-    is a point mass; two or more are joined linearly with tails extended at
-    the edge slopes and clipped to ``[0, 1]``.
-    """
-
-    edges = [(index + 1) / num_bins for index in range(num_bins)]
-    cleaned = sorted(
-        {(float(level), min(max(float(u), 0.0), 1.0)) for level, u in points}
-    )
-    if not cleaned:
-        raise ValueError("target_cdf needs at least one point")
-    levels = [level for level, _ in cleaned]
-    # Enforce a non-decreasing quantile function even for noisy labels.
-    values = sorted(u for _, u in cleaned)
-    if len(cleaned) == 1 or values[-1] - values[0] < 1e-9:
-        point = values[len(values) // 2]
-        return [1.0 if edge >= point - 1e-12 else 0.0 for edge in edges]
-
-    def interpolate(u: float) -> float:
-        if u <= values[0]:
-            slope = _segment_slope(values[0], values[1], levels[0], levels[1])
-            return levels[0] + slope * (u - values[0])
-        if u >= values[-1]:
-            slope = _segment_slope(values[-2], values[-1], levels[-2], levels[-1])
-            return levels[-1] + slope * (u - values[-1])
-        for index in range(len(values) - 1):
-            left, right = values[index], values[index + 1]
-            if left <= u <= right:
-                if right - left < 1e-12:
-                    return levels[index + 1]
-                weight = (u - left) / (right - left)
-                return levels[index] + weight * (levels[index + 1] - levels[index])
-        return levels[-1]
-
-    return [min(max(interpolate(edge), 0.0), 1.0) for edge in edges]
-
-
-def _segment_slope(u_left: float, u_right: float, q_left: float, q_right: float) -> float:
-    width = max(u_right - u_left, 1e-6)
-    return (q_right - q_left) / width
-
-
-@dataclass
-class QuantityTarget:
-    """Unit-space supervision for one (record, field) quantity."""
-
-    present: bool
-    origin_mode: int = ORIGIN_ABSOLUTE
-    origin: float | None = None
-    # Per horizon step: (level, u) points and an optional point value.
-    points: list[list[tuple[float, float]]] = field(default_factory=list)
-    point_u: list[float | None] = field(default_factory=list)
-
-
-def _stat_series(value: Any, horizon: int) -> list[Any] | None:
-    if horizon == 1:
-        if isinstance(value, list):
-            return value[:1] if len(value) == 1 else None
-        return [value]
-    if not isinstance(value, list) or len(value) != horizon:
-        return None
-    return value
-
-
-def build_quantity_target(
-    gold: Any,
-    spec: TypedFieldSpec,
-    *,
-    origin_mode: int,
-    origin: float | None,
-) -> QuantityTarget | None:
-    """Convert a gold JSON value into unit-space supervision.
-
-    Accepted gold shapes: a scalar (number or ISO string), a forecast series
-    list, or a mapping of statistic name to scalar/series.  Returns
-    ``QuantityTarget(present=False)`` for ``None`` and ``None`` when the
-    value cannot be interpreted (so the caller masks the unit).
-    """
-
-    if gold is None:
-        return QuantityTarget(present=False)
-    horizon = spec.horizon
-    if isinstance(gold, Mapping):
-        stats = {str(key).lower(): value for key, value in gold.items()}
-    elif isinstance(gold, list) and horizon > 1:
-        stats = {"value": gold}
-    else:
-        stats = {"value": gold}
-
-    points: list[list[tuple[float, float]]] = [[] for _ in range(horizon)]
-    point_u: list[float | None] = [None] * horizon
-    median_u: list[float | None] = [None] * horizon
-    any_value = False
-    for name, raw in stats.items():
-        try:
-            level = stat_level(name)
-        except ValueError:
-            continue
-        series = _stat_series(raw, horizon)
-        if series is None:
-            return None
-        for step, item in enumerate(series):
-            x = spec.encode(item)
-            if x is None:
-                if item is None:
-                    continue
-                return None
-            u = spec.to_unit(x, origin)
-            any_value = True
-            if level is None:
-                point_u[step] = u
-            else:
-                points[step].append((level, u))
-                if abs(level - 0.5) < 1e-9:
-                    median_u[step] = u
-    if not any_value:
-        return None
-    for step in range(horizon):
-        if point_u[step] is None and median_u[step] is not None:
-            point_u[step] = median_u[step]
-        if not points[step] and point_u[step] is not None:
-            # A point label alone supervises the CDF as a point mass.
-            points[step].append((0.5, point_u[step]))
-    return QuantityTarget(
-        present=True,
-        origin_mode=origin_mode,
-        origin=origin,
-        points=points,
-        point_u=point_u,
-    )
-
-
-# -- decoding ------------------------------------------------------------
-
-
-def quantile_from_histogram(probs: Sequence[float], level: float) -> float:
-    """Unit-space quantile, linear inside the crossing bin."""
-
-    num_bins = len(probs)
-    total = 0.0
-    for index, mass in enumerate(probs):
-        mass = max(float(mass), 0.0)
-        if total + mass >= level and mass > 0:
-            inside = (level - total) / mass
-            return (index + min(max(inside, 0.0), 1.0)) / num_bins
-        total += mass
-    return 1.0
-
-
-def point_from_histogram(probs: Sequence[float], offsets: Sequence[float]) -> float:
-    """Most likely bin refined by its in-bin offset."""
-
-    num_bins = len(probs)
-    best = max(range(num_bins), key=lambda index: probs[index])
-    offset = min(max(float(offsets[best]), 0.0), 1.0)
-    return (best + offset) / num_bins
-
-
-def decode_quantity(
-    spec: TypedFieldSpec,
-    probs_by_step: Sequence[Sequence[float]],
-    offsets_by_step: Sequence[Sequence[float]],
-    *,
-    origin: float | None,
-    stats: Sequence[str] | None = None,
-) -> Any:
-    """Read the requested statistics and decode them to typed values."""
-
-    names = tuple(stats or spec.stats)
-    horizon = spec.horizon
-    results: dict[str, list[Any]] = {name: [] for name in names}
-    for step in range(horizon):
-        probs = probs_by_step[step]
-        offsets = offsets_by_step[step]
-        for name in names:
-            level = stat_level(name)
-            u = (
-                point_from_histogram(probs, offsets)
-                if level is None
-                else quantile_from_histogram(probs, level)
-            )
-            results[name].append(spec.decode(spec.from_unit(u, origin)))
-    if horizon == 1:
-        flat = {name: values[0] for name, values in results.items()}
-    else:
-        flat = results
-    if names == ("value",):
-        return flat["value"]
-    return flat
 
 
 # -- schema adapters -------------------------------------------------------
@@ -1497,20 +1188,6 @@ def spec_from_json_schema(prop: Mapping[str, Any]) -> TypedFieldSpec:
             decimals = max(0, -int(math.floor(math.log10(step) + 1e-9)))
             kwargs["decimals"] = decimals
         kwargs["unit"] = prop.get("x-unit")
-    elif field_type in {"estimate", "forecast"}:
-        inner = prop.get("properties", {}).get("value", {})
-        if field_type == "forecast":
-            inner = inner.get("items", {})
-        kwargs.update(
-            minimum=inner.get("minimum"),
-            maximum=inner.get("maximum"),
-            step=inner.get("x-step"),
-            scale=prop.get("x-scale"),
-            unit=prop.get("x-unit"),
-        )
-        if field_type == "forecast":
-            kwargs["horizon"] = prop.get("x-horizon", 1)
-            kwargs["interval"] = prop.get("x-interval")
     elif field_type == "list":
         kwargs["items"] = prop.get("x-items") or "text"
     return TypedFieldSpec(**kwargs)
@@ -1588,32 +1265,22 @@ def lookup_group_types(
 
 __all__ = [
     "CLASS_KIND",
+    "CLASS_TYPES",
     "FIELD_KIND_IDS",
-    "ORIGIN_ABSOLUTE",
-    "ORIGIN_ANCHOR",
-    "ORIGIN_NAMES",
-    "ORIGIN_REFERENCE",
-    "QUANTITY_KIND",
-    "QuantityTarget",
     "SPAN_KIND",
+    "SPAN_TYPES",
+    "TEMPORAL_TYPES",
     "TypedFieldSpec",
-    "build_quantity_target",
+    "VALUE_TYPES",
     "candidate_spans",
-    "decode_quantity",
-    "decode_value",
     "encode_value",
     "find_anchor",
     "is_typed_descriptor",
     "lookup_group_types",
     "normalize_typed_name",
     "parse_text_value",
-    "point_from_histogram",
-    "quantile_from_histogram",
-    "quantile_stat_name",
     "spec_from_json_schema",
     "specs_from_dicts",
     "specs_from_json_schema",
     "specs_to_dicts",
-    "stat_level",
-    "target_cdf",
 ]

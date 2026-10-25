@@ -24,6 +24,7 @@ from ..tasks.count.processor import CountProcessor
 from ..tasks.embedding.processor import EmbeddingProcessor
 from ..tasks.joint_relex.processor import JointRelexProcessor
 from ..tasks.ner.processor import NERProcessor
+from ..tasks.normalization.processor import NormalizationProcessor
 from ..tasks.open_relex.processor import OpenRelexProcessor
 from ..tasks.structuring.processor import StructuringProcessor
 from ..tasks.vision.processor import VisionProcessor
@@ -50,6 +51,7 @@ _TEXT_TASKS = (
     "open_relex",
     "count",
     "structuring",
+    "normalization",
     "embedding",
 )
 _ALL_TASKS = (*_TEXT_TASKS, *_VISION_TASKS, *_AUDIO_TASKS)
@@ -1118,6 +1120,14 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             self.task_processors["count"] = CountProcessor(config)
         if "structuring" in allowed_tasks and config.structuring_config is not None:
             self.task_processors["structuring"] = StructuringProcessor(config, tokenizer, words_splitter)
+        if (
+            "normalization" in allowed_tasks
+            and getattr(config, "normalization_config", None) is not None
+        ):
+            normalization = NormalizationProcessor(config, tokenizer, words_splitter)
+            # Gold value spans come from the structuring records.
+            normalization.structuring_processor = self.task_processors.get("structuring")
+            self.task_processors["normalization"] = normalization
         if "embedding" in allowed_tasks and config.embedding_config is not None:
             self.task_processors["embedding"] = EmbeddingProcessor(config)
         if "image_classification" in allowed_tasks and config.image_classification_config is not None:
@@ -1854,6 +1864,18 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             )
             if structuring_result is not None:
                 tokenized_input.update(structuring_result)
+
+            # After the structuring labels: their records hold the resolved
+            # gold value spans.
+            if "normalization" in self.task_processors:
+                normalization_result = self.task_processors["normalization"].create_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=structuring_max_seq_len,
+                    sequence_lengths=sequence_lengths,
+                )
+                if normalization_result is not None:
+                    tokenized_input.update(normalization_result)
 
         if batch.get("bbox") is not None and "bbox" not in tokenized_input:
             tokenized_input["bbox"] = batch["bbox"]

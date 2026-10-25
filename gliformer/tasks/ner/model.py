@@ -204,5 +204,8 @@ class NERHead(AnchoredSpanExtractionHead):
                 "span_mask": span_mask,
                 "words_embedding": words_embedding,
                 "mask": word_mask,
+                "batch_origin": (
+                    flat_inputs.batch_origin if flat_inputs is not None else None
+                ),
             },
         )

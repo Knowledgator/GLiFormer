@@ -48,14 +48,21 @@ _VARIANT_MODALITIES = {
 }
 
 
-def _typed_structuring_kwargs(kwargs):
-    """Typed structuring tensors travel through ``**kwargs`` to the head."""
+def _extra_head_kwargs(kwargs, words_mask=None):
+    """Typed structuring and normalization tensors travel through ``**kwargs``.
 
-    return {
+    The normalization head also gets ``words_mask`` (the source word id of
+    each subword) to read a span's subword states.
+    """
+
+    extra = {
         key: value
         for key, value in kwargs.items()
-        if key.startswith("structuring_typed_")
+        if key.startswith(("structuring_typed_", "normalization_"))
     }
+    if words_mask is not None:
+        extra["normalization_words_mask"] = words_mask
+    return extra
 
 _SET_PREDICTION_COUNT_KEYS = {
     "object_detection": "object_detection_count",
@@ -2040,6 +2047,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         seg_out = head_outputs.get("segmentation", TaskHeadOutput())
         audio_seg_out = head_outputs.get("audio_segmentation", TaskHeadOutput())
         emb_out = head_outputs.get("embedding", TaskHeadOutput())
+        norm_out = head_outputs.get("normalization", TaskHeadOutput())
 
         effective_ner_logits = ner_out.logits if ner_out.logits is not None else joint_rel_out.logits
         effective_ner_extra = ner_out.extra if ner_out.logits is not None else joint_rel_out.extra
@@ -2109,22 +2117,11 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             structuring_typed_class_none_logits=struct_out.extra.get(
                 "typed_class_none_logits"
             ),
-            structuring_typed_quantity_probs=struct_out.extra.get(
-                "typed_quantity_probs"
-            ),
-            structuring_typed_quantity_offsets=struct_out.extra.get(
-                "typed_quantity_offsets"
-            ),
-            structuring_typed_quantity_presence_logits=struct_out.extra.get(
-                "typed_quantity_presence_logits"
-            ),
-            structuring_typed_quantity_anchor_entity=struct_out.extra.get(
-                "typed_quantity_anchor_entity"
-            ),
-            structuring_typed_quantity_origin=struct_out.extra.get(
-                "typed_quantity_origin"
-            ),
-            structuring_typed_regression=struct_out.extra.get("typed_regression"),
+            normalization_span_idx=norm_out.extra.get("span_idx"),
+            normalization_span_mask=norm_out.extra.get("span_mask"),
+            normalization_temporal=norm_out.extra.get("temporal"),
+            normalization_number=norm_out.extra.get("number"),
+            normalization_number_confidence=norm_out.extra.get("number_confidence"),
             embedding_logits=emb_out.logits,
             image_classification_logits=image_cls_out.logits,
             image_classification_batch_origin=flat_inputs_map["image_classification"].batch_origin if "image_classification" in flat_inputs_map else None,
@@ -2400,7 +2397,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             embedding_encodings=embedding_encodings,
             embedding_encoding_mask=embedding_encoding_mask,
             threshold=threshold, adjacency_threshold=adjacency_threshold,
-            **_typed_structuring_kwargs(kwargs),
+            **_extra_head_kwargs(kwargs, words_mask),
         )
 
         # ── 2-3. Execute heads and collect outputs ─────────────────────
@@ -2621,7 +2618,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             embedding_encodings=embedding_encodings,
             embedding_encoding_mask=embedding_encoding_mask,
             threshold=threshold, adjacency_threshold=adjacency_threshold,
-            **_typed_structuring_kwargs(kwargs),
+            **_extra_head_kwargs(kwargs, words_mask),
         )
         final_loss, head_outputs = self._execute_forward_heads(
             shared=shared,

@@ -5,7 +5,7 @@ One request becomes a few model rows:
 * the **main row** carries every ``classify`` / ``boolean`` / ordinal ``score``
   group and the ``span`` / ``relation`` groups (a second row holds tasks with
   ``flat: false``, since overlap control is per row);
-* each ``json`` task (and ``score`` with ``scale``) gets its own row, because
+* each ``json`` task gets its own row, because
   structuring in a shared row competes with the extraction groups for spans;
 * inputs longer than the window run ``span`` / ``relation`` over overlapping
   window rows.
@@ -37,7 +37,6 @@ PROMPT_MARGIN = 8          # special tokens around prompt and text
 OPEN_SPAN_LABEL = "answer"
 OPEN_SPAN_LABEL_NO_INSTRUCTION = "entity"
 DEFAULT_ENTITY_LABEL = "entity"
-SCORE_FIELD = "score"
 
 
 @dataclass
@@ -256,9 +255,9 @@ class AnalyzeEngine:
                 {"task": task.name, "tokens": text_tokens, "limit": limit},
             )
 
-        classification = [task for task in parsed.tasks if task.type in ("classify", "boolean") or (task.type == "score" and task.scale is None)]
+        classification = [task for task in parsed.tasks if task.type in ("classify", "boolean", "score")]
         extraction = [task for task in parsed.tasks if task.type in ("span", "relation")]
-        structured = [task for task in parsed.tasks if task.type == "json" or (task.type == "score" and task.scale is not None)]
+        structured = [task for task in parsed.tasks if task.type == "json"]
         embedding = [task for task in parsed.tasks if task.type in ("embedding", "rank")]
 
         def task_prompt(tasks: list[TaskSpec]) -> int:
@@ -343,7 +342,7 @@ class AnalyzeEngine:
             walk(node.item)
 
         walk(task.fields)
-        return names or [SCORE_FIELD]
+        return names
 
     def windows(self, text: str, budget: int) -> list[tuple[int, int]]:
         """Overlapping ``[start, end)`` character windows of at most ``budget`` tokens."""
@@ -443,18 +442,11 @@ class AnalyzeEngine:
         return row
 
     def json_row(self, task: TaskSpec, text: str, base_request: dict[str, Any]) -> Row:
-        if task.scale is not None:
-            scale = task.scale
-            descriptor = {"$type": "number", "$min": scale["min"], "$max": scale["max"]}
-            if "step" in scale:
-                descriptor["$step"] = scale["step"]
-            structures = {"$root": {SCORE_FIELD: descriptor}}
-        else:
-            structures = model_template(
-                task.fields,  # type: ignore[arg-type]
-                typed=self.capabilities.typed_heads,
-                show_description="{description}" in self.capabilities.label_template,
-            )
+        structures = model_template(
+            task.fields,  # type: ignore[arg-type]
+            typed=self.capabilities.typed_heads,
+            show_description="{description}" in self.capabilities.label_template,
+        )
         request = {
             "text": text,
             **base_request,
@@ -462,6 +454,8 @@ class AnalyzeEngine:
             "threshold": float(self.capabilities.default_thresholds.get("json", 0.5)),
             "flat_ner": True,
             "multi_label": False,
+            # Normalized values come with their span, for evidence.
+            "decoder_kwargs": {"value_spans": True},
         }
         if task.instruction:
             request["prompt"] = task.instruction
@@ -576,25 +570,7 @@ class AnalyzeEngine:
         return result
 
     def score_result(self, plan: Plan, task: TaskSpec) -> dict[str, Any]:
-        if task.scale is None:
-            result = self.classification_result(plan, task)
-            return result
-        row = next(row for row in plan.rows if row.json_task is task)
-        raw = (row.output or {}).get("structuring") or {}
-        value = raw.get(SCORE_FIELD) if isinstance(raw, dict) else None
-        if isinstance(value, list):
-            value = next((item for item in value if item is not None), None)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            scale = task.scale
-            value = min(max(float(value), scale["min"]), scale["max"])
-            step = scale.get("step")
-            if step:
-                value = scale["min"] + round((value - scale["min"]) / step) * step
-            if float(value).is_integer():
-                value = int(value)
-        else:
-            value = None
-        return {"type": "score", "value": value, "scale": dict(task.scale)}
+        return self.classification_result(plan, task)
 
     def located(self, rendered: RenderedInput, row: Row, start: Any, end: Any) -> Any:
         if not isinstance(start, int) or not isinstance(end, int):
