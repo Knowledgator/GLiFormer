@@ -222,7 +222,7 @@ class BaseGLiFormer(BaseGLiNER):
                 labels_tokenizer = tokenizer
 
         if getattr(config, "split_digits", False):
-            set_digit_split(tokenizer, True)
+            set_digit_split(tokenizer, config.split_digits)
 
         if is_token_level(config):
             if words_splitter is None:
@@ -329,6 +329,8 @@ class BaseGLiFormer(BaseGLiNER):
             tokens.append(self.config.child_token)
             if getattr(self.config.structuring_config, "typed_fields", False):
                 tokens.append(getattr(self.config, "option_token", "[OPTION]"))
+            if getattr(self.config, "calculation_config", None) is not None:
+                tokens.append(getattr(self.config, "calc_token", "[CALC]"))
             if getattr(self.config.structuring_config, "multi_level", False):
                 tokens.extend(
                     [
@@ -422,6 +424,10 @@ class BaseGLiFormer(BaseGLiNER):
                     for index in (_idx(token) for token in boundary_tokens if token)
                     if index is not None and index != unknown
                 ]
+            if getattr(self.config, "calculation_config", None) is not None:
+                self.config.calculation_config.calc_token_index = _idx(
+                    getattr(self.config, "calc_token", "[CALC]")
+                )
 
         if (self.config.image_classification_config is not None
                 or self.config.object_detection_config is not None
@@ -446,6 +452,7 @@ class BaseGLiFormer(BaseGLiNER):
                 old_num_tokens = int(self.config.vocab_size or 0)
                 model_embeds = token_rep_layer.resize_token_embeddings(new_num_tokens, None)
                 self._init_option_token_embedding(model_embeds, old_num_tokens)
+                self._init_calc_token_embedding(model_embeds, old_num_tokens)
                 self.config.vocab_size = model_embeds.num_embeddings
                 if hasattr(self.config, "encoder_config") and self.config.encoder_config is not None:
                     self.config.encoder_config.vocab_size = model_embeds.num_embeddings
@@ -562,20 +569,23 @@ class BaseGLiFormer(BaseGLiNER):
         )
         return True
 
-    def set_split_digits(self, enabled: bool) -> bool:
-        """Turn per-digit tokenization on or off for a loaded checkpoint.
+    def set_split_digits(self, mode) -> bool:
+        """Set per-digit tokenization for a loaded checkpoint.
 
-        No parameters change (single digits are already in the vocabulary),
-        but the encoder reads numbers differently, so the model needs
-        fine-tuning after a switch. Returns ``True`` when it changed.
+        ``mode`` is false, true/"all" or "keep_dates". No parameters change
+        (single digits are already in the vocabulary), but the encoder reads
+        numbers differently, so the model needs fine-tuning after a switch.
+        Returns ``True`` when it changed.
         """
 
-        enabled = bool(enabled)
-        if enabled == bool(getattr(self.config, "split_digits", False)):
+        from .processing.token_units import normalize_digit_split
+
+        mode = normalize_digit_split(mode)
+        if mode == normalize_digit_split(getattr(self.config, "split_digits", False)):
             return False
-        self.config.split_digits = enabled
+        self.config.split_digits = mode or False
         tokenizer = self.data_processor.transformer_tokenizer
-        set_digit_split(tokenizer, enabled)
+        set_digit_split(tokenizer, mode)
         self._create_data_processor(self.config, cache_dir=None, tokenizer=tokenizer)
         return True
 
@@ -591,6 +601,88 @@ class BaseGLiFormer(BaseGLiNER):
             normalization = processor.task_processors.get("normalization")
             if normalization is not None:
                 normalization.structuring_processor = processor.task_processors["structuring"]
+            calculation = processor.task_processors.get("calculation")
+            if calculation is not None:
+                calculation.structuring_processor = processor.task_processors["structuring"]
+
+    def enable_calculation(self, settings: Optional[Dict[str, Any]] = None) -> bool:
+        """Add a calculation head to a loaded checkpoint.
+
+        Registers the ``[CALC]`` token (its embedding row starts as a copy of
+        ``[FIELD]``), builds the head from ``settings`` (a
+        ``calculation_config`` mapping) and its processor and decoder.
+        Returns ``True`` when the model changed, ``False`` when the checkpoint
+        already has a calculation head.
+        """
+
+        from .config import CalculationHeadConfig
+        from .tasks.calculation.model import CalculationHead
+        from .tasks.calculation.processor import CalculationProcessor
+
+        heads = self.model.heads
+        if "calculation" in heads:
+            # Existing head: only settings that do not change its weights.
+            tunable = {
+                "loss_coef", "bio_loss_coef", "port_loss_coef", "op_loss_coef", "active_loss_coef",
+                "max_operand_spans", "port_threshold", "active_threshold", "operand_threshold",
+                "candidate_mode", "candidate_threshold", "bio_focal_loss_alpha", "bio_focal_loss_gamma",
+                "port_focal_loss_alpha", "port_focal_loss_gamma", "detach_record_anchors",
+            }
+            current = self.config.calculation_config
+            values = {**current.__dict__, **{k: v for k, v in dict(settings or {}).items() if k in tunable}}
+            updated = CalculationHeadConfig(**values)
+            for config in {id(current): current, id(heads["calculation"].cfg): heads["calculation"].cfg}.values():
+                for key in tunable:
+                    setattr(config, key, getattr(updated, key))
+            return False
+        if self.config.structuring_config is None:
+            raise ValueError("A calculation head needs a model with a structuring head")
+        self.config.calculation_config = CalculationHeadConfig(**dict(settings or {}))
+        calc_token = getattr(self.config, "calc_token", None) or "[CALC]"
+        self.config.calc_token = calc_token
+        tokenizer = self.data_processor.transformer_tokenizer
+        if calc_token not in tokenizer.get_vocab():
+            tokenizer.add_tokens([calc_token], special_tokens=True)
+        # Sets the [CALC] index, grows the embedding table, copies [FIELD].
+        self.resize_embeddings()
+        head = CalculationHead.from_config(self.config)
+        parameter = next(self.model.parameters())
+        heads["calculation"] = head.to(device=parameter.device, dtype=parameter.dtype)
+        processor = self.data_processor
+        calculation = CalculationProcessor(
+            self.config,
+            processor.transformer_tokenizer,
+            getattr(processor, "words_splitter", None),
+        )
+        calculation.structuring_processor = processor.task_processors.get("structuring")
+        processor.task_processors["calculation"] = calculation
+        normalization = processor.task_processors.get("normalization")
+        if normalization is not None:
+            normalization.calculation_processor = calculation
+        # The structuring processor renders [CALC] only when a calculation
+        # head exists.
+        self._rebuild_structuring_processor()
+        self.decoder = self.decoder_class(self.config)
+        return True
+
+    def _init_calc_token_embedding(self, embeddings, old_num_tokens: int) -> None:
+        """Start a newly added ``[CALC]`` row from the ``[FIELD]`` row."""
+
+        calc_cfg = getattr(self.config, "calculation_config", None)
+        struct_cfg = self.config.structuring_config
+        weight = getattr(embeddings, "weight", None)
+        if calc_cfg is None or struct_cfg is None or weight is None:
+            return
+        calc_idx = int(getattr(calc_cfg, "calc_token_index", -1))
+        child_idx = int(getattr(struct_cfg, "child_token_index", -1))
+        if (
+            calc_idx < old_num_tokens
+            or not 0 <= calc_idx < weight.shape[0]
+            or not 0 <= child_idx < weight.shape[0]
+        ):
+            return
+        with torch.no_grad():
+            weight[calc_idx].copy_(weight[child_idx])
 
     def _init_option_token_embedding(self, embeddings, old_num_tokens: int) -> None:
         """Start a newly added ``[OPTION]`` row from the ``[FIELD]`` row.
@@ -1270,6 +1362,8 @@ class BaseGLiFormer(BaseGLiNER):
                 "open_relex": "relations",
                 "joint_relex": "joint_relations",
                 "structuring": "structures",
+                # Programs behind "$calculate" field values.
+                "calculation": "structures",
             }
             results[original_index] = {
                 task: values[0]

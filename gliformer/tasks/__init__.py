@@ -731,6 +731,8 @@ TASK_REGISTRY = TaskRegistry(
         TaskDefinition("joint_relex", "gliformer.tasks.joint_relex.model", "JointRelexHead", "text"),
         TaskDefinition("open_relex", "gliformer.tasks.open_relex.model", "OpenRelexHead", "text"),
         TaskDefinition("structuring", "gliformer.tasks.structuring.model", "StructuringHead", "text"),
+        # Computes "$calculate" fields from structuring records (programs over spans).
+        TaskDefinition("calculation", "gliformer.tasks.calculation.model", "CalculationHead", "text"),
         # Reads values from the spans that the NER and structuring heads picked.
         TaskDefinition("normalization", "gliformer.tasks.normalization.model", "NormalizationHead", "text"),
         TaskDefinition("image_classification", "gliformer.tasks.vision.model", "ImageClassificationHead", "vision"),

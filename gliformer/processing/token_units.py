@@ -292,8 +292,43 @@ def unit_pieces_batch(tokens, texts):
     ]
 
 
-# A digit, with the word-start marker when it opens a word, is its own piece.
-_DIGIT_SPLIT_PATTERN = "▁?\\d"
+# ``split_digits`` modes: every digit is its own piece ("all"), or every
+# digit except those of dates, clock times and years ("keep_dates"), which
+# keep the tokenizer's usual pieces ("2024", "-", "11", "-", "18").
+DIGIT_SPLIT_MODES = ("all", "keep_dates")
+
+_DIGIT = "▁?\\d"
+_CALENDAR = (
+    "\\d{4}-\\d{1,2}-\\d{1,2}(?:T\\d{1,2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?)?"  # 2024-11-18[T09:15[:00]]
+    "|\\d{1,2}[/.\\-]\\d{1,2}[/.\\-]\\d{2,4}"  # 11/18/2024, 18.11.2024, 18-11-24
+    "|\\d{4}/\\d{1,2}/\\d{1,2}"  # 2024/11/18
+    "|\\d{1,2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?"  # 09:15[:00]
+    "|(?:19|20)\\d{2}"  # 2019
+)
+# Calendar strings must not touch other digits or a decimal/thousands part
+# ("2019.5", "12019", "2,019" are split as numbers). The pre-tokenizer runs
+# word by word, so a day after a month name ("May 14") is still split.
+_DIGIT_SPLIT_PATTERNS = {
+    "all": _DIGIT,
+    "keep_dates": f"▁?(?<![\\d.,])(?:{_CALENDAR})(?!\\d|[.,]\\d)|{_DIGIT}",
+}
+
+
+def normalize_digit_split(value) -> str | None:
+    """Config value -> mode name, or ``None`` for no split (``True`` means "all")."""
+
+    if value is None or value is False:
+        return None
+    if value is True:
+        return "all"
+    mode = str(value).lower()
+    if mode in {"none", "false", "off", ""}:
+        return None
+    if mode == "true":
+        return "all"
+    if mode not in DIGIT_SPLIT_MODES:
+        raise ValueError(f"split_digits must be false or one of {list(DIGIT_SPLIT_MODES)}, got {value!r}.")
+    return mode
 
 
 def _pre_tokenizer_parts(pre_tokenizer) -> list[dict]:
@@ -307,39 +342,59 @@ def _pre_tokenizer_parts(pre_tokenizer) -> list[dict]:
     return [state]
 
 
-def _is_digit_split(part: dict) -> bool:
-    return part.get("type") == "Split" and part.get("pattern", {}).get("Regex") == _DIGIT_SPLIT_PATTERN
+def _digit_split_mode(part: dict) -> str | None:
+    if part.get("type") != "Split":
+        return None
+    pattern = part.get("pattern", {}).get("Regex")
+    for mode, known in _DIGIT_SPLIT_PATTERNS.items():
+        if pattern == known:
+            return mode
+    return None
+
+
+def digit_split_mode(tokenizer) -> str | None:
+    """The tokenizer's digit-split mode, or ``None`` if it has none."""
+
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        return None
+    for part in _pre_tokenizer_parts(backend.pre_tokenizer):
+        mode = _digit_split_mode(part)
+        if mode is not None:
+            return mode
+    return None
 
 
 def has_digit_split(tokenizer) -> bool:
-    backend = getattr(tokenizer, "backend_tokenizer", None)
-    if backend is None:
-        return False
-    return any(_is_digit_split(part) for part in _pre_tokenizer_parts(backend.pre_tokenizer))
+    return digit_split_mode(tokenizer) is not None
 
 
-def set_digit_split(tokenizer, enabled: bool) -> bool:
-    """Make a fast tokenizer encode every digit as its own piece (or undo it).
+def set_digit_split(tokenizer, mode) -> bool:
+    """Make a fast tokenizer split digits into single pieces (or undo it).
 
+    ``mode`` is a ``split_digits`` value: false, true/"all" or "keep_dates".
     Adds a pre-tokenizer step after the existing one, so no vocabulary
     changes: digits map to the single-digit pieces the vocabulary already
     has ("▁8", "8"). Returns ``True`` when the tokenizer changed.
     """
 
-    if enabled == has_digit_split(tokenizer):
+    mode = normalize_digit_split(mode)
+    if mode == digit_split_mode(tokenizer):
         return False
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is None:
         raise ValueError("split_digits needs a fast tokenizer.")
-    parts = [part for part in _pre_tokenizer_parts(backend.pre_tokenizer) if not _is_digit_split(part)]
-    if enabled:
+    parts = [
+        part for part in _pre_tokenizer_parts(backend.pre_tokenizer)
+        if _digit_split_mode(part) is None
+    ]
+    if mode is not None:
         parts.append(
-            {"type": "Split", "pattern": {"Regex": _DIGIT_SPLIT_PATTERN},
+            {"type": "Split", "pattern": {"Regex": _DIGIT_SPLIT_PATTERNS[mode]},
              "behavior": "Isolated", "invert": False}
         )
     if parts:
-        state = {"type": "Sequence", "pretokenizers": parts}
-        backend.pre_tokenizer = _pre_tokenizer_from_state(state)
+        backend.pre_tokenizer = _pre_tokenizer_from_state({"type": "Sequence", "pretokenizers": parts})
     else:
         backend.pre_tokenizer = None
     return True

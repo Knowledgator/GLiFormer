@@ -2065,15 +2065,100 @@ class NormalizationHeadConfig:
                 raise ValueError(f"{name} must be positive")
             setattr(self, name, value)
         self.span_sources = [str(source) for source in self.span_sources]
-        unknown = set(self.span_sources) - {"structuring", "ner"}
+        unknown = set(self.span_sources) - {"structuring", "ner", "calculation"}
         if unknown:
-            raise ValueError(f"Unknown span_sources {sorted(unknown)}; use 'structuring', 'ner'")
+            raise ValueError(
+                f"Unknown span_sources {sorted(unknown)}; use 'structuring', 'ner', 'calculation'"
+            )
         if isinstance(self.temporal, dict):
             self.temporal = NormalizationTemporalConfig(**self.temporal)
         if isinstance(self.number, dict):
             self.number = NormalizationNumberConfig(**self.number)
         if isinstance(self.parser, dict):
             self.parser = NormalizationParserConfig(**self.parser)
+
+CALCULATION_SPAN_POOLERS = ("marker", "mean", "tokens")
+
+
+@dataclass
+class CalculationHeadConfig:
+    """Calculation head: computes ``$calculate`` fields with a program.
+
+    A field the schema marks ``"$calculate": true`` gets a ``[CALC]`` marker in
+    the prompt. For every (structuring record, calc field) pair the head builds
+    a query from the ``[CALC]`` vector, the record anchor and the schema parent
+    vector, extracts operand spans with it (BIO), and fills ``num_slots``
+    calculation slots. Each slot predicts an operation and two operand sets
+    over (operand spans | earlier slots | constants); the decoder runs the
+    resulting graph on the values the normalization head reads.
+    """
+
+    loss_coef: float = 1.0
+    bio_loss_coef: float = 1.0
+    port_loss_coef: float = 1.0
+    op_loss_coef: float = 1.0
+    active_loss_coef: float = 1.0
+    num_slots: int = 8
+    slot_refine_layers: int = 2
+    slot_heads: int = 8
+    readout_heads: int = 8
+    span_pooler: str = "tokens"
+    span_max_tokens: int = 32
+    span_pooler_queries: int = 4
+    span_pooler_heads: int = 8
+    max_span_width: int = 16
+    # Operand candidates per query: gold operands plus predicted spans in
+    # training (negatives), predicted spans at inference.
+    max_operand_spans: int = 48
+    port_threshold: float = 0.5
+    active_threshold: float = 0.5
+    operand_threshold: float = 0.5
+    # How operand candidates are read from the BIO scores. "threshold":
+    # spans whose start/end/inside cells all pass operand_threshold.
+    # "topk": spans ranked by the geometric mean of their start, end and
+    # inside probabilities, greedily non-overlapping, above
+    # candidate_threshold; in training they are the port negatives.
+    candidate_mode: str = "threshold"
+    candidate_threshold: float = 0.05
+    # BIO focal settings and port (operand set) focal settings; None = BCE.
+    bio_focal_loss_alpha: float | None = 0.75
+    bio_focal_loss_gamma: float | None = 2.0
+    port_focal_loss_alpha: float | None = None
+    port_focal_loss_gamma: float | None = None
+    # Stop gradients from the calculation head into the structuring anchors.
+    detach_record_anchors: bool = False
+    calc_token_index: int = -1
+
+    def __post_init__(self):
+        for name in ("loss_coef", "bio_loss_coef", "port_loss_coef", "op_loss_coef", "active_loss_coef"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            setattr(self, name, value)
+        for name in (
+            "num_slots", "slot_heads", "readout_heads", "span_max_tokens", "span_pooler_queries",
+            "span_pooler_heads", "max_span_width", "max_operand_spans",
+        ):
+            value = int(getattr(self, name))
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        self.slot_refine_layers = int(self.slot_refine_layers)
+        if self.slot_refine_layers < 0:
+            raise ValueError("slot_refine_layers must be >= 0")
+        self.span_pooler = str(self.span_pooler).lower()
+        if self.span_pooler not in CALCULATION_SPAN_POOLERS:
+            raise ValueError(f"span_pooler must be one of {list(CALCULATION_SPAN_POOLERS)}")
+        self.candidate_mode = str(self.candidate_mode).lower()
+        if self.candidate_mode not in ("threshold", "topk"):
+            raise ValueError("candidate_mode must be 'threshold' or 'topk'")
+        for name in ("port_threshold", "active_threshold", "operand_threshold", "candidate_threshold"):
+            value = float(getattr(self, name))
+            if not 0.0 < value < 1.0:
+                raise ValueError(f"{name} must be in (0, 1)")
+            setattr(self, name, value)
+        self.detach_record_anchors = bool(self.detach_record_anchors)
+        self.calc_token_index = int(self.calc_token_index)
 
 
 @dataclass
@@ -2137,6 +2222,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         "count": "count_config",
         "embedding": "embedding_config",
         "normalization": "normalization_config",
+        "calculation": "calculation_config",
     }
 
     @staticmethod
@@ -2326,6 +2412,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         count_config: Optional[dict] = None,
         embedding_config: Optional[dict] = None,
         normalization_config: Optional[dict] = None,
+        calculation_config: Optional[dict] = None,
         # Shared layers across tasks (None = each task creates its own)
         shared_anchor_modeling: Optional[str | dict[str, Any]] = None,
         shared_anchor_refinement: Optional[str | dict[str, Any]] = None,
@@ -2388,6 +2475,8 @@ class GLiFormerConfig(BaseGLiNERConfig):
         obj_token: str = "[OBJECT]",
         # Marks one option of a typed structuring class field.
         option_token: str = "[OPTION]",
+        # Follows a structuring field marked ``$calculate`` (calculation head).
+        calc_token: str = "[CALC]",
         # Descriptive aliases for the marker-token parameters above. The
         # shorter names remain the serialized/public compatibility surface.
         entity_token: Optional[str] = None,
@@ -2464,7 +2553,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         preserve_word_spaces: bool = False,
         text_unit: str = "word",
         span_boundary: str = "free",
-        split_digits: bool = False,
+        split_digits: Any = False,
         **kwargs,
     ):
         # Load-only aliases for checkpoints written while the entity-first
@@ -2828,6 +2917,20 @@ class GLiFormerConfig(BaseGLiNERConfig):
                 "(the heads whose spans it reads)"
             )
 
+        # Calculation (computed fields)
+        if isinstance(calculation_config, dict):
+            self.calculation_config = CalculationHeadConfig(**calculation_config)
+        elif dataclasses.is_dataclass(calculation_config) and not isinstance(
+            calculation_config, CalculationHeadConfig
+        ):
+            self.calculation_config = CalculationHeadConfig(
+                **dataclasses.asdict(calculation_config)
+            )
+        else:
+            self.calculation_config = calculation_config
+        if self.calculation_config is not None and self.structuring_config is None:
+            raise ValueError("calculation_config needs a structuring_config")
+
         # Embedding
         if isinstance(embedding_config, dict):
             embedding_config.setdefault("loss_coef", embedding_loss_coef)
@@ -3033,6 +3136,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.structuring_child_token = structuring_child_token
         self.structuring_end_token = structuring_end_token
         self.option_token = option_token
+        self.calc_token = calc_token
         self.obj_token = obj_token
         self.obj_token_index = obj_token_index
         self.embed_obj_token = embed_obj_token
@@ -3074,9 +3178,13 @@ class GLiFormerConfig(BaseGLiNERConfig):
         # words, so no span starts or ends inside a word.
         self.span_boundary = span_boundary
         # Tokenize every digit as its own piece ("88848" -> 8 8 8 4 8), so
-        # number readers see digits instead of arbitrary multi-digit chunks.
-        # Changes the encoder input, so it is checkpoint-bound.
-        self.split_digits = bool(split_digits)
+        # number readers see digits instead of arbitrary multi-digit chunks:
+        # false, true/"all", or "keep_dates" (dates, times and years keep
+        # their usual pieces). Changes the encoder input, so it is
+        # checkpoint-bound.
+        from .processing.token_units import normalize_digit_split
+
+        self.split_digits = normalize_digit_split(split_digits) or False
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -3200,6 +3308,7 @@ _TEXT_CONFIG_FIELDS = (
     "count_config",
     "embedding_config",
     "normalization_config",
+    "calculation_config",
 )
 _VISION_CONFIG_FIELDS = (
     "image_classification_config",
@@ -3266,6 +3375,7 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "structuring_child_token",
         "structuring_end_token",
         "option_token",
+        "calc_token",
         "obj_token",
         "per_task_parents",
         "ner_parent_token",
@@ -3294,6 +3404,7 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "count_config",
         "embedding_config",
         "normalization_config",
+        "calculation_config",
         "relations_layer",
         "classifier_layer",
         "groups_layer",

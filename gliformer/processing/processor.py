@@ -20,6 +20,7 @@ from transformers import AutoImageProcessor, AutoProcessor
 
 from ..layers.span_pooling import config_needs_token_map
 from ..tasks.audio.processor import AudioProcessor
+from ..tasks.calculation.processor import CalculationProcessor
 from ..tasks.classification.processor import ClassificationProcessor
 from ..tasks.count.processor import CountProcessor
 from ..tasks.embedding.processor import EmbeddingProcessor
@@ -61,6 +62,7 @@ _TEXT_TASKS = (
     "open_relex",
     "count",
     "structuring",
+    "calculation",
     "normalization",
     "embedding",
 )
@@ -1355,6 +1357,16 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             # Gold value spans come from the structuring records.
             normalization.structuring_processor = self.task_processors.get("structuring")
             self.task_processors["normalization"] = normalization
+        if (
+            "calculation" in allowed_tasks
+            and getattr(config, "calculation_config", None) is not None
+        ):
+            calculation = CalculationProcessor(config, tokenizer, words_splitter)
+            calculation.structuring_processor = self.task_processors.get("structuring")
+            self.task_processors["calculation"] = calculation
+            if "normalization" in self.task_processors:
+                # Operand values are extra number targets of the normalization head.
+                self.task_processors["normalization"].calculation_processor = calculation
         if "embedding" in allowed_tasks and config.embedding_config is not None:
             self.task_processors["embedding"] = EmbeddingProcessor(config)
         if "image_classification" in allowed_tasks and config.image_classification_config is not None:
@@ -1901,6 +1913,7 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             "extraction": batch.get("extraction", [[] for _ in range(batch_size)]),
             "embedding": batch.get("embedding", [[] for _ in range(batch_size)]),
             "structuring": batch.get("structuring", [{} for _ in range(batch_size)]),
+            "calculation": batch.get("calculation", [{} for _ in range(batch_size)]),
             "structuring_schema": batch.get(
                 "structuring_schema", [{} for _ in range(batch_size)]
             ),
@@ -2012,6 +2025,8 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             }
             if "structuring" in batch and i < len(batch["structuring"]):
                 item["structuring"] = batch["structuring"][i]
+            if "calculation" in batch and i < len(batch["calculation"]):
+                item["calculation"] = batch["calculation"][i]
             if (
                 "structuring_schema" in batch
                 and i < len(batch["structuring_schema"])
@@ -2058,6 +2073,7 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             "extraction": [item.get("extraction", []) for item in batch_list],
             "embedding": [item.get("embedding", []) for item in batch_list],
             "structuring": [item.get("structuring", {}) for item in batch_list],
+            "calculation": [item.get("calculation", {}) for item in batch_list],
             "structuring_schema": [
                 item.get("structuring_schema", {}) for item in batch_list
             ],
@@ -2189,6 +2205,16 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             )
             if structuring_result is not None:
                 tokenized_input.update(structuring_result)
+
+            if "calculation" in self.task_processors:
+                calculation_result = self.task_processors["calculation"].create_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=structuring_max_seq_len,
+                    sequence_lengths=sequence_lengths,
+                )
+                if calculation_result is not None:
+                    tokenized_input.update(calculation_result)
 
             # After the structuring labels: their records hold the resolved
             # gold value spans.

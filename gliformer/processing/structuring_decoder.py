@@ -16,7 +16,7 @@ from ._structuring_alignment import (
     make_multi_level_group_result,
     resolve_structuring_decoder,
 )
-from ._structuring_hierarchy import class_field_layout
+from ._structuring_hierarchy import calc_field_layout, class_field_layout
 from .structuring_processor import MULTI_LEVEL_ROOT_KEY
 from .structuring_types import is_structuring_descriptor
 from .typed_fields import TypedFieldSpec
@@ -96,6 +96,13 @@ class StructuringDecoder(SpanDecoder):
             from ..tasks.normalization.decoder import NormalizationDecoder
 
             self.normalization = NormalizationDecoder(config)
+        # ``$calculate`` fields take the value of the calculation program.
+        self.calculation = None
+        if getattr(config, "calculation_config", None) is not None:
+            from ..tasks.calculation.decoder import CalculationDecoder
+
+            self.calculation = CalculationDecoder(config)
+        self._calculation_cache = (None, None)
         self.component = resolve_structuring_decoder(
             decoder_spec,
             multi_level=configured_multi_level,
@@ -295,6 +302,91 @@ class StructuringDecoder(SpanDecoder):
                     field["value"] = (
                         {"value": value, "text": field.get("text", "")} if value_spans else value
                     )
+        return anchor_entries
+
+    def _calculation_results(self, model_output):
+        """Per-query calculation results, computed once per model output."""
+
+        key, cached = self._calculation_cache
+        if key is not model_output:
+            cached = {}
+            for result in self.calculation.query_results(model_output):
+                cached[(result["group"], result["anchor"], result["marker"])] = result
+            self._calculation_cache = (model_output, cached)
+        return cached
+
+    def _attach_calculated_values(
+        self,
+        anchor_entries,
+        model_output,
+        *,
+        group_idx,
+        struct_item,
+        objectness_logits,
+        value_spans=False,
+        output_mode=None,
+    ):
+        """Values of ``$calculate`` fields from the calculation head.
+
+        Records are chosen as for class fields (anchors with decoded spans or
+        reliable presence, else the most confident one). A computed value
+        replaces any span the structuring head picked for the field; when the
+        program fails, the picked span (if any) stays.
+        """
+
+        if self.calculation is None or struct_item is None:
+            return anchor_entries
+        layout = calc_field_layout(struct_item)
+        if not layout:
+            return anchor_entries
+        results = self._calculation_results(model_output)
+        if not anchor_entries:
+            # No slot passed objectness, but the head computed values for its
+            # best slot: that slot becomes the record.
+            anchors = sorted({
+                anchor for (group, anchor, _marker), result in results.items()
+                if group == group_idx and result["value"] is not None
+            })
+            if anchors:
+                anchor_entries = [{
+                    "anchor_index": anchors[0], "fields": [], "presence_is_reliable": False,
+                }]
+        carriers = [
+            entry for entry in anchor_entries
+            if entry["fields"] or entry.get("presence_is_reliable")
+        ]
+
+        def confidence(entry):
+            if objectness_logits is None:
+                return (len(entry["fields"]), -entry["anchor_index"])
+            return (
+                float(objectness_logits[group_idx, entry["anchor_index"]].item()),
+                len(entry["fields"]),
+            )
+
+        if not carriers and anchor_entries:
+            carriers = [max(anchor_entries, key=confidence)]
+        root_only = output_mode == "object" and carriers
+        if root_only:
+            carriers = [max(carriers, key=confidence)]
+        for entry in carriers:
+            anchor = int(entry["anchor_index"])
+            for slot, (label, _field_id, spec) in enumerate(layout):
+                result = results.get((group_idx, anchor, slot))
+                if result is None:
+                    continue
+                value = self.calculation.format_value(result["value"], spec)
+                if value is None:
+                    continue
+                entry["fields"] = [
+                    field for field in entry["fields"] if field.get("field") != label
+                ]
+                entry["fields"].append({
+                    "field": label,
+                    "value": {"value": value, "text": str(value)} if value_spans else value,
+                    "text": str(value),
+                    "score": float(result["score"]),
+                })
         return anchor_entries
 
     def _attach_typed_fields(

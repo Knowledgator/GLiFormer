@@ -130,6 +130,10 @@ class GLiFormerDecoder:
             from ..tasks.normalization.decoder import NormalizationDecoder
             self.task_decoders["normalization"] = NormalizationDecoder.from_config(config)
 
+        if getattr(config, "calculation_config", None) is not None:
+            from ..tasks.calculation.decoder import CalculationDecoder
+            self.task_decoders["calculation"] = CalculationDecoder.from_config(config)
+
         if config.embedding_config is not None:
             from ..tasks.embedding.decoder import EmbeddingDecoder
             if hasattr(EmbeddingDecoder, 'from_config'):

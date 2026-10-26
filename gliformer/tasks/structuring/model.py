@@ -1082,8 +1082,11 @@ class StructuringHead(NERHead):
         typed_supervised = self.typed_fields and any(
             batch.get(key) is not None for key in _TYPED_LABEL_KEYS
         )
+        # Records whose only supervised fields are computed by the
+        # calculation head need slots and objectness just like class fields.
+        calc_supervised = batch.get("calculation_query_group") is not None
         if (
-            typed_supervised
+            (typed_supervised or calc_supervised)
             and anchor_matches is None
             and base_loss_fn is not None
             and structuring_count is not None
@@ -1195,6 +1198,8 @@ class StructuringHead(NERHead):
             "groups_output": record_anchors,
             "anchor_mask": anchor_mask,
             "batch_origin": flat_inputs.batch_origin if flat_inputs is not None else None,
+            # Schema parent vector per group (the calculation head reads it).
+            "parent_embedding": flat_inputs.parent_embedding if flat_inputs is not None else None,
             "objectness_logits": objectness_logits,
             "entity_loss": (
                 entity_loss.detach() if entity_loss is not None else None

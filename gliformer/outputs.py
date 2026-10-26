@@ -72,6 +72,10 @@ class GLiFormerTextOutput(GLiFormerBaseOutput):
     # Decoded numbers (B, S) float64 and their confidence, per number head.
     normalization_number: Optional[dict] = None
     normalization_number_confidence: Optional[dict] = None
+    # Calculation head: everything the decoder needs to run the programs
+    # (queries, operand spans, slot op/port/active logits); see
+    # tasks/calculation/model.py.
+    calculation: Optional[dict] = None
 
     embedding_logits: Optional[torch.FloatTensor] = None
 

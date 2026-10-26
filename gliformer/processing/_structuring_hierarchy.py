@@ -90,6 +90,21 @@ def _is_span_annotation(value: object) -> bool:
     )
 
 
+def _is_value_annotation(value: object, spec) -> bool:
+    """A value field's gold written as ``{"value": v, "anchor": span|null}``.
+
+    It is one leaf (the structuring processor grounds it), not a nested object.
+    """
+
+    return (
+        spec is not None
+        and spec.value_type is not None
+        and isinstance(value, dict)
+        and "value" in value
+        and set(value).issubset({"value", "anchor", "text"})
+    )
+
+
 def _is_schema_envelope(value: dict) -> bool:
     """Recognize the historical ``{schema: [record, ...]}`` envelope."""
 
@@ -428,7 +443,7 @@ class _HierarchyNormalizer:
                 )
                 continue
 
-            if _is_span_annotation(value):
+            if _is_span_annotation(value) or _is_value_annotation(value, spec):
                 self._add_leaf(
                     group, hierarchy_node, instance, node_path, local_path, value,
                 )
@@ -788,6 +803,7 @@ class _HierarchyNormalizer:
         sep_token: str,
         use_labels_encoder: bool,
         option_token: str | None = None,
+        calc_token: str | None = None,
     ) -> list[str]:
         """Render a depth-first ``CHILD ... END`` hierarchy prompt."""
 
@@ -808,6 +824,7 @@ class _HierarchyNormalizer:
                         field_name,
                         field_types.get(field_name),
                         option_token,
+                        calc_token,
                     ))
             prompt.append(sep_token)
             return prompt
@@ -820,6 +837,7 @@ class _HierarchyNormalizer:
                         value,
                         field_types.get(value),
                         option_token,
+                        calc_token,
                     ))
             elif kind == "child":
                 marker = self.child_token
@@ -1008,6 +1026,7 @@ class StructuringProcessorComponent:
         sep_token: str,
         use_labels_encoder: bool,
         option_token: str | None = None,
+        calc_token: str | None = None,
     ) -> list[str]:
         if self._hierarchy is not None:
             return self._hierarchy.contribute_prompt(
@@ -1017,6 +1036,7 @@ class StructuringProcessorComponent:
                 sep_token=sep_token,
                 use_labels_encoder=use_labels_encoder,
                 option_token=option_token,
+                calc_token=calc_token,
             )
         prompt = [parent_token]
         field_map = struct_item.field_class_to_id
@@ -1032,6 +1052,7 @@ class StructuringProcessorComponent:
                     field_name,
                     field_types.get(field_name),
                     option_token,
+                    calc_token,
                 ))
         prompt.append(sep_token)
         return prompt
@@ -1082,8 +1103,12 @@ def render_field_prompt(
     label: str,
     spec: object,
     option_token: str | None,
+    calc_token: str | None = None,
 ) -> list[str]:
     """Render ``[FIELD] label ( type ... ) : description [OPTION] ...``.
+
+    A field marked ``$calculate`` is followed by a ``[CALC]`` marker when
+    ``calc_token`` is given; the calculation head reads that marker.
 
     Untyped and plain text fields keep the historical ``[FIELD] label`` form,
     so prompts of existing checkpoints and datasets do not change.
@@ -1101,7 +1126,32 @@ def render_field_prompt(
     rendered = [text]
     if typed.kind == CLASS_KIND and option_token:
         rendered.extend(f"{option_token} {option}" for option in typed.options)
+    if typed.calculate and calc_token:
+        rendered.append(calc_token)
     return rendered
+
+
+def calc_field_layout(struct_item, spec_factory=None):
+    """Fields marked ``$calculate`` of one schema group, in prompt order.
+
+    Entries are ``(label, field_id, TypedFieldSpec)``. The k-th entry owns the
+    k-th ``[CALC]`` marker of the group's prompt.
+    """
+
+    field_types = getattr(struct_item, "field_types", None) or {}
+    if not field_types:
+        return []
+    make_spec = spec_factory or TypedFieldSpec.from_value
+    field_to_id = struct_item.field_class_to_id.class_to_id
+    fields = []
+    for label in prompt_field_order(struct_item):
+        raw = field_types.get(label)
+        if raw is None or label not in field_to_id:
+            continue
+        spec = make_spec(raw)
+        if spec.calculate:
+            fields.append((label, field_to_id[label], spec))
+    return fields
 
 
 def typed_spec_for_schema_node(node: SchemaNode) -> TypedFieldSpec | None:
@@ -1154,6 +1204,7 @@ __all__ = [
     "prompt_field_order",
     "render_field_prompt",
     "resolve_structuring_processor",
+    "calc_field_layout",
     "class_field_layout",
     "typed_spec_for_schema_node",
 ]

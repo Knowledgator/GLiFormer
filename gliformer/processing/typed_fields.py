@@ -84,6 +84,8 @@ SPEC_OPTION_KEYS = frozenset(
         "items",
         "dayfirst",
         "partial",
+        # The field is computed by the calculation head (``[CALC]`` marker).
+        "calculate",
         # ``{"$type": "text", "$format": "date"}`` is read as ``{"$type": "date"}``.
         "format",
     }
@@ -258,6 +260,8 @@ class TypedFieldSpec:
     # Dates/times may be written partially ("May 2024" -> "2024-05"); False
     # asks for full values.
     partial: bool = True
+    # Computed by the calculation head; the prompt gets a ``[CALC]`` marker.
+    calculate: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -279,6 +283,7 @@ class TypedFieldSpec:
         if self.items is not None:
             self.items = normalize_typed_name(self.items)
         self.partial = bool(self.partial)
+        self.calculate = bool(self.calculate)
 
     # -- classification ----------------------------------------------------
 
@@ -324,6 +329,8 @@ class TypedFieldSpec:
             result["$integer"] = True
         if not self.partial:
             result["$partial"] = False
+        if self.calculate:
+            result["$calculate"] = True
         return result
 
     @classmethod
@@ -377,6 +384,7 @@ class TypedFieldSpec:
             items=values.get("items"),
             dayfirst=values.get("dayfirst"),
             partial=bool(values.get("partial", True)),
+            calculate=bool(values.get("calculate", False)),
             extra=extra,
         )
 

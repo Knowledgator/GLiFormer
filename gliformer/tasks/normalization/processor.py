@@ -93,6 +93,9 @@ class NormalizationProcessor(TaskProcessor):
         # Set by the data processor: the structuring processor whose resolved
         # records hold the gold value spans.
         self.structuring_processor = None
+        # Set by the data processor when the model has a calculation head:
+        # gold operand spans of calculation programs are number targets.
+        self.calculation_processor = None
 
     def get_classes_mapping(self, batch_list, **kwargs):
         return None
@@ -230,6 +233,14 @@ class NormalizationProcessor(TaskProcessor):
                 merged[key].merge_missing(target)
             else:
                 merged[key] = target
+        if self.calculation_processor is not None:
+            for start, end, value in self.calculation_processor.operand_targets(item):
+                key = (start, end)
+                target = SpanTarget(start, end, number=value)
+                if key in merged:
+                    merged[key].merge_missing(target)
+                else:
+                    merged[key] = target
         for target in self._silver_targets(item):
             key = (target.start, target.end)
             if key in merged:

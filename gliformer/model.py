@@ -67,7 +67,7 @@ def _extra_head_kwargs(kwargs, words_mask=None):
     extra = {
         key: value
         for key, value in kwargs.items()
-        if key.startswith(("structuring_typed_", "normalization_"))
+        if key.startswith(("structuring_typed_", "normalization_", "calculation_"))
     }
     token_words = kwargs.get("token_words_mask")
     if token_words is None:
@@ -2062,6 +2062,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         audio_seg_out = head_outputs.get("audio_segmentation", TaskHeadOutput())
         emb_out = head_outputs.get("embedding", TaskHeadOutput())
         norm_out = head_outputs.get("normalization", TaskHeadOutput())
+        calc_out = head_outputs.get("calculation", TaskHeadOutput())
 
         effective_ner_logits = ner_out.logits if ner_out.logits is not None else joint_rel_out.logits
         effective_ner_extra = ner_out.extra if ner_out.logits is not None else joint_rel_out.extra
@@ -2136,6 +2137,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             normalization_temporal=norm_out.extra.get("temporal"),
             normalization_number=norm_out.extra.get("number"),
             normalization_number_confidence=norm_out.extra.get("number_confidence"),
+            calculation=calc_out.extra.get("decode") if calc_out.extra else None,
             embedding_logits=emb_out.logits,
             image_classification_logits=image_cls_out.logits,
             image_classification_batch_origin=flat_inputs_map["image_classification"].batch_origin if "image_classification" in flat_inputs_map else None,

@@ -123,6 +123,18 @@ class NormalizationDecoder(TaskDecoder):
         ).nonzero(as_tuple=False)
         return int(matches[0, 0]) if matches.numel() else None
 
+    def number_value(self, model_output, row: int, start: int, end: int) -> float | None:
+        """Number read for the span ``(start, end)`` by the ``decode_with`` head."""
+
+        slot = self._slot(model_output, row, start, end)
+        if slot is None:
+            return None
+        numbers = getattr(model_output, "normalization_number", None) or {}
+        if self.decode_with not in numbers:
+            return None
+        number = float(numbers[self.decode_with][row, slot])
+        return number if math.isfinite(number) else None
+
     def field_value(self, model_output, row: int, start: int, end: int, spec) -> Any:
         """Normalized value of a span for a typed value field, or ``None``.
 

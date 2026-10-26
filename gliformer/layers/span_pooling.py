@@ -247,7 +247,9 @@ def build_span_pooler(task_cfg, hidden_size: int, dropout: float, max_width: int
     )
 
 
-SPAN_HEAD_CONFIGS = ("ner_config", "structuring_config", "joint_relex_config", "open_relex_config")
+SPAN_HEAD_CONFIGS = (
+    "ner_config", "structuring_config", "joint_relex_config", "open_relex_config", "calculation_config",
+)
 
 
 def config_needs_token_map(config) -> bool:

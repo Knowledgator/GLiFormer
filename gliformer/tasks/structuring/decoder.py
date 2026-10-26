@@ -258,6 +258,17 @@ class StructuringDecoder(_BaseStructuringDecoder):
                     ),
                     output_mode=group_context.get("output_mode"),
                 )
+                anchor_entries = self._attach_calculated_values(
+                    anchor_entries,
+                    model_output,
+                    group_idx=batch_idx,
+                    struct_item=group_context.get("mapping"),
+                    objectness_logits=objectness_logits,
+                    value_spans=bool(resolve_batch_control(
+                        kwargs.get("value_spans"), text_idx, False
+                    )),
+                    output_mode=group_context.get("output_mode"),
+                )
             flat_results.append(
                 self._finalize_anchor_group(
                     anchor_entries,

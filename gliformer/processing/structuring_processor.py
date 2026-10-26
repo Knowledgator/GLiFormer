@@ -160,6 +160,13 @@ class StructuringProcessor(SpanProcessor):
             raise ValueError(f"{self.config_attr} is required for {self.task_name}")
         self.typed_enabled = bool(getattr(self.task_config, "typed_fields", False))
         self.option_token = getattr(config, "option_token", "[OPTION]")
+        # ``$calculate`` fields get a ``[CALC]`` marker when the model has a
+        # calculation head.
+        self.calc_token = (
+            getattr(config, "calc_token", "[CALC]")
+            if getattr(config, "calculation_config", None) is not None
+            else None
+        )
         self._typed_spec_cache = {}
 
         # Resolve the processing strategy independently of the prediction
@@ -983,6 +990,7 @@ class StructuringProcessor(SpanProcessor):
                 sep_token=self.sep_token,
                 use_labels_encoder=use_labels_encoder,
                 option_token=self.option_token if self.typed_enabled else None,
+                calc_token=self.calc_token,
             ))
         return prompt
 

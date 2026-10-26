@@ -195,7 +195,7 @@ class NormalizationHead(TaskHead):
     """Reads numbers and calendar components from spans."""
 
     name = "normalization"
-    dependencies = ["ner", "structuring"]
+    dependencies = ["ner", "structuring", "calculation"]
 
     def __init__(self, config, hidden_size: int, dropout: float):
         super().__init__()
@@ -252,6 +252,9 @@ class NormalizationHead(TaskHead):
         origin = extra.get("batch_origin")
         if name == "structuring":
             spans, mask = extra.get("entity_spans"), extra.get("entity_mask")
+        elif name == "calculation":
+            # Operand spans of every calculation query, rows = text rows.
+            spans, mask = extra.get("operand_spans"), extra.get("operand_mask")
         else:
             if output.logits is None or output.logits.dim() != 4:
                 return None
@@ -266,7 +269,11 @@ class NormalizationHead(TaskHead):
         """Unique spans per text row from the configured source heads."""
 
         rows: list[dict[tuple[int, int], None]] = [{} for _ in range(batch_size)]
-        for name in self.cfg.span_sources:
+        sources = list(self.cfg.span_sources)
+        if "calculation" in dependency_outputs and "calculation" not in sources:
+            # Calculation operands always need values.
+            sources.append("calculation")
+        for name in sources:
             found = self._source_spans(dependency_outputs.get(name), name, threshold)
             if found is None:
                 continue
