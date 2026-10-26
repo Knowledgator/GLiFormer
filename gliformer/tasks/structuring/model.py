@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from torch import nn
 from gliner.modeling.utils import extract_spans_from_tokens
 
+from ...layers import AnchorModeling
+from ...layers.anchor_modeling import rename_state_dict_keys
 from ...layers.mlp import create_mlp
 from ...layers.span_pooling import build_span_pooler
 from ...layers.structuring_relations import (
@@ -200,38 +202,27 @@ class StructuringHead(NERHead):
     def _initialize_typed_fields(self, task_cfg, hidden_size, dropout):
         """Option scorer for class fields.
 
-        Every (record slot, class field) pair becomes one vector: a query made
-        from the record anchor and the field marker reads the text through
-        one cross-attention layer and an FFN.  The vector scores each
-        ``[OPTION]`` embedding of its field, plus a learned "none" score for
-        single-choice fields.
+        Every (record slot, class field) pair becomes one vector through the
+        configured anchor modeling (``typed_modeling``; the default
+        ``readout`` fuses record anchor and field marker, then reads the
+        text).  The vector scores each ``[OPTION]`` embedding of its field,
+        plus a learned "none" score for single-choice fields.
         """
 
         self.typed_fields = bool(getattr(task_cfg, "typed_fields", False))
         if not self.typed_fields:
             return
-        heads = int(task_cfg.typed_readout_heads)
-        if heads < 1 or hidden_size % heads != 0:
-            heads = 1
-        self.option_query = create_mlp(
-            input_dim=3 * hidden_size,
-            intermediate_dims=[hidden_size],
-            output_dim=hidden_size,
+        self.option_modeling = AnchorModeling.from_config(
+            getattr(task_cfg, "typed_modeling", "readout"),
+            hidden_size,
             dropout=dropout,
-            activation="gelu",
+            num_heads=int(task_cfg.typed_readout_heads),
         )
-        self.option_readout = nn.MultiheadAttention(
-            hidden_size, heads, dropout=dropout, batch_first=True,
-        )
-        self.option_readout_norm = nn.LayerNorm(hidden_size)
-        self.option_readout_ffn = create_mlp(
-            input_dim=hidden_size,
-            intermediate_dims=[2 * hidden_size],
-            output_dim=hidden_size,
-            dropout=dropout,
-            activation="gelu",
-        )
-        self.option_ffn_norm = nn.LayerNorm(hidden_size)
+        if not getattr(self, "_option_migration_hook", False):
+            # Checkpoints before anchor modeling stored the readout as
+            # separate ``option_*`` modules.
+            self._register_load_state_dict_pre_hook(self._migrate_option_state_dict)
+            self._option_migration_hook = True
         self.option_field_proj = nn.Linear(hidden_size, hidden_size)
         self.option_key_proj = nn.Linear(hidden_size, hidden_size)
         self.option_none = nn.Linear(hidden_size, 1)
@@ -244,13 +235,21 @@ class StructuringHead(NERHead):
         self.typed_class_focal_loss_gamma = task_cfg.typed_class_focal_loss_gamma
         self.typed_class_focal_loss_prob_margin = None
 
+    _OPTION_RENAMES = {
+        "option_query.": "option_modeling.query.",
+        "option_readout.": "option_modeling.readout.",
+        "option_readout_norm.": "option_modeling.readout_norm.",
+        "option_readout_ffn.": "option_modeling.ffn.",
+        "option_ffn_norm.": "option_modeling.ffn_norm.",
+    }
+
+    @classmethod
+    def _migrate_option_state_dict(cls, state_dict, prefix, *args, **kwargs):
+        rename_state_dict_keys(state_dict, prefix, cls._OPTION_RENAMES)
+
     def _option_modules(self):
         return (
-            self.option_query,
-            self.option_readout,
-            self.option_readout_norm,
-            self.option_readout_ffn,
-            self.option_ffn_norm,
+            self.option_modeling,
             self.option_field_proj,
             self.option_key_proj,
             self.option_none,
@@ -1324,28 +1323,9 @@ class StructuringHead(NERHead):
     def _record_field_vectors(self, records, fields, words, word_mask):
         """``(N, A, D)`` records x ``(N, C, D)`` fields -> ``(N, A, C, D)``."""
 
-        batch, num_records, dim = records.shape
-        num_fields = fields.shape[1]
-        if num_records == 0 or num_fields == 0:
-            return records.new_zeros(batch, num_records, num_fields, dim)
-        record = records.unsqueeze(2).expand(-1, -1, num_fields, -1)
-        field = fields.unsqueeze(1).expand(-1, num_records, -1, -1)
-        query = self.option_query(torch.cat([record, field, record * field], dim=-1))
-        if words.shape[1] == 0:
-            return query
-        flat = query.reshape(batch, num_records * num_fields, dim)
-        key_padding = ~word_mask.bool()
-        # Rows without visible words would make attention undefined.
-        empty = key_padding.all(dim=-1)
-        if empty.any():
-            key_padding = key_padding.clone()
-            key_padding[empty, 0] = False
-        attended, _ = self.option_readout(
-            flat, words, words, key_padding_mask=key_padding, need_weights=False,
+        return self.option_modeling.fuse(
+            records, fields, memory=words, memory_mask=word_mask,
         )
-        hidden = self.option_readout_norm(flat + attended)
-        hidden = self.option_ffn_norm(hidden + self.option_readout_ffn(hidden))
-        return hidden.reshape(batch, num_records, num_fields, dim)
 
     def _option_logits(self, vectors, option_embeddings):
         """``(N, A, Cc, D)`` x ``(N, Cc, Kc, D)`` -> option and none logits."""

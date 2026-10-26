@@ -483,7 +483,7 @@ class BaseGLiFormer(BaseGLiNER):
                     raise ValueError(f"Unknown structuring option {name!r}")
                 if name != "typed_fields":
                     setattr(struct_cfg, name, value)
-        if bool(getattr(struct_cfg, "typed_fields", False)) and hasattr(head, "option_query"):
+        if bool(getattr(struct_cfg, "typed_fields", False)) and hasattr(head, "option_modeling"):
             return False
 
         struct_cfg.typed_fields = True

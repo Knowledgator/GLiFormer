@@ -21,6 +21,7 @@ from .anchor_modeling import (
     IdentityAnchorModeling,
     LinearAnchorModeling,
     MLPAnchorModeling,
+    ReadoutAnchorModeling,
     RNNAnchorModeling,
     TransformerAnchorModeling,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "RotaryAnchorLayer", "QueryRNNAnchorLayer", "QueryTransformerAnchorLayer",
     "AnchorModeling", "IdentityAnchorModeling", "LinearAnchorModeling",
     "RNNAnchorModeling", "MLPAnchorModeling", "TransformerAnchorModeling",
+    "ReadoutAnchorModeling",
     "AnchorNormalizer", "NoAnchorNormalization",
     "LayerNormAnchorNormalization", "RMSNormAnchorNormalization",
     "L2AnchorNormalization", "CenterRMSAnchorNormalization",

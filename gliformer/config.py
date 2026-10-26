@@ -53,6 +53,26 @@ def _split_component_spec(
     return str(component_type).lower().replace("-", "_"), params
 
 
+def _validate_anchor_modeling_spec(value, *, component_name: str):
+    """Normalize an anchor-modeling spec and reject unknown types/options."""
+
+    from .layers import AnchorModeling
+
+    modeling_type, params = _split_component_spec(
+        value, default_type="linear", component_name=component_name,
+    )
+    strategy = AnchorModeling.strategy_class(modeling_type)
+    unknown = set(params) - set(strategy.config_fields)
+    if unknown:
+        raise ValueError(
+            f"Unsupported {modeling_type!r} {component_name} options: "
+            f"{sorted(unknown)}. Available: {sorted(strategy.config_fields)}"
+        )
+    if isinstance(value, str):
+        return modeling_type
+    return copy.deepcopy(dict(value))
+
+
 def _validate_attention_bias_spec(value, *, num_heads: int) -> None:
     """Validate bias component names/options without retaining a module."""
 
@@ -1701,6 +1721,11 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     # filled by ``set_class_indices``.
     typed_boundary_token_indices: Optional[list[int]] = None
     typed_readout_heads: int = 8
+    # Anchor modeling of the option scorer's (record, class field) queries:
+    # an ``AnchorModeling`` type or ``{type, params}`` mapping.  "readout"
+    # fuses record and field, then reads the text; ``typed_readout_heads``
+    # is its default ``num_heads``.
+    typed_modeling: str | dict[str, Any] = "readout"
     typed_class_loss_coef: float = 1.0
     typed_class_threshold: float = 0.5
     # Training-time prompt augmentation for typed fields.
@@ -1718,6 +1743,9 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
         if int(self.typed_readout_heads) < 1:
             raise ValueError("typed_readout_heads must be positive")
         self.typed_readout_heads = int(self.typed_readout_heads)
+        self.typed_modeling = _validate_anchor_modeling_spec(
+            self.typed_modeling, component_name="typed_modeling",
+        )
         value = float(self.typed_class_loss_coef)
         if not math.isfinite(value) or value < 0:
             raise ValueError("typed_class_loss_coef must be finite and non-negative")
@@ -2102,6 +2130,11 @@ class CalculationHeadConfig:
     slot_refine_layers: int = 2
     slot_heads: int = 8
     readout_heads: int = 8
+    # Anchor modeling of the (record anchor, [CALC] marker) query: an
+    # ``AnchorModeling`` type or ``{type, params}`` mapping.  "readout" fuses
+    # record and marker, then reads the text; ``readout_heads`` is its default
+    # ``num_heads``.  Other types (linear, mlp, ...) skip the text readout.
+    query_modeling: str | dict[str, Any] = "readout"
     span_pooler: str = "tokens"
     span_max_tokens: int = 32
     span_pooler_queries: int = 4
@@ -2143,6 +2176,9 @@ class CalculationHeadConfig:
             if value < 1:
                 raise ValueError(f"{name} must be positive")
             setattr(self, name, value)
+        self.query_modeling = _validate_anchor_modeling_spec(
+            self.query_modeling, component_name="query_modeling",
+        )
         self.slot_refine_layers = int(self.slot_refine_layers)
         if self.slot_refine_layers < 0:
             raise ValueError("slot_refine_layers must be >= 0")

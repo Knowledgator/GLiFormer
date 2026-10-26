@@ -4,8 +4,8 @@ For every (structuring record anchor, calc field) pair -- a *query* -- the
 head:
 
 1. builds a query vector from the field's ``[CALC]`` marker, the record anchor
-   and the schema parent vector, read over the text
-   (:class:`~gliformer.layers.record_field_readout.RecordFieldReadout`);
+   and the schema parent vector with the configured anchor modeling
+   (``query_modeling``; the default ``readout`` also reads the text);
 2. extracts operand spans with it (BIO, the shared
    :class:`~gliformer.layers.AnchoredSpanScorer`);
 3. fills ``num_slots`` calculation slots: fixed slot embeddings conditioned on
@@ -34,9 +34,9 @@ import torch.nn.functional as F
 from gliner.modeling.utils import extract_spans_from_tokens
 from torch import nn
 
-from ...layers import AnchoredSpanScorer
+from ...layers import AnchoredSpanScorer, AnchorModeling
+from ...layers.anchor_modeling import rename_state_dict_keys
 from ...layers.mlp import create_mlp
-from ...layers.record_field_readout import RecordFieldReadout
 from ...layers.span_pooling import SpanTokenSource, build_span_pooler
 from .. import TaskHead, TaskHeadOutput
 from ..losses import binary_focal_or_bce
@@ -83,7 +83,11 @@ class CalculationHead(TaskHead):
         self.num_consts = len(CONSTANTS)
 
         self.parent_proj = nn.Linear(hidden_size, hidden_size)
-        self.query_readout = RecordFieldReadout(hidden_size, heads=cfg.readout_heads, dropout=dropout)
+        self.query_modeling = AnchorModeling.from_config(
+            cfg.query_modeling, hidden_size, dropout=dropout, num_heads=cfg.readout_heads,
+        )
+        # Checkpoints before anchor modeling stored the readout as ``query_readout``.
+        self._register_load_state_dict_pre_hook(self._migrate_state_dict)
         self.scorer = AnchoredSpanScorer(hidden_size, dropout=dropout)
         self.span_pooler = build_span_pooler(cfg, hidden_size, dropout, max_width=cfg.max_span_width)
 
@@ -136,6 +140,10 @@ class CalculationHead(TaskHead):
             input_dim=hidden_size, intermediate_dims=[hidden_size], output_dim=1,
             dropout=dropout, activation="gelu",
         )
+
+    @staticmethod
+    def _migrate_state_dict(state_dict, prefix, *args, **kwargs):
+        rename_state_dict_keys(state_dict, prefix, {"query_readout.": "query_modeling."})
 
     @classmethod
     def from_config(cls, config, **kwargs):
@@ -426,7 +434,10 @@ class CalculationHead(TaskHead):
         record = anchor_vectors + self.parent_proj(parent[group])
         query_words = words[rows]
         query_word_mask = word_mask_all[rows].bool()
-        query = self.query_readout(record, calc_vectors, query_words, query_word_mask)
+        query = self.query_modeling.fuse(
+            record.unsqueeze(1), calc_vectors.unsqueeze(1),
+            memory=query_words, memory_mask=query_word_mask,
+        )[:, 0, 0]
 
         bio_logits = self.scorer(query.unsqueeze(1), query_words, word_mask=query_word_mask)[:, 0]
         if supervised:
