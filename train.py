@@ -888,6 +888,13 @@ def build_model(model_cfg: dict, train_cfg: dict):
             prev_path,
             _attn_implementation=model_cfg.get("_attn_implementation"),
         )
+        # Text units create no parameters: a word checkpoint can train at token level.
+        if "text_unit" in model_cfg and model.set_text_unit(
+            model_cfg["text_unit"], model_cfg.get("span_boundary"),
+        ):
+            print(f"Switched text units to {model.config.text_unit!r}")
+        if "split_digits" in model_cfg and model.set_split_digits(model_cfg["split_digits"]):
+            print(f"Set split_digits={model.config.split_digits}")
         validate_checkpoint_architecture(model, model_cfg)
         applied = apply_checkpoint_config_overrides(model, model_cfg)
         if applied:

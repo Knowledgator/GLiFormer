@@ -310,3 +310,52 @@ def test_typed_structuring_with_normalization_trains_in_token_mode():
     record = result["structuring"][0]
     for title in record.get("title") or []:
         assert title in rows[0]["text"]
+
+
+@needs_backbone
+def test_word_model_switches_to_token_units():
+    from gliformer.processing.token_units import TokenSplitter
+
+    model = _model(text_unit="word")
+    assert model.set_text_unit("token")
+    assert not model.set_text_unit("token")
+    assert model.config.text_unit == "token"
+    assert isinstance(model.data_processor.words_splitter, TokenSplitter)
+    rows = [_ner_row("Revenue rose to 1234.5678 dollars.", [["1234.5678", "amount"]])]
+    batch, losses = _train(model, rows, steps=2)
+    # "1234.5678" is several subword units, all inside the labelled span.
+    assert batch["words_mask"].amax() > len(rows[0]["text"].split())
+    assert all(torch.isfinite(torch.tensor(losses)))
+    text = "Sales were 99.5 million."
+    for entity in model.inference([text], entities=["amount"], threshold=0.0)["ner"][0]:
+        assert text[entity["start"]:entity["end"]] == entity["text"]
+
+
+@needs_backbone
+def test_split_digits_makes_every_digit_a_unit(tmp_path):
+    from gliformer import GLiFormer
+    from gliformer.processing.token_units import has_digit_split
+
+    model = _model()
+    assert not has_digit_split(model.data_processor.transformer_tokenizer)
+    assert model.set_split_digits(True)
+    assert not model.set_split_digits(True)
+    text = "Revenue was 88,848 in 2019."
+    pieces = model.data_processor.words_splitter.encode(text).pieces
+    assert pieces[2:8] == ["8", "8", ",", "8", "4", "8"]
+    assert pieces[9:13] == ["2", "0", "1", "9"]
+
+    rows = [_ner_row("Revenue rose to 1234.5678 dollars.", [["1234.5678", "amount"]])]
+    _, losses = _train(model, rows, steps=2)
+    assert all(torch.isfinite(torch.tensor(losses)))
+    for entity in model.inference([text], entities=["amount"], threshold=0.0)["ner"][0]:
+        assert text[entity["start"]:entity["end"]] == entity["text"]
+
+    model.save_pretrained(tmp_path)
+    loaded = GLiFormer.from_pretrained(str(tmp_path))
+    assert loaded.config.split_digits
+    assert loaded.data_processor.words_splitter.encode(text).pieces == pieces
+
+    assert loaded.set_split_digits(False)
+    assert not has_digit_split(loaded.data_processor.transformer_tokenizer)
+    assert "88" in loaded.data_processor.words_splitter.encode(text).pieces

@@ -290,3 +290,69 @@ def unit_pieces_batch(tokens, texts):
         UnitPieces(row, text) if row is not None else row
         for row, text in zip(tokens, texts, strict=True)
     ]
+
+
+# A digit, with the word-start marker when it opens a word, is its own piece.
+_DIGIT_SPLIT_PATTERN = "▁?\\d"
+
+
+def _pre_tokenizer_parts(pre_tokenizer) -> list[dict]:
+    import json
+
+    if pre_tokenizer is None:
+        return []
+    state = json.loads(pre_tokenizer.__getstate__())
+    if state.get("type") == "Sequence":
+        return list(state.get("pretokenizers", []))
+    return [state]
+
+
+def _is_digit_split(part: dict) -> bool:
+    return part.get("type") == "Split" and part.get("pattern", {}).get("Regex") == _DIGIT_SPLIT_PATTERN
+
+
+def has_digit_split(tokenizer) -> bool:
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        return False
+    return any(_is_digit_split(part) for part in _pre_tokenizer_parts(backend.pre_tokenizer))
+
+
+def set_digit_split(tokenizer, enabled: bool) -> bool:
+    """Make a fast tokenizer encode every digit as its own piece (or undo it).
+
+    Adds a pre-tokenizer step after the existing one, so no vocabulary
+    changes: digits map to the single-digit pieces the vocabulary already
+    has ("▁8", "8"). Returns ``True`` when the tokenizer changed.
+    """
+
+    if enabled == has_digit_split(tokenizer):
+        return False
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        raise ValueError("split_digits needs a fast tokenizer.")
+    parts = [part for part in _pre_tokenizer_parts(backend.pre_tokenizer) if not _is_digit_split(part)]
+    if enabled:
+        parts.append(
+            {"type": "Split", "pattern": {"Regex": _DIGIT_SPLIT_PATTERN},
+             "behavior": "Isolated", "invert": False}
+        )
+    if parts:
+        state = {"type": "Sequence", "pretokenizers": parts}
+        backend.pre_tokenizer = _pre_tokenizer_from_state(state)
+    else:
+        backend.pre_tokenizer = None
+    return True
+
+
+def _pre_tokenizer_from_state(state: dict):
+    """Build a pre-tokenizer from its JSON state through a tokenizer round trip."""
+
+    import json
+
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    probe = json.loads(Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")).to_str())
+    probe["pre_tokenizer"] = state
+    return Tokenizer.from_str(json.dumps(probe)).pre_tokenizer

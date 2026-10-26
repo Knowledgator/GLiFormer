@@ -2464,6 +2464,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         preserve_word_spaces: bool = False,
         text_unit: str = "word",
         span_boundary: str = "free",
+        split_digits: bool = False,
         **kwargs,
     ):
         # Load-only aliases for checkpoints written while the entity-first
@@ -3072,6 +3073,10 @@ class GLiFormerConfig(BaseGLiNERConfig):
         # Token mode only: "word" widens gold and predicted spans to whole
         # words, so no span starts or ends inside a word.
         self.span_boundary = span_boundary
+        # Tokenize every digit as its own piece ("88848" -> 8 8 8 4 8), so
+        # number readers see digits instead of arbitrary multi-digit chunks.
+        # Changes the encoder input, so it is checkpoint-bound.
+        self.split_digits = bool(split_digits)
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -3228,6 +3233,7 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "preserve_word_spaces",
         "text_unit",
         "span_boundary",
+        "split_digits",
         "num_rnn_layers",
         "fuse_layers",
         "embed_ent_token",

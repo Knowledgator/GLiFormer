@@ -52,6 +52,7 @@ from .processing.token_units import (
     TOKEN_UNIT_MARKER,
     TokenSplitter,
     is_token_level,
+    set_digit_split,
     snaps_to_words,
     word_snapped_maps,
 )
@@ -219,6 +220,9 @@ class BaseGLiFormer(BaseGLiNER):
             variant = getattr(config, "model_variant", "")
             if variant in {"vision", "audio"}:
                 labels_tokenizer = tokenizer
+
+        if getattr(config, "split_digits", False):
+            set_digit_split(tokenizer, True)
 
         if is_token_level(config):
             if words_splitter is None:
@@ -528,6 +532,51 @@ class BaseGLiFormer(BaseGLiNER):
         normalization.structuring_processor = processor.task_processors.get("structuring")
         processor.task_processors["normalization"] = normalization
         self.decoder = self.decoder_class(self.config)
+        return True
+
+    def set_text_unit(self, text_unit: str, span_boundary: Optional[str] = None) -> bool:
+        """Switch a loaded checkpoint between word and token units.
+
+        Text units create no parameters, so a word-level checkpoint can be
+        fine-tuned (or run) at token level: only the data processor changes.
+        Returns ``True`` when the unit changed.
+        """
+
+        from .config import TEXT_UNITS
+
+        text_unit = str(text_unit).lower()
+        if text_unit not in TEXT_UNITS:
+            raise ValueError(f"text_unit must be one of {list(TEXT_UNITS)}, got {text_unit!r}")
+        changed = text_unit != getattr(self.config, "text_unit", "word")
+        if span_boundary is not None and span_boundary != getattr(self.config, "span_boundary", None):
+            self.config.span_boundary = span_boundary
+            changed = True
+        if not changed:
+            return False
+        self.config.text_unit = text_unit
+        if text_unit == "token":
+            self.config.preserve_word_spaces = False
+        processor = self.data_processor
+        self._create_data_processor(
+            self.config, cache_dir=None, tokenizer=processor.transformer_tokenizer,
+        )
+        return True
+
+    def set_split_digits(self, enabled: bool) -> bool:
+        """Turn per-digit tokenization on or off for a loaded checkpoint.
+
+        No parameters change (single digits are already in the vocabulary),
+        but the encoder reads numbers differently, so the model needs
+        fine-tuning after a switch. Returns ``True`` when it changed.
+        """
+
+        enabled = bool(enabled)
+        if enabled == bool(getattr(self.config, "split_digits", False)):
+            return False
+        self.config.split_digits = enabled
+        tokenizer = self.data_processor.transformer_tokenizer
+        set_digit_split(tokenizer, enabled)
+        self._create_data_processor(self.config, cache_dir=None, tokenizer=tokenizer)
         return True
 
     def _rebuild_structuring_processor(self):
