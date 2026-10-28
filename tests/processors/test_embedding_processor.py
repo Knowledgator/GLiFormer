@@ -59,3 +59,5 @@ class TestCreateLabels:
         result = emb_proc.create_labels(batch, None)
         assert result is not None
         assert result["embedding_pair_idx"][0].tolist() == [1, 2]
+        # The offset row is never read: it must not re-encode the item's text.
+        assert result["embedding_texts"][0] == ""

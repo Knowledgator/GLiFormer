@@ -121,10 +121,10 @@ def test_typed_structuring_trains_and_decodes(multi_level):
 def test_enable_typed_structuring_adds_the_option_scorer():
     model = _model(True)
     head = model.model.heads["structuring"]
-    assert not hasattr(head, "option_query")
+    assert not hasattr(head, "option_modeling")
     assert model.enable_typed_structuring(typed_readout_heads=4) is True
     assert model.enable_typed_structuring() is False  # already enabled
-    assert hasattr(head, "option_query")
+    assert hasattr(head, "option_modeling")
     with pytest.raises(ValueError, match="Unknown structuring option"):
         model.enable_typed_structuring(typed_quantity_head="bins")
     batch = _batch(model, True)

@@ -315,6 +315,7 @@ def test_task_registry_exposes_head_order():
         "joint_relex",
         "open_relex",
         "structuring",
+        "calculation",
         "normalization",
         "image_classification",
         "object_detection",
@@ -330,6 +331,7 @@ def test_task_registry_exposes_head_order():
         "joint_relex",
         "open_relex",
         "structuring",
+        "calculation",
         "normalization",
         "embedding",
     )

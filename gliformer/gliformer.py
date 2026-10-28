@@ -339,6 +339,9 @@ class BaseGLiFormer(BaseGLiNER):
                     ]
                 )
 
+        if getattr(self.config, "sequence_editing_config", None) is not None:
+            tokens.append(getattr(self.config, "edit_token", "[EDIT]"))
+
         if (self.config.image_classification_config is not None
                 or self.config.object_detection_config is not None
                 or self.config.segmentation_config is not None
@@ -429,6 +432,11 @@ class BaseGLiFormer(BaseGLiNER):
                     getattr(self.config, "calc_token", "[CALC]")
                 )
 
+        if getattr(self.config, "sequence_editing_config", None) is not None:
+            self.config.sequence_editing_config.edit_token_index = _idx(
+                getattr(self.config, "edit_token", "[EDIT]")
+            )
+
         if (self.config.image_classification_config is not None
                 or self.config.object_detection_config is not None
                 or self.config.segmentation_config is not None
@@ -453,6 +461,7 @@ class BaseGLiFormer(BaseGLiNER):
                 model_embeds = token_rep_layer.resize_token_embeddings(new_num_tokens, None)
                 self._init_option_token_embedding(model_embeds, old_num_tokens)
                 self._init_calc_token_embedding(model_embeds, old_num_tokens)
+                self._init_edit_token_embedding(model_embeds, old_num_tokens)
                 self.config.vocab_size = model_embeds.num_embeddings
                 if hasattr(self.config, "encoder_config") and self.config.encoder_config is not None:
                     self.config.encoder_config.vocab_size = model_embeds.num_embeddings
@@ -664,6 +673,214 @@ class BaseGLiFormer(BaseGLiNER):
         self._rebuild_structuring_processor()
         self.decoder = self.decoder_class(self.config)
         return True
+
+    def enable_sequence_editing(self, settings: Optional[Dict[str, Any]] = None) -> bool:
+        """Add a sequence editing head to a loaded checkpoint.
+
+        Registers the ``[EDIT]`` token (its embedding row starts as a copy of
+        ``[SEP]``), builds the head from ``settings`` (a
+        ``sequence_editing_config`` mapping), its processor and decoder.
+        Returns ``True`` when the model changed; an existing head only takes
+        settings that do not change its weights.
+        """
+
+        from .config import SequenceEditingHeadConfig
+        from .tasks.sequence_editing.model import SequenceEditingHead
+        from .tasks.sequence_editing.processor import SequenceEditingProcessor
+
+        heads = self.model.heads
+        if "sequence_editing" in heads:
+            tunable = {
+                "loss_coef", "op_loss_coef", "length_loss_coef", "token_loss_coef", "space_loss_coef",
+                "keep_weight", "op_label_smoothing", "detach_vocab", "keep_bias", "min_edit_prob",
+                "num_iterations", "tag_loss_coef",
+            }
+            current = self.config.sequence_editing_config
+            values = {**current.__dict__, **{k: v for k, v in dict(settings or {}).items() if k in tunable}}
+            updated = SequenceEditingHeadConfig(**values)
+            head = heads["sequence_editing"]
+            for config in {id(current): current, id(head.cfg): head.cfg}.values():
+                for key in tunable:
+                    setattr(config, key, getattr(updated, key))
+            head.loss_coef = float(updated.loss_coef)
+            return False
+        self.config.sequence_editing_config = SequenceEditingHeadConfig(**dict(settings or {}))
+        edit_token = getattr(self.config, "edit_token", None) or "[EDIT]"
+        self.config.edit_token = edit_token
+        tokenizer = self.data_processor.transformer_tokenizer
+        if edit_token not in tokenizer.get_vocab():
+            tokenizer.add_tokens([edit_token], special_tokens=True)
+        # Sets the [EDIT] index, grows the embedding table, copies [SEP].
+        self.resize_embeddings()
+        head = SequenceEditingHead.from_config(
+            self.config, embedding_dim=self.model._input_embedding_dim(),
+        )
+        parameter = next(self.model.parameters())
+        heads["sequence_editing"] = head.to(device=parameter.device, dtype=parameter.dtype)
+        head.attach_vocab(self.model)
+        processor = self.data_processor
+        processor.task_processors["sequence_editing"] = SequenceEditingProcessor(
+            self.config,
+            processor.transformer_tokenizer,
+            getattr(processor, "words_splitter", None),
+        )
+        self.decoder = self.decoder_class(self.config)
+        return True
+
+    def _init_edit_token_embedding(self, embeddings, old_num_tokens: int) -> None:
+        """Start a newly added ``[EDIT]`` row from the ``[SEP]`` row."""
+
+        edit_cfg = getattr(self.config, "sequence_editing_config", None)
+        weight = getattr(embeddings, "weight", None)
+        if edit_cfg is None or weight is None:
+            return
+        edit_idx = int(getattr(edit_cfg, "edit_token_index", -1))
+        tokenizer = self.data_processor.transformer_tokenizer
+        sep_idx = tokenizer.convert_tokens_to_ids(self.config.sep_token)
+        if (
+            edit_idx < old_num_tokens
+            or not 0 <= edit_idx < weight.shape[0]
+            or not isinstance(sep_idx, int)
+            or not 0 <= sep_idx < weight.shape[0]
+        ):
+            return
+        with torch.no_grad():
+            weight[edit_idx].copy_(weight[sep_idx])
+
+    @torch.no_grad()
+    def edit_text(
+        self,
+        texts: Union[str, List[str]],
+        instruction: Optional[Union[str, List[Optional[str]]]] = None,
+        *,
+        batch_size: int = 8,
+        keep_bias: Optional[float] = None,
+        min_edit_prob: Optional[float] = None,
+        num_iterations: Optional[int] = None,
+        return_ops: bool = False,
+    ):
+        """Edit texts with the sequence editing head.
+
+        Args:
+            texts: one text or a list.
+            instruction: one instruction for all texts or one per text
+                (e.g. ``"fix grammar"``); ``None`` = the empty instruction.
+            keep_bias: added to the KEEP logit (higher = fewer edits);
+                defaults to ``sequence_editing_config.keep_bias``.
+            min_edit_prob: a text is edited only if some unit's edit
+                probability reaches it.
+            num_iterations: run the model again on its own output until
+                nothing changes, at most this many times.
+            return_ops: also return the per-slot ops of the last pass.
+
+        Returns:
+            Per text (a dict for a single string input)::
+
+                {"instruction": str, "text": edited text, "iterations": int,
+                 "edits": [{"op": "replace", "start": 4, "end": 6,
+                            "source": "go", "replacement": "went",
+                            "score": 0.97, "space": True}, ...]}
+
+            Edit offsets refer to the input text. After more than one pass
+            the edits are re-aligned against the input and carry no score.
+        """
+
+        from .tasks.sequence_editing.alignment import char_edits, plan_edits
+        from .tasks.sequence_editing.decoder import SequenceEditingDecoder
+
+        self._require_task_heads("sequence_editing")
+        cfg = self.config.sequence_editing_config
+        texts, single = self._normalize_texts(texts)
+        if instruction is None or isinstance(instruction, str):
+            instruction = [instruction] * len(texts)
+        elif len(instruction) != len(texts):
+            raise ValueError("instruction must be one string or one per text")
+        instructions = [str(value or "").strip() for value in instruction]
+        num_iterations = int(num_iterations or cfg.num_iterations)
+        self.eval()
+
+        tokenizer = self.data_processor.transformer_tokenizer
+        splitter = self.data_processor.words_splitter
+        decoder = SequenceEditingDecoder(self.config, tokenizer)
+        blocked = sorted(set(tokenizer.all_special_ids) | set(tokenizer.added_tokens_encoder.values()))
+        blocked_tensor = torch.tensor(blocked, dtype=torch.long, device=self.device)
+        collator = self.create_inference_collator(return_tokens=True)
+        model_dtype = self._model_floating_dtype()
+        forward_kwargs = {"seq_edit_blocked_tokens": blocked_tensor}
+        if keep_bias is not None:
+            forward_kwargs["seq_edit_keep_bias"] = float(keep_bias)
+        if min_edit_prob is not None:
+            forward_kwargs["seq_edit_min_edit_prob"] = float(min_edit_prob)
+
+        def run_pass(batch_texts, batch_instructions):
+            units = [[tuple(unit) for unit in splitter(text)] for text in batch_texts]
+            items = []
+            for text, pieces, text_instruction in zip(batch_texts, units, batch_instructions):
+                item = {
+                    "text": text,
+                    "tokenized_text": [unit[0] for unit in pieces] or ["[PAD]"],
+                    "sequence_editing": [{"instruction": text_instruction}],
+                }
+                if is_token_level(self.config):
+                    item[TOKEN_UNIT_MARKER] = "token"
+                items.append(item)
+            batch = collator(items)
+            model_batch = {}
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    value = value.to(self.device)
+                    if value.is_floating_point() and model_dtype is not None:
+                        value = value.to(dtype=model_dtype)
+                model_batch[key] = value
+            output = self.model(**model_batch, **forward_kwargs)
+            decode = getattr(output, "sequence_editing", None)
+            results = decoder.decode_groups(decode, batch_texts, units)
+            by_row = {result["row"]: result for result in results}
+            return [
+                by_row.get(row, {"text": text, "edits": [], "ops": []})
+                for row, text in enumerate(batch_texts)
+            ]
+
+        current = list(texts)
+        first_pass: List[Optional[dict]] = [None] * len(texts)
+        last_pass: List[Optional[dict]] = [None] * len(texts)
+        iterations = [0] * len(texts)
+        active = [index for index, text in enumerate(texts) if isinstance(text, str) and text.strip()]
+        for _ in range(num_iterations):
+            if not active:
+                break
+            still_active = []
+            for offset in range(0, len(active), batch_size):
+                chunk = active[offset: offset + batch_size]
+                outputs = run_pass([current[i] for i in chunk], [instructions[i] for i in chunk])
+                for index, result in zip(chunk, outputs):
+                    iterations[index] += 1
+                    if first_pass[index] is None:
+                        first_pass[index] = result
+                    last_pass[index] = result
+                    if result["text"] != current[index]:
+                        current[index] = result["text"]
+                        still_active.append(index)
+            active = still_active
+
+        results = []
+        for index, source in enumerate(texts):
+            if iterations[index] <= 1 or current[index] == source:
+                edits = first_pass[index]["edits"] if first_pass[index] is not None else []
+            else:
+                source_units = [tuple(unit) for unit in splitter(source)]
+                plan = plan_edits(source, source_units, current[index], [tuple(u) for u in splitter(current[index])])
+                edits = char_edits(source, source_units, plan.ops, plan.contents)
+            result = {
+                "instruction": instructions[index],
+                "text": current[index],
+                "edits": edits,
+                "iterations": iterations[index],
+            }
+            if return_ops:
+                result["ops"] = last_pass[index]["ops"] if last_pass[index] is not None else []
+            results.append(result)
+        return self._single_or_batch(results, single)
 
     def _init_calc_token_embedding(self, embeddings, old_num_tokens: int) -> None:
         """Start a newly added ``[CALC]`` row from the ``[FIELD]`` row."""
@@ -958,6 +1175,9 @@ class BaseGLiFormer(BaseGLiNER):
             return dict(value)
         if isinstance(value, (str, Path)):
             return {path_key: value}
+        # Loaded images (e.g. PIL) go through the image processor like paths do.
+        if hasattr(value, "convert") and hasattr(value, "size") and not isinstance(value, torch.Tensor):
+            return {path_key: value}
         return {tensor_key: value}
 
     def _require_task_heads(self, *task_names: str):
@@ -971,7 +1191,7 @@ class BaseGLiFormer(BaseGLiNER):
                     "ner", "classification", "joint_relex", "open_relex",
                     "structuring", "image_classification", "object_detection",
                     "segmentation", "audio_classification", "audio_segmentation",
-                    "count", "embedding",
+                    "count", "embedding", "sequence_editing",
                 )
                 if getattr(self.config, f"{name}_config", None) is not None
             ]

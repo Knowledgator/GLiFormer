@@ -76,6 +76,9 @@ class GLiFormerTextOutput(GLiFormerBaseOutput):
     # (queries, operand spans, slot op/port/active logits); see
     # tasks/calculation/model.py.
     calculation: Optional[dict] = None
+    # Sequence editing head: per-group op logits and predicted contents; see
+    # tasks/sequence_editing/model.py.
+    sequence_editing: Optional[dict] = None
 
     embedding_logits: Optional[torch.FloatTensor] = None
 

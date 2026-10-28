@@ -339,8 +339,9 @@ class LayoutEncoder(TextEncoder):
         # Text-only layout checkpoints can use the inherited GLiNER packing
         # path. Layout/media-aligned tensors require coordinated packing and
         # deliberately fall back to the established unpacked implementation.
+        train_packing = getattr(self, "training", False) and getattr(self.bert_layer.config, "train_sequence_packing", False)
         if (
-            kwargs.get("packing_config") is not None
+            (kwargs.get("packing_config") is not None or train_packing)
             and input_ids is not None
             and inputs_embeds is None
             and bbox is None

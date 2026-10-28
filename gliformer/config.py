@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+import json
 import math
 import warnings
 from collections.abc import Mapping, Sequence
@@ -2197,6 +2198,109 @@ class CalculationHeadConfig:
         self.calc_token_index = int(self.calc_token_index)
 
 
+SEQUENCE_EDITING_VOCABS = ("tied",)
+SEQUENCE_EDITING_CONTENT_MODES = ("slots", "tags")
+
+
+@dataclass
+class SequenceEditingHeadConfig:
+    """Sequence editing head: per-unit keep/delete/replace/append.
+
+    The prompt carries ``[EDIT] <instruction>``. For every text unit (word or
+    subword, following ``text_unit``) plus a virtual BOS slot the head picks
+    an operation; for ``replace``/``append`` it writes up to
+    ``max_content_len`` backbone subwords with ``num_slots`` parallel slot
+    queries, scored against the backbone's own input embedding matrix (no
+    vocabulary-sized output layer) and, with ``copy``, a pointer over the
+    input tokens. See tasks/sequence_editing/.
+    """
+
+    loss_coef: float = 1.0
+    op_loss_coef: float = 1.0
+    length_loss_coef: float = 0.5
+    token_loss_coef: float = 1.0
+    space_loss_coef: float = 0.25
+    # CE class weight of KEEP (most units are kept).
+    keep_weight: float = 0.5
+    op_label_smoothing: float = 0.0
+    max_content_len: int = 8
+    context_layers: int = 0
+    decoder_layers: int = 2
+    decoder_heads: int = 8
+    # Content slots also attend to the subwords of the edited unit and of
+    # ``local_window`` units on each side (at most ``local_max_tokens``);
+    # 0 disables it.
+    local_window: int = 0
+    local_max_tokens: int = 32
+    vocab: str = "tied"
+    copy: bool = True
+    # Stop gradients from the content scorer into the shared embedding matrix.
+    detach_vocab: bool = False
+    # Inference: added to the KEEP logit (higher = fewer edits).
+    keep_bias: float = 0.0
+    # Inference: a row is edited only if some unit's non-KEEP probability
+    # reaches this value.
+    min_edit_prob: float = 0.0
+    num_iterations: int = 1
+    edit_token_index: int = -1
+    # "slots": learned content slots (above); "tags": GECToR-style token
+    # classification, every REPLACE/APPEND unit picks one string of
+    # ``tag_vocab`` (leading space = whitespace before it). Edits whose
+    # content is not in the vocabulary get no op label.
+    content_mode: str = "slots"
+    tag_vocab: Optional[list] = None
+    # JSON list read into ``tag_vocab`` when that is empty (see
+    # tasks/sequence_editing/tags.py); the checkpoint keeps the list.
+    tag_vocab_path: Optional[str] = None
+    tag_loss_coef: float = 1.0
+
+    def __post_init__(self):
+        for name in (
+            "loss_coef", "op_loss_coef", "length_loss_coef", "token_loss_coef",
+            "space_loss_coef", "keep_weight", "tag_loss_coef",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            setattr(self, name, value)
+        for name in ("max_content_len", "decoder_heads", "num_iterations"):
+            value = int(getattr(self, name))
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        self.local_max_tokens = int(self.local_max_tokens)
+        if self.local_max_tokens < 1:
+            raise ValueError("local_max_tokens must be positive")
+        for name in ("context_layers", "decoder_layers", "local_window"):
+            value = int(getattr(self, name))
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0")
+            setattr(self, name, value)
+        self.op_label_smoothing = float(self.op_label_smoothing)
+        if not 0.0 <= self.op_label_smoothing < 1.0:
+            raise ValueError("op_label_smoothing must be in [0, 1)")
+        self.vocab = str(self.vocab).lower()
+        if self.vocab not in SEQUENCE_EDITING_VOCABS:
+            raise ValueError(f"vocab must be one of {list(SEQUENCE_EDITING_VOCABS)}")
+        self.copy = bool(self.copy)
+        self.detach_vocab = bool(self.detach_vocab)
+        self.keep_bias = float(self.keep_bias)
+        self.min_edit_prob = float(self.min_edit_prob)
+        if not 0.0 <= self.min_edit_prob < 1.0:
+            raise ValueError("min_edit_prob must be in [0, 1)")
+        self.edit_token_index = int(self.edit_token_index)
+        self.content_mode = str(self.content_mode).lower()
+        if self.content_mode not in SEQUENCE_EDITING_CONTENT_MODES:
+            raise ValueError(f"content_mode must be one of {list(SEQUENCE_EDITING_CONTENT_MODES)}")
+        if self.content_mode == "tags":
+            if not self.tag_vocab and self.tag_vocab_path:
+                with open(self.tag_vocab_path) as handle:
+                    self.tag_vocab = json.load(handle)
+            if not self.tag_vocab:
+                raise ValueError("content_mode 'tags' needs tag_vocab or tag_vocab_path")
+            self.tag_vocab = [str(tag) for tag in self.tag_vocab]
+
+
 @dataclass
 class CountHeadConfig:
     mode: str = "regression"
@@ -2259,6 +2363,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         "embedding": "embedding_config",
         "normalization": "normalization_config",
         "calculation": "calculation_config",
+        "sequence_editing": "sequence_editing_config",
     }
 
     @staticmethod
@@ -2449,6 +2554,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         embedding_config: Optional[dict] = None,
         normalization_config: Optional[dict] = None,
         calculation_config: Optional[dict] = None,
+        sequence_editing_config: Optional[dict] = None,
         # Shared layers across tasks (None = each task creates its own)
         shared_anchor_modeling: Optional[str | dict[str, Any]] = None,
         shared_anchor_refinement: Optional[str | dict[str, Any]] = None,
@@ -2513,6 +2619,8 @@ class GLiFormerConfig(BaseGLiNERConfig):
         option_token: str = "[OPTION]",
         # Follows a structuring field marked ``$calculate`` (calculation head).
         calc_token: str = "[CALC]",
+        # Starts a sequence editing instruction (sequence editing head).
+        edit_token: str = "[EDIT]",
         # Descriptive aliases for the marker-token parameters above. The
         # shorter names remain the serialized/public compatibility surface.
         entity_token: Optional[str] = None,
@@ -2590,6 +2698,9 @@ class GLiFormerConfig(BaseGLiNERConfig):
         text_unit: str = "word",
         span_boundary: str = "free",
         split_digits: Any = False,
+        # Training only: pack the rows of a batch into padding-free streams
+        # (block-diagonal attention; text-only batches). See encoders/text.py.
+        train_sequence_packing: bool = False,
         **kwargs,
     ):
         # Load-only aliases for checkpoints written while the entity-first
@@ -2967,6 +3078,18 @@ class GLiFormerConfig(BaseGLiNERConfig):
         if self.calculation_config is not None and self.structuring_config is None:
             raise ValueError("calculation_config needs a structuring_config")
 
+        # Sequence editing
+        if isinstance(sequence_editing_config, dict):
+            self.sequence_editing_config = SequenceEditingHeadConfig(**sequence_editing_config)
+        elif dataclasses.is_dataclass(sequence_editing_config) and not isinstance(
+            sequence_editing_config, SequenceEditingHeadConfig
+        ):
+            self.sequence_editing_config = SequenceEditingHeadConfig(
+                **dataclasses.asdict(sequence_editing_config)
+            )
+        else:
+            self.sequence_editing_config = sequence_editing_config
+
         # Embedding
         if isinstance(embedding_config, dict):
             embedding_config.setdefault("loss_coef", embedding_loss_coef)
@@ -3013,11 +3136,6 @@ class GLiFormerConfig(BaseGLiNERConfig):
             raise ValueError(
                 "Detection and segmentation require vision_processor_type='custom' "
                 "until external processor geometry metadata is available"
-            )
-        if dense_vision_tasks_enabled and vision_processor_type == "native":
-            raise ValueError(
-                "Detection and segmentation are not supported with vision_encoder_type='native' yet: "
-                "its image grid varies per row."
             )
         if vision_tasks_enabled and vision_model_name is None and vision_encoder_type is None:
             vision_encoder_type = "patch"
@@ -3173,6 +3291,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.structuring_end_token = structuring_end_token
         self.option_token = option_token
         self.calc_token = calc_token
+        self.edit_token = edit_token
         self.obj_token = obj_token
         self.obj_token_index = obj_token_index
         self.embed_obj_token = embed_obj_token
@@ -3221,6 +3340,7 @@ class GLiFormerConfig(BaseGLiNERConfig):
         from .processing.token_units import normalize_digit_split
 
         self.split_digits = normalize_digit_split(split_digits) or False
+        self.train_sequence_packing = bool(train_sequence_packing)
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -3345,6 +3465,7 @@ _TEXT_CONFIG_FIELDS = (
     "embedding_config",
     "normalization_config",
     "calculation_config",
+    "sequence_editing_config",
 )
 _VISION_CONFIG_FIELDS = (
     "image_classification_config",
@@ -3412,6 +3533,7 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "structuring_end_token",
         "option_token",
         "calc_token",
+        "edit_token",
         "obj_token",
         "per_task_parents",
         "ner_parent_token",
@@ -3441,6 +3563,7 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "embedding_config",
         "normalization_config",
         "calculation_config",
+        "sequence_editing_config",
         "relations_layer",
         "classifier_layer",
         "groups_layer",

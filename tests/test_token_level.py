@@ -359,3 +359,34 @@ def test_split_digits_makes_every_digit_a_unit(tmp_path):
     assert loaded.set_split_digits(False)
     assert not has_digit_split(loaded.data_processor.transformer_tokenizer)
     assert "88" in loaded.data_processor.words_splitter.encode(text).pieces
+
+
+@needs_backbone
+def test_split_digits_keep_dates_leaves_calendar_strings_whole():
+    from gliformer.processing.token_units import digit_split_mode, normalize_digit_split
+
+    assert normalize_digit_split(True) == "all"
+    assert normalize_digit_split(False) is None
+    with pytest.raises(ValueError):
+        normalize_digit_split("dates")
+
+    model = _model(split_digits="keep_dates")
+    assert model.config.split_digits == "keep_dates"
+    splitter = model.data_processor.words_splitter
+    assert digit_split_mode(splitter.tokenizer) == "keep_dates"
+
+    def pieces(text):
+        return model.data_processor.words_splitter.encode(text).pieces
+
+    plain = model.data_processor.transformer_tokenizer
+    # Dates, times and years keep the pieces they had without any digit split.
+    for text in ["Due 2024-11-18 at 09:15:00.", "Filed 11/18/2024.", "In 2019 sales rose."]:
+        assert all(len(piece.strip()) > 0 for piece in pieces(text))
+        assert any(len([c for c in piece if c.isdigit()]) >= 2 for piece in pieces(text))
+    # Other numbers are split, including year-like numbers inside longer numbers.
+    for text in ["Revenue was 88,848.", "Grew 2019.5 units and 12019 items."]:
+        assert all(sum(c.isdigit() for c in piece) <= 1 for piece in pieces(text))
+
+    assert model.set_split_digits("all")
+    assert digit_split_mode(plain) == "all"
+    assert pieces("In 2019 sales rose.")[1:5] == ["2", "0", "1", "9"]

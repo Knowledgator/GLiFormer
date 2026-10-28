@@ -21,6 +21,7 @@ from transformers import AutoImageProcessor, AutoProcessor
 from ..layers.span_pooling import config_needs_token_map
 from ..tasks.audio.processor import AudioProcessor
 from ..tasks.calculation.processor import CalculationProcessor
+from ..tasks.sequence_editing.processor import SequenceEditingProcessor
 from ..tasks.classification.processor import ClassificationProcessor
 from ..tasks.count.processor import CountProcessor
 from ..tasks.embedding.processor import EmbeddingProcessor
@@ -64,6 +65,7 @@ _TEXT_TASKS = (
     "structuring",
     "calculation",
     "normalization",
+    "sequence_editing",
     "embedding",
 )
 _ALL_TASKS = (*_TEXT_TASKS, *_VISION_TASKS, *_AUDIO_TASKS)
@@ -1367,6 +1369,13 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             if "normalization" in self.task_processors:
                 # Operand values are extra number targets of the normalization head.
                 self.task_processors["normalization"].calculation_processor = calculation
+        if (
+            "sequence_editing" in allowed_tasks
+            and getattr(config, "sequence_editing_config", None) is not None
+        ):
+            self.task_processors["sequence_editing"] = SequenceEditingProcessor(
+                config, tokenizer, words_splitter,
+            )
         if "embedding" in allowed_tasks and config.embedding_config is not None:
             self.task_processors["embedding"] = EmbeddingProcessor(config)
         if "image_classification" in allowed_tasks and config.image_classification_config is not None:
@@ -1474,6 +1483,10 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             segmentation_mapping=segmentation_mapping,
             audio_segmentation_mapping=audio_segmentation_mapping,
         )
+        if "sequence_editing" in self.task_processors:
+            classes_mapping.sequence_editing_mapping = self.task_processors[
+                "sequence_editing"
+            ].get_classes_mapping(batch_list, **kwargs)
 
         # Label-schema augmentation is deliberately applied to the ephemeral
         # mappings, not to dataset annotations.  It must happen before text
@@ -1525,6 +1538,11 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
 
             if "structuring" in self.task_processors:
                 prompt.extend(self.task_processors["structuring"].contribute_prompt(
+                    classes_mapping, i, use_labels_encoder,
+                ))
+
+            if "sequence_editing" in self.task_processors:
+                prompt.extend(self.task_processors["sequence_editing"].contribute_prompt(
                     classes_mapping, i, use_labels_encoder,
                 ))
 
@@ -1914,6 +1932,7 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             "embedding": batch.get("embedding", [[] for _ in range(batch_size)]),
             "structuring": batch.get("structuring", [{} for _ in range(batch_size)]),
             "calculation": batch.get("calculation", [{} for _ in range(batch_size)]),
+            "sequence_editing": batch.get("sequence_editing", [None for _ in range(batch_size)]),
             "structuring_schema": batch.get(
                 "structuring_schema", [{} for _ in range(batch_size)]
             ),
@@ -2027,6 +2046,8 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
                 item["structuring"] = batch["structuring"][i]
             if "calculation" in batch and i < len(batch["calculation"]):
                 item["calculation"] = batch["calculation"][i]
+            if "sequence_editing" in batch and i < len(batch["sequence_editing"]):
+                item["sequence_editing"] = batch["sequence_editing"][i]
             if (
                 "structuring_schema" in batch
                 and i < len(batch["structuring_schema"])
@@ -2074,6 +2095,7 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             "embedding": [item.get("embedding", []) for item in batch_list],
             "structuring": [item.get("structuring", {}) for item in batch_list],
             "calculation": [item.get("calculation", {}) for item in batch_list],
+            "sequence_editing": [item.get("sequence_editing") for item in batch_list],
             "structuring_schema": [
                 item.get("structuring_schema", {}) for item in batch_list
             ],
@@ -2159,6 +2181,7 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
                     emb_texts,
                     return_tensors="pt",
                     truncation=True,
+                    max_length=int(self.config.max_len),
                     padding="longest",
                 )
                 tokenized_input["embedding_input_ids"] = emb_tokenized["input_ids"]
@@ -2215,6 +2238,16 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
                 )
                 if calculation_result is not None:
                     tokenized_input.update(calculation_result)
+
+            if "sequence_editing" in self.task_processors:
+                editing_result = self.task_processors["sequence_editing"].create_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=max_seq_len,
+                    sequence_lengths=sequence_lengths,
+                )
+                if editing_result is not None:
+                    tokenized_input.update(editing_result)
 
             # After the structuring labels: their records hold the resolved
             # gold value spans.

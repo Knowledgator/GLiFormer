@@ -110,6 +110,7 @@ _LABEL_KEYS = frozenset(
         "structuring_relation_labels",
         "embedding_labels",
         "count_targets",
+        "seq_edit_op",
         # Vision tasks
         "image_classification_labels",
         "object_detection_class_labels",

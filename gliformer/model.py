@@ -67,7 +67,7 @@ def _extra_head_kwargs(kwargs, words_mask=None):
     extra = {
         key: value
         for key, value in kwargs.items()
-        if key.startswith(("structuring_typed_", "normalization_", "calculation_"))
+        if key.startswith(("structuring_typed_", "normalization_", "calculation_", "seq_edit_"))
     }
     token_words = kwargs.get("token_words_mask")
     if token_words is None:
@@ -233,12 +233,26 @@ class BaseGLiFormerModel(BaseModel):
                     if "ner" in self.heads
                     else None
                 )
+            if HeadClass.__name__ == "SequenceEditingHead":
+                head_kwargs["embedding_dim"] = self._input_embedding_dim()
             head = HeadClass.from_config(config, **head_kwargs)
             if head is not None:
                 canonical_name = task_definition.name
                 if enabled_task_names is not None and canonical_name not in enabled_task_names:
                     continue
                 self.heads[canonical_name] = head
+                if hasattr(head, "attach_vocab"):
+                    head.attach_vocab(self)
+
+    def _input_embedding_dim(self):
+        """Width of the backbone's token embedding table (None if unknown)."""
+
+        from .tasks.sequence_editing.model import input_embedding_module
+
+        try:
+            return int(input_embedding_module(self.token_rep_layer).embedding_dim)
+        except (AttributeError, TypeError):
+            return None
 
     def _migrate_renamed_task_state_dict(
         self,
@@ -1171,6 +1185,20 @@ class BaseGLiFormerModel(BaseModel):
             feature_mask=flat_word_mask,
         )
 
+    @staticmethod
+    def _pad_rnn_output(output, width: int):
+        """Pad a packed RNN's output back to the input width.
+
+        ``pad_packed_sequence`` stops at the longest row's mask sum. That is
+        shorter than the mask when it has holes, e.g. layout image states
+        appended after padded words; the positions past it get zeros, as
+        padding does.
+        """
+
+        if output.shape[1] >= width:
+            return output
+        return torch.nn.functional.pad(output, (0, 0, 0, width - output.shape[1]))
+
     def _apply_word_rnn(self, words_embedding, mask):
         """Run the packed RNN only for rows containing at least one word."""
 
@@ -1180,11 +1208,11 @@ class BaseGLiFormerModel(BaseModel):
         if not nonempty_rows.any():
             return words_embedding
         if nonempty_rows.all():
-            return self.rnn(words_embedding, mask)
+            return BaseGLiFormerModel._pad_rnn_output(self.rnn(words_embedding, mask), words_embedding.shape[1])
         row_indices = torch.where(nonempty_rows)[0]
-        encoded = self.rnn(
-            words_embedding[row_indices],
-            mask[row_indices],
+        encoded = BaseGLiFormerModel._pad_rnn_output(
+            self.rnn(words_embedding[row_indices], mask[row_indices]),
+            words_embedding.shape[1],
         )
         output = encoded.new_zeros(
             words_embedding.shape[0],
@@ -2063,6 +2091,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         emb_out = head_outputs.get("embedding", TaskHeadOutput())
         norm_out = head_outputs.get("normalization", TaskHeadOutput())
         calc_out = head_outputs.get("calculation", TaskHeadOutput())
+        edit_out = head_outputs.get("sequence_editing", TaskHeadOutput())
 
         effective_ner_logits = ner_out.logits if ner_out.logits is not None else joint_rel_out.logits
         effective_ner_extra = ner_out.extra if ner_out.logits is not None else joint_rel_out.extra
@@ -2138,6 +2167,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             normalization_number=norm_out.extra.get("number"),
             normalization_number_confidence=norm_out.extra.get("number_confidence"),
             calculation=calc_out.extra.get("decode") if calc_out.extra else None,
+            sequence_editing=edit_out.extra.get("decode") if edit_out.extra else None,
             embedding_logits=emb_out.logits,
             image_classification_logits=image_cls_out.logits,
             image_classification_batch_origin=flat_inputs_map["image_classification"].batch_origin if "image_classification" in flat_inputs_map else None,

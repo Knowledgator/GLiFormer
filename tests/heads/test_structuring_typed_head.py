@@ -154,7 +154,7 @@ def test_typed_disabled_head_has_no_option_parameters():
 
 def test_typed_head_has_only_option_parameters():
     names = {name.split(".")[0] for name, _ in _head().named_parameters()}
-    assert {"option_query", "option_readout", "option_none"} <= names
+    assert {"option_modeling", "option_none"} <= names
     assert not names & {"typed_head", "typed_regression_head", "typed_bin_head"}
 
 

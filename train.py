@@ -139,6 +139,9 @@ _TASK_CONFIG_ATTRS = {
     "embedding": "embedding_config",
 }
 
+# Global fields that only change how data are cut, applied on prev_path loads.
+_CHECKPOINT_SAFE_GLOBAL_FIELDS = {"max_len": int, "train_sequence_packing": bool}
+
 _GLOBAL_ARCHITECTURE_FIELDS = {
     "model_variant",
     "model_name",
@@ -541,6 +544,16 @@ def apply_checkpoint_config_overrides(model, model_cfg: dict):
     heads = getattr(getattr(model, "model", None), "heads", None)
     applied = []
 
+    # Data budgets and batching create no parameters. ``max_len`` caps the
+    # text units and the tokenizer length; without this a checkpoint's own
+    # value (16384 for gliformer-large-v1) silently wins over the YAML.
+    for name, cast in _CHECKPOINT_SAFE_GLOBAL_FIELDS.items():
+        if name in model_cfg and model_cfg[name] is not None:
+            value = cast(model_cfg[name])
+            if getattr(model.config, name, None) != value:
+                setattr(model.config, name, value)
+                applied.append(name)
+
     # Most heads keep only a few scalar loss weights on the module and retain
     # their task config object for the rest. Update both so the active policy is
     # effective immediately and is also serialized with the retrained model.
@@ -915,6 +928,14 @@ def build_model(model_cfg: dict, train_cfg: dict):
         if isinstance(normalization_cfg, Mapping):
             if model.enable_normalization(normalization_cfg):
                 print("Added a normalization head (initialized from scratch)")
+        calculation_cfg = model_cfg.get("calculation_config")
+        if isinstance(calculation_cfg, Mapping):
+            if model.enable_calculation(calculation_cfg):
+                print("Added a calculation head ([CALC] token, initialized from scratch)")
+        editing_cfg = model_cfg.get("sequence_editing_config")
+        if isinstance(editing_cfg, Mapping):
+            if model.enable_sequence_editing(editing_cfg):
+                print("Added a sequence editing head ([EDIT] token, initialized from scratch)")
         return model
     print("Initializing model from config...")
     return GLiFormer.load_from_config(model_cfg)

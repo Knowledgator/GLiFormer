@@ -38,7 +38,7 @@ from ...layers import AnchoredSpanScorer, AnchorModeling
 from ...layers.anchor_modeling import rename_state_dict_keys
 from ...layers.mlp import create_mlp
 from ...layers.span_pooling import SpanTokenSource, build_span_pooler
-from .. import TaskHead, TaskHeadOutput
+from .. import TaskHead, TaskHeadOutput, text_token_states
 from ..losses import binary_focal_or_bce
 from .program import CONSTANTS, NUM_PORTS, OP_NAMES
 
@@ -295,7 +295,7 @@ class CalculationHead(TaskHead):
     def _token_source(self, shared, rows, batch):
         if not self.span_pooler.uses_tokens:
             return None
-        tokens = getattr(shared, "token_embeds", None)
+        tokens = text_token_states(shared) if getattr(shared, "token_embeds", None) is not None else None
         token_words = batch.get("span_token_words")
         if tokens is None or token_words is None or token_words.shape != tokens.shape[:2]:
             return None

@@ -134,9 +134,10 @@ class TestNativeVisionConfig:
         with pytest.raises(ValueError, match="vision_model_name"):
             _native_config(vision_model_name="google/vit-base-patch16-224")
 
-    def test_dense_vision_heads_are_not_supported_yet(self):
-        with pytest.raises(ValueError, match="not supported"):
-            _native_config(object_detection_config={})
+    def test_dense_vision_heads_are_supported(self):
+        config = _native_config(object_detection_config={}, segmentation_config={})
+        assert config.object_detection_config is not None
+        assert config.segmentation_config is not None
 
     def test_fields_survive_serialization(self):
         config = _native_config(vision_min_pixels=4096, vision_max_pixels=65536, freeze_native_vision=False)

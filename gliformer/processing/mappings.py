@@ -109,6 +109,8 @@ class BatchClassesMapping:
     object_detection_mapping: List[VisionClassMapping] = field(default_factory=list)
     segmentation_mapping: List[VisionClassMapping] = field(default_factory=list)
     audio_segmentation_mapping: List[VisionClassMapping] = field(default_factory=list)
+    # Sequence editing instructions per row, in prompt order.
+    sequence_editing_mapping: List[List[str]] = field(default_factory=list)
 
     def get_item_mapping(self, index: int) -> Tuple[CatClassMapping, ExtractionClassMapping]:
         return self.cat_mapping[index], self.extraction_mapping[index]

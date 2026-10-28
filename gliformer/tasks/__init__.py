@@ -37,6 +37,22 @@ class SharedRepresentations:
     image_sizes: Optional[torch.Tensor] = None        # (B, 2) original image sizes as (height, width)
 
 
+def text_token_states(shared: "SharedRepresentations") -> torch.Tensor:
+    """Encoder states of the text tokens only: ``(B, S, D)``, ``S = input_ids.shape[1]``.
+
+    Layout backbones append image patch states after the text when a batch
+    has images, so ``token_embeds`` can be longer than ``input_ids`` and
+    ``attention_mask``; heads that pair subword states with those (copy
+    pointers, ``span_token_words``) read this view.
+    """
+
+    tokens = shared.token_embeds
+    input_ids = getattr(shared, "input_ids", None)
+    if tokens is not None and input_ids is not None and tokens.shape[1] > input_ids.shape[1]:
+        tokens = tokens[:, : input_ids.shape[1]]
+    return tokens
+
+
 @dataclass
 class TaskFlatInputs:
     """Per-task flattened representations with BN indexing.
@@ -735,6 +751,8 @@ TASK_REGISTRY = TaskRegistry(
         TaskDefinition("calculation", "gliformer.tasks.calculation.model", "CalculationHead", "text"),
         # Reads values from the spans that the NER and structuring heads picked.
         TaskDefinition("normalization", "gliformer.tasks.normalization.model", "NormalizationHead", "text"),
+        # Per-unit keep/delete/replace/append edits of the text.
+        TaskDefinition("sequence_editing", "gliformer.tasks.sequence_editing.model", "SequenceEditingHead", "text"),
         TaskDefinition("image_classification", "gliformer.tasks.vision.model", "ImageClassificationHead", "vision"),
         TaskDefinition("object_detection", "gliformer.tasks.vision.model", "ObjectDetectionHead", "vision"),
         TaskDefinition("segmentation", "gliformer.tasks.vision.model", "SegmentationHead", "vision"),

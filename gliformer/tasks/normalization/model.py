@@ -29,7 +29,7 @@ from torch import nn
 
 from ...layers.mlp import create_mlp
 from ...layers.span_pooling import SpanTokenSource, build_span_pooler, gather_span_tokens
-from .. import TaskHead, TaskHeadOutput
+from .. import TaskHead, TaskHeadOutput, text_token_states
 from .numbers import build_number_heads
 from .values import IGNORE, NULL, YEAR_DIGITS
 
@@ -307,7 +307,7 @@ class NormalizationHead(TaskHead):
     def _token_source(shared, words, batch):
         """Subword states of the text rows, or ``None`` (the unit states are used)."""
 
-        tokens = getattr(shared, "token_embeds", None)
+        tokens = text_token_states(shared) if getattr(shared, "token_embeds", None) is not None else None
         token_words = batch.get("span_token_words")
         if tokens is None or token_words is None or tokens.dim() != 3:
             return None

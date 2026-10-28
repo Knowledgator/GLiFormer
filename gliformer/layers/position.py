@@ -52,6 +52,36 @@ def normalized_grid_2d(
     )
 
 
+def ragged_normalized_grid_2d(
+    spatial_shapes: torch.Tensor,
+    count: int,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cell-centre coordinates for rows that each flatten their own grid.
+
+    Row ``b`` holds an ``(h_b, w_b)`` grid flattened row-major into its first
+    ``h_b * w_b`` of ``count`` slots. Returns ``(coordinates, valid)`` with
+    shapes ``(B, count, 2)`` in normalized ``(x, y)`` order and ``(B, count)``;
+    slots past a row's grid are zero and invalid.
+    """
+    spatial_shapes = spatial_shapes.to(device=device, dtype=torch.long)
+    if spatial_shapes.dim() != 2 or spatial_shapes.shape[-1] != 2:
+        raise ValueError(f"spatial_shapes must have shape (B, 2), got {tuple(spatial_shapes.shape)}")
+    if (spatial_shapes < 0).any():
+        raise ValueError("spatial_shapes must be non-negative")
+    heights = spatial_shapes[:, :1]
+    widths = spatial_shapes[:, 1:]
+    slots = torch.arange(count, device=spatial_shapes.device).unsqueeze(0)
+    valid = slots < heights * widths
+    safe_widths = widths.clamp(min=1)
+    xs = ((slots % safe_widths).to(dtype) + 0.5) / safe_widths.to(dtype)
+    ys = ((slots // safe_widths).to(dtype) + 0.5) / heights.clamp(min=1).to(dtype)
+    coordinates = torch.stack([xs, ys], dim=-1) * valid.unsqueeze(-1).to(dtype)
+    return coordinates, valid
+
+
 def normalized_grid_1d(
     count: int,
     *,
