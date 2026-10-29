@@ -429,10 +429,13 @@ class ReadoutAnchorModeling(AnchorModeling, modeling_type="readout"):
         else:
             key_padding = ~memory_mask.bool()
         # Rows without visible memory would make attention undefined.
-        empty = key_padding.all(dim=-1)
-        if empty.any():
-            key_padding = key_padding.clone()
-            key_padding[empty, 0] = False
+        # Unmasking the first key of fully masked rows is a no-op elsewhere,
+        # so apply it unconditionally instead of branching on a device value.
+        empty = key_padding.all(dim=-1, keepdim=True)
+        key_padding = torch.cat(
+            [key_padding[:, :1] & ~empty, key_padding[:, 1:]],
+            dim=1,
+        )
         attended, _ = self.readout(
             flat, memory, memory, key_padding_mask=key_padding, need_weights=False,
         )

@@ -92,6 +92,7 @@ _TRAINING_CONTROL_FIELDS = {
     "prev_path",
     "resume_from_checkpoint",
     "compile_model",
+    "compile_backbone_layers",
     "train_head_only",
     "freeze_components",
     "classification_parent_name_dropout",
@@ -892,6 +893,34 @@ def prepare_training_records(records, model):
     return filtered, len(records) - len(filtered)
 
 
+def compile_backbone_layers(model) -> int:
+    """Compile each backbone decoder layer with ``torch.compile``.
+
+    Fuses the many small elementwise kernels of a layer (norms, gates,
+    activations, dtype casts). Whole-model compile is not an option: the task
+    heads are data-dependent Python. Parameter names are unchanged, so
+    checkpoints stay compatible. Returns the number of compiled layers.
+    """
+
+    # Layers see a few input variants (mask dtype, size classes); never fall
+    # back to eager because the default recompile limit ran out.
+    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+    torch._dynamo.config.accumulated_recompile_limit = max(
+        torch._dynamo.config.accumulated_recompile_limit, 1024
+    )
+    encoder = getattr(getattr(model, "model", None), "token_rep_layer", None)
+    if encoder is None:
+        return 0
+    count = 0
+    for module in encoder.modules():
+        name = type(module).__name__
+        # Text decoder layers only: compiling the frozen vision tower was slower.
+        if name.endswith("DecoderLayer") and "Vision" not in name:
+            module.compile(dynamic=True)
+            count += 1
+    return count
+
+
 def build_model(model_cfg: dict, train_cfg: dict):
     """Build or load GLiFormer model."""
     prev_path = train_cfg.get("prev_path")
@@ -982,6 +1011,9 @@ def main(cfg_path: str, resume_from_checkpoint: str | bool | None = None):
     # Build model
     model = build_model(model_cfg, train_cfg).to(dtype=torch.float32)
     print(f"Model type: {model.__class__.__name__}")
+
+    if train_cfg.get("compile_backbone_layers", False):
+        print(f"Compiled {compile_backbone_layers(model)} backbone decoder layers")
 
     # Enabled task heads
     enabled = list(getattr(model.model, "heads", {}))

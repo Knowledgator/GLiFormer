@@ -8,6 +8,7 @@ from torch import nn
 from .audio import AudioEncoder, audio_token_mask
 from .media import apply_input_mask, get_config_value as _get_config_value
 from .native_vision import (
+    NativeVisionBatch,
     build_native_vision_batch,
     gather_text_tokens,
     gather_vision_tokens,
@@ -651,6 +652,30 @@ class OmniEncoder(nn.Module):
         if bool(_get_config_value(config, "freeze_native_vision", True)):
             native_vision_tower(backbone).requires_grad_(False)
 
+    def _host_native_kwargs(self, native: NativeVisionBatch) -> Dict[str, Any]:
+        """Backbone inputs computed from the CPU copy of the layout, so no step waits for the GPU.
+
+        The M-RoPE positions come from the backbone's own ``get_rope_index`` on
+        the CPU tensors (the stock forward would compute the same from device
+        copies), and the image grid lets the vision tower size its inputs on
+        the host.
+        """
+        backbone = self.text_encoder.bert_layer.model
+        host = native.host
+        if not hasattr(backbone, "get_rope_index"):
+            return {}
+        position_ids, _ = backbone.get_rope_index(
+            host.input_ids,
+            mm_token_type_ids=host.mm_token_type_ids,
+            image_grid_thw=host.image_grid_thw,
+            attention_mask=host.attention_mask,
+        )
+        device = native.input_ids.device
+        return {
+            "position_ids": position_ids.pin_memory().to(device, non_blocking=True),
+            "native_image_grid_thw": host.image_grid_thw,
+        }
+
     def _encode_native_vision(
         self,
         input_ids: Optional[torch.Tensor],
@@ -674,10 +699,16 @@ class OmniEncoder(nn.Module):
         text_mask = _resize_mask(attention_mask, input_ids)
         native = None
         if pixel_values is not None:
+            host = kwargs.get("native_vision_host")
+            if host is not None and attention_mask is not None and text_mask is not attention_mask:
+                host = None  # the mask was replaced; the host copy no longer describes it
             native = build_native_vision_batch(
                 self.native_vision, input_ids, text_mask, pixel_values, image_grid_thw, vision_input_mask,
+                host=host,
             )
         model_kwargs = {key: value for key, value in kwargs.items() if key in _NATIVE_TRANSFORMER_KWARGS}
+        if native is not None and native.host is not None:
+            model_kwargs.update(self._host_native_kwargs(native))
         if native is None:
             encoded = self.text_encoder.encode_input_ids(input_ids, text_mask, **model_kwargs)
             return OmniEncoderOutput(

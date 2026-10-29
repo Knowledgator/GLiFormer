@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.modeling_layers import GradientCheckpointingLayer
 
 from .qwen3 import (
@@ -14,6 +15,11 @@ from .qwen3 import (
     _get_alibi_slopes,
     attention_forward_with_position_bias,
 )
+
+# The cuDNN attention kernel returns NaN gradients for head_dim 256 under an
+# attention mask (seen on torch 2.14 / cuDNN 9.24, B200). Qwen3.5 has head_dim
+# 256 and always gets a padding mask, so its attention avoids that kernel.
+_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 try:
     from transformers.cache_utils import Cache
@@ -28,10 +34,28 @@ try:
         Qwen3_5RMSNorm,
         Qwen3_5TextModel,
         Qwen3_5TextRotaryEmbedding,
+        Qwen3_5VisionAttention,
         Qwen3_5VisionModel,
         apply_rotary_pos_emb,
+        apply_rotary_pos_emb_vision,
         repeat_kv,
     )
+
+    from transformers.vision_utils import (
+        get_vision_attention_seqlens,
+        get_vision_interpolation_indices_and_weights,
+        get_vision_position_ids,
+    )
+
+    try:
+        from torch.nn.attention.varlen import varlen_attn
+    except ImportError:
+        varlen_attn = None
+    try:
+        from transformers.modeling_flash_attention_utils import is_flash_attention_requested
+    except ImportError:
+        def is_flash_attention_requested(config):
+            return "flash" in str(getattr(config, "_attn_implementation", "") or "")
 
     try:
         from transformers.masking_utils import create_recurrent_attention_mask
@@ -39,6 +63,42 @@ try:
         create_recurrent_attention_mask = None
 
     QWEN3_5_AVAILABLE = True
+
+    def _route_cpu_to_torch_kernels():
+        """Run the Gated DeltaNet helpers in plain torch for CPU tensors.
+
+        transformers binds these helpers to the ``causal_conv1d`` / ``fla`` kernels
+        whenever those packages import, without checking the device, so a CPU
+        forward fails with "Expected x.is_cuda()". The torch versions stay
+        reachable through ``__wrapped__``.
+        """
+        import inspect
+
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as stock
+
+        names = (
+            "causal_conv1d_fn",
+            "causal_conv1d_update",
+            "torch_chunk_gated_delta_rule",
+            "torch_recurrent_gated_delta_rule",
+        )
+        for name in names:
+            fast = getattr(stock, name, None)
+            if fast is None or getattr(fast, "_gliformer_device_routed", False):
+                continue
+            fallback = inspect.unwrap(fast)
+            if fallback is fast:
+                continue
+
+            def routed(*args, _fast=fast, _fallback=fallback, **kwargs):
+                if args and isinstance(args[0], torch.Tensor) and not args[0].is_cuda:
+                    return _fallback(*args, **kwargs)
+                return _fast(*args, **kwargs)
+
+            routed._gliformer_device_routed = True
+            setattr(stock, name, routed)
+
+    _route_cpu_to_torch_kernels()
 except ImportError:
     Qwen3_5Config = None
     Qwen3_5TextConfig = None
@@ -137,6 +197,20 @@ if QWEN3_5_AVAILABLE:
             return (c2p_att + p2c_att) * self.scaling
 
         def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            attention_mask: torch.Tensor | None,
+            past_key_values: Cache | None = None,
+            position_ids: torch.LongTensor | None = None,
+            **kwargs,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            with sdpa_kernel(_SDPA_BACKENDS):
+                return self._attention_forward(
+                    hidden_states, position_embeddings, attention_mask, past_key_values, position_ids, **kwargs
+                )
+
+        def _attention_forward(
             self,
             hidden_states: torch.Tensor,
             position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -269,6 +343,16 @@ if QWEN3_5_AVAILABLE:
             """The 2D padding mask for the Gated DeltaNet layers, however this transformers builds it."""
             if create_recurrent_attention_mask is None:
                 return self._update_linear_attn_mask(attention_mask, past_key_values)
+            if (
+                past_key_values is None
+                and attention_mask is not None
+                and attention_mask.ndim == 2
+                and inputs_embeds.shape[1] > 1
+            ):
+                # The stock helper drops an all-ones mask, which reads it back from the
+                # GPU on every forward. The mask only multiplies the hidden states, so
+                # keeping it gives the same values without waiting for the GPU.
+                return attention_mask[:, -inputs_embeds.shape[1]:].contiguous()
             return create_recurrent_attention_mask(
                 config=self.config,
                 inputs_embeds=inputs_embeds,
@@ -347,6 +431,62 @@ if QWEN3_5_AVAILABLE:
             )
 
 
+    def _vision_max_seqlen(cu_seqlens: torch.Tensor) -> int:
+        """Longest image of a vision batch, read once and kept on the tensor.
+
+        Every vision block gets the same ``cu_seqlens`` tensor, so the
+        device read happens once per forward instead of once per block.
+        """
+
+        cached = getattr(cu_seqlens, "_gliformer_max_seqlen", None)
+        if cached is None:
+            cached = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+            cu_seqlens._gliformer_max_seqlen = cached
+        return cached
+
+
+    class GLiFormerQwen3_5VisionAttention(Qwen3_5VisionAttention):
+        """Vision attention over all images in one variable-length kernel.
+
+        Without flash-attn the stock module runs attention once per image in
+        every block, reading the image lengths back from the device each
+        time. ``torch.nn.attention.varlen.varlen_attn`` does the same
+        block-diagonal attention in one call.
+        """
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            cu_seqlens: torch.Tensor,
+            position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+            max_seqlen: int | None = None,
+            **kwargs,
+        ) -> torch.Tensor:
+            if (
+                varlen_attn is None
+                or not hidden_states.is_cuda
+                or is_flash_attention_requested(self.config)
+                or position_embeddings is None
+            ):
+                return super().forward(hidden_states, cu_seqlens, position_embeddings, max_seqlen, **kwargs)
+            seq_length = hidden_states.shape[0]
+            query, key, value = (
+                self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+            )
+            cos, sin = position_embeddings
+            query, key = apply_rotary_pos_emb_vision(query, key, cos, sin)
+            if query.dtype not in (torch.float16, torch.bfloat16) or value.dtype != query.dtype:
+                return super().forward(hidden_states, cu_seqlens, position_embeddings, max_seqlen, **kwargs)
+            if max_seqlen is None:
+                max_seqlen = _vision_max_seqlen(cu_seqlens)
+            cu = cu_seqlens.to(torch.int32)
+            output = varlen_attn(
+                query.contiguous(), key.contiguous(), value.contiguous(),
+                cu, cu, int(max_seqlen), int(max_seqlen), scale=self.scaling,
+            )
+            return self.proj(output.reshape(seq_length, -1).contiguous())
+
+
     class GLiFormerQwen3_5Model(Qwen3_5Model):
         """Multimodal Qwen3.5 with GLiFormer text-backbone attention options."""
 
@@ -370,22 +510,107 @@ if QWEN3_5_AVAILABLE:
                 if hasattr(config, name) and not hasattr(text_config, name):
                     setattr(text_config, name, getattr(config, name))
             self.visual = Qwen3_5VisionModel._from_config(config.vision_config)
+            for module in self.visual.modules():
+                # Same parameters; only the attention call changes.
+                if type(module) is Qwen3_5VisionAttention:
+                    module.__class__ = GLiFormerQwen3_5VisionAttention
             self.language_model = GLiFormerQwen3_5TextModel._from_config(text_config)
             self.rope_deltas = None
             self.post_init()
 
-        def forward(self, *args, **kwargs):
+        def get_rope_index(
+            self,
+            input_ids: torch.LongTensor,
+            mm_token_type_ids: torch.IntTensor,
+            image_grid_thw: torch.LongTensor | None = None,
+            video_grid_thw: torch.LongTensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+            **kwargs,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            """The stock M-RoPE positions, computed on the host.
+
+            The stock version loops over rows with several device reads and
+            dozens of tiny kernels per row. The same integer computation on
+            CPU copies gives identical positions at a fraction of the cost.
+            """
+
+            device = input_ids.device
+            if device.type == "cpu":
+                return super().get_rope_index(
+                    input_ids, mm_token_type_ids, image_grid_thw, video_grid_thw, attention_mask, **kwargs,
+                )
+            host = [
+                None if tensor is None else tensor.to("cpu", non_blocking=True)
+                for tensor in (input_ids, mm_token_type_ids, image_grid_thw, video_grid_thw, attention_mask)
+            ]
+            torch.cuda.current_stream(device).synchronize()
+            position_ids, deltas = super().get_rope_index(*host, **kwargs)
+            return position_ids.to(device, non_blocking=True), deltas.to(device, non_blocking=True)
+
+        def forward(self, *args, native_image_grid_thw: torch.Tensor | None = None, **kwargs):
+            # ``native_image_grid_thw``: a CPU copy of ``image_grid_thw``. With it the
+            # vision tower sizes its inputs on the host instead of reading the grid
+            # back from the GPU.
+            self._host_image_grid_thw = native_image_grid_thw
             try:
                 return super().forward(*args, **kwargs)
             finally:
+                self._host_image_grid_thw = None
                 # Kept by the stock model to continue a generation. An encoder never does,
                 # and a later inputs_embeds call would be shifted by this batch's deltas.
                 self.rope_deltas = None
+
+        def get_image_features(self, pixel_values, image_grid_thw=None, **kwargs):
+            grid = getattr(self, "_host_image_grid_thw", None)
+            if grid is None or image_grid_thw is None or not pixel_values.is_cuda:
+                return super().get_image_features(pixel_values, image_grid_thw, **kwargs)
+            # The stock method, with the grid-derived inputs of the vision tower
+            # computed on the CPU copy (the same helpers it calls on the device grid).
+            kwargs.pop("return_dict", None)
+            visual = self.visual
+            device = pixel_values.device
+            grid = grid.to(torch.long)
+            interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+                grid,
+                num_grid_per_side=visual.num_grid_per_side,
+                mode=visual.interpolation_mode,
+                align_corners=visual.interpolation_align_corners,
+                spatial_merge_size=visual.config.spatial_merge_size,
+            )
+            position_ids = get_vision_position_ids(grid, visual.spatial_merge_size)
+            cu_seqlens, _ = get_vision_attention_seqlens(grid, visual.config)
+            max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+
+            def move(tensor):
+                return tensor.pin_memory().to(device, non_blocking=True)
+
+            vision_output = visual(
+                pixel_values.type(visual.dtype),
+                grid_thw=image_grid_thw,
+                interp_indices=move(interp_indices),
+                interp_weights=move(interp_weights),
+                position_ids=move(position_ids),
+                cu_seqlens=move(cu_seqlens),
+                max_seqlen=max_seqlen,
+                return_dict=True,
+                **kwargs,
+            )
+            split_sizes = (grid.prod(-1) // visual.spatial_merge_size**2).tolist()
+            vision_output.pooler_output = torch.split(vision_output.pooler_output, split_sizes)
+            return vision_output
+
+        def get_placeholder_mask(self, input_ids, inputs_embeds, image_features=None, video_features=None):
+            if getattr(self, "_host_image_grid_thw", None) is not None and input_ids is not None:
+                # The token count check reads a device sum back; the image blocks were
+                # laid out on the host from this same grid, so the counts match.
+                return super().get_placeholder_mask(input_ids, inputs_embeds)
+            return super().get_placeholder_mask(input_ids, inputs_embeds, image_features, video_features)
 
 
     Qwen3_5BidirectionalModel = GLiFormerQwen3_5Model
 
 else:
+    GLiFormerQwen3_5VisionAttention = None
     GLiFormerQwen3_5Attention = None
     GLiFormerQwen3_5DecoderLayer = None
     GLiFormerQwen3_5TextModel = None
@@ -398,6 +623,7 @@ __all__ = [
     "GLiFormerQwen3_5DecoderLayer",
     "GLiFormerQwen3_5TextModel",
     "GLiFormerQwen3_5Model",
+    "GLiFormerQwen3_5VisionAttention",
     "Qwen3_5BidirectionalModel",
     "QWEN3_5_AVAILABLE",
 ]

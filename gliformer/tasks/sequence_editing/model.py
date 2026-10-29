@@ -33,12 +33,18 @@ from torch import nn
 from torch.nn import functional as F
 
 from .. import TaskHead, TaskHeadOutput, text_token_states
-from ..calculation.model import marker_stream
+from ..calculation.model import marker_positions
 from .alignment import APPEND, DELETE, KEEP, NUM_OPS, REPLACE
 
 IGNORE = -100
 # Rows of the vocabulary softmax computed at once at inference.
 _VOCAB_CHUNK = 512
+
+
+def _loss_stats(terms) -> dict:
+    """Detached loss terms; kept on the device so logging them costs no sync."""
+
+    return {name: value.detach() for name, value in terms.items() if torch.is_tensor(value)}
 
 
 def _mlp(hidden: int, out: int, dropout: float) -> nn.Sequential:
@@ -308,11 +314,18 @@ class SequenceEditingHead(TaskHead):
         device = shared.words_embedding.device
         group_row = group_row.to(device)
         marker = marker.to(device)
-        stream, counts = marker_stream(shared, self.edit_token_index)
-        if stream is None:
+        tokens, order, counts = marker_positions(shared, self.edit_token_index)
+        if tokens is None:
             return None
         valid = marker < counts[group_row]
-        query = stream[group_row, marker.clamp(max=stream.shape[1] - 1)]
+        # Same lookup as ``marker_stream(...)[0][group_row, marker.clamp(max=W - 1)]``
+        # with ``W = max(counts.max(), 1)``, computed on the device: slots past a
+        # row's markers read zeros.
+        width = counts.max().clamp(min=1) if counts.numel() else counts.new_ones(())
+        slot = torch.minimum(marker, width - 1)
+        present = slot < counts[group_row]
+        position = order[group_row, slot.clamp(max=order.shape[1] - 1)]
+        query = tokens[group_row, position].masked_fill(~present[:, None], 0)
         return group_row, query, valid
 
     def _unused(self, reference):
@@ -381,8 +394,7 @@ class SequenceEditingHead(TaskHead):
             edit_ops = labels[positions[:, 0], positions[:, 1]]
             terms["tag"] = F.cross_entropy(self._tag_logits(edit_states, edit_ops), tags)
         loss = cfg.op_loss_coef * terms["op"] + cfg.tag_loss_coef * terms.get("tag", 0.0) + terms.get("content", 0.0)
-        stats = {name: float(value.detach()) for name, value in terms.items() if torch.is_tensor(value)}
-        return loss, stats
+        return loss, _loss_stats(terms)
 
     def _losses(self, states, op_logits, slot_mask, group_row, shared, batch):
         cfg = self.cfg
@@ -432,8 +444,12 @@ class SequenceEditingHead(TaskHead):
                 log_pointer = F.log_softmax(pointer, dim=-1)
                 memory_ids = shared.input_ids[packing.rows][packing.local]  # (E, S)
                 slot_edit = torch.arange(slots.shape[0], device=device)[:, None].expand_as(gold)[gold]
-                match = memory_ids[slot_edit] == target[:, None]
-                log_copy = torch.logsumexp(log_pointer.masked_fill(~match, float("-inf")), dim=-1)
+                match = (memory_ids[slot_edit] == target[:, None]) & torch.isfinite(log_pointer)
+                # A logsumexp over all -inf has a NaN gradient, so mask with a finite
+                # floor and set tokens with no copy source to -inf afterwards.
+                floor = torch.finfo(log_pointer.dtype).min
+                log_copy = torch.logsumexp(log_pointer.masked_fill(~match, floor), dim=-1)
+                log_copy = log_copy.masked_fill(~match.any(dim=-1), float("-inf"))
                 gate = self.copy_gate(hidden).float().squeeze(-1)
                 log_prob = torch.logaddexp(F.logsigmoid(gate) + log_prob, F.logsigmoid(-gate) + log_copy)
             terms["token"] = -log_prob.mean()
@@ -445,8 +461,7 @@ class SequenceEditingHead(TaskHead):
             + cfg.space_loss_coef * terms.get("space", 0.0)
             + terms.get("content", 0.0)
         )
-        stats = {name: float(value.detach()) for name, value in terms.items() if torch.is_tensor(value)}
-        return loss, stats
+        return loss, _loss_stats(terms)
 
     # -- inference ---------------------------------------------------------------
 

@@ -83,15 +83,20 @@ def year_digit_targets(codes: torch.Tensor) -> torch.Tensor:
     return digits.masked_fill(~written.unsqueeze(-1), IGNORE)
 
 
-def _masked_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor | None:
-    """Mean cross-entropy over targets that are not ``IGNORE``; None if none."""
+def _masked_ce_terms(logits: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean cross-entropy over targets that are not ``IGNORE`` (0 if none) and
+    whether there were any, without reading anything back from the device."""
 
     flat = targets.reshape(-1)
-    if not (flat != IGNORE).any():
-        return None
-    return F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]).float(), flat, ignore_index=IGNORE,
+    count = (flat != IGNORE).sum()
+    total = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float(), flat, ignore_index=IGNORE, reduction="sum",
     )
+    return total / count.clamp(min=1), count > 0
+
+
+def _ddp_active() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
 
 
 class SpanTokenQueries(nn.Module):
@@ -169,7 +174,10 @@ class TemporalClassifier(nn.Module):
             hidden = self.hidden(vectors)
             per_part = dict.fromkeys(("year", *self.components), hidden)
         else:
-            per_part = {name: self.hidden(parts[name]) for name in ("year", *self.components)}
+            # One MLP call over all parts instead of one per part.
+            names = ("year", *self.components)
+            hidden = self.hidden(torch.stack([parts[name] for name in names], dim=-2))
+            per_part = {name: hidden[..., index, :] for index, name in enumerate(names)}
         logits = {"year": self.year(per_part["year"])}
         if self.year_digits:
             logits["year_digits"] = self.digits(per_part["year"]).unflatten(-1, (YEAR_DIGITS, 10))
@@ -178,17 +186,20 @@ class TemporalClassifier(nn.Module):
         return logits
 
     def loss(self, logits: dict[str, torch.Tensor], codes: dict[str, torch.Tensor]) -> torch.Tensor | None:
-        """Mean over components that have targets in this batch."""
+        """Mean over components that have targets in this batch (0 if none).
 
-        terms = [_masked_ce(logits["year"], year_targets(codes["year"], self.first, self.last))]
+        Computed without device syncs: absent components are masked out
+        instead of being dropped from a Python list.
+        """
+
+        terms = [_masked_ce_terms(logits["year"], year_targets(codes["year"], self.first, self.last))]
         if self.year_digits:
-            terms.append(_masked_ce(logits["year_digits"], year_digit_targets(codes["year"])))
+            terms.append(_masked_ce_terms(logits["year_digits"], year_digit_targets(codes["year"])))
         for name, (classes, offset) in _COMPONENT_LAYOUT.items():
-            terms.append(_masked_ce(logits[name], component_targets(codes[name], classes, offset)))
-        terms = [term for term in terms if term is not None]
-        if not terms:
-            return None
-        return torch.stack(terms).mean()
+            terms.append(_masked_ce_terms(logits[name], component_targets(codes[name], classes, offset)))
+        losses = torch.stack([loss for loss, _ in terms])
+        present = torch.stack([has for _, has in terms]).to(losses.dtype)
+        return (losses * present).sum() / present.sum().clamp(min=1)
 
 
 class NormalizationHead(TaskHead):
@@ -301,6 +312,9 @@ class NormalizationHead(TaskHead):
 
     def _unused_parameters_loss(self, reference: torch.Tensor) -> torch.Tensor:
         # Keeps every parameter in the graph for DDP when a batch has no target.
+        # Off DDP that costs hundreds of kernels per step for nothing.
+        if not _ddp_active():
+            return reference.sum() * 0.0
         return sum(parameter.sum() for parameter in self.parameters()) * 0.0 + reference.sum() * 0.0
 
     @staticmethod
@@ -327,6 +341,10 @@ class NormalizationHead(TaskHead):
         batch_size, width = words.shape[:2]
         span_idx = batch.get("normalization_span_idx")
         supervised = span_idx is not None
+        if self.training and not supervised and not _ddp_active():
+            # No targets in this training batch: the inference path would
+            # only collect spans and return no loss.
+            return TaskHeadOutput(loss=None, extra={})
         if supervised:
             span_idx = span_idx.to(words.device).long()
             span_mask = batch["normalization_span_mask"].to(words.device).bool()

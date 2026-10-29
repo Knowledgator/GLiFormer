@@ -14,13 +14,12 @@ from gliner.modeling.layers import create_projection_layer
 from gliner.modeling.multitask.relations_layers import RelationsRepLayer
 from gliner.modeling.multitask.triples_layers import TriplesScoreLayer
 from gliner.modeling.utils import (
-    build_all_entity_pairs,
     build_entity_pairs,
-    extract_prompt_features,
     extract_spans_from_tokens,
 )
 from torch.nn import functional as F
 
+from ...prompt_features import build_all_entity_pairs, extract_prompt_features
 from ...layers import AnchorModeling, AnchorPairRelationsLayer
 from ...layers.span_pooling import build_span_pooler
 from .. import TaskHeadOutput

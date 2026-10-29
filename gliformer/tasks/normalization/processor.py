@@ -49,6 +49,9 @@ from .values import (
     is_iso_value,
 )
 
+# Row key of calculation programs (same as calculation.processor.DATA_KEY).
+CALCULATION_DATA_KEY = "calculation"
+
 @dataclass
 class SpanTarget:
     """Targets of one labelled span (either part may be missing)."""
@@ -226,6 +229,8 @@ class NormalizationProcessor(TaskProcessor):
         """Labelled spans of one row in reading order, within ``limit`` words."""
 
         cfg = self.task_config
+        if cfg.train_rows == "calculation" and not isinstance(item.get(CALCULATION_DATA_KEY), dict):
+            return []
         merged: dict[tuple[int, int], SpanTarget] = {}
         for target in self._gold_targets(item):
             key = (target.start, target.end)

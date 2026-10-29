@@ -24,6 +24,11 @@ from ..media import (
     matched_mask_loss,
     normalized_objectness_loss,
 )
+from ..matcher import (
+    batched_minimum_cost_assignment,
+    match_index_array,
+    match_index_tensors,
+)
 
 
 def _xyxy_from_raw(raw: torch.Tensor) -> torch.Tensor:
@@ -429,15 +434,24 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 "Dense vision heads require feature_spatial_shape and "
                 "feature_prefix_tokens from VisionEncoderOutput"
             )
-        if not torch.equal(prefix_tokens, prefix_tokens[:1].expand_as(prefix_tokens)):
+        # Grid metadata is read on the host in one copy (free when it already
+        # lives on the CPU) instead of one synchronization per check.
+        host_prefix = torch.as_tensor(prefix_tokens).detach().reshape(-1).long()
+        host_shapes = torch.as_tensor(spatial_shapes).detach().long()
+        packed = torch.cat(
+            [host_prefix.to(host_shapes.device), host_shapes.reshape(-1)]
+        ).cpu()
+        host_prefix = packed[:host_prefix.numel()]
+        host_shapes = packed[host_prefix.numel():].reshape(host_shapes.shape)
+        if not torch.equal(host_prefix, host_prefix[:1].expand_as(host_prefix)):
             raise ValueError("A dense token tensor must have one prefix-token count per padded batch")
         spatial_shapes = spatial_shapes.to(device=image_features.device, dtype=torch.long)
-        uniform = bool(torch.equal(spatial_shapes, spatial_shapes[:1].expand_as(spatial_shapes)))
-        dense_count = int(spatial_shapes.prod(-1).max())
+        uniform = bool(torch.equal(host_shapes, host_shapes[:1].expand_as(host_shapes)))
+        dense_count = int(host_shapes.prod(-1).max())
         if dense_count == 0:
             raise ValueError("Dense vision heads received no image tokens")
 
-        prefix_count = int(prefix_tokens[0].item())
+        prefix_count = int(host_prefix[0])
         end = prefix_count + dense_count
         if prefix_count < 0 or end > image_features.shape[1]:
             raise ValueError(
@@ -449,7 +463,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             image_mask = image_mask[:, prefix_count:end]
 
         if uniform:
-            rows, cols = (int(value) for value in spatial_shapes[0].tolist())
+            rows, cols = (int(value) for value in host_shapes[0].tolist())
             coordinates = normalized_grid_2d(
                 rows,
                 cols,
@@ -683,6 +697,57 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             target_giou_geometry=gold_boxes,
         )
 
+    def _matching_geometry(self, bbox_preds, bbox_cxcywh, gold_boxes):
+        if (
+            getattr(self.det_cfg, "bbox_l1_format", "cxcywh") == "cxcywh"
+            and bbox_cxcywh is not None
+        ):
+            return bbox_cxcywh, box_xyxy_to_cxcywh(gold_boxes)
+        return bbox_preds, gold_boxes
+
+    @torch.no_grad()
+    def _match_stages(
+        self,
+        stages,
+        class_labels,
+        bbox_labels,
+        object_mask,
+        anchor_mask,
+    ) -> list[list[list[tuple[int, int]]]]:
+        """Hungarian-match every decoder stage with one host round trip.
+
+        ``stages`` holds ``(class_logits, boxes_xyxy, boxes_cxcywh)`` per stage.
+        Costs of all stages and samples are stacked into one padded tensor,
+        so the main and auxiliary matchings share a single device-to-host copy.
+        """
+
+        costs = []
+        for class_logits, bbox_preds, bbox_cxcywh in stages:
+            geometry_preds, target_geometry = self._matching_geometry(
+                bbox_preds, bbox_cxcywh, bbox_labels,
+            )
+            costs.append(
+                self.matcher.pairwise_cost(
+                    class_logits,
+                    geometry_preds,
+                    class_labels,
+                    target_geometry,
+                    giou_geometry_preds=bbox_preds,
+                    target_giou_geometry=bbox_labels,
+                )
+            )
+        batch_size = costs[0].shape[0]
+        stage_count = len(costs)
+        matches = batched_minimum_cost_assignment(
+            torch.cat(costs, dim=0),
+            (anchor_mask > 0).repeat(stage_count, 1),
+            (object_mask > 0).to(anchor_mask.device).repeat(stage_count, 1),
+        )
+        return [
+            matches[stage * batch_size:(stage + 1) * batch_size]
+            for stage in range(stage_count)
+        ]
+
     def _detection_loss(
         self,
         class_logits,
@@ -696,42 +761,51 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         object_mask,
         base_loss_fn=None,
         auxiliary_predictions: tuple[DetectionStagePredictions, ...] = (),
+        matches: Optional[list] = None,
     ) -> Tuple[torch.Tensor, Dict[int, list]]:
         B, A, C = class_logits.shape
         device = class_logits.device
-        target_objectness = torch.zeros_like(objectness_logits)
-        matches_by_batch: Dict[int, list] = {}
-
-        # Flat (batch, anchor, target) indices of all matched pairs.
-        src_batch_idx: list = []
-        src_anchor_idx: list = []
-        tgt_obj_idx: list = []
-        for b in range(B):
-            matches = self._match_single(
-                class_logits[b],
-                bbox_preds[b],
-                class_labels[b],
-                bbox_labels[b],
-                object_mask[b],
-                anchor_mask[b],
-                bbox_cxcywh[b],
+        auxiliary_coef = float(
+            getattr(self.det_cfg, "auxiliary_detection_loss_coef", 0.0)
+        )
+        auxiliary_predictions = (
+            tuple(auxiliary_predictions) if auxiliary_coef > 0.0 else ()
+        )
+        auxiliary_matches = [None] * len(auxiliary_predictions)
+        if matches is None:
+            stage_matches = self._match_stages(
+                [
+                    (class_logits, bbox_preds, bbox_cxcywh),
+                    *(
+                        (
+                            auxiliary.class_logits,
+                            auxiliary.boxes_xyxy,
+                            auxiliary.boxes_cxcywh,
+                        )
+                        for auxiliary in auxiliary_predictions
+                    ),
+                ],
+                class_labels,
+                bbox_labels,
+                object_mask,
+                anchor_mask,
             )
-            matches_by_batch[b] = matches
-            if matches:
-                src_idx = torch.tensor([a for a, _ in matches], dtype=torch.long, device=device)
-                target_objectness[b, src_idx] = 1.0
-                for anchor_idx, obj_idx in matches:
-                    src_batch_idx.append(b)
-                    src_anchor_idx.append(anchor_idx)
-                    tgt_obj_idx.append(obj_idx)
+            matches = stage_matches[0]
+            auxiliary_matches = stage_matches[1:]
+        matches_by_batch: Dict[int, list] = {
+            b: matches[b] for b in range(B)
+        }
 
-        num_matched = max(len(src_batch_idx), 1)
+        # Flat (batch, anchor, target) indices of all matched pairs, shipped
+        # to the device in one asynchronous copy.
+        flat_matches = match_index_array(matches)
+        num_matched = max(flat_matches.shape[1], 1)
         loss_fn = base_loss_fn or self._default_binary_loss
+        target_objectness = torch.zeros_like(objectness_logits)
 
-        if src_batch_idx:
-            sb = torch.tensor(src_batch_idx, dtype=torch.long, device=device)
-            sa = torch.tensor(src_anchor_idx, dtype=torch.long, device=device)
-            tt = torch.tensor(tgt_obj_idx, dtype=torch.long, device=device)
+        if flat_matches.shape[1] > 0:
+            sb, sa, tt = match_index_tensors(flat_matches, device)
+            target_objectness[sb, sa] = 1.0
 
             class_loss = matched_classification_loss(
                 class_logits,
@@ -744,6 +818,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                     "class_probability",
                     "sigmoid",
                 ),
+                match_indices=(sb, sa, tt),
             )
 
             matched_bbox_pred = bbox_preds[sb, sa]
@@ -797,12 +872,11 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             + float(getattr(self.det_cfg, "iou_loss_coef", 0.0)) * iou_loss
             + float(getattr(self.det_cfg, "objectness_loss_coef", 1.0)) * objectness_loss
         )
-        auxiliary_coef = float(
-            getattr(self.det_cfg, "auxiliary_detection_loss_coef", 0.0)
-        )
-        if auxiliary_coef > 0.0 and auxiliary_predictions:
+        if auxiliary_predictions:
             auxiliary_losses = []
-            for auxiliary in auxiliary_predictions:
+            for auxiliary, stage_matches in zip(
+                auxiliary_predictions, auxiliary_matches, strict=True,
+            ):
                 auxiliary_loss, _ = self._detection_loss(
                     auxiliary.class_logits,
                     auxiliary.boxes_xyxy,
@@ -814,6 +888,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                     bbox_labels,
                     object_mask,
                     base_loss_fn=base_loss_fn,
+                    matches=stage_matches,
                 )
                 auxiliary_losses.append(auxiliary_loss)
             loss = loss + auxiliary_coef * torch.stack(auxiliary_losses).mean()

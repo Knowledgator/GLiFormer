@@ -65,6 +65,44 @@ def marker_stream(shared, token_index: int):
     return stream, counts
 
 
+def marker_positions(shared, token_index: int):
+    """Like :func:`marker_stream` but without a host sync or a per-row loop.
+
+    Returns ``(tokens, order, counts)``: ``order[b, k]`` is the token position
+    of row ``b``'s ``k``-th marker (valid for ``k < counts[b]``), so
+    ``tokens[b, order[b, k]]`` equals ``marker_stream(...)[0][b, k]``.
+    """
+
+    tokens, input_ids = shared.token_embeds, shared.input_ids
+    if tokens is None or input_ids is None or token_index < 0:
+        return None, None, None
+    attention = (
+        shared.attention_mask.bool()
+        if shared.attention_mask is not None
+        else torch.ones_like(input_ids, dtype=torch.bool)
+    )
+    markers = (input_ids == token_index) & attention
+    counts = markers.sum(dim=1)
+    # Stable sort puts the markers first, in position order.
+    order = torch.argsort(markers.to(torch.int8), dim=1, descending=True, stable=True)
+    return tokens, order, counts
+
+
+def span_fits(spans, word_mask, max_width: int):
+    """``(Q, N)``: span no wider than ``max_width`` and all its units unmasked.
+
+    Vectorized ``end - start + 1 <= max_width and word_mask[q, start:end + 1].all()``
+    for in-range spans (``0 <= start <= end < L``); other spans get an
+    arbitrary value.
+    """
+
+    length = word_mask.shape[1]
+    holes = F.pad((~word_mask.bool()).long().cumsum(dim=1), (1, 0))  # (Q, L + 1)
+    start, end = spans[..., 0], spans[..., 1]
+    inside = holes.gather(1, (end + 1).clamp(0, length)) - holes.gather(1, start.clamp(0, length))
+    return (end - start + 1 <= max_width) & (inside == 0)
+
+
 class CalculationHead(TaskHead):
     """Predicts a calculation program per (record, ``$calculate`` field)."""
 
@@ -140,6 +178,9 @@ class CalculationHead(TaskHead):
             input_dim=hidden_size, intermediate_dims=[hidden_size], output_dim=1,
             dropout=dropout, activation="gelu",
         )
+        # (length, device) -> flattened (start, end, width) of every span
+        # ``_ranked_spans`` scores, offset-major.
+        self._span_grids = {}
 
     @staticmethod
     def _migrate_state_dict(state_dict, prefix, *args, **kwargs):
@@ -171,11 +212,19 @@ class CalculationHead(TaskHead):
     def _training_queries(self, batch, anchor_mask, matches):
         """``(group, anchor, marker slot, label row)`` of supervised queries."""
 
-        groups = batch["calculation_query_group"].tolist()
-        records = batch["calculation_query_record"].tolist()
-        markers = batch["calculation_query_marker"].tolist()
+        listed = batch.get("calculation_query_list")
+        if listed is not None:
+            # Python list from the collator: no device round trip.
+            triples = [(int(g), int(r), int(m)) for g, r, m in listed]
+        else:
+            triples = list(zip(
+                batch["calculation_query_group"].tolist(),
+                batch["calculation_query_record"].tolist(),
+                batch["calculation_query_marker"].tolist(),
+            ))
+        host_anchor_mask = None
         queries = []
-        for row, (group, record, marker) in enumerate(zip(groups, records, markers)):
+        for row, (group, record, marker) in enumerate(triples):
             if group >= anchor_mask.shape[0]:
                 continue
             anchor = None
@@ -184,11 +233,40 @@ class CalculationHead(TaskHead):
                     if int(gold) == record:
                         anchor = int(prediction)
                         break
-            elif record < anchor_mask.shape[1] and bool(anchor_mask[group, record]):
-                anchor = record
+            elif record < anchor_mask.shape[1]:
+                if host_anchor_mask is None:
+                    host_anchor_mask = anchor_mask.bool().tolist()
+                if host_anchor_mask[group][record]:
+                    anchor = record
             if anchor is not None:
                 queries.append((group, anchor, marker, row))
         return queries
+
+    @staticmethod
+    def _marker_ordinals(batch, marker_index, marker_mask):
+        """Per group, the ``[CALC]`` ordinal of every calc field slot (``None`` = no marker)."""
+
+        listed = batch.get("calculation_marker_list")
+        if listed is not None and len(listed) == marker_index.shape[0]:
+            return [list(row) for row in listed]
+        return [
+            [ordinal if keep else None for ordinal, keep in zip(index_row, mask_row)]
+            for index_row, mask_row in zip(marker_index.tolist(), marker_mask.bool().tolist())
+        ]
+
+    @staticmethod
+    def _keep_marked(queries, ordinals, counts, origin):
+        """Drop queries whose marker was cut off by truncation; ``(query, ordinal)``."""
+
+        kept = []
+        for query in queries:
+            group, _anchor, slot, _row = query
+            if group >= len(ordinals) or slot >= len(ordinals[group]):
+                continue
+            ordinal = ordinals[group][slot]
+            if ordinal is not None and ordinal < counts[origin[group]]:
+                kept.append((query, ordinal))
+        return kept
 
     def _inference_queries(self, batch, anchor_mask, objectness, marker_mask):
         threshold = self._objectness_threshold(batch)
@@ -211,60 +289,95 @@ class CalculationHead(TaskHead):
 
     # -- candidates ----------------------------------------------------------
 
-    def _candidates(self, bio_logits, word_mask, gold_idx=None, gold_mask=None):
-        """Operand candidates per query: gold spans first, then predicted ones."""
+    def _candidates(self, bio_logits, word_mask, gold_idx=None, gold_mask=None, gold_spans=None):
+        """Operand candidates per query: gold spans first, then predicted ones.
+
+        ``gold_spans`` (per query, a list of ``(start, end)``) or the padded
+        ``gold_idx`` / ``gold_mask`` give the gold spans. Predicted spans and
+        their validity are computed on the device and read back with a
+        single copy; the greedy selection then runs on the host.
+        """
 
         cfg = self.cfg
-        if cfg.candidate_mode == "topk":
-            predicted, predicted_mask = self._ranked_spans(bio_logits, word_mask)
-        else:
-            predicted, predicted_mask = extract_spans_from_tokens(
-                bio_logits.detach().float().unsqueeze(2), labels=None, threshold=cfg.operand_threshold,
-            )
-        rows = []
+        topk = cfg.candidate_mode == "topk"
+        word_mask = word_mask.bool()
         width = word_mask.shape[1]
+        if gold_spans is None and gold_idx is not None:
+            gold_spans = [
+                [(start, end) for (start, end), keep in zip(idx_row, mask_row) if keep]
+                for idx_row, mask_row in zip(gold_idx.tolist(), gold_mask.bool().tolist())
+            ]
+        if topk:
+            predicted, predicted_mask = self._ranked_spans(bio_logits, word_mask)
+            fits = span_fits(predicted, word_mask, cfg.max_span_width)
+            host = torch.cat(
+                [predicted, predicted_mask.unsqueeze(-1).long(), fits.unsqueeze(-1).long()], dim=-1,
+            ).cpu()
+            predicted, keeps, fits = host[..., :2].tolist(), host[..., 2].tolist(), host[..., 3].tolist()
+        else:
+            cells = torch.sigmoid(bio_logits.detach().float()) > cfg.operand_threshold  # (Q, L, 3)
+            host = torch.cat([cells, word_mask.unsqueeze(-1)], dim=-1).cpu()
+            cells = host[..., :3].float().unsqueeze(2)
+            predicted, predicted_mask = extract_spans_from_tokens(cells, labels=cells)
+            fits = span_fits(predicted, host[..., 3], cfg.max_span_width)
+            predicted, keeps, fits = predicted.tolist(), predicted_mask.tolist(), fits.tolist()
+        rows = []
         for query in range(bio_logits.shape[0]):
-            spans = []
-            seen = set()
-            if gold_idx is not None:
-                for (start, end), keep in zip(gold_idx[query].tolist(), gold_mask[query].tolist()):
-                    if keep:
-                        spans.append((start, end))
-                        seen.add((start, end))
+            spans = [tuple(span) for span in gold_spans[query]] if gold_spans is not None else []
+            seen = set(spans)
             covered = set()
-            if cfg.candidate_mode == "topk":
+            if topk:
                 for start, end in spans:
                     covered.update(range(start, end + 1))
-            for (start, end), keep in zip(predicted[query].tolist(), predicted_mask[query].tolist()):
+            for (start, end), keep, fit in zip(predicted[query], keeps[query], fits[query]):
                 if len(spans) >= cfg.max_operand_spans:
                     break
                 if not keep or (start, end) in seen or start < 0 or end < start or end >= width:
                     continue
-                if cfg.candidate_mode == "topk":
+                if topk:
                     # Ranked spans: skip those overlapping a better one.
                     if any(unit in covered for unit in range(start, end + 1)):
                         continue
                     covered.update(range(start, end + 1))
-                if end - start + 1 > cfg.max_span_width or not bool(word_mask[query, start:end + 1].all()):
+                if not fit:
                     continue
                 spans.append((start, end))
                 seen.add((start, end))
             rows.append(spans)
         count = max(max((len(spans) for spans in rows), default=0), 1)
-        device = bio_logits.device
-        span_idx = torch.zeros(len(rows), count, 2, dtype=torch.long, device=device)
-        span_mask = torch.zeros(len(rows), count, dtype=torch.bool, device=device)
-        for query, spans in enumerate(rows):
-            for slot, (start, end) in enumerate(spans):
-                span_idx[query, slot, 0], span_idx[query, slot, 1] = start, end
-                span_mask[query, slot] = True
-        return span_idx, span_mask
+        padded = [
+            [[start, end, 1] for start, end in spans] + [[0, 0, 0]] * (count - len(spans))
+            for spans in rows
+        ]
+        table = torch.tensor(padded, dtype=torch.long).reshape(len(rows), count, 3)
+        table = table.to(bio_logits.device, non_blocking=True)
+        return table[..., :2].contiguous(), table[..., 2].bool()
+
+    def _span_grid(self, length: int, device):
+        """Cached offset-major ``(starts, ends, width scale)`` of ``_ranked_spans``."""
+
+        key = (length, str(device))
+        grid = self._span_grids.get(key)
+        if grid is None:
+            offsets = range(min(self.cfg.max_span_width, length))
+            starts = torch.cat([torch.arange(length - offset) for offset in offsets])
+            widths = torch.cat([torch.full((length - offset,), offset + 1) for offset in offsets])
+            if torch.device(device).type == "cuda":
+                # CUDA divides by a Python scalar as a multiply by its float32
+                # reciprocal; reproduce that exactly.
+                scale = 1.0 / widths.float()
+            else:
+                scale = widths.float()
+            grid = (starts.to(device), (starts + widths - 1).to(device), scale.to(device))
+            self._span_grids[key] = grid
+        return grid
 
     def _ranked_spans(self, bio_logits, word_mask):
         """Spans ranked by the geometric mean of start, end and inside probabilities.
 
         Returns ``(Q, N, 2)`` spans sorted best first and their mask; at most
         ``4 * max_operand_spans`` per query, all above ``candidate_threshold``.
+        All widths are scored at once over a cached span grid.
         """
 
         cfg = self.cfg
@@ -272,20 +385,15 @@ class CalculationHead(TaskHead):
         count, length = logp.shape[:2]
         valid = word_mask.bool()
         inside = torch.nn.functional.pad(logp[..., 2].masked_fill(~valid, -1e4).cumsum(dim=1), (1, 0))
-        scores, starts, ends = [], [], []
-        positions = torch.arange(length, device=logp.device)
-        for offset in range(min(cfg.max_span_width, length)):
-            end = positions[offset:]
-            start = positions[: length - offset]
-            mean_inside = (inside[:, end + 1] - inside[:, start]) / (offset + 1)
-            score = (logp[:, start, 0] + logp[:, end, 1] + mean_inside) / 3.0
-            ok = valid[:, start] & valid[:, end]
-            scores.append(score.masked_fill(~ok, float("-inf")))
-            starts.append(start)
-            ends.append(end)
-        scores = torch.cat(scores, dim=1)
-        starts = torch.cat(starts)
-        ends = torch.cat(ends)
+        starts, ends, scale = self._span_grid(length, logp.device)
+        inside_sum = inside[:, ends + 1] - inside[:, starts]
+        if logp.device.type == "cuda":
+            mean_inside = inside_sum * scale
+        else:
+            mean_inside = inside_sum / scale
+        scores = (logp[:, starts, 0] + logp[:, ends, 1] + mean_inside) / 3.0
+        ok = valid[:, starts] & valid[:, ends]
+        scores = scores.masked_fill(~ok, float("-inf"))
         keep = min(scores.shape[1], 4 * cfg.max_operand_spans)
         best, index = scores.topk(keep, dim=1)
         span_idx = torch.stack([starts[index], ends[index]], dim=-1)
@@ -304,12 +412,21 @@ class CalculationHead(TaskHead):
     # -- losses --------------------------------------------------------------
 
     def _unused(self, reference):
-        return sum(parameter.sum() for parameter in self.parameters()) * 0.0 + reference.sum() * 0.0
+        """A zero loss tied to the graph.
+
+        Under DDP every parameter must receive a gradient, so it also touches
+        all of them (one reduction kernel each); otherwise that is skipped.
+        """
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return sum(parameter.sum() for parameter in self.parameters()) * 0.0 + reference.sum() * 0.0
+        return reference.sum() * 0.0
 
     def _losses(self, outputs, batch, label_rows, word_mask, extra):
         cfg = self.cfg
         device = outputs["op_logits"].device
-        label_rows = torch.tensor(label_rows, dtype=torch.long, device=device)
+        if not torch.is_tensor(label_rows):
+            label_rows = torch.tensor(label_rows, dtype=torch.long, device=device)
 
         def take(name):
             return batch[name].to(device)[label_rows]
@@ -331,11 +448,12 @@ class CalculationHead(TaskHead):
         active = take("calculation_active").float()
         terms["active"] = F.binary_cross_entropy_with_logits(outputs["active_logits"].float(), active)
 
-        op = take("calculation_op")
-        if (op >= 0).any():
-            terms["op"] = F.cross_entropy(
-                outputs["op_logits"].float().reshape(-1, self.num_ops), op.reshape(-1), ignore_index=-100,
-            )
+        # Mean over labelled steps without a host check for "any labelled":
+        # with none the term is 0 (``mean`` would give NaN).
+        op = take("calculation_op").reshape(-1)
+        terms["op"] = F.cross_entropy(
+            outputs["op_logits"].float().reshape(-1, self.num_ops), op, ignore_index=-100, reduction="sum",
+        ) / (op != -100).sum().clamp(min=1)
 
         # Operand sets: BCE per pool element on program steps; normalized per
         # (step, port) so a port's few positives are not drowned out.
@@ -382,55 +500,59 @@ class CalculationHead(TaskHead):
         words = shared.words_embedding
         word_mask_all = shared.mask
         supervised = batch.get("calculation_query_group") is not None
-        empty = TaskHeadOutput(
-            loss=self._unused(words) if (self.training and supervised) else None,
-            extra={},
-        )
+
+        def empty():
+            return TaskHeadOutput(
+                loss=self._unused(words) if (self.training and supervised) else None,
+                extra={},
+            )
+
         struct = (dependency_outputs or {}).get("structuring")
         marker_index = batch.get("calculation_marker_index")
         marker_mask = batch.get("calculation_marker_mask")
         if struct is None or struct.extra is None or marker_index is None:
-            return empty
+            return empty()
         extra_in = struct.extra
         anchors = extra_in.get("groups_output")
         anchor_mask = extra_in.get("anchor_mask")
         origin = extra_in.get("batch_origin")
         parent = extra_in.get("parent_embedding")
         if anchors is None or anchor_mask is None or origin is None or parent is None:
-            return empty
+            return empty()
         device = words.device
-        marker_index = marker_index.to(device)
-        marker_mask = marker_mask.to(device).bool()
         field_idx = batch.get("calculation_field_idx")
 
         if supervised:
             queries = self._training_queries(batch, anchor_mask, extra_in.get("anchor_matches"))
         else:
             queries = self._inference_queries(
-                batch, anchor_mask, extra_in.get("objectness_logits"), marker_mask,
+                batch, anchor_mask, extra_in.get("objectness_logits"), marker_mask.to(device).bool(),
             )
-        stream, counts = marker_stream(shared, self.calc_token_index)
-        if stream is not None:
-            # A marker cut off by truncation has no state.
-            queries = [
-                q for q in queries
-                if q[0] < marker_index.shape[0] and q[2] < marker_index.shape[1]
-                and bool(marker_mask[q[0], q[2]])
-                and int(marker_index[q[0], q[2]]) < int(counts[int(origin[q[0]])])
-            ]
-        if stream is None or not queries:
-            return empty
+        tokens, marker_order, counts = marker_positions(shared, self.calc_token_index)
+        if tokens is None or not queries:
+            return empty()
+        # A marker cut off by truncation has no state. One host copy brings
+        # the per-row marker counts and the group -> row map.
+        batch_size = counts.shape[0]
+        host = torch.cat([counts.reshape(-1), origin.reshape(-1).to(counts.device, torch.long)]).tolist()
+        kept = self._keep_marked(
+            queries, self._marker_ordinals(batch, marker_index, marker_mask),
+            host[:batch_size], host[batch_size:],
+        )
+        if not kept:
+            return empty()
 
-        group = torch.tensor([q[0] for q in queries], dtype=torch.long, device=device)
-        anchor = torch.tensor([q[1] for q in queries], dtype=torch.long, device=device)
-        marker = torch.tensor([q[2] for q in queries], dtype=torch.long, device=device)
-        label_rows = [q[3] for q in queries]
+        # (group, anchor, marker slot, marker ordinal, label row) per query, one copy.
+        index = torch.tensor(
+            [[q[0], q[1], q[2], ordinal, max(q[3], 0)] for q, ordinal in kept], dtype=torch.long,
+        ).to(device, non_blocking=True)
+        group, anchor, marker, ordinal, label_index = index.unbind(dim=1)
         rows = origin.to(device)[group]
 
         anchor_vectors = anchors[group, anchor]
         if self.cfg.detach_record_anchors:
             anchor_vectors = anchor_vectors.detach()
-        calc_vectors = stream[rows, marker_index[group, marker]]
+        calc_vectors = tokens[rows, marker_order[rows, ordinal]]
         record = anchor_vectors + self.parent_proj(parent[group])
         query_words = words[rows]
         query_word_mask = word_mask_all[rows].bool()
@@ -441,12 +563,17 @@ class CalculationHead(TaskHead):
 
         bio_logits = self.scorer(query.unsqueeze(1), query_words, word_mask=query_word_mask)[:, 0]
         if supervised:
-            label_index = torch.tensor(label_rows, dtype=torch.long, device=device)
-            operand_spans, operand_mask = self._candidates(
-                bio_logits, query_word_mask,
-                batch["calculation_span_idx"].to(device)[label_index],
-                batch["calculation_span_mask"].to(device)[label_index].bool(),
-            )
+            span_lists = batch.get("calculation_span_list")
+            if span_lists is not None:
+                operand_spans, operand_mask = self._candidates(
+                    bio_logits, query_word_mask, gold_spans=[span_lists[q[3]] for q, _ in kept],
+                )
+            else:
+                operand_spans, operand_mask = self._candidates(
+                    bio_logits, query_word_mask,
+                    batch["calculation_span_idx"].to(device)[label_index],
+                    batch["calculation_span_mask"].to(device)[label_index].bool(),
+                )
         else:
             operand_spans, operand_mask = self._candidates(bio_logits, query_word_mask)
         safe_spans = operand_spans * operand_mask.unsqueeze(-1).long()
@@ -501,7 +628,7 @@ class CalculationHead(TaskHead):
         }
         loss = None
         if supervised:
-            loss = self._losses(outputs, batch, label_rows, query_word_mask, extra)
+            loss = self._losses(outputs, batch, label_index, query_word_mask, extra)
             if self.training:
                 loss = loss + self._unused(query)
         if not self.training:
@@ -525,4 +652,4 @@ class CalculationHead(TaskHead):
         return TaskHeadOutput(loss=loss, extra=extra)
 
 
-__all__ = ["CalculationHead", "marker_stream"]
+__all__ = ["CalculationHead", "marker_positions", "marker_stream", "span_fits"]

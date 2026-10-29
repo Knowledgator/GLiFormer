@@ -14,7 +14,8 @@ Label-free tensors (training and inference), per flat structuring group
 
 * ``calculation_marker_index`` ``(BN, Kc)``: ordinal of the field's ``[CALC]``
   marker among the row's markers;
-* ``calculation_marker_mask`` ``(BN, Kc)``, ``calculation_field_idx`` ``(BN, Kc)``.
+* ``calculation_marker_mask`` ``(BN, Kc)``, ``calculation_field_idx`` ``(BN, Kc)``;
+* ``calculation_marker_list``: the same ordinals as a Python list per group.
 
 Training tensors, one row per supervised query ``Q`` = (group, gold record,
 calc field), ``S`` operand spans, ``K`` slots, ``C`` constants:
@@ -25,7 +26,9 @@ calc field), ``S`` operand spans, ``K`` slots, ``C`` constants:
 * ``calculation_op`` ``(Q, K)`` op ids (-100 past the program);
 * ``calculation_active`` ``(Q, K)`` 1 for program steps;
 * ``calculation_port_spans`` ``(Q, K, 2, S)``, ``_port_refs`` ``(Q, K, 2, K)``,
-  ``_port_consts`` ``(Q, K, 2, C)``: operand-set targets.
+  ``_port_consts`` ``(Q, K, 2, C)``: operand-set targets;
+* ``calculation_query_list`` / ``_span_list``: Python lists of the query
+  triples and gold spans, read by the head without a device round trip.
 """
 
 from __future__ import annotations
@@ -185,8 +188,11 @@ class CalculationProcessor(TaskProcessor):
         marker_mask = torch.zeros(len(layouts), width, dtype=torch.bool)
         field_idx = torch.zeros(len(layouts), width, dtype=torch.long)
         counts: dict[int, int] = {}
+        ordinals: list[list[int]] = []
         for group, (batch_idx, layout) in enumerate(layouts):
+            ordinals.append([])
             for slot, (_label, field_id, _spec) in enumerate(layout):
+                ordinals[group].append(counts.get(batch_idx, 0))
                 marker_index[group, slot] = counts.get(batch_idx, 0)
                 counts[batch_idx] = counts.get(batch_idx, 0) + 1
                 marker_mask[group, slot] = True
@@ -195,6 +201,10 @@ class CalculationProcessor(TaskProcessor):
             "calculation_marker_index": marker_index,
             "calculation_marker_mask": marker_mask,
             "calculation_field_idx": field_idx,
+            # Host copy of the marker ordinals (``marker_index`` where
+            # ``marker_mask``): a Python list stays on the CPU when the
+            # trainer moves the batch, so the head reads it without a sync.
+            "calculation_marker_list": ordinals,
         }
 
     # -- training targets --------------------------------------------------
@@ -310,6 +320,11 @@ class CalculationProcessor(TaskProcessor):
             "calculation_port_spans": port_spans,
             "calculation_port_refs": port_refs,
             "calculation_port_consts": port_consts,
+            # Host copies for the head (Python lists are not moved to the
+            # device): ``(group, record, marker)`` per query and its gold
+            # operand spans (``span_idx`` where ``span_mask``).
+            "calculation_query_list": [[flat, record_idx, slot] for flat, record_idx, slot, _ in queries],
+            "calculation_span_list": [[list(span) for span in spans] for spans in span_lists],
         }
 
 

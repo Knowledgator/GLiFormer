@@ -47,6 +47,50 @@ class NativeVisionBatch:
     vision_index: torch.Tensor  # (batch, max image tokens), positions in the sequence
     vision_mask: torch.Tensor  # (batch, max image tokens)
     spatial_shape: torch.Tensor  # (batch, 2), merged grid height/width
+    # The same layout on the CPU (pixel_values left empty), when it was built
+    # from NativeVisionHost copies; the backbone reads its sizes from it
+    # without waiting for the GPU.
+    host: Optional["NativeVisionBatch"] = None
+
+
+class NativeVisionHost:
+    """CPU copies of the inputs that decide a native vision batch's layout.
+
+    The data collator attaches one to each image batch. It is deliberately not
+    a tensor container (no ``to``/``pin_memory``), so the trainer's move to the
+    GPU leaves it on the CPU, and the layout sizes can be read without a
+    device sync.
+    """
+
+    def __init__(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        image_grid_thw: torch.Tensor,
+        vision_input_mask: Optional[torch.Tensor] = None,
+    ):
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
+        self.image_grid_thw = image_grid_thw
+        self.vision_input_mask = vision_input_mask
+
+    def matches(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor], pixel_values: torch.Tensor) -> bool:
+        """True when these copies describe the given (device) batch."""
+        if tuple(self.input_ids.shape) != tuple(input_ids.shape):
+            return False
+        if self.image_grid_thw.shape != (input_ids.shape[0], 3) or pixel_values.dim() != 3:
+            return False
+        if (attention_mask is None) != (self.attention_mask is None):
+            return False
+        if attention_mask is not None and tuple(self.attention_mask.shape) != tuple(attention_mask.shape):
+            return False
+        return self.vision_input_mask is None or self.vision_input_mask.shape[0] == input_ids.shape[0]
+
+
+def _to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if device.type == "cuda":
+        return tensor.pin_memory().to(device, non_blocking=True)
+    return tensor.to(device)
 
 
 def native_vision_tower(model: nn.Module) -> Optional[nn.Module]:
@@ -91,6 +135,7 @@ def build_native_vision_batch(
     pixel_values: torch.Tensor,
     image_grid_thw: torch.Tensor,
     vision_input_mask: Optional[torch.Tensor] = None,
+    host: Optional[NativeVisionHost] = None,
 ) -> Optional[NativeVisionBatch]:
     """Put each row's image block in front of its text.
 
@@ -99,7 +144,13 @@ def build_native_vision_batch(
     padding ahead of the content would run through their state. The text therefore
     starts at a per-row offset, kept in ``text_index``. Returns None when no row
     carries an image.
+
+    With ``host`` copies of the inputs, the layout is built on the CPU and
+    copied over asynchronously; otherwise its sizes are read from the device
+    tensors, which waits for the GPU.
     """
+    if host is not None and input_ids.device.type != "cpu" and host.matches(input_ids, attention_mask, pixel_values):
+        return _build_from_host(spec, host, input_ids.device, pixel_values)
     batch_size, text_length = input_ids.shape
     device = input_ids.device
     if pixel_values.dim() != 3 or pixel_values.shape[0] != batch_size:
@@ -169,6 +220,48 @@ def build_native_vision_batch(
         vision_index=vision_index,
         vision_mask=vision_mask.to(attention_mask.dtype),
         spatial_shape=torch.where(has_image.unsqueeze(1), merged_grid, torch.zeros_like(merged_grid)),
+    )
+
+
+def _build_from_host(
+    spec: NativeVisionSpec,
+    host: NativeVisionHost,
+    device: torch.device,
+    pixel_values: torch.Tensor,
+) -> Optional[NativeVisionBatch]:
+    """The device-tensor layout of ``build_native_vision_batch``, computed on the CPU."""
+    batch_size, max_patches = pixel_values.shape[:2]
+    # Same code on CPU tensors; the patches only matter for their count here.
+    cpu = build_native_vision_batch(
+        spec,
+        host.input_ids,
+        host.attention_mask,
+        torch.empty((batch_size, max_patches, 0)),
+        host.image_grid_thw,
+        host.vision_input_mask,
+    )
+    if cpu is None:
+        return None
+    grid = host.image_grid_thw.to(torch.long)
+    num_patches = grid.prod(-1)
+    has_image = num_patches > 0
+    if host.vision_input_mask is not None:
+        has_image = has_image & host.vision_input_mask.bool()
+    patch_mask = torch.arange(max_patches).unsqueeze(0) < torch.where(has_image, num_patches, 0).unsqueeze(1)
+    # pixel_values[patch_mask], as a gather of known size instead of a boolean index.
+    patch_index = _to_device(patch_mask.flatten().nonzero().squeeze(1), device)
+    pixels = pixel_values.flatten(0, 1).index_select(0, patch_index)
+    return NativeVisionBatch(
+        input_ids=_to_device(cpu.input_ids, device),
+        attention_mask=_to_device(cpu.attention_mask, device),
+        mm_token_type_ids=_to_device(cpu.mm_token_type_ids, device),
+        pixel_values=pixels,
+        image_grid_thw=_to_device(cpu.image_grid_thw, device),
+        text_index=_to_device(cpu.text_index, device),
+        vision_index=_to_device(cpu.vision_index, device),
+        vision_mask=_to_device(cpu.vision_mask, device),
+        spatial_shape=_to_device(cpu.spatial_shape, device),
+        host=cpu,
     )
 
 

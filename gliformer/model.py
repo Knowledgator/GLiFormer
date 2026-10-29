@@ -4,14 +4,11 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from gliner.modeling.base import BaseModel
 from gliner.modeling.layers import CrossFuser, LstmSeq2SeqEncoder
-from gliner.modeling.utils import (
-    extract_prompt_features,
-    extract_prompt_features_and_word_embeddings,
-    extract_word_embeddings,
-)
+from gliner.modeling.utils import extract_word_embeddings
 from torch import nn
 
 from .config import GLiFormerConfig
@@ -27,6 +24,13 @@ from .encoders.omni import (
 from .encoders.text import TextBiEncoder, TextEncoder
 from .encoders.vision import VisionBiEncoder, vision_encoder_kwargs, vision_token_mask
 from .layers import AnchorCrossAttentionLayer, AnchorModeling
+from .prompt_features import (
+    PROMPT_MARKER_COUNTS_KEY,
+    PromptMarkerCounts,
+    extract_prompt_features,
+    prompt_marker_token_indices,
+)
+from .tasks.matcher import host_to_device
 from .outputs import (
     GLiFormerAudioOutput,
     GLiFormerLayoutOutput,
@@ -85,12 +89,20 @@ _SET_PREDICTION_COUNT_KEYS = {
 
 @dataclass(frozen=True)
 class _FlatGroupLayout:
-    """Indexes one task's groups in flattened BN order."""
+    """Indexes one task's groups in flattened BN order.
+
+    The ``host_*`` tuples mirror the tensors as Python ints so slicing and
+    gathering can plan their copies without reading device values.
+    """
 
     batch_origin: torch.Tensor
     group_index: torch.Tensor
     starts: torch.Tensor
     sizes: torch.Tensor
+    host_batch_origin: Tuple[int, ...] = ()
+    host_group_index: Tuple[int, ...] = ()
+    host_starts: Tuple[int, ...] = ()
+    host_sizes: Tuple[int, ...] = ()
 
     @property
     def count(self) -> int:
@@ -781,6 +793,95 @@ class BaseGLiFormerModel(BaseModel):
         audio_mask = apply_input_mask(audio_mask, kwargs.get("audio_input_mask"))
         return audio_tokens, audio_mask
 
+    def _forward_host_counts(self, input_ids, attention_mask):
+        cache = getattr(self, "_forward_marker_counts", None)
+        if cache is None or not cache.matches(input_ids, attention_mask):
+            return None
+        return cache
+
+    def _start_forward_host_counts(self, input_ids, attention_mask, text_lengths, kwargs) -> None:
+        """Remember host-side marker counts and word lengths for this forward.
+
+        The collator supplies them as Python lists (``prompt_marker_counts``,
+        ``word_lengths``); missing marker counts are read from the device
+        once, together, the first time one is needed.
+        """
+
+        if input_ids is None or attention_mask is None:
+            self._forward_marker_counts = None
+            return
+        self._forward_marker_counts = PromptMarkerCounts(
+            input_ids,
+            attention_mask,
+            prompt_marker_token_indices(self.config),
+            kwargs.get(PROMPT_MARKER_COUNTS_KEY),
+            text_lengths=text_lengths if torch.is_tensor(text_lengths) else None,
+            word_lengths=kwargs.get("word_lengths"),
+        )
+
+    def _extract_prompt_features(
+        self,
+        token_index: int,
+        token_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        embed_dim: int,
+        embed_token: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """gliner's ``extract_prompt_features`` with host-side marker counts."""
+
+        cache = self._forward_host_counts(input_ids, attention_mask)
+        return extract_prompt_features(
+            token_index,
+            token_embeds,
+            input_ids,
+            attention_mask,
+            batch_size,
+            embed_dim,
+            embed_token,
+            counts=None if cache is None else cache.get(token_index),
+        )
+
+    def _extract_prompt_features_and_word_embeddings(
+        self,
+        class_token_index: int,
+        token_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        text_lengths: torch.Tensor,
+        words_mask: torch.Tensor,
+        embed_ent_token: bool = True,
+        subtoken_pooling: str = "first",
+    ):
+        """gliner's combined prompt/word extraction without device reads."""
+
+        batch_size, _, embed_dim = token_embeds.shape
+        cache = self._forward_host_counts(input_ids, attention_mask)
+        max_text_length = None if cache is None else cache.max_text_length(text_lengths)
+        if max_text_length is None:
+            max_text_length = text_lengths.max()
+        prompts_embedding, prompts_embedding_mask = self._extract_prompt_features(
+            class_token_index,
+            token_embeds,
+            input_ids,
+            attention_mask,
+            batch_size,
+            embed_dim,
+            embed_ent_token,
+        )
+        words_embedding, mask = extract_word_embeddings(
+            token_embeds,
+            words_mask,
+            attention_mask,
+            batch_size,
+            max_text_length,
+            embed_dim,
+            text_lengths,
+            subtoken_pooling,
+        )
+        return prompts_embedding, prompts_embedding_mask, words_embedding, mask
+
     @staticmethod
     def _build_group_layout(
         classes_mapping,
@@ -790,34 +891,38 @@ class BaseGLiFormerModel(BaseModel):
         label_kind: str = "primary",
         explicit_sizes: Optional[torch.Tensor] = None,
     ) -> _FlatGroupLayout:
-        """Describe task groups, their source slices, and original batch rows."""
+        """Describe task groups, their source slices, and original batch rows.
+
+        Everything is planned on the host; the four index rows reach the
+        device with one asynchronous copy. Explicit (labels-encoder) sizes are
+        read once when they live on the device.
+        """
 
         groups = list(classes_mapping.flat_iter(task_name))
-        batch_origin = torch.tensor(
-            [batch_idx for _, batch_idx, _, _ in groups],
-            dtype=torch.long,
-            device=device,
-        )
-        group_index = torch.tensor(
-            [group_idx for _, _, group_idx, _ in groups],
-            dtype=torch.long,
-            device=device,
-        )
+        batch_origin = [batch_idx for _, batch_idx, _, _ in groups]
+        group_index = [group_idx for _, _, group_idx, _ in groups]
 
         if explicit_sizes is not None:
-            sizes = explicit_sizes.to(device=device, dtype=torch.long).flatten()
-            if sizes.numel() != len(groups):
+            if torch.is_tensor(explicit_sizes):
+                sizes = explicit_sizes.to(dtype=torch.long).flatten().tolist()
+            else:
+                sizes = [int(size) for size in np.asarray(explicit_sizes).reshape(-1)]
+            if len(sizes) != len(groups):
                 raise ValueError(
                     f"{task_name} has {len(groups)} flat groups but received "
-                    f"{sizes.numel()} label-group sizes"
+                    f"{len(sizes)} label-group sizes"
                 )
-            if bool((sizes < 0).any()):
+            if any(size < 0 for size in sizes):
                 raise ValueError("label-group sizes must be non-negative")
-            starts = torch.cumsum(sizes, dim=0) - sizes
+            starts = []
+            offset = 0
+            for size in sizes:
+                starts.append(offset)
+                offset += size
         else:
             offsets = {}
-            starts_list = []
-            sizes_list = []
+            starts = []
+            sizes = []
             for _, batch_idx, group_idx, _ in groups:
                 size = classes_mapping.label_size(
                     task_name,
@@ -826,17 +931,24 @@ class BaseGLiFormerModel(BaseModel):
                     label_kind=label_kind,
                 )
                 start = offsets.get(batch_idx, 0)
-                starts_list.append(start)
-                sizes_list.append(size)
+                starts.append(start)
+                sizes.append(size)
                 offsets[batch_idx] = start + size
-            starts = torch.tensor(starts_list, dtype=torch.long, device=device)
-            sizes = torch.tensor(sizes_list, dtype=torch.long, device=device)
 
+        table = np.asarray(
+            [batch_origin, group_index, starts, sizes],
+            dtype=np.int64,
+        ).reshape(4, len(groups))
+        table = host_to_device(table, device)
         return _FlatGroupLayout(
-            batch_origin=batch_origin,
-            group_index=group_index,
-            starts=starts,
-            sizes=sizes,
+            batch_origin=table[0],
+            group_index=table[1],
+            starts=table[2],
+            sizes=table[3],
+            host_batch_origin=tuple(int(value) for value in batch_origin),
+            host_group_index=tuple(int(value) for value in group_index),
+            host_starts=tuple(int(value) for value in starts),
+            host_sizes=tuple(int(value) for value in sizes),
         )
 
     @staticmethod
@@ -847,7 +959,12 @@ class BaseGLiFormerModel(BaseModel):
         *,
         mask_dtype: torch.dtype = torch.float,
     ) -> _FlatEmbeddingBatch:
-        """Slice packed 2D or batch-packed 3D embeddings into padded groups."""
+        """Slice packed 2D or batch-packed 3D embeddings into padded groups.
+
+        The copy plan (destination slot, source row, source position) is built
+        from the layout's host ints and applied with one gather and one
+        ``index_copy`` instead of a slice assignment per group.
+        """
 
         if embeddings.dim() not in {2, 3}:
             raise ValueError(
@@ -864,53 +981,72 @@ class BaseGLiFormerModel(BaseModel):
                     "grouped embedding mask must match the embedding label axes"
                 )
 
-        max_size = int(layout.sizes.max().item()) if layout.count else 0
-        flat_embeddings = embeddings.new_zeros(
-            layout.count,
-            max_size,
-            embeddings.shape[-1],
-        )
+        count = layout.count
+        max_size = max(layout.host_sizes, default=0) if count else 0
+        hidden = embeddings.shape[-1]
+        flat_embeddings = embeddings.new_zeros(count, max_size, hidden)
         flat_mask = torch.zeros(
-            layout.count,
+            count,
             max_size,
             device=embeddings.device,
             dtype=mask_dtype,
         )
-        descriptors = zip(
-            layout.batch_origin.tolist(),
-            layout.starts.tolist(),
-            layout.sizes.tolist(),
-        )
-        for flat_idx, (batch_idx, start, size) in enumerate(descriptors):
+
+        flat_ids, rows, starts, sizes = [], [], [], []
+        for flat_idx, (batch_idx, start, size) in enumerate(
+            zip(layout.host_batch_origin, layout.host_starts, layout.host_sizes)
+        ):
             if size <= 0:
                 continue
             end = start + size
             if embeddings.dim() == 2:
                 if end > embeddings.shape[0]:
                     continue
-                flat_embeddings[flat_idx, :size] = embeddings[start:end]
-            else:
-                if batch_idx >= embeddings.shape[0] or end > embeddings.shape[1]:
-                    continue
-                flat_embeddings[flat_idx, :size] = embeddings[
-                    batch_idx,
-                    start:end,
-                ]
+            elif batch_idx >= embeddings.shape[0] or end > embeddings.shape[1]:
+                continue
+            flat_ids.append(flat_idx)
+            rows.append(batch_idx)
+            starts.append(start)
+            sizes.append(size)
+        if not sizes:
+            return _FlatEmbeddingBatch(flat_embeddings, flat_mask)
 
-            if source_mask is None:
-                flat_mask[flat_idx, :size] = 1
-            elif embeddings.dim() == 2:
-                flat_mask[flat_idx, :size] = source_mask[start:end].to(
-                    device=flat_mask.device,
-                    dtype=mask_dtype,
-                )
-            else:
-                flat_mask[flat_idx, :size] = source_mask[
-                    batch_idx,
-                    start:end,
-                ].to(device=flat_mask.device, dtype=mask_dtype)
+        sizes_np = np.asarray(sizes, dtype=np.int64)
+        total = int(sizes_np.sum())
+        group_offsets = np.repeat(np.cumsum(sizes_np) - sizes_np, sizes_np)
+        within = np.arange(total, dtype=np.int64) - group_offsets
+        plan = np.empty((3, total), dtype=np.int64)
+        plan[0] = np.repeat(np.asarray(flat_ids, dtype=np.int64) * max_size, sizes_np) + within
+        plan[1] = np.repeat(np.asarray(rows, dtype=np.int64), sizes_np)
+        plan[2] = np.repeat(np.asarray(starts, dtype=np.int64), sizes_np) + within
+        plan = host_to_device(plan, embeddings.device)
+        destination, source_rows, source_positions = plan[0], plan[1], plan[2]
 
-        return _FlatEmbeddingBatch(flat_embeddings, flat_mask)
+        if embeddings.dim() == 2:
+            values = embeddings[source_positions]
+        else:
+            values = embeddings[source_rows, source_positions]
+        flat_embeddings = flat_embeddings.view(count * max_size, hidden).index_copy(
+            0, destination, values
+        ).view(count, max_size, hidden)
+
+        flat_mask = flat_mask.view(count * max_size)
+        if source_mask is None:
+            flat_mask = flat_mask.index_fill(0, destination, 1)
+        else:
+            source_rows = source_rows.to(source_mask.device)
+            source_positions = source_positions.to(source_mask.device)
+            mask_values = (
+                source_mask[source_positions]
+                if embeddings.dim() == 2
+                else source_mask[source_rows, source_positions]
+            )
+            flat_mask = flat_mask.index_copy(
+                0,
+                destination,
+                mask_values.to(device=flat_mask.device, dtype=mask_dtype),
+            )
+        return _FlatEmbeddingBatch(flat_embeddings, flat_mask.view(count, max_size))
 
     @staticmethod
     def _slice_prompt_features(
@@ -1068,8 +1204,9 @@ class BaseGLiFormerModel(BaseModel):
             layout.count,
             parent_embeddings.shape[-1],
         )
+        plan = []
         for flat_idx, (batch_idx, group_idx) in enumerate(
-            zip(layout.batch_origin.tolist(), layout.group_index.tolist())
+            zip(layout.host_batch_origin, layout.host_group_index)
         ):
             parent_idx = group_idx
             if not per_task_parents:
@@ -1081,8 +1218,18 @@ class BaseGLiFormerModel(BaseModel):
                 batch_idx < parent_embeddings.shape[0]
                 and parent_idx < parent_embeddings.shape[1]
             ):
-                flat_parents[flat_idx] = parent_embeddings[batch_idx, parent_idx]
-        return flat_parents
+                plan.append((flat_idx, batch_idx, parent_idx))
+        if not plan:
+            return flat_parents
+        plan = host_to_device(
+            np.asarray(plan, dtype=np.int64).T,
+            parent_embeddings.device,
+        )
+        return flat_parents.index_copy(
+            0,
+            plan[0],
+            parent_embeddings[plan[1], plan[2]],
+        )
 
     def _build_flat_rel_prompts(
         self,
@@ -1258,7 +1405,7 @@ class BaseGLiFormerModel(BaseModel):
         else:
             token_embeds = self.token_rep_layer(input_ids, attention_mask, **encoder_kwargs)
             prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
-                extract_prompt_features_and_word_embeddings(
+                self._extract_prompt_features_and_word_embeddings(
                     self.config.class_token_index, token_embeds, input_ids, attention_mask,
                     text_lengths, words_mask, self.config.embed_ent_token,
                     subtoken_pooling=_subtoken_pooling(self.config),
@@ -1355,6 +1502,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             "interpolate_pos_encoding",
             "pixel_mask",
             "audio_input_mask",
+            "native_vision_host",
         }
         direct_media_keys = {
             "pixel_values",
@@ -1552,7 +1700,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
                 prompt_task_names = tuple(prompt_parent_cfgs)
                 for task_name, task_cfg in task_parent_cfgs.items():
                     if task_cfg is not None and getattr(task_cfg, "parent_token_index", -1) > 0:
-                        parent_e, parent_m = extract_prompt_features(
+                        parent_e, parent_m = self._extract_prompt_features(
                             task_cfg.parent_token_index,
                             token_embeds,
                             input_ids,
@@ -1592,7 +1740,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
                 if "ner" in per_task_parent_embeds:
                     per_task_parent_embeds["joint_relex"] = per_task_parent_embeds["ner"]
             elif self.config.parent_token_index > 0:
-                parent_embeds, _ = extract_prompt_features(
+                parent_embeds, _ = self._extract_prompt_features(
                     self.config.parent_token_index,
                     token_embeds,
                     input_ids,
@@ -1608,7 +1756,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         cat_child_embeds, cat_child_mask = None, None
         if "classification" in self.heads and cat_label_embeds is None:
             cat_cfg = self.config.classification_config
-            cat_child_embeds, cat_child_mask = extract_prompt_features(
+            cat_child_embeds, cat_child_mask = self._extract_prompt_features(
                 cat_cfg.cat_token_index,
                 token_embeds,
                 input_ids,
@@ -1628,7 +1776,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         joint_rel_flat_prompts, joint_rel_flat_mask = None, None
         if joint_relex_active and rel_label_embeds is None:
             jr_cfg = self.config.joint_relex_config
-            rel_prompts_batch, rel_prompts_batch_mask = extract_prompt_features(
+            rel_prompts_batch, rel_prompts_batch_mask = self._extract_prompt_features(
                 jr_cfg.rel_token_index,
                 token_embeds,
                 input_ids,
@@ -1652,7 +1800,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         open_rel_child_embeds, open_rel_child_mask = None, None
         if "open_relex" in self.heads and open_rel_label_embeds is None:
             or_cfg = self.config.open_relex_config
-            open_rel_child_embeds, open_rel_child_mask = extract_prompt_features(
+            open_rel_child_embeds, open_rel_child_mask = self._extract_prompt_features(
                 or_cfg.rel_token_index,
                 token_embeds,
                 input_ids,
@@ -1681,7 +1829,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         if "structuring" in self.heads and child_label_embeds is None:
             s_cfg = self.config.structuring_config
             all_struct_child_embeds, all_struct_child_mask = (
-                extract_prompt_features(
+                self._extract_prompt_features(
                 s_cfg.child_token_index,
                 token_embeds,
                 input_ids,
@@ -1709,7 +1857,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
 
         obj_child_embeds, obj_child_mask = None, None
         if media_tasks and any(name in self.heads for name in media_tasks):
-            obj_child_embeds, obj_child_mask = extract_prompt_features(
+            obj_child_embeds, obj_child_mask = self._extract_prompt_features(
                 self.config.obj_token_index,
                 token_embeds,
                 input_ids,
@@ -2298,6 +2446,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
     ) -> GLiFormerOutput:
 
         self._forward_modality_cache = {}
+        self._start_forward_host_counts(input_ids, attention_mask, text_lengths, kwargs)
         classes_mapping = kwargs.get("classes_mapping")
         pixel_values = self._resolve_media_argument(pixel_values, kwargs, "pixel_values")
         vision_attention_mask = self._resolve_media_argument(
@@ -2562,6 +2711,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             for key in kwargs
             if key in representation_keys
         }
+        self._start_forward_host_counts(input_ids, attention_mask, text_lengths, kwargs)
         token_embeds, prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
             self.get_representations(
                 input_ids,
@@ -3300,7 +3450,7 @@ class GLiFormerLayoutModel(_GLiFormerJointForwardModel):
             **encoder_kwargs,
         )
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
-            extract_prompt_features_and_word_embeddings(
+            self._extract_prompt_features_and_word_embeddings(
                 self.config.class_token_index, token_embeds, input_ids, attention_mask,
                 text_lengths, words_mask, self.config.embed_ent_token,
                 subtoken_pooling=_subtoken_pooling(self.config),
@@ -3402,7 +3552,7 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
             "vision_attention_mask", "audio_values", "audio_attention_mask",
             "vision_input_mask", "audio_input_mask", "bbox", "layout_input_mask",
             "vision_encoder_kwargs", "interpolate_pos_encoding", "pixel_mask",
-            "adapter_ids",
+            "adapter_ids", "native_vision_host",
         }
         cls._reject_unsupported_input_names(kwargs)
         return {key: kwargs[key] for key in allowed if key in kwargs}
@@ -3473,7 +3623,7 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
         if getattr(output, "audio_embeddings", None) is not None:
             _cache_forward_modality(self, "audio", output.audio_embeddings, output.audio_attention_mask)
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
-            extract_prompt_features_and_word_embeddings(
+            self._extract_prompt_features_and_word_embeddings(
                 self.config.class_token_index, token_embeds, input_ids, attention_mask,
                 text_lengths, words_mask, self.config.embed_ent_token,
                 subtoken_pooling=_subtoken_pooling(self.config),

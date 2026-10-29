@@ -2065,6 +2065,9 @@ class NormalizationHeadConfig:
     # (the structuring decoder can only take values of spans the head read).
     max_spans: int = 64
     max_inference_spans: int = 512
+    # Rows that supply training targets: "all", or "calculation" (only rows
+    # with calculation programs; other rows give the head no targets).
+    train_rows: str = "all"
     span_sources: list[str] = dataclasses.field(
         default_factory=lambda: ["structuring", "ner"]
     )
@@ -2093,6 +2096,9 @@ class NormalizationHeadConfig:
             if value < 1:
                 raise ValueError(f"{name} must be positive")
             setattr(self, name, value)
+        self.train_rows = str(self.train_rows).lower()
+        if self.train_rows not in ("all", "calculation"):
+            raise ValueError("train_rows must be 'all' or 'calculation'")
         self.span_sources = [str(source) for source in self.span_sources]
         unknown = set(self.span_sources) - {"structuring", "ner", "calculation"}
         if unknown:

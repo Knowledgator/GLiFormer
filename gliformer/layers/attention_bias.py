@@ -71,25 +71,39 @@ def _broadcast_coordinate_batches(
     return queries, keys
 
 
+_DIMENSION_INDEX_CACHE: dict[tuple[tuple[int, ...], torch.device], torch.Tensor] = {}
+
+
+def _dimension_index(indices: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """Device index tensor for ``indices``, copied to ``device`` only once."""
+
+    key = (indices, torch.device(device))
+    cached = _DIMENSION_INDEX_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(indices, dtype=torch.long).to(device)
+        _DIMENSION_INDEX_CACHE[key] = cached
+    return cached
+
+
 def _select_dimensions(
     coordinates: torch.Tensor,
     dimensions: Sequence[int] | None,
     width: int | None = None,
 ) -> torch.Tensor:
     if dimensions is not None:
-        indices = torch.as_tensor(
-            tuple(int(index) for index in dimensions),
-            dtype=torch.long,
-            device=coordinates.device,
-        )
-        if indices.numel() == 0:
+        # Validate the configured dimensions on the host: they are Python ints,
+        # so checking them on the device would only add GPU->CPU syncs.
+        indices = tuple(int(index) for index in dimensions)
+        if not indices:
             raise ValueError("attention bias coordinate dimensions cannot be empty")
-        if (indices < 0).any() or (indices >= coordinates.shape[-1]).any():
+        if any(index < 0 or index >= coordinates.shape[-1] for index in indices):
             raise ValueError(
                 "attention bias coordinate dimension is outside the supplied "
                 f"width {coordinates.shape[-1]}"
             )
-        coordinates = coordinates.index_select(-1, indices)
+        coordinates = coordinates.index_select(
+            -1, _dimension_index(indices, coordinates.device)
+        )
     if width is not None:
         if coordinates.shape[-1] < width:
             raise ValueError(
@@ -296,11 +310,16 @@ class GaussianDistanceAttentionBias(
         value: float | torch.Tensor,
         reference: torch.Tensor,
     ) -> torch.Tensor:
-        value = torch.as_tensor(
-            value,
-            dtype=reference.dtype,
-            device=reference.device,
-        )
+        if torch.is_tensor(value):
+            value = value.to(dtype=reference.dtype, device=reference.device)
+        else:
+            # A device fill, not a host->device copy of a Python scalar.
+            value = torch.full(
+                (),
+                value,
+                dtype=reference.dtype,
+                device=reference.device,
+            )
         if not self.per_head:
             return value
         if value.dim() == 0:
