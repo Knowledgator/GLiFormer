@@ -175,6 +175,50 @@ def score_anchor_labels(
     return logits
 
 
+def all_slot_classification_loss(
+    class_logits: torch.Tensor,
+    class_labels: torch.Tensor,
+    child_mask: torch.Tensor,
+    anchor_mask: torch.Tensor,
+    match_indices: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    loss_fn,
+    normalizer: torch.Tensor | float,
+) -> torch.Tensor:
+    """Sigmoid class loss over every (slot, label) pair, DETR style.
+
+    Matched slots target their gold class; every other valid pair, including
+    all labels of unmatched slots, targets zero. Unlike a matched-only loss,
+    background slots learn to give low class scores, so the class score alone
+    ranks detections. The sum is divided by ``normalizer`` (the matched-object
+    count), as in Deformable DETR.
+    """
+
+    batch_size, anchor_count, class_count = class_logits.shape
+    if class_count == 0 or anchor_count == 0:
+        return class_logits.new_tensor(0.0)
+    device = class_logits.device
+    sb, sa, tt = match_indices
+    targets = torch.zeros(
+        batch_size, anchor_count, class_count, device=device, dtype=torch.float32,
+    )
+    if sb.numel() > 0:
+        target_classes = class_labels[
+            sb.to(class_labels.device), tt.to(class_labels.device)
+        ].to(device=device).long()
+        valid = (target_classes >= 0) & (target_classes < class_count)
+        targets.index_put_(
+            (sb, sa, target_classes.clamp(0, class_count - 1)),
+            valid.float(),
+            accumulate=False,
+        )
+    pair_mask = (
+        child_mask[:, None, :class_count].to(device=device).bool()
+        & anchor_mask[:, :, None].to(device=device).bool()
+    )
+    losses = loss_fn(class_logits.float(), targets)
+    return torch.where(pair_mask, losses, torch.zeros_like(losses)).sum() / normalizer
+
+
 def normalized_objectness_loss(
     objectness_logits: torch.Tensor,
     target_objectness: torch.Tensor,
@@ -238,6 +282,11 @@ class MediaSetPredictionHead(TaskHead):
                 "class_probability",
                 "sigmoid",
             ),
+            class_cost_type=getattr(
+                task_config, "matcher_class_cost_type", "probability"
+            ),
+            focal_alpha=getattr(task_config, "matcher_focal_alpha", 0.25),
+            focal_gamma=getattr(task_config, "matcher_focal_gamma", 2.0),
         )
 
     def _init_set_prediction_pipeline(
@@ -381,6 +430,14 @@ class MediaSetPredictionDecoder(TaskDecoder):
             if objectness is not None
             else torch.ones_like(class_probabilities[..., 0])
         )
+        # "class": rank by class probability alone (heads trained with an
+        # all-slot class loss); "class_x_objectness": the historical product.
+        score_mode = getattr(head_config, "detection_score", "class_x_objectness")
+        score_objectness = (
+            torch.ones_like(objectness_probabilities)
+            if score_mode == "class"
+            else objectness_probabilities
+        )
         id_to_class_maps = id_maps(classes_mapping, self.mapping_name)
         flat_results = []
         for batch_idx in range(class_probabilities.shape[0]):
@@ -403,7 +460,7 @@ class MediaSetPredictionDecoder(TaskDecoder):
                     continue
                 scores = (
                     class_probabilities[batch_idx, anchor_idx, :class_count]
-                    * objectness_probabilities[batch_idx, anchor_idx]
+                    * score_objectness[batch_idx, anchor_idx]
                 )
                 if multi_label:
                     class_indices = torch.nonzero(

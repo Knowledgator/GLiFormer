@@ -220,6 +220,7 @@ class GaussianDistanceAttentionBias(
             "learnable_sigma",
             "learnable_weight",
             "per_head",
+            "min_box_size",
         }
     )
 
@@ -234,10 +235,15 @@ class GaussianDistanceAttentionBias(
         learnable_sigma: bool = False,
         learnable_weight: bool = False,
         per_head: bool = False,
+        min_box_size: float = 0.05,
         **kwargs,
     ):
         super().__init__()
         sigma = _finite("sigma", sigma)
+        min_box_size = _finite("min_box_size", min_box_size)
+        if min_box_size <= 0.0:
+            raise ValueError("attention bias min_box_size must be positive")
+        self.min_box_size = min_box_size
         if sigma <= 0.0:
             raise ValueError("attention bias sigma must be positive")
         weight = _finite("weight", weight)
@@ -281,10 +287,13 @@ class GaussianDistanceAttentionBias(
         else:
             self.register_parameter("raw_weight", None)
         self.units = str(units).lower().replace("-", "_")
-        if self.units not in {"normalized", "query_steps"}:
+        # "box": distances are measured in the query box's own width and
+        # height (query coordinates cx, cy, w, h), so a small box attends to a
+        # small region and a large box to a large one.
+        if self.units not in {"normalized", "query_steps", "box"}:
             raise ValueError(
-                "Gaussian attention bias units must be 'normalized' or "
-                "'query_steps'"
+                "Gaussian attention bias units must be 'normalized', "
+                "'query_steps' or 'box'"
             )
         self.query_dimensions = (
             None if query_dimensions is None else tuple(query_dimensions)
@@ -349,6 +358,14 @@ class GaussianDistanceAttentionBias(
             length=key_length,
             device=device,
         )
+        box_size = None
+        if self.units == "box":
+            if queries.shape[-1] < 4:
+                raise ValueError(
+                    "Gaussian attention bias units 'box' needs query "
+                    "coordinates (cx, cy, w, h)"
+                )
+            box_size = queries[..., 2:4].clamp_min(self.min_box_size)
         queries = _select_dimensions(queries, self.query_dimensions)
         keys = _select_dimensions(keys, self.key_dimensions)
         coordinate_width = min(queries.shape[-1], keys.shape[-1])
@@ -358,6 +375,14 @@ class GaussianDistanceAttentionBias(
         delta = queries.unsqueeze(-2) - keys.unsqueeze(-3)
         if self.units == "query_steps":
             delta = delta * max(int(query_length), 1)
+        elif box_size is not None:
+            if delta.shape[-1] != 2:
+                raise ValueError(
+                    "Gaussian attention bias units 'box' compares 2D centers"
+                )
+            if box_size.shape[0] != delta.shape[0]:
+                box_size = box_size.expand(delta.shape[0], -1, -1)
+            delta = delta / box_size.unsqueeze(-2)
         squared_distance = delta.square().sum(dim=-1)
         sigma = self._broadcast_parameter(self.sigma, squared_distance)
         weight = self._broadcast_parameter(self.weight, squared_distance)

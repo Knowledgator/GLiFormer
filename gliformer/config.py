@@ -636,6 +636,8 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
         "reference_box_initialization",
         "reference_box_initial_size",
         "reference_box_grid_margin",
+        "memory_norm",
+        "query_selection_topk",
     )
 
     anchor_refine_layers: int = 2
@@ -665,10 +667,58 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
     iou_loss_coef: float = 2.0
     matcher_bbox_cost: float = 5.0
     matcher_giou_cost: float = 2.0
+    # "matched": class loss on matched slots only (historical). "all_slots":
+    # sigmoid loss over every slot and label, unmatched slots targeting zero,
+    # summed and divided by the matched count (Deformable DETR). Pair it with
+    # focal_loss_alpha/gamma (0.25/2.0) and detection_score="class".
+    class_loss_scope: str = "matched"
+    # "probability": -p(target class). "focal": Deformable-DETR focal cost.
+    matcher_class_cost_type: str = "probability"
+    matcher_focal_alpha: float = 0.25
+    matcher_focal_gamma: float = 2.0
+    # Subtracted times sigmoid(objectness) from every pair cost of a slot.
+    matcher_objectness_cost: float = 0.0
+    # "binary": matched slots target 1. "iou": they target their box IoU.
+    objectness_target: str = "binary"
+    # Decoder score: "class_x_objectness" (historical) or "class".
+    detection_score: str = "class_x_objectness"
+    # Image tokens leave the backbone at a small scale (RMS ~0.3 on Qwen3.5)
+    # next to unit-scale sine positions, so attention would mostly follow
+    # position. "layernorm" or "linear_layernorm" (DETR's input projection)
+    # brings the decoder memory to unit scale; "none" keeps raw features.
+    memory_norm: str = "none"
+    # Two-stage "mixed" query selection: every image token proposes a box and
+    # class scores; the top-k tokens seed the first k slots' reference boxes
+    # (slot content stays learned). 0 disables it. Keep k at or below the
+    # smallest image's token count (vision_min_pixels / 32**2).
+    query_selection_topk: int = 0
+    # Weight of the token-proposal set loss (needs query_selection_topk > 0).
+    encoder_loss_coef: float = 1.0
 
     def __post_init__(self):
         super().__post_init__()
         from .layers.position import PositionEmbedding, covering_grid_2d
+
+        if self.class_loss_scope not in {"matched", "all_slots"}:
+            raise ValueError("class_loss_scope must be 'matched' or 'all_slots'")
+        if self.matcher_class_cost_type not in {"probability", "focal"}:
+            raise ValueError("matcher_class_cost_type must be 'probability' or 'focal'")
+        if self.objectness_target not in {"binary", "iou"}:
+            raise ValueError("objectness_target must be 'binary' or 'iou'")
+        if self.detection_score not in {"class_x_objectness", "class"}:
+            raise ValueError("detection_score must be 'class_x_objectness' or 'class'")
+        if self.matcher_objectness_cost < 0:
+            raise ValueError("matcher_objectness_cost must be non-negative")
+        if self.query_selection_topk < 0 or self.encoder_loss_coef < 0:
+            raise ValueError(
+                "query_selection_topk and encoder_loss_coef must be non-negative"
+            )
+        if self.query_selection_topk > 0 and not self.iterative_box_refinement:
+            raise ValueError("query_selection_topk requires iterative_box_refinement")
+        if self.memory_norm not in {"none", "layernorm", "linear_layernorm"}:
+            raise ValueError(
+                "memory_norm must be 'none', 'layernorm' or 'linear_layernorm'"
+            )
 
         self.memory_position_embedding_kwargs = dict(
             self.memory_position_embedding_kwargs or {}
@@ -857,6 +907,8 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
             "spatial_attention_bias_type",
             "spatial_attention_sigma",
             "spatial_attention_bias_weight",
+            "memory_norm",
+            "query_selection_topk",
         ]
         if mode == "features":
             fields.extend(

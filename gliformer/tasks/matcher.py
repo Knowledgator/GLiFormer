@@ -352,9 +352,23 @@ class HungarianMatcher(nn.Module):
         cost_geometry: float = 1.0,
         cost_giou: float = 0.0,
         class_probability: ClassProbability = "sigmoid",
+        class_cost_type: str = "probability",
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
     ):
         super().__init__()
         self.cost_class = float(cost_class)
+        # "probability": -p of the target class. "focal": the Deformable-DETR
+        # cost, the focal loss of calling the pair positive minus that of
+        # calling it negative, which separates confident slots far more.
+        if class_cost_type not in {"probability", "focal"}:
+            raise ValueError(
+                "class_cost_type must be 'probability' or 'focal', "
+                f"got {class_cost_type!r}"
+            )
+        self.class_cost_type = class_cost_type
+        self.focal_alpha = float(focal_alpha)
+        self.focal_gamma = float(focal_gamma)
         self.cost_geometry = float(cost_geometry)
         self.cost_giou = float(cost_giou)
         if isinstance(class_probability, str):
@@ -398,8 +412,13 @@ class HungarianMatcher(nn.Module):
         target_geometry: torch.Tensor,
         giou_geometry_preds: torch.Tensor | None = None,
         target_giou_geometry: torch.Tensor | None = None,
+        objectness_logits: torch.Tensor | None = None,
+        cost_objectness: float = 0.0,
     ) -> torch.Tensor:
         """Return the padded ``(N, P, T)`` matching cost for a whole batch.
+
+        ``objectness_logits`` ``(N, P)`` with a positive ``cost_objectness``
+        makes slots that already claim an object cheaper to match.
 
         Every entry equals the cost the single-sample matcher computes for the
         same prediction/target pair; masking happens in the assignment step.
@@ -436,9 +455,24 @@ class HungarianMatcher(nn.Module):
                 .unsqueeze(1)
                 .expand(-1, predictions, -1),
             )
+            if self.class_cost_type == "focal":
+                eps = 1e-8
+                positive = (
+                    self.focal_alpha
+                    * (1.0 - gathered).pow(self.focal_gamma)
+                    * -(gathered + eps).log()
+                )
+                negative = (
+                    (1.0 - self.focal_alpha)
+                    * gathered.pow(self.focal_gamma)
+                    * -(1.0 - gathered + eps).log()
+                )
+                pair_cost = positive - negative
+            else:
+                pair_cost = -gathered
             class_cost = torch.where(
                 valid_classes.unsqueeze(1),
-                -gathered,
+                pair_cost,
                 torch.zeros_like(gathered),
             )
         else:
@@ -465,11 +499,16 @@ class HungarianMatcher(nn.Module):
             )
         else:
             giou_cost = geometry_cost.new_zeros(geometry_cost.shape)
-        return (
+        cost = (
             self.cost_class * class_cost
             + self.cost_geometry * geometry_cost
             + self.cost_giou * giou_cost
         )
+        if objectness_logits is not None and cost_objectness:
+            cost = cost - float(cost_objectness) * (
+                objectness_logits.float().sigmoid().unsqueeze(-1)
+            )
+        return cost
 
     @torch.no_grad()
     def match_batch(

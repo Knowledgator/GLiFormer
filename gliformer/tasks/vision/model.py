@@ -10,6 +10,7 @@ from torch import nn
 
 from .. import TaskHead, TaskHeadOutput
 from ..box_ops import (
+    aligned_box_iou,
     aligned_generalized_box_iou,
     box_cxcywh_to_xyxy,
     box_xyxy_to_cxcywh,
@@ -18,6 +19,7 @@ from ...layers import covering_grid_2d, normalized_grid_2d, ragged_normalized_gr
 from ...layers.mlp import create_mlp
 from ..media import (
     MediaClassificationHead,
+    all_slot_classification_loss,
     MediaSetPredictionHead,
     flat_features,
     matched_classification_loss,
@@ -112,6 +114,10 @@ class DetectionPredictions:
     # One (height, width) for the batch, or a (BN, 2) tensor when rows differ.
     spatial_shape: Union[Tuple[int, int], torch.Tensor]
     auxiliary_predictions: tuple[DetectionStagePredictions, ...] = ()
+    # Two-stage query selection: per-token proposals over the image grid and
+    # the token mask they are matched under.
+    encoder_predictions: Optional[DetectionStagePredictions] = None
+    encoder_mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -197,6 +203,37 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             dropout=dropout,
             activation="gelu",
         )
+        memory_norm = getattr(cfg, "memory_norm", "none")
+        if memory_norm == "layernorm":
+            self.memory_norm = nn.LayerNorm(hidden_size)
+        elif memory_norm == "linear_layernorm":
+            self.memory_norm = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+            )
+        else:
+            self.memory_norm = None
+        self.query_selection_topk = int(getattr(cfg, "query_selection_topk", 0) or 0)
+        if self.query_selection_topk > 0:
+            self.encoder_proposal = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+            )
+            self.encoder_bbox_head = create_mlp(
+                input_dim=hidden_size,
+                intermediate_dims=[hidden_size // 2],
+                output_dim=4,
+                dropout=dropout,
+                activation="gelu",
+            )
+            self._zero_output_layer(self.encoder_bbox_head)
+            self.encoder_objectness_head = create_mlp(
+                input_dim=hidden_size,
+                intermediate_dims=[hidden_size // 2],
+                output_dim=1,
+                dropout=dropout,
+                activation="gelu",
+            )
         self.reference_boxes = None
         if getattr(cfg, "reference_box_mode", "learned") == "learned":
             fixed_modes = {"fixed", "fixed_rnn", "fixed_transformer"}
@@ -522,9 +559,109 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         grid = self._dense_grid(flat_inputs)
         return grid.features, grid.mask, self._grid_memory_positions(grid), grid.spatial_shape
 
+    def _encoder_proposals(
+        self,
+        grid: DenseGrid,
+        flat_inputs,
+    ) -> Tuple[DetectionStagePredictions, torch.Tensor, torch.Tensor]:
+        """Score every image token as an object proposal.
+
+        Each token predicts a box relative to a prior centred on its own cell
+        and class logits against the prompt labels. Returns the proposals, the
+        box logits and the boolean token mask.
+        """
+
+        features = grid.features
+        batch_size, token_count = features.shape[:2]
+        if grid.mask is None:
+            token_mask = torch.ones(
+                batch_size, token_count, dtype=torch.bool, device=features.device,
+            )
+        else:
+            token_mask = grid.mask.to(device=features.device).bool()
+        coordinates = grid.coordinates.to(device=features.device, dtype=torch.float32)
+        if coordinates.dim() == 2:
+            coordinates = coordinates.unsqueeze(0).expand(batch_size, -1, -1)
+        if grid.uniform_shape is not None:
+            rows, cols = grid.uniform_shape
+            cell = coordinates.new_tensor([1.0 / cols, 1.0 / rows]).expand_as(coordinates)
+        else:
+            shapes = grid.row_shapes.to(device=features.device, dtype=torch.float32)
+            cell = (1.0 / shapes.flip(-1).clamp(min=1.0))[:, None, :].expand_as(coordinates)
+        # A prior twice the cell size, centred on the token.
+        prior = torch.cat([coordinates, (2.0 * cell).clamp(max=0.5)], dim=-1)
+        prior_logits = _inverse_sigmoid(prior)
+
+        tokens = self.encoder_proposal(features)
+        box_logits = self.encoder_bbox_head(tokens).float() + prior_logits
+        boxes_cxcywh = box_logits.sigmoid()
+        class_logits = self._score_anchor_labels(
+            tokens,
+            flat_inputs.child_embedding,
+            flat_inputs.child_mask,
+            token_mask,
+        )
+        proposals = DetectionStagePredictions(
+            class_logits=class_logits,
+            boxes_xyxy=box_cxcywh_to_xyxy(boxes_cxcywh),
+            boxes_cxcywh=boxes_cxcywh,
+            objectness_logits=self.encoder_objectness_head(tokens).squeeze(-1),
+            anchors=tokens,
+        )
+        return proposals, box_logits, token_mask
+
+    def _select_reference_logits(
+        self,
+        reference_logits: torch.Tensor,
+        proposals: DetectionStagePredictions,
+        proposal_box_logits: torch.Tensor,
+        token_mask: torch.Tensor,
+        child_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Seed the first ``query_selection_topk`` slots with the best tokens.
+
+        Slots keep their learned content embeddings ("mixed" query selection,
+        as in DINO-DETR); only their starting boxes come from the image. A
+        selected padding token (an image with fewer tokens than ``k``) keeps
+        the learned reference box instead, so no step reads a device value.
+        """
+
+        k = min(
+            self.query_selection_topk,
+            reference_logits.shape[1],
+            proposals.class_logits.shape[1],
+        )
+        if k <= 0:
+            return reference_logits
+        class_count = proposals.class_logits.shape[-1]
+        label_mask = child_mask[:, None, :class_count].to(
+            device=token_mask.device,
+        ).bool()
+        scores = proposals.class_logits.detach().float().masked_fill(~label_mask, -1e4)
+        scores = scores.max(dim=-1).values if class_count > 0 else torch.zeros_like(
+            token_mask, dtype=torch.float32,
+        )
+        scores = scores + proposals.objectness_logits.detach().float()
+        scores = scores.masked_fill(~token_mask, float("-inf"))
+        top = scores.topk(k, dim=1).indices
+        selected = proposal_box_logits.detach().gather(
+            1, top.unsqueeze(-1).expand(-1, -1, 4),
+        )
+        selected_valid = token_mask.gather(1, top).unsqueeze(-1)
+        head = torch.where(selected_valid, selected, reference_logits[:, :k])
+        return torch.cat([head, reference_logits[:, k:]], dim=1)
+
     def _compute_detection(self, flat_inputs, count=None, threshold=0.5) -> DetectionPredictions:
         grid = self._dense_grid(flat_inputs)
         image_features, image_mask = grid.features, grid.mask
+        # Mask-head features stay raw; the decoder reads the normalized memory.
+        dense_features = image_features
+        if self.memory_norm is not None:
+            image_features = self.memory_norm(image_features)
+            grid = DenseGrid(
+                image_features, image_mask, grid.coordinates,
+                grid.row_shapes, grid.uniform_shape,
+            )
         memory_positions = self._grid_memory_positions(grid)
         memory_coordinates = grid.coordinates
         # Grid-table position strategies need one shape; per-row grids pass None.
@@ -561,6 +698,19 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 -1,
                 -1,
             ).float()
+            encoder_predictions = None
+            encoder_mask = None
+            if self.query_selection_topk > 0:
+                encoder_predictions, proposal_logits, encoder_mask = (
+                    self._encoder_proposals(grid, flat_inputs)
+                )
+                reference_logits = self._select_reference_logits(
+                    reference_logits,
+                    encoder_predictions,
+                    proposal_logits,
+                    encoder_mask,
+                    flat_inputs.child_mask,
+                )
             stage_predictions: list[DetectionStagePredictions] = []
             for layer_index in range(num_layers):
                 reference_boxes = reference_logits.sigmoid()
@@ -613,10 +763,12 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 objectness_logits=final.objectness_logits,
                 anchors=final.anchors,
                 anchor_mask=anchor_mask,
-                dense_features=image_features,
+                dense_features=dense_features,
                 dense_mask=image_mask,
                 spatial_shape=spatial_shape,
                 auxiliary_predictions=tuple(stage_predictions[:-1]),
+                encoder_predictions=encoder_predictions,
+                encoder_mask=encoder_mask,
             )
 
         static_references = None
@@ -662,7 +814,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             objectness_logits=objectness_logits,
             anchors=anchors,
             anchor_mask=anchor_mask,
-            dense_features=image_features,
+            dense_features=dense_features,
             dense_mask=image_mask,
             spatial_shape=spatial_shape,
         )
@@ -713,16 +865,21 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         bbox_labels,
         object_mask,
         anchor_mask,
+        stage_masks=None,
     ) -> list[list[list[tuple[int, int]]]]:
         """Hungarian-match every decoder stage with one host round trip.
 
-        ``stages`` holds ``(class_logits, boxes_xyxy, boxes_cxcywh)`` per stage.
-        Costs of all stages and samples are stacked into one padded tensor,
-        so the main and auxiliary matchings share a single device-to-host copy.
+        ``stages`` holds ``(class_logits, boxes_xyxy, boxes_cxcywh)`` per stage,
+        optionally followed by the stage's objectness logits. Costs of all
+        stages and samples are stacked into one padded tensor, so the main and
+        auxiliary matchings share a single device-to-host copy.
         """
 
+        objectness_cost = float(getattr(self.det_cfg, "matcher_objectness_cost", 0.0))
         costs = []
-        for class_logits, bbox_preds, bbox_cxcywh in stages:
+        for stage in stages:
+            class_logits, bbox_preds, bbox_cxcywh = stage[:3]
+            objectness_logits = stage[3] if len(stage) > 3 else None
             geometry_preds, target_geometry = self._matching_geometry(
                 bbox_preds, bbox_cxcywh, bbox_labels,
             )
@@ -734,14 +891,31 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                     target_geometry,
                     giou_geometry_preds=bbox_preds,
                     target_giou_geometry=bbox_labels,
+                    objectness_logits=objectness_logits,
+                    cost_objectness=objectness_cost,
                 )
             )
         batch_size = costs[0].shape[0]
         stage_count = len(costs)
+        if stage_masks is None:
+            stage_masks = [anchor_mask] * stage_count
+        # Stages may predict different numbers of slots (decoder slots vs
+        # image tokens): pad them to one width, padded rows masked out.
+        width = max(cost.shape[1] for cost in costs)
+        padded_costs = []
+        padded_masks = []
+        for cost, mask in zip(costs, stage_masks, strict=True):
+            extra = width - cost.shape[1]
+            mask = (mask > 0).to(device=cost.device)
+            if extra:
+                cost = F.pad(cost, (0, 0, 0, extra))
+                mask = F.pad(mask, (0, extra), value=False)
+            padded_costs.append(cost)
+            padded_masks.append(mask)
         matches = batched_minimum_cost_assignment(
-            torch.cat(costs, dim=0),
-            (anchor_mask > 0).repeat(stage_count, 1),
-            (object_mask > 0).to(anchor_mask.device).repeat(stage_count, 1),
+            torch.cat(padded_costs, dim=0),
+            torch.cat(padded_masks, dim=0),
+            (object_mask > 0).to(padded_costs[0].device).repeat(stage_count, 1),
         )
         return [
             matches[stage * batch_size:(stage + 1) * batch_size]
@@ -762,6 +936,8 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         base_loss_fn=None,
         auxiliary_predictions: tuple[DetectionStagePredictions, ...] = (),
         matches: Optional[list] = None,
+        encoder_predictions: Optional[DetectionStagePredictions] = None,
+        encoder_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[int, list]]:
         B, A, C = class_logits.shape
         device = class_logits.device
@@ -772,26 +948,46 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             tuple(auxiliary_predictions) if auxiliary_coef > 0.0 else ()
         )
         auxiliary_matches = [None] * len(auxiliary_predictions)
+        encoder_coef = float(getattr(self.det_cfg, "encoder_loss_coef", 1.0))
+        if encoder_predictions is None or encoder_coef <= 0.0:
+            encoder_predictions = None
+        encoder_stages = (
+            [(
+                encoder_predictions.class_logits,
+                encoder_predictions.boxes_xyxy,
+                encoder_predictions.boxes_cxcywh,
+                encoder_predictions.objectness_logits,
+            )]
+            if encoder_predictions is not None
+            else []
+        )
+        encoder_matches = None
         if matches is None:
             stage_matches = self._match_stages(
                 [
-                    (class_logits, bbox_preds, bbox_cxcywh),
+                    (class_logits, bbox_preds, bbox_cxcywh, objectness_logits),
                     *(
                         (
                             auxiliary.class_logits,
                             auxiliary.boxes_xyxy,
                             auxiliary.boxes_cxcywh,
+                            auxiliary.objectness_logits,
                         )
                         for auxiliary in auxiliary_predictions
                     ),
+                    *encoder_stages,
                 ],
                 class_labels,
                 bbox_labels,
                 object_mask,
                 anchor_mask,
+                stage_masks=[anchor_mask] * (1 + len(auxiliary_predictions))
+                + ([encoder_mask] if encoder_stages else []),
             )
             matches = stage_matches[0]
-            auxiliary_matches = stage_matches[1:]
+            auxiliary_matches = stage_matches[1:1 + len(auxiliary_predictions)]
+            if encoder_stages:
+                encoder_matches = stage_matches[-1]
         matches_by_batch: Dict[int, list] = {
             b: matches[b] for b in range(B)
         }
@@ -803,26 +999,47 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         loss_fn = base_loss_fn or self._default_binary_loss
         target_objectness = torch.zeros_like(objectness_logits)
 
+        class_loss_scope = getattr(self.det_cfg, "class_loss_scope", "matched")
         if flat_matches.shape[1] > 0:
             sb, sa, tt = match_index_tensors(flat_matches, device)
-            target_objectness[sb, sa] = 1.0
-
-            class_loss = matched_classification_loss(
-                class_logits,
-                class_labels,
-                child_mask,
-                matches_by_batch,
-                loss_fn,
-                class_probability=getattr(
-                    self.det_cfg,
-                    "class_probability",
-                    "sigmoid",
-                ),
-                match_indices=(sb, sa, tt),
-            )
-
             matched_bbox_pred = bbox_preds[sb, sa]
             matched_bbox_target = bbox_labels[sb, tt].to(device=device, dtype=bbox_preds.dtype)
+            if getattr(self.det_cfg, "objectness_target", "binary") == "iou":
+                # Quality-aware objectness: a matched slot's target is its
+                # box IoU, so the score ranks well-localized boxes first.
+                matched_iou = aligned_box_iou(
+                    matched_bbox_pred.detach().float(),
+                    matched_bbox_target.float(),
+                ).clamp(min=0.01, max=1.0)
+                target_objectness[sb, sa] = matched_iou.to(target_objectness.dtype)
+            else:
+                target_objectness[sb, sa] = 1.0
+
+            if class_loss_scope == "all_slots":
+                class_loss = all_slot_classification_loss(
+                    class_logits,
+                    class_labels,
+                    child_mask,
+                    anchor_mask,
+                    (sb, sa, tt),
+                    loss_fn,
+                    float(num_matched),
+                )
+            else:
+                class_loss = matched_classification_loss(
+                    class_logits,
+                    class_labels,
+                    child_mask,
+                    matches_by_batch,
+                    loss_fn,
+                    class_probability=getattr(
+                        self.det_cfg,
+                        "class_probability",
+                        "sigmoid",
+                    ),
+                    match_indices=(sb, sa, tt),
+                )
+
             if getattr(self.det_cfg, "bbox_l1_format", "cxcywh") == "cxcywh":
                 matched_l1_pred = bbox_cxcywh[sb, sa]
                 matched_l1_target = box_xyxy_to_cxcywh(matched_bbox_target)
@@ -841,7 +1058,15 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 )
             ).sum() / num_matched
         else:
-            class_loss = class_logits.new_tensor(0.0)
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            class_loss = (
+                all_slot_classification_loss(
+                    class_logits, class_labels, child_mask, anchor_mask,
+                    (empty, empty, empty), loss_fn, 1.0,
+                )
+                if class_loss_scope == "all_slots"
+                else class_logits.new_tensor(0.0)
+            )
             bbox_loss = class_logits.new_tensor(0.0)
             iou_loss = class_logits.new_tensor(0.0)
 
@@ -892,6 +1117,21 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 )
                 auxiliary_losses.append(auxiliary_loss)
             loss = loss + auxiliary_coef * torch.stack(auxiliary_losses).mean()
+        if encoder_predictions is not None and encoder_matches is not None:
+            encoder_loss, _ = self._detection_loss(
+                encoder_predictions.class_logits,
+                encoder_predictions.boxes_xyxy,
+                encoder_predictions.boxes_cxcywh,
+                encoder_predictions.objectness_logits,
+                encoder_mask,
+                child_mask,
+                class_labels,
+                bbox_labels,
+                object_mask,
+                base_loss_fn=base_loss_fn,
+                matches=encoder_matches,
+            )
+            loss = loss + encoder_coef * encoder_loss
         return loss, matches_by_batch
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
@@ -919,6 +1159,8 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 flat_inputs.child_mask, class_labels, bbox_labels, object_mask,
                 base_loss_fn=batch.get("base_loss_fn"),
                 auxiliary_predictions=predictions.auxiliary_predictions,
+                encoder_predictions=predictions.encoder_predictions,
+                encoder_mask=predictions.encoder_mask,
             )
 
         return TaskHeadOutput(
@@ -1294,6 +1536,8 @@ class SegmentationHead(ObjectDetectionHead):
                 flat_inputs.child_mask, class_labels, bbox_labels, object_mask,
                 base_loss_fn=batch.get("base_loss_fn"),
                 auxiliary_predictions=predictions.auxiliary_predictions,
+                encoder_predictions=predictions.encoder_predictions,
+                encoder_mask=predictions.encoder_mask,
             )
             mask_loss = predictions.class_logits.new_tensor(0.0)
             if mask_labels is not None:
