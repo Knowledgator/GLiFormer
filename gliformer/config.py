@@ -1786,11 +1786,18 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     typed_shuffle_options: bool = True
     typed_class_focal_loss_alpha: Optional[float] = None
     typed_class_focal_loss_gamma: Optional[float] = None
+    # Record-slot refinement reads the text words only by default. True also
+    # lets the slots cross-attend to the schema: the structure token and its
+    # field tokens, appended after the text with no position and a learned
+    # "schema" embedding instead. Needs no cross-attention bias.
+    anchor_memory_schema: bool = False
 
     def __post_init__(self):
         super().__post_init__()
         if not isinstance(self.reuse_ner_head, bool):
             raise TypeError("reuse_ner_head must be a boolean")
+        if not isinstance(self.anchor_memory_schema, bool):
+            raise TypeError("anchor_memory_schema must be a boolean")
         self.typed_fields = bool(self.typed_fields)
         self.typed_shuffle_options = bool(self.typed_shuffle_options)
         if int(self.typed_readout_heads) < 1:
@@ -2263,6 +2270,7 @@ class CalculationHeadConfig:
 
 SEQUENCE_EDITING_VOCABS = ("tied",)
 SEQUENCE_EDITING_CONTENT_MODES = ("slots", "tags")
+SEQUENCE_EDITING_SLOT_DECODERS = ("decoder", "mlp")
 
 
 @dataclass
@@ -2290,6 +2298,14 @@ class SequenceEditingHeadConfig:
     context_layers: int = 0
     decoder_layers: int = 2
     decoder_heads: int = 8
+    # How the content slots of an edit are built from its unit state.
+    # "decoder": slot queries refined by ``decoder_layers`` blocks of slot
+    # self-attention + cross-attention to the encoder tokens (historical).
+    # "mlp": one MLP projects the unit state (+ op) into the ``max_content_len``
+    # slot states; no attention, ``decoder_layers``/``local_window`` unused.
+    # Same accuracy as "decoder" in experiments/edit_slots, ~40% faster
+    # training of the head and 1.8x fewer parameters.
+    slot_decoder: str = "decoder"
     # Content slots also attend to the subwords of the edited unit and of
     # ``local_window`` units on each side (at most ``local_max_tokens``);
     # 0 disables it.
@@ -2352,6 +2368,11 @@ class SequenceEditingHeadConfig:
         if not 0.0 <= self.min_edit_prob < 1.0:
             raise ValueError("min_edit_prob must be in [0, 1)")
         self.edit_token_index = int(self.edit_token_index)
+        self.slot_decoder = str(self.slot_decoder).lower()
+        if self.slot_decoder not in SEQUENCE_EDITING_SLOT_DECODERS:
+            raise ValueError(f"slot_decoder must be one of {list(SEQUENCE_EDITING_SLOT_DECODERS)}")
+        if self.slot_decoder == "mlp" and self.local_window > 0:
+            raise ValueError("local_window needs slot_decoder 'decoder'")
         self.content_mode = str(self.content_mode).lower()
         if self.content_mode not in SEQUENCE_EDITING_CONTENT_MODES:
             raise ValueError(f"content_mode must be one of {list(SEQUENCE_EDITING_CONTENT_MODES)}")

@@ -168,12 +168,21 @@ class SequenceEditingHead(TaskHead):
         self.length_head = _mlp(hidden_size, self.max_content, dropout)
         self.space_head = _mlp(hidden_size, 1, dropout)
 
-        # Unit scale, like the LayerNorm'd unit states it is added to: a small
-        # init leaves the slots nearly identical and they copy each other.
-        self.slot_pos = nn.Parameter(torch.randn(self.max_content, hidden_size))
-        self.decoder = nn.ModuleList(
-            SlotDecoderLayer(hidden_size, cfg.decoder_heads, dropout) for _ in range(cfg.decoder_layers)
-        )
+        self.slot_mlp = None
+        if getattr(cfg, "slot_decoder", "decoder") == "mlp":
+            # Unit state (+ op) -> all ``M`` slot states at once.
+            self.slot_mlp = nn.Sequential(
+                nn.Linear(hidden_size, 2 * hidden_size), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(2 * hidden_size, self.max_content * hidden_size),
+            )
+            self.decoder = nn.ModuleList()
+        else:
+            # Unit scale, like the LayerNorm'd unit states it is added to: a small
+            # init leaves the slots nearly identical and they copy each other.
+            self.slot_pos = nn.Parameter(torch.randn(self.max_content, hidden_size))
+            self.decoder = nn.ModuleList(
+                SlotDecoderLayer(hidden_size, cfg.decoder_heads, dropout) for _ in range(cfg.decoder_layers)
+            )
         self.out_norm = nn.LayerNorm(hidden_size)
         self.local_window = int(cfg.local_window)
         if self.local_window > 0:
@@ -280,17 +289,22 @@ class SequenceEditingHead(TaskHead):
     def _decode_slots(self, edit_states, edit_ops, edit_rows, shared, local=None, local_pad=None):
         """Refined slot states ``(E, M, D)`` and the row packing used."""
 
-        slots = (
-            edit_states[:, None, :]
-            + self.slot_pos[None].to(edit_states.dtype)
-            + self.op_embed(edit_ops)[:, None, :]
-        )
         packing = _RowPacking(edit_rows, self.max_content)
         memory = text_token_states(shared)[packing.rows]
         if shared.attention_mask is not None:
             memory_pad = ~shared.attention_mask[packing.rows].bool()
         else:
             memory_pad = torch.zeros(memory.shape[:2], dtype=torch.bool, device=memory.device)
+        if self.slot_mlp is not None:
+            # Memory is still returned: the copy pointer reads it.
+            projected = self.slot_mlp(edit_states + self.op_embed(edit_ops))
+            slots = edit_states[:, None, :] + projected.view(-1, self.max_content, self.hidden_size)
+            return self.out_norm(slots), packing, memory, memory_pad
+        slots = (
+            edit_states[:, None, :]
+            + self.slot_pos[None].to(edit_states.dtype)
+            + self.op_embed(edit_ops)[:, None, :]
+        )
         for layer in self.decoder:
             slots = layer(slots, packing, memory, memory_pad, local, local_pad)
         return self.out_norm(slots), packing, memory, memory_pad
