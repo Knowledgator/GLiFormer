@@ -2189,6 +2189,11 @@ class CalculationHeadConfig:
     slot_refine_layers: int = 2
     slot_heads: int = 8
     readout_heads: int = 8
+    # Normalization of the initial slots (table + query + position) before
+    # refinement: an ``AnchorNormalizer`` type or ``{type, params}`` mapping,
+    # e.g. ``{type: center_rms, params: {center: anchors}}`` (subtract the
+    # slot mean, rescale to unit RMS). "none" keeps the slots as built.
+    slot_normalization: str | dict[str, Any] = "none"
     # Anchor modeling of the (record anchor, [CALC] marker) query: an
     # ``AnchorModeling`` type or ``{type, params}`` mapping.  "readout" fuses
     # record and marker, then reads the text; ``readout_heads`` is its default

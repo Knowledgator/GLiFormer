@@ -229,7 +229,10 @@ class NormalizationProcessor(TaskProcessor):
         """Labelled spans of one row in reading order, within ``limit`` words."""
 
         cfg = self.task_config
-        if cfg.train_rows == "calculation" and not isinstance(item.get(CALCULATION_DATA_KEY), dict):
+        # The collator fills every row with an empty ``calculation`` dict, so
+        # only a non-empty one marks a row with calculation programs.
+        programs = item.get(CALCULATION_DATA_KEY)
+        if cfg.train_rows == "calculation" and not (isinstance(programs, dict) and programs):
             return []
         merged: dict[tuple[int, int], SpanTarget] = {}
         for target in self._gold_targets(item):

@@ -35,6 +35,7 @@ from gliner.modeling.utils import extract_spans_from_tokens
 from torch import nn
 
 from ...layers import AnchoredSpanScorer, AnchorModeling
+from ...layers.anchor_normalization import AnchorNormalizer
 from ...layers.anchor_modeling import rename_state_dict_keys
 from ...layers.mlp import create_mlp
 from ...layers.span_pooling import SpanTokenSource, build_span_pooler
@@ -157,6 +158,7 @@ class CalculationHead(TaskHead):
         # like the query and slots could not learn their step position.
         self.slot_position = nn.Embedding(cfg.num_slots, hidden_size)
         nn.init.normal_(self.slot_position.weight, std=1.0)
+        self.slot_norm = AnchorNormalizer.from_config(cfg.slot_normalization, hidden_size)
         # Memory segments: 0 query, 1 operand span, 2 text unit.
         self.memory_type = nn.Embedding(3, hidden_size)
         self.port_role = nn.Embedding(NUM_PORTS, hidden_size)
@@ -584,6 +586,7 @@ class CalculationHead(TaskHead):
 
         slots, slot_mask = self.slot_layer(query)
         slots = slots + self.slot_position.weight.unsqueeze(0)
+        slots = self.slot_norm(slots, slot_mask)
         memory = torch.cat([
             (query + self.memory_type.weight[0]).unsqueeze(1),
             span_vectors + self.memory_type.weight[1],
