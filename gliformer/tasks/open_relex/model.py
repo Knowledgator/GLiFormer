@@ -5,11 +5,11 @@ import warnings
 from copy import copy
 
 import torch
-from gliner.modeling.span_rep import SpanRepLayer
 from gliner.modeling.utils import extract_spans_from_tokens
 from torch import nn
 
 from ...layers.mlp import create_mlp
+from ...layers.span_pooling import build_span_pooler
 from .. import TaskHeadOutput
 from ..matcher import (
     batched_masked_assignment,
@@ -122,11 +122,11 @@ class OpenRelexHead(NERHead):
                 num_heads=self.relation_anchor_refine.num_heads,
             )
 
-        self.entity_span_rep_layer = SpanRepLayer(
-            span_mode="token_level",
-            hidden_size=hidden_size,
+        self.entity_span_rep_layer = build_span_pooler(
+            task_cfg,
+            hidden_size,
+            dropout,
             max_width=getattr(config, "max_width", 12),
-            dropout=dropout,
         )
         self.endpoint_query = nn.Linear(hidden_size, hidden_size * 2)
         self.pair_fusion = nn.Sequential(
@@ -244,13 +244,13 @@ class OpenRelexHead(NERHead):
                 ].amax(dim=1)
         return unique_idx, unique_mask, merged
 
-    def _pool_entity_spans(self, words_embedding, span_idx, span_mask):
+    def _pool_entity_spans(self, words_embedding, span_idx, span_mask, token_source=None):
         if words_embedding.shape[1] == 0:
             return words_embedding.new_zeros(
                 words_embedding.shape[0], span_idx.shape[1], words_embedding.shape[-1]
             )
         safe_idx = span_idx * span_mask.unsqueeze(-1).long()
-        representations = self.entity_span_rep_layer(words_embedding, safe_idx)
+        representations = self._pool_spans(self.entity_span_rep_layer, words_embedding, safe_idx, token_source)
         return representations * span_mask.unsqueeze(-1).to(representations.dtype)
 
     def _relation_anchors(
@@ -626,6 +626,9 @@ class OpenRelexHead(NERHead):
             words_embedding,
             span_idx,
             span_mask,
+            token_source=self._span_token_source(
+                self.entity_span_rep_layer, shared, flat_inputs, batch,
+            ),
         )
         anchors, anchor_mask = self._relation_anchors(
             flat_inputs,

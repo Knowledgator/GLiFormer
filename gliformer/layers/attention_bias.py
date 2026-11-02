@@ -71,25 +71,39 @@ def _broadcast_coordinate_batches(
     return queries, keys
 
 
+_DIMENSION_INDEX_CACHE: dict[tuple[tuple[int, ...], torch.device], torch.Tensor] = {}
+
+
+def _dimension_index(indices: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """Device index tensor for ``indices``, copied to ``device`` only once."""
+
+    key = (indices, torch.device(device))
+    cached = _DIMENSION_INDEX_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(indices, dtype=torch.long).to(device)
+        _DIMENSION_INDEX_CACHE[key] = cached
+    return cached
+
+
 def _select_dimensions(
     coordinates: torch.Tensor,
     dimensions: Sequence[int] | None,
     width: int | None = None,
 ) -> torch.Tensor:
     if dimensions is not None:
-        indices = torch.as_tensor(
-            tuple(int(index) for index in dimensions),
-            dtype=torch.long,
-            device=coordinates.device,
-        )
-        if indices.numel() == 0:
+        # Validate the configured dimensions on the host: they are Python ints,
+        # so checking them on the device would only add GPU->CPU syncs.
+        indices = tuple(int(index) for index in dimensions)
+        if not indices:
             raise ValueError("attention bias coordinate dimensions cannot be empty")
-        if (indices < 0).any() or (indices >= coordinates.shape[-1]).any():
+        if any(index < 0 or index >= coordinates.shape[-1] for index in indices):
             raise ValueError(
                 "attention bias coordinate dimension is outside the supplied "
                 f"width {coordinates.shape[-1]}"
             )
-        coordinates = coordinates.index_select(-1, indices)
+        coordinates = coordinates.index_select(
+            -1, _dimension_index(indices, coordinates.device)
+        )
     if width is not None:
         if coordinates.shape[-1] < width:
             raise ValueError(
@@ -206,6 +220,7 @@ class GaussianDistanceAttentionBias(
             "learnable_sigma",
             "learnable_weight",
             "per_head",
+            "min_box_size",
         }
     )
 
@@ -220,10 +235,15 @@ class GaussianDistanceAttentionBias(
         learnable_sigma: bool = False,
         learnable_weight: bool = False,
         per_head: bool = False,
+        min_box_size: float = 0.05,
         **kwargs,
     ):
         super().__init__()
         sigma = _finite("sigma", sigma)
+        min_box_size = _finite("min_box_size", min_box_size)
+        if min_box_size <= 0.0:
+            raise ValueError("attention bias min_box_size must be positive")
+        self.min_box_size = min_box_size
         if sigma <= 0.0:
             raise ValueError("attention bias sigma must be positive")
         weight = _finite("weight", weight)
@@ -267,10 +287,13 @@ class GaussianDistanceAttentionBias(
         else:
             self.register_parameter("raw_weight", None)
         self.units = str(units).lower().replace("-", "_")
-        if self.units not in {"normalized", "query_steps"}:
+        # "box": distances are measured in the query box's own width and
+        # height (query coordinates cx, cy, w, h), so a small box attends to a
+        # small region and a large box to a large one.
+        if self.units not in {"normalized", "query_steps", "box"}:
             raise ValueError(
-                "Gaussian attention bias units must be 'normalized' or "
-                "'query_steps'"
+                "Gaussian attention bias units must be 'normalized', "
+                "'query_steps' or 'box'"
             )
         self.query_dimensions = (
             None if query_dimensions is None else tuple(query_dimensions)
@@ -296,11 +319,16 @@ class GaussianDistanceAttentionBias(
         value: float | torch.Tensor,
         reference: torch.Tensor,
     ) -> torch.Tensor:
-        value = torch.as_tensor(
-            value,
-            dtype=reference.dtype,
-            device=reference.device,
-        )
+        if torch.is_tensor(value):
+            value = value.to(dtype=reference.dtype, device=reference.device)
+        else:
+            # A device fill, not a host->device copy of a Python scalar.
+            value = torch.full(
+                (),
+                value,
+                dtype=reference.dtype,
+                device=reference.device,
+            )
         if not self.per_head:
             return value
         if value.dim() == 0:
@@ -330,6 +358,14 @@ class GaussianDistanceAttentionBias(
             length=key_length,
             device=device,
         )
+        box_size = None
+        if self.units == "box":
+            if queries.shape[-1] < 4:
+                raise ValueError(
+                    "Gaussian attention bias units 'box' needs query "
+                    "coordinates (cx, cy, w, h)"
+                )
+            box_size = queries[..., 2:4].clamp_min(self.min_box_size)
         queries = _select_dimensions(queries, self.query_dimensions)
         keys = _select_dimensions(keys, self.key_dimensions)
         coordinate_width = min(queries.shape[-1], keys.shape[-1])
@@ -339,6 +375,14 @@ class GaussianDistanceAttentionBias(
         delta = queries.unsqueeze(-2) - keys.unsqueeze(-3)
         if self.units == "query_steps":
             delta = delta * max(int(query_length), 1)
+        elif box_size is not None:
+            if delta.shape[-1] != 2:
+                raise ValueError(
+                    "Gaussian attention bias units 'box' compares 2D centers"
+                )
+            if box_size.shape[0] != delta.shape[0]:
+                box_size = box_size.expand(delta.shape[0], -1, -1)
+            delta = delta / box_size.unsqueeze(-2)
         squared_distance = delta.square().sum(dim=-1)
         sigma = self._broadcast_parameter(self.sigma, squared_distance)
         weight = self._broadcast_parameter(self.weight, squared_distance)

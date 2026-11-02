@@ -92,6 +92,7 @@ _TRAINING_CONTROL_FIELDS = {
     "prev_path",
     "resume_from_checkpoint",
     "compile_model",
+    "compile_backbone_layers",
     "train_head_only",
     "freeze_components",
     "classification_parent_name_dropout",
@@ -139,6 +140,9 @@ _TASK_CONFIG_ATTRS = {
     "embedding": "embedding_config",
 }
 
+# Global fields that only change how data are cut, applied on prev_path loads.
+_CHECKPOINT_SAFE_GLOBAL_FIELDS = {"max_len": int, "train_sequence_packing": bool}
+
 _GLOBAL_ARCHITECTURE_FIELDS = {
     "model_variant",
     "model_name",
@@ -146,6 +150,7 @@ _GLOBAL_ARCHITECTURE_FIELDS = {
     "hidden_size",
     "dropout",
     "subtoken_pooling",
+    "text_unit",
     "span_mode",
     "max_width",
     "backbone_type",
@@ -540,6 +545,16 @@ def apply_checkpoint_config_overrides(model, model_cfg: dict):
     heads = getattr(getattr(model, "model", None), "heads", None)
     applied = []
 
+    # Data budgets and batching create no parameters. ``max_len`` caps the
+    # text units and the tokenizer length; without this a checkpoint's own
+    # value (16384 for gliformer-large-v1) silently wins over the YAML.
+    for name, cast in _CHECKPOINT_SAFE_GLOBAL_FIELDS.items():
+        if name in model_cfg and model_cfg[name] is not None:
+            value = cast(model_cfg[name])
+            if getattr(model.config, name, None) != value:
+                setattr(model.config, name, value)
+                applied.append(name)
+
     # Most heads keep only a few scalar loss weights on the module and retain
     # their task config object for the rest. Update both so the active policy is
     # effective immediately and is also serialized with the retrained model.
@@ -878,12 +893,50 @@ def prepare_training_records(records, model):
     return filtered, len(records) - len(filtered)
 
 
+def compile_backbone_layers(model) -> int:
+    """Compile each backbone decoder layer with ``torch.compile``.
+
+    Fuses the many small elementwise kernels of a layer (norms, gates,
+    activations, dtype casts). Whole-model compile is not an option: the task
+    heads are data-dependent Python. Parameter names are unchanged, so
+    checkpoints stay compatible. Returns the number of compiled layers.
+    """
+
+    # Layers see a few input variants (mask dtype, size classes); never fall
+    # back to eager because the default recompile limit ran out.
+    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+    torch._dynamo.config.accumulated_recompile_limit = max(
+        torch._dynamo.config.accumulated_recompile_limit, 1024
+    )
+    encoder = getattr(getattr(model, "model", None), "token_rep_layer", None)
+    if encoder is None:
+        return 0
+    count = 0
+    for module in encoder.modules():
+        name = type(module).__name__
+        # Text decoder layers only: compiling the frozen vision tower was slower.
+        if name.endswith("DecoderLayer") and "Vision" not in name:
+            module.compile(dynamic=True)
+            count += 1
+    return count
+
+
 def build_model(model_cfg: dict, train_cfg: dict):
     """Build or load GLiFormer model."""
     prev_path = train_cfg.get("prev_path")
     if prev_path and str(prev_path).lower() not in ("none", "null", ""):
         print(f"Loading pretrained model from: {prev_path}")
-        model = GLiFormer.from_pretrained(prev_path)
+        model = GLiFormer.from_pretrained(
+            prev_path,
+            _attn_implementation=model_cfg.get("_attn_implementation"),
+        )
+        # Text units create no parameters: a word checkpoint can train at token level.
+        if "text_unit" in model_cfg and model.set_text_unit(
+            model_cfg["text_unit"], model_cfg.get("span_boundary"),
+        ):
+            print(f"Switched text units to {model.config.text_unit!r}")
+        if "split_digits" in model_cfg and model.set_split_digits(model_cfg["split_digits"]):
+            print(f"Set split_digits={model.config.split_digits}")
         validate_checkpoint_architecture(model, model_cfg)
         applied = apply_checkpoint_config_overrides(model, model_cfg)
         if applied:
@@ -891,6 +944,27 @@ def build_model(model_cfg: dict, train_cfg: dict):
                 "Applied checkpoint-safe task overrides: "
                 + ", ".join(applied)
             )
+        structuring_cfg = model_cfg.get("structuring_config")
+        if isinstance(structuring_cfg, Mapping) and structuring_cfg.get("typed_fields"):
+            typed_settings = {
+                name: value
+                for name, value in structuring_cfg.items()
+                if name.startswith("typed_") or name == "embed_option_token"
+            }
+            if model.enable_typed_structuring(**typed_settings):
+                print("Added typed structuring fields ([OPTION] token and option scorer)")
+        normalization_cfg = model_cfg.get("normalization_config")
+        if isinstance(normalization_cfg, Mapping):
+            if model.enable_normalization(normalization_cfg):
+                print("Added a normalization head (initialized from scratch)")
+        calculation_cfg = model_cfg.get("calculation_config")
+        if isinstance(calculation_cfg, Mapping):
+            if model.enable_calculation(calculation_cfg):
+                print("Added a calculation head ([CALC] token, initialized from scratch)")
+        editing_cfg = model_cfg.get("sequence_editing_config")
+        if isinstance(editing_cfg, Mapping):
+            if model.enable_sequence_editing(editing_cfg):
+                print("Added a sequence editing head ([EDIT] token, initialized from scratch)")
         return model
     print("Initializing model from config...")
     return GLiFormer.load_from_config(model_cfg)
@@ -938,6 +1012,9 @@ def main(cfg_path: str, resume_from_checkpoint: str | bool | None = None):
     model = build_model(model_cfg, train_cfg).to(dtype=torch.float32)
     print(f"Model type: {model.__class__.__name__}")
 
+    if train_cfg.get("compile_backbone_layers", False):
+        print(f"Compiled {compile_backbone_layers(model)} backbone decoder layers")
+
     # Enabled task heads
     enabled = list(getattr(model.model, "heads", {}))
     print(f"Enabled tasks: {', '.join(enabled)}")
@@ -975,6 +1052,7 @@ def main(cfg_path: str, resume_from_checkpoint: str | bool | None = None):
             0.0,
         ),
         label_augmentation=train_cfg.get("label_augmentation"),
+        save_only_model=True,
         **training_kwargs,
     )
 

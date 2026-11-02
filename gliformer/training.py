@@ -110,6 +110,7 @@ _LABEL_KEYS = frozenset(
         "structuring_relation_labels",
         "embedding_labels",
         "count_targets",
+        "seq_edit_op",
         # Vision tasks
         "image_classification_labels",
         "object_detection_class_labels",
@@ -265,6 +266,18 @@ _OPEN_REL_ASSIGNMENT_PREDICTION_FIELDS = frozenset(
 )
 
 
+_REBALANCE_STRATEGIES = ("batch_rebalance", "task_batch_rebalance")
+
+
+def _native_vision_spec_of(model: nn.Module):
+    """The native vision layout of a model's encoder, if it encodes images that way."""
+    for module in model.modules():
+        spec = getattr(module, "native_vision", None)
+        if spec is not None and hasattr(spec, "merge_size"):
+            return spec
+    return None
+
+
 def _present_label_keys(inputs: dict[str, Any]) -> tuple[str, ...]:
     """Return task supervision keys that carry a value in this batch."""
     return tuple(sorted(key for key in _LABEL_KEYS if inputs.get(key) is not None))
@@ -348,6 +361,110 @@ class GLiFormerTrainer(GLiNERTrainer):
         # (classes_mapping, tokens, etc. travel through **kwargs)
         self.args.remove_unused_columns = False
 
+    def get_train_dataloader(self):
+        """``train_sampling_strategy: batch_rebalance`` as in transformers >= 5.17.
+
+        Each optimizer step's samples are sorted by estimated length and split
+        into variable-size micro-batches of balanced padded cost
+        (``BatchRebalanceSampler``). ``task_batch_rebalance`` does the same
+        with every micro-batch holding a single task group
+        (``TaskGroupedBatchRebalanceSampler``). The sampler yields whole
+        micro-batches, so it is passed as ``batch_sampler``.
+        """
+        if getattr(self.args, "train_sampling_strategy", None) not in _REBALANCE_STRATEGIES or isinstance(
+            self.train_dataset, torch.utils.data.IterableDataset
+        ):
+            return super().get_train_dataloader()
+        from functools import partial
+
+        from transformers.trainer_utils import seed_worker
+
+        sampler = self._batch_rebalance_sampler()
+        params = {
+            "batch_sampler": sampler,
+            "collate_fn": self.data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "worker_init_fn": partial(
+                seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
+            ),
+        }
+        if self.args.dataloader_num_workers > 0:
+            params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+        dataloader = self.accelerator.prepare(torch.utils.data.DataLoader(self.train_dataset, **params))
+        # The sampler is already rank-aware; accelerate's BatchSamplerShard would
+        # re-shard it and drop samples, so make that wrapper a passthrough.
+        prepared = getattr(dataloader, "batch_sampler", None)
+        if prepared is not None and getattr(prepared, "batch_sampler", None) is sampler:
+            prepared.num_processes = 1
+            prepared.process_index = 0
+            # The wrapper has no set_epoch, so the trainer's per-epoch reshuffle
+            # would never reach the sampler and every epoch would repeat the first.
+            if not hasattr(prepared, "set_epoch"):
+                prepared.set_epoch = sampler.set_epoch
+        return dataloader
+
+    def _batch_rebalance_sampler(self):
+        from .batch_rebalance import (
+            BatchRebalanceSampler,
+            TaskGroupedBatchRebalanceSampler,
+            estimate_lengths,
+            row_task,
+        )
+
+        lengths = getattr(self, "_rebalance_lengths", None)
+        if lengths is None or len(lengths) != len(self.train_dataset):
+            lengths, report = estimate_lengths(
+                self.train_dataset,
+                self._encoded_length,
+                max_text_length=int(getattr(getattr(self.model, "config", None), "max_len", None) or 1024),
+                seed=self.args.seed,
+                num_workers=max(1, self.args.dataloader_num_workers),
+            )
+            self._rebalance_lengths = lengths
+            logger.info("batch_rebalance length estimates per row kind: %s", report)
+            print(
+                "batch_rebalance: estimated lengths of %d rows (mean %.0f tokens) from %d row kinds"
+                % (len(lengths), sum(lengths) / max(1, len(lengths)), len(report))
+            )
+        world_size = max(1, self.args.world_size)
+        grad_accum = self.args.gradient_accumulation_steps
+        options = {}
+        sampler_class = BatchRebalanceSampler
+        if self.args.train_sampling_strategy == "task_batch_rebalance":
+            tasks = [row_task(row) for row in self.train_dataset]
+            counts = {}
+            for task in tasks:
+                counts[task] = counts.get(task, 0) + 1
+            print("task_batch_rebalance: task groups %s" % dict(sorted(counts.items(), key=lambda kv: -kv[1])))
+            sampler_class = TaskGroupedBatchRebalanceSampler
+            options["tasks"] = tasks
+        return sampler_class(
+            **options,
+            lengths=lengths,
+            effective_batch_size=self.args.train_batch_size * grad_accum * world_size,
+            dp_size=world_size,
+            grad_accum=grad_accum,
+            rank=self.args.process_index if world_size > 1 else 0,
+            seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+            drop_last=self.args.dataloader_drop_last,
+        )
+
+    def _encoded_length(self, row):
+        """(text tokens, image tokens) of one row as the collator encodes it."""
+        batch = self.data_collator([row])
+        mask = batch.get("attention_mask")
+        if mask is None:
+            return None
+        image_tokens = 0
+        grid = batch.get("image_grid_thw")
+        spec = _native_vision_spec_of(self.model)
+        if grid is not None and spec is not None:
+            per_image = grid.prod(-1) // (spec.merge_size**2)
+            image_tokens = int(per_image.sum()) + spec.marker_tokens * int((per_image > 0).sum())
+        return int(mask.sum()), image_tokens
+
     def compute_loss(
         self,
         model,
@@ -394,7 +511,9 @@ class GLiFormerTrainer(GLiNERTrainer):
         Replaces the base trainer's ``labels`` key check with a check for
         any of the task-specific label keys.
         """
-        model.train()
+        if not model.training:
+            # ``train()`` walks every module; after the first step it is a no-op.
+            model.train()
         inputs = self._prepare_inputs(inputs)
 
         # A malformed or unresolvable annotation must not terminate a long

@@ -2,12 +2,18 @@
 
 from dataclasses import replace
 
+import math
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-from gliner.modeling.span_rep import SpanRepLayer
+from torch import nn
 from gliner.modeling.utils import extract_spans_from_tokens
 
+from ...layers import AnchorModeling, NoAttentionBias
+from ...layers.anchor_modeling import rename_state_dict_keys
 from ...layers.mlp import create_mlp
+from ...layers.span_pooling import build_span_pooler
 from ...layers.structuring_relations import (
     initialize_anchor_relations,
     maybe_anchor_relation_loss,
@@ -16,13 +22,22 @@ from ...layers.structuring_relations import (
 )
 from .. import StructuringTaskHeadOutput
 from ..losses import binary_focal_or_bce, binary_loss_with_focal_overrides
+from ...layers.anchor_layer import (
+    FixedAnchorLayer,
+    FixedRNNAnchorLayer,
+    FixedTransformerAnchorLayer,
+)
 from ..matcher import (
-    batched_masked_assignment,
+    batched_minimum_cost_assignment,
     gold_anchor_mask,
+    host_to_device,
+    match_index_array,
     matched_anchor_targets,
     matched_objectness_loss,
+    matched_prediction_mask,
 )
 from ..ner.model import NERHead
+_TYPED_LABEL_KEYS = ("structuring_typed_class_targets",)
 
 
 class StructuringHead(NERHead):
@@ -140,6 +155,12 @@ class StructuringHead(NERHead):
             self.record_anchor_layer,
             "num_slots",
         )
+        # Fixed slot layers receive no count (see ``_record_anchors``), so
+        # their slot mask is all-true by construction.
+        self._record_slots_always_active = isinstance(
+            self.record_anchor_layer,
+            (FixedAnchorLayer, FixedRNNAnchorLayer, FixedTransformerAnchorLayer),
+        )
 
         refinement = self._build_anchor_refinement(
             task_cfg,
@@ -166,15 +187,33 @@ class StructuringHead(NERHead):
                 task_cfg,
                 num_heads=self.record_anchor_refine.num_heads,
             )
+        self.anchor_memory_schema = bool(
+            getattr(task_cfg, "anchor_memory_schema", False)
+        )
+        if self.anchor_memory_schema:
+            if not hasattr(self, "record_anchor_refine"):
+                raise ValueError(
+                    "anchor_memory_schema needs anchor refinement layers"
+                )
+            if not isinstance(self.record_cross_attention_bias, NoAttentionBias):
+                raise ValueError(
+                    "anchor_memory_schema does not support a cross-attention "
+                    "bias: schema tokens have no text position"
+                )
+            # Added to schema keys (and values, as text positions are) in
+            # place of a position, so slots can tell schema from text.
+            self.schema_memory_embedding = nn.Parameter(
+                torch.randn(hidden_size) * 0.02
+            )
 
         # As in joint relation extraction, the second stage always needs a
         # token-level representation for each selected entity regardless of
         # whether the generic NER auxiliary span loss is enabled.
-        self.entity_span_rep_layer = SpanRepLayer(
-            span_mode="token_level",
-            hidden_size=hidden_size,
+        self.entity_span_rep_layer = build_span_pooler(
+            task_cfg,
+            hidden_size,
+            dropout,
             max_width=getattr(config, "max_width", 12),
-            dropout=dropout,
         )
 
         self.use_anchor_objectness = task_cfg.anchor_objectness
@@ -191,6 +230,63 @@ class StructuringHead(NERHead):
             )
 
         initialize_anchor_relations(self, task_cfg, hidden_size)
+        self._initialize_typed_fields(task_cfg, hidden_size, dropout)
+
+    def _initialize_typed_fields(self, task_cfg, hidden_size, dropout):
+        """Option scorer for class fields.
+
+        Every (record slot, class field) pair becomes one vector through the
+        configured anchor modeling (``typed_modeling``; the default
+        ``readout`` fuses record anchor and field marker, then reads the
+        text).  The vector scores each ``[OPTION]`` embedding of its field,
+        plus a learned "none" score for single-choice fields.
+        """
+
+        self.typed_fields = bool(getattr(task_cfg, "typed_fields", False))
+        if not self.typed_fields:
+            return
+        self.option_modeling = AnchorModeling.from_config(
+            getattr(task_cfg, "typed_modeling", "readout"),
+            hidden_size,
+            dropout=dropout,
+            num_heads=int(task_cfg.typed_readout_heads),
+        )
+        if not getattr(self, "_option_migration_hook", False):
+            # Checkpoints before anchor modeling stored the readout as
+            # separate ``option_*`` modules.
+            self._register_load_state_dict_pre_hook(self._migrate_option_state_dict)
+            self._option_migration_hook = True
+        self.option_field_proj = nn.Linear(hidden_size, hidden_size)
+        self.option_key_proj = nn.Linear(hidden_size, hidden_size)
+        self.option_none = nn.Linear(hidden_size, 1)
+        # Token ids are assigned after the tokenizer grows, i.e. after this
+        # head is built, so they are read from the config at forward time.
+        self._typed_task_config = task_cfg
+        self.embed_option_token = bool(task_cfg.embed_option_token)
+        self.typed_class_loss_coef = task_cfg.typed_class_loss_coef
+        self.typed_class_focal_loss_alpha = task_cfg.typed_class_focal_loss_alpha
+        self.typed_class_focal_loss_gamma = task_cfg.typed_class_focal_loss_gamma
+        self.typed_class_focal_loss_prob_margin = None
+
+    _OPTION_RENAMES = {
+        "option_query.": "option_modeling.query.",
+        "option_readout.": "option_modeling.readout.",
+        "option_readout_norm.": "option_modeling.readout_norm.",
+        "option_readout_ffn.": "option_modeling.ffn.",
+        "option_ffn_norm.": "option_modeling.ffn_norm.",
+    }
+
+    @classmethod
+    def _migrate_option_state_dict(cls, state_dict, prefix, *args, **kwargs):
+        rename_state_dict_keys(state_dict, prefix, cls._OPTION_RENAMES)
+
+    def _option_modules(self):
+        return (
+            self.option_modeling,
+            self.option_field_proj,
+            self.option_key_proj,
+            self.option_none,
+        )
 
     @classmethod
     def from_config(
@@ -220,6 +316,7 @@ class StructuringHead(NERHead):
         focal_loss_alpha=None,
         focal_loss_gamma=None,
         focal_loss_prob_margin=None,
+        field_loss_mask=None,
     ):
         """Run the private or shared NER module on structuring field inputs."""
 
@@ -237,6 +334,8 @@ class StructuringHead(NERHead):
             "ner_labels": entity_labels,
             "threshold": threshold,
         }
+        if field_loss_mask is not None:
+            ner_kwargs["ner_field_loss_mask"] = field_loss_mask
         if self._owns_ner_head:
             return NERHead.forward(
                 self,
@@ -323,19 +422,72 @@ class StructuringHead(NERHead):
             source_mask=feature_mask,
         )
         if hasattr(self, "record_anchor_refine"):
+            memory, memory_mask, memory_positions = (
+                feature_embeddings, feature_mask, None,
+            )
+            if self.anchor_memory_schema:
+                memory, memory_mask, memory_positions = self._schema_memory(
+                    flat_inputs, feature_embeddings, feature_mask,
+                )
             anchors = self.record_anchor_refine(
                 anchors,
-                feature_embeddings,
-                token_mask=feature_mask,
+                memory,
+                token_mask=memory_mask,
                 query_mask=anchor_mask,
+                memory_pos_emb=memory_positions,
                 position_encoding=self.record_anchor_refine_positions,
                 self_attention_bias_module=self.record_self_attention_bias,
                 cross_attention_bias_module=self.record_cross_attention_bias,
             )
         return anchors, anchor_mask
 
-    def _pool_entity_spans(self, words_embedding, span_idx, span_mask):
-        """Represent selected entities through the relex token span layer."""
+    def _schema_memory(self, flat_inputs, text, text_mask):
+        """Text words followed by the structure and field tokens.
+
+        Text keeps the positions it gets without the schema; schema tokens
+        get ``schema_memory_embedding`` instead of a position.
+        """
+        batch_size, _, hidden_size = text.shape
+        if text_mask is None:
+            text_mask = text.new_ones(text.shape[:2], dtype=torch.bool)
+        text_mask = text_mask.bool()
+        schema = torch.cat(
+            [
+                flat_inputs.parent_embedding.unsqueeze(1).to(text.dtype),
+                flat_inputs.child_embedding.to(text.dtype),
+            ],
+            dim=1,
+        )
+        schema_mask = torch.cat(
+            [
+                text_mask.new_ones(batch_size, 1),
+                flat_inputs.child_mask.to(device=text.device).bool(),
+            ],
+            dim=1,
+        )
+        positions = self.record_anchor_refine_positions
+        text_positions = (
+            positions.memory_positions(text, text_mask)
+            if positions is not None
+            else None
+        )
+        if text_positions is None:
+            text_positions = text.new_zeros(batch_size, text.shape[1], hidden_size)
+        else:
+            text_positions = text_positions.to(text.dtype).expand(
+                batch_size, -1, -1,
+            )
+        schema_positions = self.schema_memory_embedding.to(text.dtype).expand(
+            batch_size, schema.shape[1], hidden_size,
+        )
+        return (
+            torch.cat([text, schema], dim=1),
+            torch.cat([text_mask, schema_mask], dim=1),
+            torch.cat([text_positions, schema_positions], dim=1),
+        )
+
+    def _pool_entity_spans(self, words_embedding, span_idx, span_mask, token_source=None):
+        """Represent selected entities through the configured span pooler."""
 
         if words_embedding.shape[1] == 0:
             return words_embedding.new_zeros(
@@ -344,9 +496,11 @@ class StructuringHead(NERHead):
                 words_embedding.shape[-1],
             )
         safe_span_idx = span_idx * span_mask.unsqueeze(-1).long()
-        representations = self.entity_span_rep_layer(
+        representations = self._pool_spans(
+            self.entity_span_rep_layer,
             words_embedding,
             safe_span_idx,
+            token_source,
         )
         return representations * span_mask.unsqueeze(-1).to(
             representations.dtype
@@ -364,49 +518,77 @@ class StructuringHead(NERHead):
         ):
             raise ValueError("span labels and indices must share (BN, E)")
 
+        # Boundary deduplication is inherently host-side; read indices and
+        # mask together in a single device-to-host copy.
+        batch_size, entity_count = span_mask.shape
+        boundary_width = span_idx.shape[2]
+        host = torch.cat(
+            [
+                span_idx.detach().reshape(
+                    batch_size, entity_count * boundary_width,
+                ).long(),
+                span_mask.detach().reshape(batch_size, entity_count).bool().long().to(
+                    span_idx.device
+                ),
+            ],
+            dim=1,
+        ).cpu().numpy()
+        host_idx = host[:, :entity_count * boundary_width].reshape(
+            batch_size, entity_count, boundary_width,
+        )
+        host_mask = host[:, entity_count * boundary_width:] != 0
+
         unique_per_batch = []
-        source_groups = []
-        for batch_idx in range(span_idx.shape[0]):
+        # Output row of every source entity; ``-1`` marks unselected rows.
+        source_to_output = np.full((batch_size, entity_count), -1, dtype=np.int64)
+        for batch_idx in range(batch_size):
             boundary_to_output = {}
             unique = []
-            groups = []
-            for entity_idx in torch.where(span_mask[batch_idx].bool())[0].tolist():
-                span = tuple(span_idx[batch_idx, entity_idx].tolist())
+            for entity_idx in np.flatnonzero(host_mask[batch_idx]).tolist():
+                span = tuple(host_idx[batch_idx, entity_idx].tolist())
                 output_idx = boundary_to_output.get(span)
                 if output_idx is None:
                     output_idx = len(unique)
                     boundary_to_output[span] = output_idx
                     unique.append(span)
-                    groups.append([])
-                groups[output_idx].append(entity_idx)
+                source_to_output[batch_idx, entity_idx] = output_idx
             unique_per_batch.append(unique)
-            source_groups.append(groups)
 
         max_entities = max(
             max((len(spans) for spans in unique_per_batch), default=0),
             1,
         )
-        unique_idx = span_idx.new_zeros(span_idx.shape[0], max_entities, 2)
-        unique_mask = span_mask.new_zeros(span_idx.shape[0], max_entities)
+        host_unique = np.zeros(
+            (batch_size, max_entities, boundary_width), dtype=np.int64,
+        )
+        host_unique_mask = np.zeros((batch_size, max_entities), dtype=np.bool_)
         for batch_idx, spans in enumerate(unique_per_batch):
-            if not spans:
-                continue
-            count = len(spans)
-            unique_idx[batch_idx, :count] = span_idx.new_tensor(spans)
-            unique_mask[batch_idx, :count] = True
+            if spans:
+                host_unique[batch_idx, :len(spans)] = spans
+                host_unique_mask[batch_idx, :len(spans)] = True
+        unique_idx = host_to_device(host_unique, span_idx.device).to(span_idx.dtype)
+        unique_mask = host_to_device(host_unique_mask, span_mask.device).to(
+            span_mask.dtype
+        )
         if span_labels is None:
             return unique_idx, unique_mask, None
 
-        unique_labels = span_labels.new_zeros(
-            (span_labels.shape[0], max_entities, *span_labels.shape[2:])
-        )
-        for batch_idx, groups in enumerate(source_groups):
-            for output_idx, source_ids in enumerate(groups):
-                unique_labels[batch_idx, output_idx] = span_labels[
-                    batch_idx,
-                    source_ids,
-                ].amax(dim=0)
-        return unique_idx, unique_mask, unique_labels
+        # Merge duplicate boundaries with an elementwise max; unselected rows
+        # are routed to a discarded trailing output row.
+        source_to_output[source_to_output < 0] = max_entities
+        index = host_to_device(source_to_output, span_labels.device)
+        index = index.reshape(
+            batch_size, entity_count, *([1] * (span_labels.dim() - 2))
+        ).expand_as(span_labels)
+        labels = span_labels
+        if labels.dtype == torch.bool:
+            labels = labels.to(torch.uint8)
+        unique_labels = labels.new_zeros(
+            (batch_size, max_entities + 1, *span_labels.shape[2:])
+        ).scatter_reduce(
+            1, index, labels, reduce="amax", include_self=False,
+        )[:, :max_entities]
+        return unique_idx, unique_mask, unique_labels.to(span_labels.dtype)
 
     @classmethod
     def _deduplicate_spans(cls, span_idx, span_mask):
@@ -473,27 +655,86 @@ class StructuringHead(NERHead):
             (batch_size, entity_count, class_count),
             float("-inf"),
         )
-        for batch_idx in range(batch_size):
-            for entity_idx in torch.where(span_mask[batch_idx].bool())[0].tolist():
-                start = int(span_idx[batch_idx, entity_idx, 0].item())
-                end = int(span_idx[batch_idx, entity_idx, 1].item())
-                if start < 0 or end < start or end >= sequence_length:
-                    continue
-                if (
-                    word_mask is not None
-                    and not word_mask[batch_idx, start:end + 1].bool().all()
-                ):
-                    continue
-                score_parts = [
-                    entity_logits[batch_idx, start, :, 0],
-                    entity_logits[batch_idx, end, :, 1],
-                    entity_logits[batch_idx, start:end + 1, :, 2].amin(dim=0),
-                ]
-                field_logits[batch_idx, entity_idx] = torch.stack(
-                    score_parts,
-                    dim=0,
-                ).amin(dim=0)
-        return field_logits
+        if batch_size == 0 or entity_count == 0 or sequence_length == 0:
+            return field_logits
+
+        device = entity_logits.device
+        starts = span_idx[..., 0].to(device=device, dtype=torch.long)
+        ends = span_idx[..., 1].to(device=device, dtype=torch.long)
+        valid = (
+            span_mask.to(device).bool()
+            & (starts >= 0)
+            & (ends >= starts)
+            & (ends < sequence_length)
+        )
+        safe_starts = starts.clamp(0, sequence_length - 1)
+        safe_ends = ends.clamp(0, sequence_length - 1)
+        if word_mask is not None:
+            # Every word inside the span must be visible. Positions beyond the
+            # mask's width impose no constraint, matching a truncated slice.
+            words = word_mask.to(device).bool()[:, :sequence_length]
+            if words.shape[1] < sequence_length:
+                words = torch.cat(
+                    [
+                        words,
+                        words.new_ones(
+                            words.shape[0], sequence_length - words.shape[1],
+                        ),
+                    ],
+                    dim=1,
+                )
+            hidden = F.pad((~words).long().cumsum(dim=1), (1, 0))
+            hidden_inside = (
+                hidden.gather(1, safe_ends + 1) - hidden.gather(1, safe_starts)
+            )
+            valid = valid & (hidden_inside == 0)
+
+        def at(positions, channel):
+            return entity_logits[..., channel].gather(
+                1,
+                positions.unsqueeze(-1).expand(-1, -1, class_count),
+            )
+
+        # Range minimum of the inside logits via a sparse table: level ``k``
+        # holds minima over windows of ``2**k`` tokens, and every span is the
+        # union of two (possibly overlapping) windows of one level.
+        inside = entity_logits[..., 2]
+        levels = [inside]
+        width = 1
+        while 2 * width <= sequence_length:
+            previous = levels[-1]
+            current = torch.minimum(
+                previous[:, : sequence_length - 2 * width + 1],
+                previous[:, width : sequence_length - width + 1],
+            )
+            levels.append(
+                F.pad(current, (0, 0, 0, sequence_length - current.shape[1]),
+                      value=float("inf"))
+            )
+            width *= 2
+        table = torch.cat(levels, dim=1)
+        lengths = (safe_ends - safe_starts).clamp(min=0) + 1
+        level = torch.zeros_like(lengths)
+        for power in range(1, len(levels)):
+            level = level + (lengths >= (1 << power)).long()
+        window = torch.ones_like(lengths) << level
+        offset = level * sequence_length
+
+        def from_table(positions):
+            return table.gather(
+                1,
+                (offset + positions).unsqueeze(-1).expand(-1, -1, class_count),
+            )
+
+        inside_min = torch.minimum(
+            from_table(safe_starts),
+            from_table(safe_ends - window + 1),
+        )
+        scores = torch.stack(
+            [at(safe_starts, 0), at(safe_ends, 1), inside_min],
+            dim=0,
+        ).amin(dim=0)
+        return torch.where(valid.unsqueeze(-1), scores, field_logits)
 
     @staticmethod
     def _score_anchor_membership(
@@ -515,14 +756,19 @@ class StructuringHead(NERHead):
         )
         return logits * valid.to(logits.dtype)
 
-    def _score_anchor_relations(self, record_anchors, anchor_mask):
-        """Score only active anchors, then restore the public padded axes."""
+    def _score_anchor_relations(self, record_anchors, anchor_mask, *, all_active=False):
+        """Score only active anchors, then restore the public padded axes.
+
+        ``all_active`` declares that every slot is active by construction,
+        which lets compaction build its indices without host synchronization.
+        """
 
         return score_anchor_relations(
             getattr(self, "anchor_relations_rep_layer", None),
             record_anchors,
             anchor_mask,
             compact=True,
+            all_active=all_active,
         )
 
     @staticmethod
@@ -560,17 +806,18 @@ class StructuringHead(NERHead):
     ):
         """Return threshold-centered signed BCE over supervised entities."""
 
+        # Shapes broadcast over any leading group axes:
+        # logits (..., P, E), labels (..., T, E), entity_mask (..., E).
         logits = logits.float()
-        pair_logits = logits[:, None].expand(
-            -1,
-            labels.shape[0],
-            -1,
+        pair_shape = (
+            *logits.shape[:-1],
+            labels.shape[-2],
+            logits.shape[-1],
         )
-        pair_labels = labels[None].expand(
-            logits.shape[0],
-            -1,
-            -1,
-        ).to(pair_logits.dtype)
+        pair_logits = logits.unsqueeze(-2).expand(pair_shape)
+        pair_labels = labels.unsqueeze(-3).expand(pair_shape).to(
+            pair_logits.dtype
+        )
         bce = F.binary_cross_entropy_with_logits(
             pair_logits,
             pair_labels,
@@ -592,7 +839,7 @@ class StructuringHead(NERHead):
             centered_bce / (boundary + 1.0).clamp(min=eps),
             centered_bce / (1.0 - boundary).clamp(min=eps),
         ).clamp(min=-1.0, max=1.0)
-        mask = entity_mask.to(signed_bce.dtype)[None, None]
+        mask = entity_mask.to(signed_bce.dtype)[..., None, None, :]
         return (signed_bce * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(
             min=1.0
         )
@@ -607,9 +854,9 @@ class StructuringHead(NERHead):
     ):
         """Return pairwise soft-Dice cost over supervised entities only."""
 
-        mask = entity_mask.to(probabilities.dtype)
-        predicted = probabilities[:, None] * mask[None, None]
-        gold = labels[None].to(probabilities.dtype) * mask[None, None]
+        mask = entity_mask.to(probabilities.dtype)[..., None, None, :]
+        predicted = probabilities.unsqueeze(-2) * mask
+        gold = labels.unsqueeze(-3).to(probabilities.dtype) * mask
         intersection = (predicted * gold).sum(dim=-1)
         predicted_sum = predicted.sum(dim=-1)
         gold_sum = gold.sum(dim=-1)
@@ -622,7 +869,8 @@ class StructuringHead(NERHead):
     def _objectness_matching_cost(probabilities, gold_count):
         """Broadcast bounded anchor-presence cost across gold records."""
 
-        return (1.0 - 2.0 * probabilities)[:, None].expand(-1, gold_count)
+        values = 1.0 - 2.0 * probabilities
+        return values.unsqueeze(-1).expand(*values.shape, gold_count)
 
     def _record_anchor_pair_cost(
         self,
@@ -680,7 +928,7 @@ class StructuringHead(NERHead):
             )
             objectness_cost = self._objectness_matching_cost(
                 objectness_probabilities,
-                labels.shape[0],
+                labels.shape[-2],
             )
             total_cost = (
                 total_cost
@@ -689,6 +937,10 @@ class StructuringHead(NERHead):
             total_weight += self.matcher_objectness_cost
 
         return total_cost / max(total_weight, eps)
+
+    # Upper bound on (groups x slots x gold x entities) elements per chunk
+    # of the batched matching cost.
+    _MATCHING_CHUNK_ELEMENTS = 1 << 24
 
     def _match_record_anchors(
         self,
@@ -702,27 +954,39 @@ class StructuringHead(NERHead):
         membership_threshold=0.5,
         objectness_threshold=None,
     ):
-        def pair_cost(batch_idx, prediction_ids, gold_ids):
-            predicted = predictions[batch_idx, prediction_ids]
-            gold = labels[batch_idx, gold_ids]
-            predicted_objectness = (
-                objectness_logits[batch_idx, prediction_ids]
-                if objectness_logits is not None
-                else None
+        # All groups' costs are built at once on padded axes and matched with
+        # a single device-to-host copy. Chunking bounds the (G, A, R, E)
+        # temporaries without depending on device values.
+        groups, slots, entities = predictions.shape
+        gold_count = labels.shape[1]
+        per_group = max(slots * gold_count * max(entities, 1), 1)
+        chunk = max(1, self._MATCHING_CHUNK_ELEMENTS // per_group)
+        costs = []
+        for start in range(0, groups, chunk):
+            stop = min(start + chunk, groups)
+            costs.append(
+                self._record_anchor_pair_cost(
+                    predictions[start:stop],
+                    labels[start:stop],
+                    entity_mask[start:stop],
+                    objectness_logits=(
+                        objectness_logits[start:stop]
+                        if objectness_logits is not None
+                        else None
+                    ),
+                    membership_threshold=membership_threshold,
+                    objectness_threshold=objectness_threshold,
+                )
             )
-            return self._record_anchor_pair_cost(
-                predicted,
-                gold,
-                entity_mask[batch_idx],
-                objectness_logits=predicted_objectness,
-                membership_threshold=membership_threshold,
-                objectness_threshold=objectness_threshold,
-            )
-
-        return batched_masked_assignment(
+        cost = (
+            torch.cat(costs, dim=0)
+            if costs
+            else predictions.new_zeros(0, slots, gold_count, dtype=torch.float32)
+        )
+        return batched_minimum_cost_assignment(
+            cost,
             prediction_mask,
             gold_mask,
-            pair_cost,
         )
 
     def _assignment_loss(
@@ -784,10 +1048,7 @@ class StructuringHead(NERHead):
         losses = matching_loss_fn(predictions, targets)
         # Membership is defined only for matched records. Unmatched active
         # slots remain negative examples for the separate objectness loss.
-        matched_anchor_mask = torch.zeros_like(prediction_mask)
-        for batch_idx, batch_matches in enumerate(matches):
-            for prediction_idx, _ in batch_matches:
-                matched_anchor_mask[batch_idx, prediction_idx] = True
+        matched_anchor_mask = matched_prediction_mask(prediction_mask, matches)
         loss_mask = (
             matched_anchor_mask.to(losses.dtype).unsqueeze(-1)
             * supervised_entity_mask.unsqueeze(1)
@@ -866,6 +1127,11 @@ class StructuringHead(NERHead):
             base_loss_fn,
             entity_labels,
             membership_threshold,
+            field_loss_mask=(
+                batch.get("structuring_typed_bio_field_mask")
+                if entity_labels is not None
+                else None
+            ),
         )
 
         if entity_output.logits is None:
@@ -926,6 +1192,9 @@ class StructuringHead(NERHead):
             words_embedding,
             entity_span_idx,
             entity_mask,
+            token_source=self._span_token_source(
+                self.entity_span_rep_layer, shared, flat_inputs, batch,
+            ),
         )
         record_anchors, anchor_mask = self._record_anchors(
             flat_inputs,
@@ -936,6 +1205,7 @@ class StructuringHead(NERHead):
             anchor_relation_scores = self._score_anchor_relations(
                 record_anchors,
                 anchor_mask,
+                all_active=self._record_slots_always_active,
             )
         entity_field_logits = self._span_field_logits(
             entity_output.logits,
@@ -1002,6 +1272,94 @@ class StructuringHead(NERHead):
                 )
                 combined_loss = combined_loss + weighted_objectness_loss
 
+        typed_supervised = self.typed_fields and any(
+            batch.get(key) is not None for key in _TYPED_LABEL_KEYS
+        )
+        # Records whose only supervised fields are computed by the
+        # calculation head need slots and objectness just like class fields.
+        calc_supervised = batch.get("calculation_query_group") is not None
+        if (
+            (typed_supervised or calc_supervised)
+            and anchor_matches is None
+            and base_loss_fn is not None
+            and structuring_count is not None
+        ):
+            # No span targets in this batch, so Hungarian matching did not
+            # run. Typed-only records keep their order on the slot axis.
+            # One device-to-host copy of counts and slot mask.
+            host = torch.cat(
+                [
+                    structuring_count.reshape(-1, 1).long().to(anchor_mask.device),
+                    anchor_mask.long(),
+                ],
+                dim=1,
+            ).cpu().numpy()
+            anchor_matches = [
+                [
+                    (index, index)
+                    for index in range(
+                        min(int(host[group, 0]), anchor_mask.shape[1])
+                    )
+                    if host[group, 1 + index]
+                ]
+                for group in range(anchor_mask.shape[0])
+            ]
+            if objectness_logits is not None:
+                objectness_loss = self._objectness_loss(
+                    objectness_logits,
+                    anchor_matches,
+                    supervised_anchor_mask,
+                    base_loss_fn=base_loss_fn,
+                )
+                weighted_objectness_loss = (
+                    self.anchor_objectness_loss_coef * objectness_loss
+                )
+                combined_loss = (
+                    weighted_objectness_loss
+                    if combined_loss is None
+                    else combined_loss + weighted_objectness_loss
+                )
+
+        typed_extra = {}
+        if self.typed_fields:
+            typed_loss, typed_extra = self._typed_forward(
+                shared,
+                flat_inputs,
+                batch,
+                words_embedding=words_embedding,
+                word_mask=entity_output.extra.get("mask"),
+                record_anchors=record_anchors,
+                anchor_mask=anchor_mask,
+                anchor_matches=anchor_matches,
+                gold_count=structuring_count,
+                num_gold=(
+                    structuring_labels.shape[1]
+                    if structuring_labels is not None else 0
+                ),
+                base_loss_fn=base_loss_fn,
+                supervised=typed_supervised,
+            )
+            if typed_loss is not None:
+                combined_loss = (
+                    typed_loss
+                    if combined_loss is None
+                    else combined_loss + typed_loss
+                )
+            if (
+                self.training
+                and combined_loss is not None
+                and torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                # Batches without class fields leave the option scorer
+                # without gradients, which DDP rejects unless it searches for
+                # unused parameters. A zero-weighted term keeps it attached.
+                combined_loss = combined_loss + 0.0 * sum(
+                    parameter.sum()
+                    for module in self._option_modules()
+                    for parameter in module.parameters()
+                )
+
         relation_loss, weighted_relation_loss = maybe_anchor_relation_loss(
             anchor_relation_scores,
             target("relation_labels"),
@@ -1045,6 +1403,9 @@ class StructuringHead(NERHead):
             "span_mask": entity_mask,
             "groups_output": record_anchors,
             "anchor_mask": anchor_mask,
+            "batch_origin": flat_inputs.batch_origin if flat_inputs is not None else None,
+            # Schema parent vector per group (the calculation head reads it).
+            "parent_embedding": flat_inputs.parent_embedding if flat_inputs is not None else None,
             "objectness_logits": objectness_logits,
             "entity_loss": (
                 entity_loss.detach() if entity_loss is not None else None
@@ -1062,12 +1423,326 @@ class StructuringHead(NERHead):
             "anchor_relation_loss": (
                 relation_loss.detach() if relation_loss is not None else None
             ),
+            **typed_extra,
         }
         return StructuringTaskHeadOutput(
             loss=combined_loss,
             logits=entity_output.logits,
             extra=extra,
         )
+
+
+    # -- typed fields ---------------------------------------------------------
+
+    def _option_stream(self, shared):
+        """Every ``[OPTION]`` representation per batch row, in prompt order.
+
+        Returns ``(B, N, D)`` embeddings and ``(B,)`` counts.  With
+        ``embed_option_token`` the marker itself is used (bidirectional
+        encoders); otherwise the last token of the option label, which is the
+        only position a causal decoder lets see the whole label.
+        """
+
+        token_embeds = shared.token_embeds
+        input_ids = shared.input_ids
+        if token_embeds is None or input_ids is None or self.option_token_index < 0:
+            return None, None
+        attention = (
+            shared.attention_mask.bool()
+            if shared.attention_mask is not None
+            else torch.ones_like(input_ids, dtype=torch.bool)
+        )
+        markers = (input_ids == self.option_token_index) & attention
+        counts = markers.sum(dim=1)
+        batch, length, dim = token_embeds.shape
+        width = max(int(counts.max().item()) if counts.numel() else 0, 1)
+        stream = token_embeds.new_zeros(batch, width, dim)
+        if not self.embed_option_token:
+            boundary = markers.clone()
+            for index in (self.child_token_index_value(), *self.typed_boundary_token_indices):
+                if index is not None and index >= 0:
+                    boundary |= input_ids == index
+            boundary |= ~attention
+        for row in range(batch):
+            positions = torch.nonzero(markers[row], as_tuple=False).squeeze(-1)
+            if positions.numel() == 0:
+                continue
+            if not self.embed_option_token:
+                following = []
+                row_boundary = boundary[row]
+                for position in positions.tolist():
+                    end = position + 1
+                    while end < length and not bool(row_boundary[end]):
+                        end += 1
+                    following.append(max(position, end - 1))
+                positions = torch.tensor(following, device=input_ids.device)
+            stream[row, : positions.numel()] = token_embeds[row, positions]
+        return stream, counts
+
+    def _option_positions(self, shared):
+        """Token position of every ``[OPTION]`` per row, without host syncs.
+
+        Returns a ``(B, L)`` table whose ``k``-th entry is the position
+        :meth:`_option_stream` reads for the ``k``-th option of the row (valid
+        for ``k < counts``), and the ``(B,)`` option counts.
+        """
+
+        token_embeds = shared.token_embeds
+        input_ids = shared.input_ids
+        if token_embeds is None or input_ids is None or self.option_token_index < 0:
+            return None, None
+        attention = (
+            shared.attention_mask.bool()
+            if shared.attention_mask is not None
+            else torch.ones_like(input_ids, dtype=torch.bool)
+        )
+        markers = (input_ids == self.option_token_index) & attention
+        counts = markers.sum(dim=1)
+        batch, length = input_ids.shape
+        steps = torch.arange(length, device=input_ids.device)
+        token_positions = steps.unsqueeze(0).expand(batch, -1)
+        if not self.embed_option_token:
+            boundary = markers.clone()
+            for index in (self.child_token_index_value(), *self.typed_boundary_token_indices):
+                if index is not None and index >= 0:
+                    boundary |= input_ids == index
+            boundary |= ~attention
+            # First boundary strictly after each position (``length`` if none);
+            # the label's last token sits just before it.
+            boundary_at = torch.where(boundary, steps, torch.full_like(steps, length))
+            following = torch.cat(
+                [boundary_at[:, 1:], boundary_at.new_full((batch, 1), length)],
+                dim=1,
+            )
+            next_boundary = following.flip(1).cummin(dim=1).values.flip(1)
+            token_positions = torch.maximum(token_positions, next_boundary - 1)
+        rank = markers.long().cumsum(dim=1) - 1
+        # Non-marker tokens go to distinct discarded columns past ``length``.
+        slot = torch.where(markers, rank, length + steps)
+        positions = torch.zeros(
+            batch, 2 * length, dtype=torch.long, device=input_ids.device,
+        ).scatter(1, slot, token_positions)
+        return positions[:, :max(length, 1)], counts
+
+    def child_token_index_value(self):
+        return int(getattr(self.config, "child_token_index", -1) or -1)
+
+    def _typed_config(self):
+        struct_cfg = getattr(self.config, "structuring_config", None)
+        return struct_cfg if struct_cfg is not None else self._typed_task_config
+
+    @property
+    def option_token_index(self):
+        return int(getattr(self._typed_config(), "option_token_index", -1))
+
+    @property
+    def typed_boundary_token_indices(self):
+        return tuple(
+            int(index)
+            for index in (
+                getattr(self._typed_config(), "typed_boundary_token_indices", None) or ()
+            )
+        )
+
+    def _group_option_embeddings(self, shared, batch, batch_origin):
+        option_index = batch.get("structuring_typed_option_index")
+        option_mask = batch.get("structuring_typed_option_mask")
+        if option_index is None or option_mask is None:
+            return None, None
+        positions, counts = self._option_positions(shared)
+        if positions is None:
+            return None, None
+        token_embeds = shared.token_embeds
+        device = token_embeds.device
+        rows = batch_origin.to(device).clamp(0, token_embeds.shape[0] - 1)
+        index = option_index.to(device)
+        # Same slot as indexing the padded option stream of ``_option_stream``
+        # (width ``max(counts.max(), 1)``), computed without reading the width.
+        width = counts.max().clamp(min=1) if counts.numel() else counts.new_ones(())
+        safe = torch.minimum(index.clamp(min=0), width - 1)
+        row_index = rows[:, None, None]
+        token_positions = positions[row_index, safe]
+        embeddings = token_embeds[row_index, token_positions]
+        present = (safe < counts[rows][:, None, None]).unsqueeze(-1)
+        embeddings = torch.where(present, embeddings, torch.zeros_like(embeddings))
+        # Options cut off by prompt truncation are not supervised or scored.
+        visible = index < counts[rows][:, None, None]
+        return embeddings, option_mask.bool().to(device) & visible
+
+    @staticmethod
+    def _gather_fields(child_embedding, field_idx):
+        width = child_embedding.shape[1]
+        if width == 0:
+            return child_embedding.new_zeros(
+                *field_idx.shape, child_embedding.shape[-1]
+            )
+        index = field_idx.clamp(0, width - 1).unsqueeze(-1).expand(
+            -1, -1, child_embedding.shape[-1]
+        )
+        return child_embedding.gather(1, index)
+
+    def _record_field_vectors(self, records, fields, words, word_mask):
+        """``(N, A, D)`` records x ``(N, C, D)`` fields -> ``(N, A, C, D)``."""
+
+        return self.option_modeling.fuse(
+            records, fields, memory=words, memory_mask=word_mask,
+        )
+
+    def _option_logits(self, vectors, option_embeddings):
+        """``(N, A, Cc, D)`` x ``(N, Cc, Kc, D)`` -> option and none logits."""
+
+        query = self.option_field_proj(vectors)
+        key = self.option_key_proj(option_embeddings)
+        logits = torch.einsum("nacd,nckd->nack", query, key) / math.sqrt(
+            query.shape[-1]
+        )
+        return logits, self.option_none(vectors).squeeze(-1)
+
+    def _typed_forward(
+        self,
+        shared,
+        flat_inputs,
+        batch,
+        *,
+        words_embedding,
+        word_mask,
+        record_anchors,
+        anchor_mask,
+        anchor_matches,
+        gold_count,
+        num_gold,
+        base_loss_fn,
+        supervised,
+    ):
+        """Class-field predictions and, with targets, their loss."""
+
+        class_field_idx = batch.get("structuring_typed_class_field_idx")
+        if class_field_idx is None:
+            return None, {}
+        device = record_anchors.device
+        if word_mask is None:
+            word_mask = flat_inputs.mask
+        word_mask = self._fit_feature_mask(word_mask, words_embedding.shape[1]).bool()
+        options, option_mask = self._group_option_embeddings(
+            shared, batch, flat_inputs.batch_origin,
+        )
+        if options is None:
+            return None, {}
+        if supervised:
+            if num_gold == 0:
+                return None, {}
+            records, record_mask = gold_record_anchors(
+                record_anchors, anchor_mask, anchor_matches, num_gold, gold_count,
+            )
+        else:
+            records, record_mask = record_anchors, anchor_mask.bool()
+
+        class_field_idx = class_field_idx.to(device)
+        class_field_mask = batch["structuring_typed_class_field_mask"].to(device).bool()
+        fields = self._gather_fields(flat_inputs.child_embedding, class_field_idx)
+        vectors = self._record_field_vectors(records, fields, words_embedding, word_mask)
+        logits, none_logits = self._option_logits(vectors, options)
+        field_ok = class_field_mask & option_mask.any(-1)
+        if not (supervised and batch.get("structuring_typed_class_targets") is not None):
+            return None, {
+                "typed_class_logits": logits.masked_fill(
+                    ~option_mask[:, None], float("-inf")
+                ),
+                "typed_class_none_logits": none_logits,
+                "typed_class_field_mask": field_ok,
+            }
+        targets = batch["structuring_typed_class_targets"].to(device)
+        targets = targets[:, :num_gold, : logits.shape[2], : logits.shape[3]]
+        unit = (
+            batch["structuring_typed_class_unit_mask"].to(device).bool()[:, :num_gold]
+            & record_mask[:, :, None]
+            & field_ok[:, None, :]
+        )
+        loss_fn = self._component_loss_fn(
+            base_loss_fn
+            or (lambda x, y: F.binary_cross_entropy_with_logits(x, y, reduction="none")),
+            "typed_class",
+        )
+        class_loss = option_loss(
+            logits,
+            none_logits,
+            targets.to(logits.dtype),
+            option_mask,
+            unit,
+            batch["structuring_typed_class_multi"].to(device),
+            loss_fn,
+        )
+        return self.typed_class_loss_coef * class_loss, {
+            "typed_class_loss": class_loss.detach(),
+        }
+
+
+def option_loss(logits, none_logits, targets, option_mask, unit_mask, multi, binary_loss_fn):
+    """Per-unit mean over options, then mean over supervised units.
+
+    ``logits``/``targets`` ``(G, R, Cc, Kc)``, ``option_mask`` ``(G, Cc, Kc)``,
+    ``unit_mask`` ``(G, R, Cc)``, ``multi`` ``(G, Cc)``.  Multi-choice fields
+    use the binary loss per option; single-choice fields a softmax over their
+    options plus "none".  Averaging inside each (record, field) unit first
+    keeps fields with many options from dominating.
+    """
+
+    # An empty ``unit`` needs no special case: every term below is masked
+    # and the clamped denominator turns the empty sum into an exact zero.
+    unit = unit_mask.bool()
+    options = option_mask.bool().unsqueeze(1).expand_as(logits)
+    element = (unit.unsqueeze(-1) & options).to(logits.dtype)
+    elementwise = binary_loss_fn(logits, targets)
+    multi_unit = (elementwise * element).sum(-1) / element.sum(-1).clamp(min=1.0)
+
+    option_f = options.to(targets.dtype)
+    none_target = (targets * option_f).sum(-1).eq(0).to(targets.dtype)
+    full_logits = torch.cat(
+        [logits.masked_fill(~options, -1e4), none_logits.unsqueeze(-1)], dim=-1,
+    )
+    full_targets = torch.cat([targets * option_f, none_target.unsqueeze(-1)], dim=-1)
+    log_probs = F.log_softmax(full_logits.float(), dim=-1).to(full_logits.dtype)
+    single_unit = -(full_targets * log_probs).sum(-1) / full_targets.sum(-1).clamp(min=1.0)
+
+    is_multi = multi.bool().unsqueeze(1).expand_as(unit)
+    unit_loss = torch.where(is_multi, multi_unit, single_unit)
+    unit_f = unit.to(unit_loss.dtype)
+    return (unit_loss * unit_f).sum() / unit_f.sum().clamp(min=1.0)
+
+
+def gold_record_anchors(record_anchors, anchor_mask, matches, num_gold, gold_count):
+    """Gather the record slot matched to every gold record.
+
+    Returns ``(G, R, D)`` anchors and a ``(G, R)`` mask.  Without Hungarian
+    matches (for example, a batch with no span targets) gold record ``r`` uses
+    slot ``r``.
+    """
+
+    groups, slots, dim = record_anchors.shape
+    device = record_anchors.device
+    if matches is not None:
+        # The assignment already lives on the host; build both tables there.
+        host = np.zeros((2, groups, num_gold), dtype=np.int64)
+        flat = match_index_array(matches)
+        keep = (flat[2] < num_gold) & (flat[1] < slots)
+        host[0, flat[0, keep], flat[2, keep]] = flat[1, keep]
+        host[1, flat[0, keep], flat[2, keep]] = 1
+        host = host_to_device(host, device)
+        index, mask = host[0], host[1].bool()
+    else:
+        gold = torch.arange(num_gold, device=device)
+        limit = min(num_gold, slots)
+        if gold_count is not None:
+            count = gold_count.to(device).long().reshape(-1)
+            mask = gold.unsqueeze(0) < torch.clamp(count, max=limit).unsqueeze(1)
+        else:
+            mask = (gold < limit).unsqueeze(0).expand(groups, -1)
+        active = torch.zeros(groups, num_gold, dtype=torch.bool, device=device)
+        active[:, :limit] = anchor_mask[:, :limit].to(device).bool()
+        mask = mask & active
+        index = torch.where(mask, gold.unsqueeze(0), torch.zeros_like(gold).unsqueeze(0))
+    gathered = record_anchors.gather(1, index.unsqueeze(-1).expand(-1, -1, dim))
+    return gathered, mask
 
 
 __all__ = ["StructuringHead"]

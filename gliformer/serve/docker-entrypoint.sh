@@ -13,6 +13,9 @@ args=(
 )
 
 [[ -n "${GLIFORMER_ROUTE_PREFIX:-}" ]] && args+=(--route-prefix "$GLIFORMER_ROUTE_PREFIX")
+[[ -n "${GLIFORMER_MODEL_ID:-}" ]] && args+=(--model-id "$GLIFORMER_MODEL_ID")
+[[ -n "${GLIFORMER_LABEL_TEMPLATE:-}" ]] && args+=(--label-template "$GLIFORMER_LABEL_TEMPLATE")
+[[ -n "${GLIFORMER_DEFAULT_THRESHOLDS:-}" ]] && args+=(--default-thresholds "$GLIFORMER_DEFAULT_THRESHOLDS")
 [[ -n "${GLIFORMER_NUM_REPLICAS:-}" ]] && args+=(--num-replicas "$GLIFORMER_NUM_REPLICAS")
 [[ -n "${GLIFORMER_QUANTIZATION:-}" ]] && args+=(--quantization "$GLIFORMER_QUANTIZATION")
 [[ -n "${GLIFORMER_PRECOMPILED_BATCH_SIZES:-}" ]] && args+=(--precompiled-batch-sizes "$GLIFORMER_PRECOMPILED_BATCH_SIZES")

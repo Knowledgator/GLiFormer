@@ -231,13 +231,30 @@ class CenterRMSAnchorNormalization(
     This exactly supports position-bucket anchors whose buckets may contain
     slightly different numbers of source tokens. Otherwise a support-weighted
     masked anchor mean is used.
+
+    ``center="anchors"`` always uses the anchor mean, ignoring the source.
+    That is the right shared component for fixed learned slots: they do not
+    contain the document mean, so subtracting it would add the same large
+    vector to every slot and make them near-identical.
     """
 
-    config_fields = frozenset({"eps"})
+    config_fields = frozenset({"eps", "center"})
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6, **kwargs):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        center: str = "source",
+        **kwargs,
+    ):
         super().__init__()
         self.eps = _validated_eps(eps)
+        center = str(center).lower()
+        if center not in {"source", "anchors"}:
+            raise ValueError(
+                "center_rms center must be 'source' or 'anchors'"
+            )
+        self.center = center
 
     @staticmethod
     def _source_mean(
@@ -300,6 +317,8 @@ class CenterRMSAnchorNormalization(
         support=None,
     ):
         valid = _anchor_mask(anchors, mask)
+        if self.center == "anchors":
+            source_embeddings = source_mask = None
         shared = self._source_mean(
             anchors,
             valid,

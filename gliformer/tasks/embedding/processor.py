@@ -102,9 +102,12 @@ class EmbeddingProcessor(TaskProcessor):
             # Legacy pair indices counted one encoder row for a batch item
             # without embedding pairs.  Preserve that offset in the separate
             # embedding text batch so the indices remain both compatible and
-            # valid for the newer independently encoded representation.
+            # valid for the newer independently encoded representation.  The
+            # row is never read, so it is an empty text: encoding the item's
+            # own text here re-ran the encoder on every non-embedding row of
+            # the batch, padded to the longest of them.
             if not item_pairs:
-                embedding_texts.append(self._normalize_text(item.get("text", "")))
+                embedding_texts.append("")
 
         if not scores:
             return None

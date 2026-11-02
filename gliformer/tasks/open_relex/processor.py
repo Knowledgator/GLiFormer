@@ -10,6 +10,7 @@ from ...processing.mappings import (
     OpenRelexClassMapping,
     OpenRelexItemMapping,
 )
+from ...processing.token_units import TOKEN_UNIT_MARKER
 from ..ner.processor import NERProcessor
 
 
@@ -330,6 +331,8 @@ class OpenRelexProcessor(NERProcessor):
             }
             if "tokenized_text" in item:
                 extraction_item["tokenized_text"] = item["tokenized_text"]
+            if TOKEN_UNIT_MARKER in item:
+                extraction_item[TOKEN_UNIT_MARKER] = item[TOKEN_UNIT_MARKER]
             super().resolve_spans(extraction_item)
             for (group_idx, _), resolved_group in zip(
                 extraction_groups,

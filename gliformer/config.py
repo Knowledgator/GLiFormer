@@ -1,6 +1,8 @@
 import copy
 import dataclasses
+import json
 import math
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
@@ -10,6 +12,10 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from . import backbones as _layout_backbones  # noqa: F401 - registers custom AutoConfig entries
 from .backbones import get_backbone, normalize_backbone_type
+
+# Units a GLiFormer model can index text by (see ``GLiFormerConfig.text_unit``).
+TEXT_UNITS = ("word", "token")
+SPAN_BOUNDARIES = ("free", "word")
 
 
 _FIXED_WIDTH_ANCHOR_MODES = frozenset({
@@ -46,6 +52,26 @@ def _split_component_spec(
     params = dict(configured_params)
     params.update(raw)
     return str(component_type).lower().replace("-", "_"), params
+
+
+def _validate_anchor_modeling_spec(value, *, component_name: str):
+    """Normalize an anchor-modeling spec and reject unknown types/options."""
+
+    from .layers import AnchorModeling
+
+    modeling_type, params = _split_component_spec(
+        value, default_type="linear", component_name=component_name,
+    )
+    strategy = AnchorModeling.strategy_class(modeling_type)
+    unknown = set(params) - set(strategy.config_fields)
+    if unknown:
+        raise ValueError(
+            f"Unsupported {modeling_type!r} {component_name} options: "
+            f"{sorted(unknown)}. Available: {sorted(strategy.config_fields)}"
+        )
+    if isinstance(value, str):
+        return modeling_type
+    return copy.deepcopy(dict(value))
 
 
 def _validate_attention_bias_spec(value, *, num_heads: int) -> None:
@@ -446,6 +472,15 @@ class BaseHeadConfig(AnchorHeadConfig):
     # objective, which is only comparable to a mean-reduced token loss after
     # scaling ``span_loss_coef`` by that cell count.
     span_loss_reduction: str = "mean"  # "sum" | "mean"
+    # How a span becomes a vector (gliformer/layers/span_pooling.py):
+    # "marker" (start/end MLPs, the historical layer), "mean" (mean of the
+    # span's subword states, then a projection) or "tokens" (keeps up to
+    # ``span_max_tokens`` subword states per span; ``span_pooler_queries``
+    # learned queries attend over them on top of the marker vector).
+    span_pooler: str = "marker"
+    span_max_tokens: int = 32
+    span_pooler_queries: int = 4
+    span_pooler_heads: int = 8
 
     def __post_init__(self):
         super().__post_init__()
@@ -453,6 +488,14 @@ class BaseHeadConfig(AnchorHeadConfig):
         if value not in {"sum", "mean"}:
             raise ValueError("span_loss_reduction must be 'sum' or 'mean'")
         self.span_loss_reduction = value
+        pooler = str(self.span_pooler or "marker").lower()
+        if pooler not in {"marker", "mean", "tokens"}:
+            raise ValueError("span_pooler must be 'marker', 'mean' or 'tokens'")
+        self.span_pooler = pooler
+        for name in ("span_max_tokens", "span_pooler_queries", "span_pooler_heads"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be at least 1")
+            setattr(self, name, int(getattr(self, name)))
 
 
 @dataclass
@@ -593,6 +636,8 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
         "reference_box_initialization",
         "reference_box_initial_size",
         "reference_box_grid_margin",
+        "memory_norm",
+        "query_selection_topk",
     )
 
     anchor_refine_layers: int = 2
@@ -622,10 +667,58 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
     iou_loss_coef: float = 2.0
     matcher_bbox_cost: float = 5.0
     matcher_giou_cost: float = 2.0
+    # "matched": class loss on matched slots only (historical). "all_slots":
+    # sigmoid loss over every slot and label, unmatched slots targeting zero,
+    # summed and divided by the matched count (Deformable DETR). Pair it with
+    # focal_loss_alpha/gamma (0.25/2.0) and detection_score="class".
+    class_loss_scope: str = "matched"
+    # "probability": -p(target class). "focal": Deformable-DETR focal cost.
+    matcher_class_cost_type: str = "probability"
+    matcher_focal_alpha: float = 0.25
+    matcher_focal_gamma: float = 2.0
+    # Subtracted times sigmoid(objectness) from every pair cost of a slot.
+    matcher_objectness_cost: float = 0.0
+    # "binary": matched slots target 1. "iou": they target their box IoU.
+    objectness_target: str = "binary"
+    # Decoder score: "class_x_objectness" (historical) or "class".
+    detection_score: str = "class_x_objectness"
+    # Image tokens leave the backbone at a small scale (RMS ~0.3 on Qwen3.5)
+    # next to unit-scale sine positions, so attention would mostly follow
+    # position. "layernorm" or "linear_layernorm" (DETR's input projection)
+    # brings the decoder memory to unit scale; "none" keeps raw features.
+    memory_norm: str = "none"
+    # Two-stage "mixed" query selection: every image token proposes a box and
+    # class scores; the top-k tokens seed the first k slots' reference boxes
+    # (slot content stays learned). 0 disables it. Keep k at or below the
+    # smallest image's token count (vision_min_pixels / 32**2).
+    query_selection_topk: int = 0
+    # Weight of the token-proposal set loss (needs query_selection_topk > 0).
+    encoder_loss_coef: float = 1.0
 
     def __post_init__(self):
         super().__post_init__()
         from .layers.position import PositionEmbedding, covering_grid_2d
+
+        if self.class_loss_scope not in {"matched", "all_slots"}:
+            raise ValueError("class_loss_scope must be 'matched' or 'all_slots'")
+        if self.matcher_class_cost_type not in {"probability", "focal"}:
+            raise ValueError("matcher_class_cost_type must be 'probability' or 'focal'")
+        if self.objectness_target not in {"binary", "iou"}:
+            raise ValueError("objectness_target must be 'binary' or 'iou'")
+        if self.detection_score not in {"class_x_objectness", "class"}:
+            raise ValueError("detection_score must be 'class_x_objectness' or 'class'")
+        if self.matcher_objectness_cost < 0:
+            raise ValueError("matcher_objectness_cost must be non-negative")
+        if self.query_selection_topk < 0 or self.encoder_loss_coef < 0:
+            raise ValueError(
+                "query_selection_topk and encoder_loss_coef must be non-negative"
+            )
+        if self.query_selection_topk > 0 and not self.iterative_box_refinement:
+            raise ValueError("query_selection_topk requires iterative_box_refinement")
+        if self.memory_norm not in {"none", "layernorm", "linear_layernorm"}:
+            raise ValueError(
+                "memory_norm must be 'none', 'layernorm' or 'linear_layernorm'"
+            )
 
         self.memory_position_embedding_kwargs = dict(
             self.memory_position_embedding_kwargs or {}
@@ -814,6 +907,8 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
             "spatial_attention_bias_type",
             "spatial_attention_sigma",
             "spatial_attention_bias_weight",
+            "memory_norm",
+            "query_selection_topk",
         ]
         if mode == "features":
             fields.extend(
@@ -1665,11 +1760,61 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     objectness_focal_loss_alpha: Optional[float] = None
     objectness_focal_loss_gamma: Optional[float] = None
     objectness_focal_loss_prob_margin: Optional[float] = None
+    # Typed fields: class fields choose from ``[OPTION]`` labels rendered in
+    # the prompt and are scored by the structuring head. Number, duration,
+    # date, time and datetime fields are span fields; their values are read
+    # by the normalization head. Off by default so plain configs need no
+    # ``[OPTION]`` token.
+    typed_fields: bool = False
+    option_token_index: int = -1
+    # True: use the ``[OPTION]`` marker embedding (bidirectional encoders).
+    # False: use the last token of the option label (causal decoders).
+    embed_option_token: bool = True
+    # Token ids that end an option label for ``embed_option_token=False``;
+    # filled by ``set_class_indices``.
+    typed_boundary_token_indices: Optional[list[int]] = None
+    typed_readout_heads: int = 8
+    # Anchor modeling of the option scorer's (record, class field) queries:
+    # an ``AnchorModeling`` type or ``{type, params}`` mapping.  "readout"
+    # fuses record and field, then reads the text; ``typed_readout_heads``
+    # is its default ``num_heads``.
+    typed_modeling: str | dict[str, Any] = "readout"
+    typed_class_loss_coef: float = 1.0
+    typed_class_threshold: float = 0.5
+    # Training-time prompt augmentation for typed fields.
+    typed_description_dropout: float = 0.3
+    typed_shuffle_options: bool = True
+    typed_class_focal_loss_alpha: Optional[float] = None
+    typed_class_focal_loss_gamma: Optional[float] = None
+    # Record-slot refinement reads the text words only by default. True also
+    # lets the slots cross-attend to the schema: the structure token and its
+    # field tokens, appended after the text with no position and a learned
+    # "schema" embedding instead. Needs no cross-attention bias.
+    anchor_memory_schema: bool = False
 
     def __post_init__(self):
         super().__post_init__()
         if not isinstance(self.reuse_ner_head, bool):
             raise TypeError("reuse_ner_head must be a boolean")
+        if not isinstance(self.anchor_memory_schema, bool):
+            raise TypeError("anchor_memory_schema must be a boolean")
+        self.typed_fields = bool(self.typed_fields)
+        self.typed_shuffle_options = bool(self.typed_shuffle_options)
+        if int(self.typed_readout_heads) < 1:
+            raise ValueError("typed_readout_heads must be positive")
+        self.typed_readout_heads = int(self.typed_readout_heads)
+        self.typed_modeling = _validate_anchor_modeling_spec(
+            self.typed_modeling, component_name="typed_modeling",
+        )
+        value = float(self.typed_class_loss_coef)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("typed_class_loss_coef must be finite and non-negative")
+        self.typed_class_loss_coef = value
+        for name in ("typed_class_threshold", "typed_description_dropout"):
+            value = float(getattr(self, name))
+            if not 0 <= value <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+            setattr(self, name, value)
         if self.assignment_loss_coef is None:
             self.assignment_loss_coef = float(self.span_loss_coef)
         if (
@@ -1722,6 +1867,522 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
                     "anchor_objectness_threshold must be finite and in [0, 1]"
                 )
             self.anchor_objectness_threshold = threshold
+
+
+@dataclass
+class NormalizationParserConfig:
+    """Rule-based parser that adds silver-labelled spans to training inputs.
+
+    Off by default. It never produces model outputs.
+    """
+
+    enabled: bool = False
+    numbers: bool = True
+    dates: bool = True
+    times: bool = True
+    # English number words ("one hundred and five") become spans too.
+    number_words: bool = False
+    max_mentions: int = 64
+
+    def __post_init__(self):
+        for name in ("enabled", "numbers", "dates", "times", "number_words"):
+            setattr(self, name, bool(getattr(self, name)))
+        self.max_mentions = int(self.max_mentions)
+        if self.max_mentions < 1:
+            raise ValueError("parser max_mentions must be positive")
+
+
+@dataclass
+class NormalizationTemporalConfig:
+    """Calendar classifiers for date, time and datetime spans.
+
+    Years in ``year_range`` are classes (plus "out of range" and "null");
+    ``year_digits`` adds an era + 4-digit head that reads out-of-range years.
+    ``year_range: null`` leaves every year to the digit head. Month, day,
+    hour, minute and second each get a class per value plus "null".
+    """
+
+    year_range: Optional[list[int]] = dataclasses.field(
+        default_factory=lambda: [1800, 2199]
+    )
+    year_digits: bool = True
+    loss_coef: float = 1.0
+
+    def __post_init__(self):
+        if self.year_range is not None:
+            first, last = (int(value) for value in self.year_range)
+            if first > last:
+                raise ValueError("temporal year_range must be [first, last] with first <= last")
+            self.year_range = [first, last]
+        self.year_digits = bool(self.year_digits)
+        if self.year_range is None and not self.year_digits:
+            raise ValueError("temporal needs year_range or year_digits")
+        if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
+            raise ValueError("temporal loss_coef must be finite and non-negative")
+        self.loss_coef = float(self.loss_coef)
+
+    def year_bounds(self) -> tuple[int, int]:
+        """Class range; an empty range (0, -1) when every year is digits."""
+
+        if self.year_range is None:
+            return 0, -1
+        return int(self.year_range[0]), int(self.year_range[1])
+
+
+@dataclass
+class NormalizationRegressionConfig:
+    """Number read as one regressed value.
+
+    ``asinh``: z = asinh(y / scale), any sign. ``log10``: a sign/zero class
+    plus z = log10(|y| / scale). ``loss``: ``huber`` (``huber_delta``) or ``l1``
+    on z.
+    """
+
+    transform: str = "asinh"
+    scale: float = 1.0
+    loss: str = "huber"
+    huber_delta: float = 1.0
+
+    def __post_init__(self):
+        self.transform = str(self.transform).lower()
+        if self.transform not in {"asinh", "log10"}:
+            raise ValueError("regression transform must be 'asinh' or 'log10'")
+        self.loss = str(self.loss).lower()
+        if self.loss not in {"huber", "l1"}:
+            raise ValueError("regression loss must be 'huber' or 'l1'")
+        for name in ("scale", "huber_delta"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"regression {name} must be finite and positive")
+            setattr(self, name, value)
+
+
+@dataclass
+class NormalizationBinsConfig:
+    """Number read as one class over fixed bins of a transformed value.
+
+    ``asinh`` or ``log10`` (with a zero class and a sign) of y / scale;
+    ``count`` uniform bins on ``range`` or explicit ``edges``. ``unbounded``
+    support adds two tail classes (half-normal, ``tail_scale``); ``finite``
+    skips values outside the edges. Decoded as the distribution's median.
+    """
+
+    transform: str = "asinh"
+    scale: float = 1.0
+    # 2048 bins on [-32, 32] cover |y| up to ~4e13 (asinh); a value can be
+    # off by up to half a bin, about 1.6% for large numbers.
+    count: int = 2048
+    range: list[float] = dataclasses.field(default_factory=lambda: [-32.0, 32.0])
+    edges: Optional[list[float]] = None
+    support: str = "unbounded"
+    tail_scale: float = 1.0
+
+    def __post_init__(self):
+        self.transform = str(self.transform).lower()
+        if self.transform not in {"asinh", "log10"}:
+            raise ValueError("bins transform must be 'asinh' or 'log10'")
+        self.support = str(self.support).lower()
+        if self.support not in {"unbounded", "finite"}:
+            raise ValueError("bins support must be 'unbounded' or 'finite'")
+        for name in ("scale", "tail_scale"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"bins {name} must be finite and positive")
+            setattr(self, name, value)
+        self.count = int(self.count)
+        if self.count < 2:
+            raise ValueError("bins count must be at least 2")
+        low, high = (float(value) for value in self.range)
+        if not (math.isfinite(low) and math.isfinite(high) and low < high):
+            raise ValueError("bins range must be two finite values, low < high")
+        self.range = [low, high]
+        if self.edges is not None:
+            edges = [float(value) for value in self.edges]
+            if len(edges) < 3 or any(right <= left for left, right in zip(edges, edges[1:])):
+                raise ValueError("bins edges must be at least 3 strictly increasing values")
+            self.edges = edges
+
+
+@dataclass
+class NormalizationSciDigitsConfig:
+    """Number read as sign x digits x coefficient x 10^exponent.
+
+    A sign/zero class, an exponent class over ``exp_range``, and ``digits``
+    significant digits as 10-way classes (each conditioned on the exponent and
+    the digits before it). With ``coefficient``, a regressed multiplier
+    c = 10^(``coefficient_log10_range`` * tanh(.)) scales the digits; it is
+    trained on the head's own greedy digits and applied at decode when
+    ``apply_coefficient``. Exponents outside the range get only the sign loss.
+    """
+
+    exp_range: list[int] = dataclasses.field(default_factory=lambda: [-10, 15])
+    digits: int = 5
+    hidden: int = 256
+    coefficient: bool = True
+    coefficient_log10_range: float = 0.5
+    apply_coefficient: bool = True
+    coefficient_loss_coef: float = 1.0
+
+    def __post_init__(self):
+        low, high = (int(value) for value in self.exp_range)
+        if low > high:
+            raise ValueError("sci_digits exp_range must be [low, high] with low <= high")
+        self.exp_range = [low, high]
+        self.digits = int(self.digits)
+        if not 1 <= self.digits <= 15:
+            raise ValueError("sci_digits digits must be in [1, 15]")
+        self.hidden = int(self.hidden)
+        if self.hidden < 1:
+            raise ValueError("sci_digits hidden must be positive")
+        self.coefficient = bool(self.coefficient)
+        self.apply_coefficient = bool(self.apply_coefficient)
+        for name in ("coefficient_log10_range", "coefficient_loss_coef"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"sci_digits {name} must be finite and non-negative")
+            setattr(self, name, value)
+
+
+NUMBER_HEAD_KINDS = ("regression", "bins", "sci_digits")
+
+
+@dataclass
+class NormalizationNumberConfig:
+    """Number heads of the normalization head.
+
+    ``heads`` lists one or more of ``regression``, ``bins``, ``sci_digits``;
+    all listed heads train together, and ``decode_with`` (default: the first)
+    gives the decoded number. An empty list reads no numbers.
+    """
+
+    heads: list[str] = dataclasses.field(default_factory=lambda: ["bins"])
+    decode_with: Optional[str] = None
+    loss_coef: float = 1.0
+    regression: NormalizationRegressionConfig | dict = dataclasses.field(
+        default_factory=NormalizationRegressionConfig
+    )
+    bins: NormalizationBinsConfig | dict = dataclasses.field(
+        default_factory=NormalizationBinsConfig
+    )
+    sci_digits: NormalizationSciDigitsConfig | dict = dataclasses.field(
+        default_factory=NormalizationSciDigitsConfig
+    )
+
+    def __post_init__(self):
+        self.heads = list(dict.fromkeys(str(kind).lower() for kind in self.heads))
+        unknown = set(self.heads) - set(NUMBER_HEAD_KINDS)
+        if unknown:
+            raise ValueError(
+                f"Unknown number heads {sorted(unknown)}; use {list(NUMBER_HEAD_KINDS)}"
+            )
+        if self.decode_with is not None:
+            self.decode_with = str(self.decode_with).lower()
+            if self.decode_with not in self.heads:
+                raise ValueError("number decode_with must be one of the listed heads")
+        elif self.heads:
+            self.decode_with = self.heads[0]
+        if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
+            raise ValueError("number loss_coef must be finite and non-negative")
+        self.loss_coef = float(self.loss_coef)
+        if isinstance(self.regression, dict):
+            self.regression = NormalizationRegressionConfig(**self.regression)
+        if isinstance(self.bins, dict):
+            self.bins = NormalizationBinsConfig(**self.bins)
+        if isinstance(self.sci_digits, dict):
+            self.sci_digits = NormalizationSciDigitsConfig(**self.sci_digits)
+
+
+NORMALIZATION_SPAN_ENCODERS = ("marker", "mean", "tokens")
+
+
+@dataclass
+class NormalizationHeadConfig:
+    """Span-level normalization head: reads values from spans.
+
+    At inference the head reads every span the ``span_sources`` heads
+    picked (``structuring`` entity spans, ``ner`` spans). During training it
+    reads labelled spans: gold value fields of the structuring data, plus
+    parser spans when ``parser.enabled``.
+    """
+
+    loss_coef: float = 1.0
+    # How a span becomes a vector: one of the shared span poolers
+    # (gliformer/layers/span_pooling.py), "marker", "mean" or "tokens";
+    # "tokens" also keeps the span's subword states for ``token_queries``.
+    span_encoder: str = "tokens"
+    span_queries: int = 4
+    span_attention_heads: int = 8
+    max_span_tokens: int = 32
+    # Token queries: every output (each significant digit, each calendar
+    # component, the number value) gets its own learned query, and the
+    # queries read the span's subword states through ``token_query_layers``
+    # transformer decoder layers. Off: every output reads the one span vector.
+    token_queries: bool = True
+    token_query_layers: int = 2
+    max_span_width: int = 16
+    # Labelled spans per text in training; spans read per text at inference
+    # (the structuring decoder can only take values of spans the head read).
+    max_spans: int = 64
+    max_inference_spans: int = 512
+    # Rows that supply training targets: "all", or "calculation" (only rows
+    # with calculation programs; other rows give the head no targets).
+    train_rows: str = "all"
+    span_sources: list[str] = dataclasses.field(
+        default_factory=lambda: ["structuring", "ner"]
+    )
+    temporal: NormalizationTemporalConfig | dict = dataclasses.field(
+        default_factory=NormalizationTemporalConfig
+    )
+    number: NormalizationNumberConfig | dict = dataclasses.field(
+        default_factory=NormalizationNumberConfig
+    )
+    parser: NormalizationParserConfig | dict = dataclasses.field(
+        default_factory=NormalizationParserConfig
+    )
+
+    def __post_init__(self):
+        if not math.isfinite(float(self.loss_coef)) or self.loss_coef < 0:
+            raise ValueError("loss_coef must be finite and non-negative")
+        self.span_encoder = str(self.span_encoder).lower()
+        if self.span_encoder not in NORMALIZATION_SPAN_ENCODERS:
+            raise ValueError(f"span_encoder must be one of {list(NORMALIZATION_SPAN_ENCODERS)}")
+        self.token_queries = bool(self.token_queries)
+        for name in (
+            "span_queries", "span_attention_heads", "max_span_tokens", "token_query_layers",
+            "max_span_width", "max_spans", "max_inference_spans",
+        ):
+            value = int(getattr(self, name))
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        self.train_rows = str(self.train_rows).lower()
+        if self.train_rows not in ("all", "calculation"):
+            raise ValueError("train_rows must be 'all' or 'calculation'")
+        self.span_sources = [str(source) for source in self.span_sources]
+        unknown = set(self.span_sources) - {"structuring", "ner", "calculation"}
+        if unknown:
+            raise ValueError(
+                f"Unknown span_sources {sorted(unknown)}; use 'structuring', 'ner', 'calculation'"
+            )
+        if isinstance(self.temporal, dict):
+            self.temporal = NormalizationTemporalConfig(**self.temporal)
+        if isinstance(self.number, dict):
+            self.number = NormalizationNumberConfig(**self.number)
+        if isinstance(self.parser, dict):
+            self.parser = NormalizationParserConfig(**self.parser)
+
+CALCULATION_SPAN_POOLERS = ("marker", "mean", "tokens")
+
+
+@dataclass
+class CalculationHeadConfig:
+    """Calculation head: computes ``$calculate`` fields with a program.
+
+    A field the schema marks ``"$calculate": true`` gets a ``[CALC]`` marker in
+    the prompt. For every (structuring record, calc field) pair the head builds
+    a query from the ``[CALC]`` vector, the record anchor and the schema parent
+    vector, extracts operand spans with it (BIO), and fills ``num_slots``
+    calculation slots. Each slot predicts an operation and two operand sets
+    over (operand spans | earlier slots | constants); the decoder runs the
+    resulting graph on the values the normalization head reads.
+    """
+
+    loss_coef: float = 1.0
+    bio_loss_coef: float = 1.0
+    port_loss_coef: float = 1.0
+    op_loss_coef: float = 1.0
+    active_loss_coef: float = 1.0
+    num_slots: int = 8
+    slot_refine_layers: int = 2
+    slot_heads: int = 8
+    readout_heads: int = 8
+    # Normalization of the initial slots (table + query + position) before
+    # refinement: an ``AnchorNormalizer`` type or ``{type, params}`` mapping,
+    # e.g. ``{type: center_rms, params: {center: anchors}}`` (subtract the
+    # slot mean, rescale to unit RMS). "none" keeps the slots as built.
+    slot_normalization: str | dict[str, Any] = "none"
+    # Anchor modeling of the (record anchor, [CALC] marker) query: an
+    # ``AnchorModeling`` type or ``{type, params}`` mapping.  "readout" fuses
+    # record and marker, then reads the text; ``readout_heads`` is its default
+    # ``num_heads``.  Other types (linear, mlp, ...) skip the text readout.
+    query_modeling: str | dict[str, Any] = "readout"
+    span_pooler: str = "tokens"
+    span_max_tokens: int = 32
+    span_pooler_queries: int = 4
+    span_pooler_heads: int = 8
+    max_span_width: int = 16
+    # Operand candidates per query: gold operands plus predicted spans in
+    # training (negatives), predicted spans at inference.
+    max_operand_spans: int = 48
+    port_threshold: float = 0.5
+    active_threshold: float = 0.5
+    operand_threshold: float = 0.5
+    # How operand candidates are read from the BIO scores. "threshold":
+    # spans whose start/end/inside cells all pass operand_threshold.
+    # "topk": spans ranked by the geometric mean of their start, end and
+    # inside probabilities, greedily non-overlapping, above
+    # candidate_threshold; in training they are the port negatives.
+    candidate_mode: str = "threshold"
+    candidate_threshold: float = 0.05
+    # BIO focal settings and port (operand set) focal settings; None = BCE.
+    bio_focal_loss_alpha: float | None = 0.75
+    bio_focal_loss_gamma: float | None = 2.0
+    port_focal_loss_alpha: float | None = None
+    port_focal_loss_gamma: float | None = None
+    # Stop gradients from the calculation head into the structuring anchors.
+    detach_record_anchors: bool = False
+    calc_token_index: int = -1
+
+    def __post_init__(self):
+        for name in ("loss_coef", "bio_loss_coef", "port_loss_coef", "op_loss_coef", "active_loss_coef"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            setattr(self, name, value)
+        for name in (
+            "num_slots", "slot_heads", "readout_heads", "span_max_tokens", "span_pooler_queries",
+            "span_pooler_heads", "max_span_width", "max_operand_spans",
+        ):
+            value = int(getattr(self, name))
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        self.query_modeling = _validate_anchor_modeling_spec(
+            self.query_modeling, component_name="query_modeling",
+        )
+        self.slot_refine_layers = int(self.slot_refine_layers)
+        if self.slot_refine_layers < 0:
+            raise ValueError("slot_refine_layers must be >= 0")
+        self.span_pooler = str(self.span_pooler).lower()
+        if self.span_pooler not in CALCULATION_SPAN_POOLERS:
+            raise ValueError(f"span_pooler must be one of {list(CALCULATION_SPAN_POOLERS)}")
+        self.candidate_mode = str(self.candidate_mode).lower()
+        if self.candidate_mode not in ("threshold", "topk"):
+            raise ValueError("candidate_mode must be 'threshold' or 'topk'")
+        for name in ("port_threshold", "active_threshold", "operand_threshold", "candidate_threshold"):
+            value = float(getattr(self, name))
+            if not 0.0 < value < 1.0:
+                raise ValueError(f"{name} must be in (0, 1)")
+            setattr(self, name, value)
+        self.detach_record_anchors = bool(self.detach_record_anchors)
+        self.calc_token_index = int(self.calc_token_index)
+
+
+SEQUENCE_EDITING_VOCABS = ("tied",)
+SEQUENCE_EDITING_CONTENT_MODES = ("slots", "tags")
+SEQUENCE_EDITING_SLOT_DECODERS = ("decoder", "mlp")
+
+
+@dataclass
+class SequenceEditingHeadConfig:
+    """Sequence editing head: per-unit keep/delete/replace/append.
+
+    The prompt carries ``[EDIT] <instruction>``. For every text unit (word or
+    subword, following ``text_unit``) plus a virtual BOS slot the head picks
+    an operation; for ``replace``/``append`` it writes up to
+    ``max_content_len`` backbone subwords with ``num_slots`` parallel slot
+    queries, scored against the backbone's own input embedding matrix (no
+    vocabulary-sized output layer) and, with ``copy``, a pointer over the
+    input tokens. See tasks/sequence_editing/.
+    """
+
+    loss_coef: float = 1.0
+    op_loss_coef: float = 1.0
+    length_loss_coef: float = 0.5
+    token_loss_coef: float = 1.0
+    space_loss_coef: float = 0.25
+    # CE class weight of KEEP (most units are kept).
+    keep_weight: float = 0.5
+    op_label_smoothing: float = 0.0
+    max_content_len: int = 8
+    context_layers: int = 0
+    decoder_layers: int = 2
+    decoder_heads: int = 8
+    # How the content slots of an edit are built from its unit state.
+    # "decoder": slot queries refined by ``decoder_layers`` blocks of slot
+    # self-attention + cross-attention to the encoder tokens (historical).
+    # "mlp": one MLP projects the unit state (+ op) into the ``max_content_len``
+    # slot states; no attention, ``decoder_layers``/``local_window`` unused.
+    # Same accuracy as "decoder" in experiments/edit_slots, ~40% faster
+    # training of the head and 1.8x fewer parameters.
+    slot_decoder: str = "decoder"
+    # Content slots also attend to the subwords of the edited unit and of
+    # ``local_window`` units on each side (at most ``local_max_tokens``);
+    # 0 disables it.
+    local_window: int = 0
+    local_max_tokens: int = 32
+    vocab: str = "tied"
+    copy: bool = True
+    # Stop gradients from the content scorer into the shared embedding matrix.
+    detach_vocab: bool = False
+    # Inference: added to the KEEP logit (higher = fewer edits).
+    keep_bias: float = 0.0
+    # Inference: a row is edited only if some unit's non-KEEP probability
+    # reaches this value.
+    min_edit_prob: float = 0.0
+    num_iterations: int = 1
+    edit_token_index: int = -1
+    # "slots": learned content slots (above); "tags": GECToR-style token
+    # classification, every REPLACE/APPEND unit picks one string of
+    # ``tag_vocab`` (leading space = whitespace before it). Edits whose
+    # content is not in the vocabulary get no op label.
+    content_mode: str = "slots"
+    tag_vocab: Optional[list] = None
+    # JSON list read into ``tag_vocab`` when that is empty (see
+    # tasks/sequence_editing/tags.py); the checkpoint keeps the list.
+    tag_vocab_path: Optional[str] = None
+    tag_loss_coef: float = 1.0
+
+    def __post_init__(self):
+        for name in (
+            "loss_coef", "op_loss_coef", "length_loss_coef", "token_loss_coef",
+            "space_loss_coef", "keep_weight", "tag_loss_coef",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            setattr(self, name, value)
+        for name in ("max_content_len", "decoder_heads", "num_iterations"):
+            value = int(getattr(self, name))
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        self.local_max_tokens = int(self.local_max_tokens)
+        if self.local_max_tokens < 1:
+            raise ValueError("local_max_tokens must be positive")
+        for name in ("context_layers", "decoder_layers", "local_window"):
+            value = int(getattr(self, name))
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0")
+            setattr(self, name, value)
+        self.op_label_smoothing = float(self.op_label_smoothing)
+        if not 0.0 <= self.op_label_smoothing < 1.0:
+            raise ValueError("op_label_smoothing must be in [0, 1)")
+        self.vocab = str(self.vocab).lower()
+        if self.vocab not in SEQUENCE_EDITING_VOCABS:
+            raise ValueError(f"vocab must be one of {list(SEQUENCE_EDITING_VOCABS)}")
+        self.copy = bool(self.copy)
+        self.detach_vocab = bool(self.detach_vocab)
+        self.keep_bias = float(self.keep_bias)
+        self.min_edit_prob = float(self.min_edit_prob)
+        if not 0.0 <= self.min_edit_prob < 1.0:
+            raise ValueError("min_edit_prob must be in [0, 1)")
+        self.edit_token_index = int(self.edit_token_index)
+        self.slot_decoder = str(self.slot_decoder).lower()
+        if self.slot_decoder not in SEQUENCE_EDITING_SLOT_DECODERS:
+            raise ValueError(f"slot_decoder must be one of {list(SEQUENCE_EDITING_SLOT_DECODERS)}")
+        if self.slot_decoder == "mlp" and self.local_window > 0:
+            raise ValueError("local_window needs slot_decoder 'decoder'")
+        self.content_mode = str(self.content_mode).lower()
+        if self.content_mode not in SEQUENCE_EDITING_CONTENT_MODES:
+            raise ValueError(f"content_mode must be one of {list(SEQUENCE_EDITING_CONTENT_MODES)}")
+        if self.content_mode == "tags":
+            if not self.tag_vocab and self.tag_vocab_path:
+                with open(self.tag_vocab_path) as handle:
+                    self.tag_vocab = json.load(handle)
+            if not self.tag_vocab:
+                raise ValueError("content_mode 'tags' needs tag_vocab or tag_vocab_path")
+            self.tag_vocab = [str(tag) for tag in self.tag_vocab]
 
 
 @dataclass
@@ -1784,6 +2445,9 @@ class GLiFormerConfig(BaseGLiNERConfig):
         "structuring": "structuring_config",
         "count": "count_config",
         "embedding": "embedding_config",
+        "normalization": "normalization_config",
+        "calculation": "calculation_config",
+        "sequence_editing": "sequence_editing_config",
     }
 
     @staticmethod
@@ -1972,6 +2636,9 @@ class GLiFormerConfig(BaseGLiNERConfig):
         structuring_config: Optional[dict] = None,
         count_config: Optional[dict] = None,
         embedding_config: Optional[dict] = None,
+        normalization_config: Optional[dict] = None,
+        calculation_config: Optional[dict] = None,
+        sequence_editing_config: Optional[dict] = None,
         # Shared layers across tasks (None = each task creates its own)
         shared_anchor_modeling: Optional[str | dict[str, Any]] = None,
         shared_anchor_refinement: Optional[str | dict[str, Any]] = None,
@@ -2032,6 +2699,12 @@ class GLiFormerConfig(BaseGLiNERConfig):
         structuring_child_token: str = "<<CHILD>>",
         structuring_end_token: str = "<<END>>",
         obj_token: str = "[OBJECT]",
+        # Marks one option of a typed structuring class field.
+        option_token: str = "[OPTION]",
+        # Follows a structuring field marked ``$calculate`` (calculation head).
+        calc_token: str = "[CALC]",
+        # Starts a sequence editing instruction (sequence editing head).
+        edit_token: str = "[EDIT]",
         # Descriptive aliases for the marker-token parameters above. The
         # shorter names remain the serialized/public compatibility surface.
         entity_token: Optional[str] = None,
@@ -2102,6 +2775,16 @@ class GLiFormerConfig(BaseGLiNERConfig):
         vision_do_normalize: bool = False,
         vision_image_mean: Optional[list[float]] = None,
         vision_image_std: Optional[list[float]] = None,
+        vision_min_pixels: Optional[int] = None,
+        vision_max_pixels: Optional[int] = None,
+        freeze_native_vision: bool = True,
+        preserve_word_spaces: bool = False,
+        text_unit: str = "word",
+        span_boundary: str = "free",
+        split_digits: Any = False,
+        # Training only: pack the rows of a batch into padding-free streams
+        # (block-diagonal attention; text-only batches). See encoders/text.py.
+        train_sequence_packing: bool = False,
         **kwargs,
     ):
         # Load-only aliases for checkpoints written while the entity-first
@@ -2143,10 +2826,25 @@ class GLiFormerConfig(BaseGLiNERConfig):
             )
 
         allowed_processor_types = {"custom", "auto"}
-        if vision_processor_type not in allowed_processor_types:
+        # "native": the backbone's own vision tower, fed by its own image processor.
+        native_vision = str(vision_encoder_type or "").lower() == "native"
+        if native_vision:
+            vision_encoder_type = "native"
+            if vision_processor_type == "custom":
+                vision_processor_type = "native"
+        if vision_processor_type not in allowed_processor_types | {"native"}:
             raise ValueError(
                 "vision_processor_type must be one of "
-                f"{sorted(allowed_processor_types)}, got {vision_processor_type!r}."
+                f"{sorted(allowed_processor_types | {'native'})}, got {vision_processor_type!r}."
+            )
+        if native_vision != (vision_processor_type == "native"):
+            raise ValueError(
+                "vision_encoder_type='native' and vision_processor_type='native' go together: "
+                "a backbone's vision tower only reads patches from its own image processor."
+            )
+        if native_vision and vision_model_name is not None:
+            raise ValueError(
+                "vision_encoder_type='native' uses the backbone's vision tower; drop vision_model_name."
             )
         if audio_processor_type not in allowed_processor_types:
             raise ValueError(
@@ -2431,6 +3129,51 @@ class GLiFormerConfig(BaseGLiNERConfig):
         else:
             self.count_config = count_config
 
+        # Normalization (span values)
+        if isinstance(normalization_config, dict):
+            self.normalization_config = NormalizationHeadConfig(**normalization_config)
+        elif dataclasses.is_dataclass(normalization_config) and not isinstance(
+            normalization_config, NormalizationHeadConfig
+        ):
+            self.normalization_config = NormalizationHeadConfig(
+                **dataclasses.asdict(normalization_config)
+            )
+        else:
+            self.normalization_config = normalization_config
+        if self.normalization_config is not None and (
+            self.structuring_config is None and self.ner_config is None
+        ):
+            raise ValueError(
+                "normalization_config needs a structuring_config or ner_config "
+                "(the heads whose spans it reads)"
+            )
+
+        # Calculation (computed fields)
+        if isinstance(calculation_config, dict):
+            self.calculation_config = CalculationHeadConfig(**calculation_config)
+        elif dataclasses.is_dataclass(calculation_config) and not isinstance(
+            calculation_config, CalculationHeadConfig
+        ):
+            self.calculation_config = CalculationHeadConfig(
+                **dataclasses.asdict(calculation_config)
+            )
+        else:
+            self.calculation_config = calculation_config
+        if self.calculation_config is not None and self.structuring_config is None:
+            raise ValueError("calculation_config needs a structuring_config")
+
+        # Sequence editing
+        if isinstance(sequence_editing_config, dict):
+            self.sequence_editing_config = SequenceEditingHeadConfig(**sequence_editing_config)
+        elif dataclasses.is_dataclass(sequence_editing_config) and not isinstance(
+            sequence_editing_config, SequenceEditingHeadConfig
+        ):
+            self.sequence_editing_config = SequenceEditingHeadConfig(
+                **dataclasses.asdict(sequence_editing_config)
+            )
+        else:
+            self.sequence_editing_config = sequence_editing_config
+
         # Embedding
         if isinstance(embedding_config, dict):
             embedding_config.setdefault("loss_coef", embedding_loss_coef)
@@ -2449,6 +3192,15 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.backbone_type = normalize_backbone_type(backbone_type)
         if self.backbone_type != "auto":
             get_backbone(self.backbone_type)
+        if native_vision:
+            backbone = get_backbone(self.backbone_type)
+            if backbone is None or "vision" not in backbone.native_modalities:
+                raise ValueError(
+                    "vision_encoder_type='native' needs a backbone_type that ships a vision tower "
+                    f"(e.g. 'qwen3_5'), got {self.backbone_type!r}."
+                )
+            if model_variant != "omni":
+                raise ValueError("vision_encoder_type='native' is only available with model_variant='omni'.")
 
         vision_tasks_enabled = (
             self.image_classification_config is not None
@@ -2621,6 +3373,9 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.child_token = child_token
         self.structuring_child_token = structuring_child_token
         self.structuring_end_token = structuring_end_token
+        self.option_token = option_token
+        self.calc_token = calc_token
+        self.edit_token = edit_token
         self.obj_token = obj_token
         self.obj_token_index = obj_token_index
         self.embed_obj_token = embed_obj_token
@@ -2634,6 +3389,42 @@ class GLiFormerConfig(BaseGLiNERConfig):
         self.vision_do_normalize = vision_do_normalize
         self.vision_image_mean = vision_image_mean
         self.vision_image_std = vision_image_std
+        self.vision_min_pixels = vision_min_pixels
+        self.vision_max_pixels = vision_max_pixels
+        self.freeze_native_vision = freeze_native_vision
+        # Changes what the backbone reads, so a checkpoint must keep the value it was trained with.
+        self.preserve_word_spaces = preserve_word_spaces
+        # Unit every span head works on: "word" (splitter words, subwords
+        # pooled per word) or "token" (each backbone subword is a position).
+        # Both change what the heads were trained on, so they are
+        # checkpoint-bound.
+        text_unit = str(text_unit).lower()
+        if text_unit not in TEXT_UNITS:
+            raise ValueError(f"text_unit must be one of {list(TEXT_UNITS)}, got {text_unit!r}.")
+        span_boundary = str(span_boundary).lower()
+        if span_boundary not in SPAN_BOUNDARIES:
+            raise ValueError(
+                f"span_boundary must be one of {list(SPAN_BOUNDARIES)}, got {span_boundary!r}."
+            )
+        if text_unit == "token" and preserve_word_spaces:
+            warnings.warn(
+                "preserve_word_spaces has no effect with text_unit='token': "
+                "the text is encoded from the raw string.",
+                stacklevel=2,
+            )
+        self.text_unit = text_unit
+        # Token mode only: "word" widens gold and predicted spans to whole
+        # words, so no span starts or ends inside a word.
+        self.span_boundary = span_boundary
+        # Tokenize every digit as its own piece ("88848" -> 8 8 8 4 8), so
+        # number readers see digits instead of arbitrary multi-digit chunks:
+        # false, true/"all", or "keep_dates" (dates, times and years keep
+        # their usual pieces). Changes the encoder input, so it is
+        # checkpoint-bound.
+        from .processing.token_units import normalize_digit_split
+
+        self.split_digits = normalize_digit_split(split_digits) or False
+        self.train_sequence_packing = bool(train_sequence_packing)
         # Per-task parent tokens
         if per_task_parents is True:
             # Distinct parent tokens per task (use explicit overrides or defaults)
@@ -2756,6 +3547,9 @@ _TEXT_CONFIG_FIELDS = (
     "structuring_config",
     "count_config",
     "embedding_config",
+    "normalization_config",
+    "calculation_config",
+    "sequence_editing_config",
 )
 _VISION_CONFIG_FIELDS = (
     "image_classification_config",
@@ -2786,6 +3580,10 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "max_types",
         "max_len",
         "words_splitter_type",
+        "preserve_word_spaces",
+        "text_unit",
+        "span_boundary",
+        "split_digits",
         "num_rnn_layers",
         "fuse_layers",
         "embed_ent_token",
@@ -2817,6 +3615,9 @@ _BASE_SERIALIZED_FIELDS = frozenset(
         "child_token",
         "structuring_child_token",
         "structuring_end_token",
+        "option_token",
+        "calc_token",
+        "edit_token",
         "obj_token",
         "per_task_parents",
         "ner_parent_token",
@@ -2844,6 +3645,9 @@ _TEXT_SERIALIZED_FIELDS = frozenset(
         "structuring_config",
         "count_config",
         "embedding_config",
+        "normalization_config",
+        "calculation_config",
+        "sequence_editing_config",
         "relations_layer",
         "classifier_layer",
         "groups_layer",
@@ -2898,6 +3702,9 @@ _VISION_SERIALIZED_FIELDS = frozenset(
         "vision_do_normalize",
         "vision_image_mean",
         "vision_image_std",
+        "vision_min_pixels",
+        "vision_max_pixels",
+        "freeze_native_vision",
         "image_classification_loss_coef",
         "object_detection_loss_coef",
         "segmentation_loss_coef",

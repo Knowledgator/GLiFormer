@@ -14,20 +14,34 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from gliner.data_processing import BaseProcessor
+from gliner.data_processing import BaseProcessor, WordsSplitter
 from PIL import Image
 from transformers import AutoImageProcessor, AutoProcessor
 
+from ..layers.span_pooling import config_needs_token_map
 from ..tasks.audio.processor import AudioProcessor
+from ..tasks.calculation.processor import CalculationProcessor
+from ..tasks.sequence_editing.processor import SequenceEditingProcessor
 from ..tasks.classification.processor import ClassificationProcessor
 from ..tasks.count.processor import CountProcessor
 from ..tasks.embedding.processor import EmbeddingProcessor
 from ..tasks.joint_relex.processor import JointRelexProcessor
 from ..tasks.ner.processor import NERProcessor
+from ..tasks.normalization.processor import NormalizationProcessor
 from ..tasks.open_relex.processor import OpenRelexProcessor
 from ..tasks.structuring.processor import StructuringProcessor
 from ..tasks.vision.processor import VisionProcessor
 from ..utils import pair_2d
+from .word_spacing import restore_word_spaces, tokenizer_drops_word_spaces
+from .token_units import (
+    TOKEN_UNIT_MARKER,
+    TokenSplitter,
+    WordIndexConverter,
+    aligned_word_grid,
+    is_token_level,
+    joined_word_grid,
+    unit_word_ids,
+)
 from .mappings import (
     BatchClassesMapping,
     CatClassMapping,
@@ -49,6 +63,9 @@ _TEXT_TASKS = (
     "open_relex",
     "count",
     "structuring",
+    "calculation",
+    "normalization",
+    "sequence_editing",
     "embedding",
 )
 _ALL_TASKS = (*_TEXT_TASKS, *_VISION_TASKS, *_AUDIO_TASKS)
@@ -158,6 +175,53 @@ class TorchVisionImageProcessor:
 
         pixel_values = torch.stack(batch)
         return {"pixel_values": pixel_values} if return_tensors == "pt" else pixel_values
+
+
+class NativeImageProcessor:
+    """A multimodal backbone's own image processor, held to a pixel budget.
+
+    Returns the flattened patches and the ``(t, h, w)`` patch grid the backbone's
+    vision tower reads. Images keep their aspect ratio and are resized so that
+    their area stays within ``[min_pixels, max_pixels]``, which bounds the image
+    tokens a row adds to the sequence.
+    """
+
+    # Stock processors allow images of several thousand tokens.
+    DEFAULT_MAX_PIXELS = 512 * 512
+
+    def __init__(self, processor: Any, min_pixels: Optional[int] = None, max_pixels: Optional[int] = None):
+        self.processor = processor
+        self.max_pixels = int(max_pixels) if max_pixels is not None else self.DEFAULT_MAX_PIXELS
+        default_min = getattr(getattr(processor, "size", None), "shortest_edge", None)
+        self.min_pixels = int(min_pixels) if min_pixels is not None else int(default_min or 0)
+        self.min_pixels = min(self.min_pixels, self.max_pixels)
+
+    @classmethod
+    def from_config(cls, config):
+        source = getattr(config, "vision_processor_name", None) or getattr(config, "model_name", None)
+        if source is None:
+            raise ValueError("vision_processor_type='native' requires model_name or vision_processor_name.")
+        return cls(
+            AutoImageProcessor.from_pretrained(source),
+            min_pixels=getattr(config, "vision_min_pixels", None),
+            max_pixels=getattr(config, "vision_max_pixels", None),
+        )
+
+    def __call__(self, images, return_tensors: Optional[str] = None, **kwargs):
+        output = self.processor(
+            images=images,
+            return_tensors="pt",
+            size={"shortest_edge": self.min_pixels, "longest_edge": self.max_pixels},
+        )
+        if "image_grid_thw" not in output:
+            raise ValueError(
+                f"{type(self.processor).__name__} does not return image_grid_thw; "
+                "vision_processor_type='native' needs a patch-grid image processor."
+            )
+        return {
+            "pixel_values": torch.as_tensor(output["pixel_values"], dtype=torch.float),
+            "image_grid_thw": torch.as_tensor(output["image_grid_thw"], dtype=torch.long).view(-1, 3),
+        }
 
 
 class TorchAudioProcessor:
@@ -306,6 +370,16 @@ class TorchAudioProcessor:
         return values
 
 
+class _TokenUnitInputs(dict):
+    """Token-mode model inputs; ``word_ids`` maps positions to prompt words and text units."""
+
+    def set_word_ids(self, word_ids):
+        self._word_ids = word_ids
+
+    def word_ids(self, batch_index=0):
+        return self._word_ids[batch_index]
+
+
 class TextProcessingMixin:
     """Text tokenization and word-level preprocessing."""
 
@@ -351,8 +425,24 @@ class TextProcessingMixin:
             ]
         return [self._preprocess_text_only(item) for item in batch_list]
 
+    def _restores_word_spaces(self) -> bool:
+        if not getattr(self.config, "preserve_word_spaces", False):
+            return False
+        if not hasattr(self, "_tokenizer_drops_word_spaces"):
+            self._tokenizer_drops_word_spaces = tokenizer_drops_word_spaces(self.transformer_tokenizer)
+        return self._tokenizer_drops_word_spaces
+
     def tokenize_inputs(self, texts, classes_mapping, **kwargs):
+        if is_token_level(self.config):
+            tokenized_inputs = self._tokenize_token_units(texts, classes_mapping, **kwargs)
+            return self._add_prompt_side_inputs(tokenized_inputs, classes_mapping, texts)
+        kwargs.pop("source_texts", None)
         input_texts, prompt_lengths = self.prepare_inputs(texts, classes_mapping, **kwargs)
+        if self._restores_word_spaces():
+            input_texts = [
+                words[:prompt_length] + restore_word_spaces(words[prompt_length:])
+                for words, prompt_length in zip(input_texts, prompt_lengths)
+            ]
 
         # ``max_len`` is also the encoder's sequence budget.  Capping the
         # word list alone is insufficient: a single word can expand to many
@@ -371,6 +461,12 @@ class TextProcessingMixin:
         tokenized_inputs = self._as_tokenized_mapping(tokenizer_output)
         words_mask = torch.tensor(words_masks)
         tokenized_inputs["words_mask"] = words_mask
+        if config_needs_token_map(self.config):
+            # ``words_mask`` marks only the subwords ``subtoken_pooling``
+            # keeps; span poolers that read subwords need all of them.
+            tokenized_inputs["token_words_mask"] = torch.tensor(
+                self.prepare_word_mask(texts, tokenizer_output, prompt_lengths, token_level=True)
+            )
         # Prompt and source share the transformer's token budget. The largest
         # 1-based source-word id is therefore the exact number of source words
         # that survived subtoken truncation (and is zero for prompt-only rows).
@@ -385,9 +481,171 @@ class TextProcessingMixin:
             )
         )
 
+        return self._add_prompt_side_inputs(tokenized_inputs, classes_mapping, texts)
+
+    def _add_prompt_side_inputs(self, tokenized_inputs, classes_mapping, texts):
         label_enc = self.prepare_all_label_encoder_inputs(classes_mapping)
         tokenized_inputs.update(label_enc)
+        tokenized_inputs.update(self.prepare_all_typed_inputs(classes_mapping, texts))
         return tokenized_inputs
+
+    def _special_token_frame(self):
+        """Special ids the tokenizer puts before and after one sequence."""
+
+        frame = getattr(self, "_token_unit_frame", None)
+        if frame is not None:
+            return frame
+        tokenizer = self.transformer_tokenizer
+        probe = ["probe"]
+        framed = list(tokenizer(probe, is_split_into_words=True)["input_ids"])
+        bare = list(tokenizer(probe, is_split_into_words=True, add_special_tokens=False)["input_ids"])
+        frame = ([], [])
+        for start in range(len(framed) - len(bare) + 1):
+            if framed[start:start + len(bare)] == bare:
+                frame = (framed[:start], framed[start + len(bare):])
+                break
+        self._token_unit_frame = frame
+        return frame
+
+    def _tokenize_token_units(self, texts, classes_mapping, **kwargs):
+        """Encode rows whose text units are backbone subwords.
+
+        The prompt is encoded word by word as in word mode; the text ids come
+        from encoding the raw source text once, so subword pieces are never
+        re-tokenized. ``words_mask`` numbers the units 1..T and the shared
+        ``max_len`` budget truncates the text at a unit boundary.
+        """
+        source_texts = kwargs.pop("source_texts", None)
+        if source_texts is None or len(source_texts) != len(texts):
+            raise ValueError("text_unit='token' needs the source text of every row.")
+        tokenizer = self.transformer_tokenizer
+        splitter = self.words_splitter
+        prompts, prompt_lengths = self.prepare_inputs(
+            [[] for _ in texts], classes_mapping, **kwargs,
+        )
+        prompt_ids = tokenizer(
+            prompts, is_split_into_words=True, add_special_tokens=False,
+        )["input_ids"]
+        prefix, suffix = self._special_token_frame()
+        max_len = int(self.config.max_len)
+        pooling = getattr(self.config, "subtoken_pooling", "first")
+
+        rows = []
+        for row, pieces in enumerate(texts):
+            pieces = list(pieces)
+            encoding = splitter.encode(source_texts[row] or "")
+            if encoding.pieces[: len(pieces)] == pieces:
+                text_ids = list(encoding.input_ids)
+                id_units = list(encoding.id_units)
+                first_ids = list(encoding.unit_first_id)
+                num_units = len(pieces)
+            elif not encoding.units and len(pieces) <= 1:
+                # Empty text: one placeholder unit, like the word-mode "[PAD]".
+                placeholder = tokenizer.pad_token_id
+                if placeholder is None:
+                    placeholder = tokenizer.unk_token_id or 0
+                text_ids, id_units, first_ids, num_units = [placeholder], [0], [0], 1
+            else:
+                raise ValueError(
+                    "Token units of a row do not match its text; rows must be split "
+                    "with the processor's TokenSplitter."
+                )
+            row_prompt = list(prompt_ids[row])
+            budget = max_len - len(prefix) - len(suffix)
+            if len(row_prompt) > budget:
+                row_prompt = row_prompt[: max(budget, 0)]
+            available = max(budget - len(row_prompt), 0)
+
+            def id_count(count):
+                return len(text_ids) if count >= len(first_ids) else (first_ids[count] if count > 0 else 0)
+
+            low, high = 0, num_units
+            while low < high:
+                middle = (low + high + 1) // 2
+                if id_count(middle) <= available:
+                    low = middle
+                else:
+                    high = middle - 1
+            kept = low
+            text_ids = text_ids[: id_count(kept)]
+            id_units = id_units[: len(text_ids)]
+
+            mask_values = []
+            word_ids = []
+            # Every subword of a unit (``words_mask`` keeps only the ones
+            # ``subtoken_pooling`` selects, e.g. the first byte piece).
+            token_values = [unit + 1 if 0 <= unit < kept else 0 for unit in id_units]
+            for position, unit in enumerate(id_units):
+                if unit < 0 or unit >= kept:
+                    mask_values.append(0)
+                    word_ids.append(None)
+                    continue
+                word_ids.append(prompt_lengths[row] + unit)
+                if pooling in {"mean", "max"}:
+                    selected = True
+                elif pooling == "last":
+                    selected = position + 1 >= len(id_units) or id_units[position + 1] != unit
+                else:
+                    selected = position == first_ids[unit]
+                mask_values.append(unit + 1 if selected else 0)
+            input_ids = [*prefix, *row_prompt, *text_ids, *suffix]
+            words_mask = [0] * (len(prefix) + len(row_prompt)) + mask_values + [0] * len(suffix)
+            word_ids = [None] * (len(prefix) + len(row_prompt)) + word_ids + [None] * len(suffix)
+            token_values = [0] * (len(prefix) + len(row_prompt)) + token_values + [0] * len(suffix)
+            rows.append((input_ids, words_mask, word_ids, kept, token_values))
+
+        width = max((len(row[0]) for row in rows), default=0)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        left = getattr(tokenizer, "padding_side", "right") == "left"
+        batch_ids, batch_attention, batch_words, batch_word_ids, batch_tokens = [], [], [], [], []
+        for ids, words_mask, word_ids, _, token_values in rows:
+            pad = width - len(ids)
+            if left:
+                batch_ids.append([pad_id] * pad + ids)
+                batch_attention.append([0] * pad + [1] * len(ids))
+                batch_words.append([0] * pad + words_mask)
+                batch_word_ids.append([None] * pad + word_ids)
+                batch_tokens.append([0] * pad + token_values)
+            else:
+                batch_ids.append(ids + [pad_id] * pad)
+                batch_attention.append([1] * len(ids) + [0] * pad)
+                batch_words.append(words_mask + [0] * pad)
+                batch_word_ids.append(word_ids + [None] * pad)
+                batch_tokens.append(token_values + [0] * pad)
+
+        tokenized_inputs = _TokenUnitInputs(
+            input_ids=torch.tensor(batch_ids, dtype=torch.long),
+            attention_mask=torch.tensor(batch_attention, dtype=torch.long),
+        )
+        tokenized_inputs.set_word_ids(batch_word_ids)
+        if "token_type_ids" in getattr(tokenizer, "model_input_names", ()):
+            tokenized_inputs["token_type_ids"] = torch.zeros_like(tokenized_inputs["input_ids"])
+        tokenized_inputs["words_mask"] = torch.tensor(batch_words, dtype=torch.long)
+        if config_needs_token_map(self.config):
+            tokenized_inputs["token_words_mask"] = torch.tensor(batch_tokens, dtype=torch.long)
+        tokenized_inputs["text_lengths"] = torch.tensor(
+            [[row[3]] for row in rows], dtype=torch.long,
+        ).reshape(len(rows), 1)
+        return tokenized_inputs
+
+    def prepare_all_typed_inputs(self, classes_mapping, texts=None):
+        """Label-free typed-field tensors (option indices, field kinds)."""
+
+        result = {}
+        if classes_mapping is None:
+            return result
+        use_labels_encoder = getattr(self, "labels_tokenizer", None) is not None
+        for proc in getattr(self, "task_processors", {}).values():
+            prepare = getattr(proc, "prepare_typed_inputs", None)
+            if prepare is not None:
+                result.update(prepare(
+                    classes_mapping,
+                    use_labels_encoder=use_labels_encoder,
+                    texts=texts,
+                ))
+        return result
 
 
 class VisionProcessingMixin:
@@ -415,6 +673,8 @@ class VisionProcessingMixin:
                 self.vision_input_processor = AutoProcessor.from_pretrained(source)
             except ValueError:
                 self.vision_input_processor = AutoImageProcessor.from_pretrained(source)
+        elif self.vision_input_processor is None and processor_mode == "native":
+            self.vision_input_processor = NativeImageProcessor.from_config(self.config)
         elif self.vision_input_processor is None:
             self.vision_input_processor = TorchVisionImageProcessor.from_config(self.config)
         self._vision_processor_initialized = True
@@ -423,15 +683,41 @@ class VisionProcessingMixin:
         if not getattr(self, "_vision_processor_initialized", False):
             self._build_vision_processor()
 
+    def _uses_native_vision(self) -> bool:
+        return str(getattr(self.config, "vision_processor_type", "") or "").lower() == "native"
+
     def _has_vision_inputs(self) -> bool:
-        return any(name in self.task_processors for name in _VISION_TASKS)
+        # A native tower puts the image into the sequence, where text heads read it too.
+        return self._uses_native_vision() or any(name in self.task_processors for name in _VISION_TASKS)
 
     def _open_image(self, item: Dict[str, Any]) -> Tuple[Image.Image, Tuple[int, int]]:
         path = item.get("image")
         if path is None:
             raise ValueError("Vision tasks require each item to contain 'image' or 'pixel_values'.")
-        image = Image.open(path).convert("RGB")
+        image = path if isinstance(path, Image.Image) else Image.open(path)
+        image = image.convert("RGB")
         return image, (image.height, image.width)
+
+    def load_native_image(self, item: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+        """Patches ``(patches, patch_dim)`` and patch grid ``(3,)`` for the backbone's vision tower."""
+        if item.get("pixel_values") is not None:
+            if item.get("image_grid_thw") is None:
+                raise ValueError("Precomputed native pixel_values need their image_grid_thw.")
+            pixel_values = torch.as_tensor(item["pixel_values"], dtype=torch.float)
+            grid = torch.as_tensor(item["image_grid_thw"], dtype=torch.long).view(-1, 3)
+            orig_size = tuple(int(v) for v in item.get("_image_size", (0, 0)))
+        else:
+            self._ensure_vision_processor()
+            image, orig_size = self._open_image(item)
+            output = self.vision_input_processor(images=image, return_tensors="pt")
+            pixel_values, grid = output["pixel_values"], output["image_grid_thw"]
+        if grid.shape[0] != 1:
+            raise ValueError(f"Native vision takes one image per row, got {grid.shape[0]}.")
+        if pixel_values.dim() != 2 or pixel_values.shape[0] != int(grid[0].prod()):
+            raise ValueError(
+                f"pixel_values of shape {tuple(pixel_values.shape)} do not match image_grid_thw {grid[0].tolist()}."
+            )
+        return pixel_values, grid[0], orig_size
 
     def _apply_vision_processor(self, image: Image.Image, orig_size: Tuple[int, int]) -> Tuple[torch.Tensor, Tuple[int, int]]:
         self._ensure_vision_processor()
@@ -875,7 +1161,10 @@ class LayoutProcessingMixin:
         has_layout = False
         has_page_ids = False
         for item in batch_list:
-            words, bboxes, page_ids = self._extract_layout_words_bboxes_and_pages(item)
+            if is_token_level(self.config):
+                words, bboxes, page_ids = self._token_unit_layout(item)
+            else:
+                words, bboxes, page_ids = self._extract_layout_words_bboxes_and_pages(item)
             if words is None or bboxes is None:
                 word_bboxes.append(None)
                 word_page_ids.append(None)
@@ -910,6 +1199,47 @@ class LayoutProcessingMixin:
             fields["word_page_ids"] = word_page_ids
             fields["page_input_mask"] = torch.tensor(page_input_mask, dtype=torch.bool)
         return fields
+
+    _UNIT_LAYOUT_KEY = "_gliformer_unit_layout"
+
+    def _token_unit_layout(self, item):
+        """Layout boxes and pages per token unit (token mode).
+
+        Boxes are given per word; every unit takes the box of the word that
+        holds it. The result is cached on the item because its
+        ``tokenized_text`` holds units from then on.
+        """
+        cached = item.get(self._UNIT_LAYOUT_KEY)
+        if cached is not None:
+            return cached
+        words, bboxes, page_ids = self._extract_layout_words_bboxes_and_pages(item)
+        if words is None or bboxes is None:
+            return words, bboxes, page_ids
+        if len(words) != len(bboxes):
+            raise ValueError(
+                f"Layout words and bboxes must have the same length, got {len(words)} and {len(bboxes)}."
+            )
+        if item.get(TOKEN_UNIT_MARKER) == "token":
+            raise ValueError("Layout row was split into token units before its boxes were attached.")
+        item.setdefault("tokenized_text", words)
+        item.setdefault("text", " ".join(words))
+        unit_words = self._ensure_token_units(item)
+        if unit_words is None:
+            raise ValueError("Layout words do not line up with the row text.")
+        units = list(item["tokenized_text"])
+        unit_boxes = []
+        unit_pages = [] if page_ids is not None else None
+        previous = 0
+        for word_index in unit_words:
+            if word_index is None:
+                word_index = previous
+            previous = word_index
+            unit_boxes.append(bboxes[word_index] if word_index < len(bboxes) else [0, 0, 0, 0])
+            if unit_pages is not None:
+                unit_pages.append(page_ids[word_index] if word_index < len(page_ids) else 0)
+        result = (units, unit_boxes, unit_pages)
+        item[self._UNIT_LAYOUT_KEY] = result
+        return result
 
     def _augment_label_item(self, item, batch, batch_idx):
         if batch.get("image_batch_idx") is not None:
@@ -985,6 +1315,15 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
 
     def __init__(self, config, tokenizer, words_splitter,
                  labels_tokenizer: Optional[object] = None):
+        # Word grid of the configured splitter. In token mode it still reads
+        # word-index annotations and widens spans to words.
+        self.word_splitter = None
+        if is_token_level(config):
+            if isinstance(words_splitter, TokenSplitter):
+                pass
+            elif tokenizer is not None:
+                words_splitter = TokenSplitter(tokenizer)
+            self.word_splitter = WordsSplitter(config.words_splitter_type)
         super().__init__(config, tokenizer, words_splitter)
         self.labels_tokenizer = labels_tokenizer
 
@@ -1012,6 +1351,31 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             self.task_processors["count"] = CountProcessor(config)
         if "structuring" in allowed_tasks and config.structuring_config is not None:
             self.task_processors["structuring"] = StructuringProcessor(config, tokenizer, words_splitter)
+        if (
+            "normalization" in allowed_tasks
+            and getattr(config, "normalization_config", None) is not None
+        ):
+            normalization = NormalizationProcessor(config, tokenizer, words_splitter)
+            # Gold value spans come from the structuring records.
+            normalization.structuring_processor = self.task_processors.get("structuring")
+            self.task_processors["normalization"] = normalization
+        if (
+            "calculation" in allowed_tasks
+            and getattr(config, "calculation_config", None) is not None
+        ):
+            calculation = CalculationProcessor(config, tokenizer, words_splitter)
+            calculation.structuring_processor = self.task_processors.get("structuring")
+            self.task_processors["calculation"] = calculation
+            if "normalization" in self.task_processors:
+                # Operand values are extra number targets of the normalization head.
+                self.task_processors["normalization"].calculation_processor = calculation
+        if (
+            "sequence_editing" in allowed_tasks
+            and getattr(config, "sequence_editing_config", None) is not None
+        ):
+            self.task_processors["sequence_editing"] = SequenceEditingProcessor(
+                config, tokenizer, words_splitter,
+            )
         if "embedding" in allowed_tasks and config.embedding_config is not None:
             self.task_processors["embedding"] = EmbeddingProcessor(config)
         if "image_classification" in allowed_tasks and config.image_classification_config is not None:
@@ -1119,6 +1483,10 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             segmentation_mapping=segmentation_mapping,
             audio_segmentation_mapping=audio_segmentation_mapping,
         )
+        if "sequence_editing" in self.task_processors:
+            classes_mapping.sequence_editing_mapping = self.task_processors[
+                "sequence_editing"
+            ].get_classes_mapping(batch_list, **kwargs)
 
         # Label-schema augmentation is deliberately applied to the ephemeral
         # mappings, not to dataset annotations.  It must happen before text
@@ -1170,6 +1538,11 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
 
             if "structuring" in self.task_processors:
                 prompt.extend(self.task_processors["structuring"].contribute_prompt(
+                    classes_mapping, i, use_labels_encoder,
+                ))
+
+            if "sequence_editing" in self.task_processors:
+                prompt.extend(self.task_processors["sequence_editing"].contribute_prompt(
                     classes_mapping, i, use_labels_encoder,
                 ))
 
@@ -1254,6 +1627,100 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             if empty:
                 results.update(empty)
         return results
+
+    # ── Token-level units ───────────────────────────────────────────────
+
+    def _ensure_token_units(self, item):
+        """Re-split ``item`` into backbone subword units (token mode only).
+
+        Word-index annotations (legacy NER triplets, pre-resolved spans) are
+        first rewritten as character offsets on the item's word grid, then
+        ``tokenized_text`` becomes the unit pieces. Returns the word index of
+        every unit when the item carried pre-split words (layout boxes are
+        given per word), else None.
+        """
+        if not is_token_level(self.config) or not isinstance(item, dict):
+            return None
+        if item.get(TOKEN_UNIT_MARKER) == "token":
+            return None
+        text = item.get("text")
+        words = item.get("tokenized_text")
+        words = [str(word) for word in words] if words else None
+        if not text:
+            if not words:
+                return None
+            text, grid = joined_word_grid(words)
+            item["text"] = text
+        else:
+            grid = aligned_word_grid(words, text) if words else None
+        self._convert_word_annotations(item, text, grid, has_word_tokens=bool(words))
+        units = list(self.words_splitter(text))
+        item["tokenized_text"] = [piece for piece, _, _ in units]
+        item[TOKEN_UNIT_MARKER] = "token"
+        return unit_word_ids(units, grid) if grid is not None else None
+
+    def _require_grid(self, grid, what):
+        if grid is None:
+            raise ValueError(
+                f"text_unit='token' cannot read {what}: they are word indices and the "
+                "row's tokenized_text does not line up with its text. Give character "
+                "offsets or mention text instead."
+            )
+        return WordIndexConverter(grid)
+
+    def _convert_ner_groups(self, groups, text, grid, word_indexed):
+        """Rewrite word-index NER entities of extraction groups as character offsets."""
+
+        fallback_grid = None
+        for group in groups:
+            if not isinstance(group, dict) or not group.get("ner"):
+                continue
+            group_grid = grid
+            indexed = word_indexed
+            if not indexed:
+                # Same detection the word-mode NER resolver applies.
+                if fallback_grid is None:
+                    fallback_grid = list(self.word_splitter(text))
+                indexed = NERProcessor._uses_legacy_token_offsets(
+                    group["ner"], fallback_grid, num_tokens=len(fallback_grid),
+                )
+                group_grid = fallback_grid
+            if not indexed:
+                continue
+            converter = self._require_grid(group_grid, "NER spans")
+            group["ner"] = [converter.ner_entity(entity) for entity in group["ner"]]
+
+    def _convert_word_annotations(self, item, text, grid, *, has_word_tokens):
+        extraction_resolved = bool(item.pop("_gliformer_extraction_spans_resolved", False))
+        self._convert_ner_groups(
+            item.get("extraction") or [], text, grid,
+            word_indexed=extraction_resolved or has_word_tokens,
+        )
+
+        open_relex = self.task_processors.get("open_relex")
+        groups = item.get("open_relex")
+        if isinstance(groups, list) and groups:
+            item_resolved = bool(item.pop(OpenRelexProcessor.resolved_flag, False))
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                group_resolved = bool(group.pop(OpenRelexProcessor.resolved_group_flag, False))
+                resolved = item_resolved or group_resolved
+                if open_relex is not None and open_relex._is_extraction_group(group):
+                    self._convert_ner_groups(
+                        [group], text, grid, word_indexed=resolved or has_word_tokens,
+                    )
+                elif resolved:
+                    converter = self._require_grid(grid, "resolved relation endpoints")
+                    group["relations"] = converter.span_dicts(group.get("relations", []))
+        else:
+            item.pop(OpenRelexProcessor.resolved_flag, None)
+
+        structuring = self.task_processors.get("structuring")
+        flag = getattr(structuring, "resolved_flag", "_gliformer_structuring_spans_resolved")
+        if item.pop(flag, False) and item.get("structuring"):
+            converter = self._require_grid(grid, "resolved structuring spans")
+            item["structuring"] = converter.span_dicts(item["structuring"])
 
     # ── Tokenization ────────────────────────────────────────────────────
 
@@ -1464,6 +1931,8 @@ class BaseGLiFormerProcessor(TextProcessingMixin, BaseProcessor):
             "extraction": batch.get("extraction", [[] for _ in range(batch_size)]),
             "embedding": batch.get("embedding", [[] for _ in range(batch_size)]),
             "structuring": batch.get("structuring", [{} for _ in range(batch_size)]),
+            "calculation": batch.get("calculation", [{} for _ in range(batch_size)]),
+            "sequence_editing": batch.get("sequence_editing", [None for _ in range(batch_size)]),
             "structuring_schema": batch.get(
                 "structuring_schema", [{} for _ in range(batch_size)]
             ),
@@ -1567,6 +2036,7 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
                 # offsets a second time.
                 "tokenized_text": batch["tokens"][i],
                 "_gliformer_extraction_spans_resolved": True,
+                TOKEN_UNIT_MARKER: getattr(self.config, "text_unit", "word"),
                 "classification": batch["classification"][i],
                 "extraction": batch["extraction"][i],
                 "embedding": batch["embedding"][i],
@@ -1574,6 +2044,10 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             }
             if "structuring" in batch and i < len(batch["structuring"]):
                 item["structuring"] = batch["structuring"][i]
+            if "calculation" in batch and i < len(batch["calculation"]):
+                item["calculation"] = batch["calculation"][i]
+            if "sequence_editing" in batch and i < len(batch["sequence_editing"]):
+                item["sequence_editing"] = batch["sequence_editing"][i]
             if (
                 "structuring_schema" in batch
                 and i < len(batch["structuring_schema"])
@@ -1601,6 +2075,7 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
 
     def collate_raw_batch(self, batch_list, **kwargs):
         for item in batch_list:
+            self._ensure_token_units(item)
             self._canonicalize_structuring_tokens(item)
             for proc in self.task_processors.values():
                 proc.resolve_spans(item)
@@ -1619,6 +2094,8 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             "extraction": [item.get("extraction", []) for item in batch_list],
             "embedding": [item.get("embedding", []) for item in batch_list],
             "structuring": [item.get("structuring", {}) for item in batch_list],
+            "calculation": [item.get("calculation", {}) for item in batch_list],
+            "sequence_editing": [item.get("sequence_editing") for item in batch_list],
             "structuring_schema": [
                 item.get("structuring_schema", {}) for item in batch_list
             ],
@@ -1649,6 +2126,8 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             tokenize_kwargs["layout_input_mask"] = batch["layout_input_mask"]
         if batch.get("page_input_mask") is not None:
             tokenize_kwargs["page_input_mask"] = batch["page_input_mask"]
+        if is_token_level(self.config):
+            tokenize_kwargs["source_texts"] = batch["text"]
         tokenized_input = self.tokenize_inputs(batch["tokens"], classes_mapping, **tokenize_kwargs)
         tokenized_input["classes_mapping"] = classes_mapping
 
@@ -1702,6 +2181,7 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
                     emb_texts,
                     return_tensors="pt",
                     truncation=True,
+                    max_length=int(self.config.max_len),
                     padding="longest",
                 )
                 tokenized_input["embedding_input_ids"] = emb_tokenized["input_ids"]
@@ -1748,6 +2228,38 @@ class GLiFormerTextProcessor(BaseGLiFormerProcessor):
             )
             if structuring_result is not None:
                 tokenized_input.update(structuring_result)
+
+            if "calculation" in self.task_processors:
+                calculation_result = self.task_processors["calculation"].create_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=structuring_max_seq_len,
+                    sequence_lengths=sequence_lengths,
+                )
+                if calculation_result is not None:
+                    tokenized_input.update(calculation_result)
+
+            if "sequence_editing" in self.task_processors:
+                editing_result = self.task_processors["sequence_editing"].create_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=max_seq_len,
+                    sequence_lengths=sequence_lengths,
+                )
+                if editing_result is not None:
+                    tokenized_input.update(editing_result)
+
+            # After the structuring labels: their records hold the resolved
+            # gold value spans.
+            if "normalization" in self.task_processors:
+                normalization_result = self.task_processors["normalization"].create_labels(
+                    batch_list,
+                    classes_mapping,
+                    max_seq_len=structuring_max_seq_len,
+                    sequence_lengths=sequence_lengths,
+                )
+                if normalization_result is not None:
+                    tokenized_input.update(normalization_result)
 
         if batch.get("bbox") is not None and "bbox" not in tokenized_input:
             tokenized_input["bbox"] = batch["bbox"]
@@ -2064,9 +2576,40 @@ class GLiFormerOmniProcessor(
             else:
                 item.pop("_skip_audio_tasks", None)
 
+    def _prepare_native_vision_batch(self, batch_list):
+        """Per-row patches padded over the patch axis; rows without an image get an all-zero grid."""
+        loaded = {}
+        for idx, item in enumerate(batch_list):
+            if item.get("_skip_vision_tasks"):
+                continue
+            loaded[idx] = self.load_native_image(item)
+            item["_image_size"] = loaded[idx][2]
+        if not loaded:
+            return {}
+
+        max_patches = max(patches.shape[0] for patches, _, _ in loaded.values())
+        patch_dim = next(iter(loaded.values()))[0].shape[1]
+        pixel_values = torch.zeros((len(batch_list), max_patches, patch_dim), dtype=torch.float)
+        image_grid_thw = torch.zeros((len(batch_list), 3), dtype=torch.long)
+        image_sizes = torch.zeros((len(batch_list), 2), dtype=torch.long)
+        vision_input_mask = torch.zeros(len(batch_list), dtype=torch.long)
+        for idx, (patches, grid, image_size) in loaded.items():
+            pixel_values[idx, : patches.shape[0]] = patches
+            image_grid_thw[idx] = grid
+            image_sizes[idx] = torch.tensor(image_size, dtype=torch.long)
+            vision_input_mask[idx] = 1
+        return {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "image_sizes": image_sizes,
+            "vision_input_mask": vision_input_mask,
+        }
+
     def _prepare_optional_vision_batch(self, batch_list):
         if not self._has_vision_inputs():
             return {}
+        if self._uses_native_vision():
+            return self._prepare_native_vision_batch(batch_list)
 
         image_tensors = [None for _ in batch_list]
         image_sizes = [(0, 0) for _ in batch_list]
@@ -2218,6 +2761,8 @@ class GLiFormerOmniProcessor(
             )
         if batch.get("pixel_values") is not None:
             tokenized_input["pixel_values"] = batch["pixel_values"]
+        if batch.get("image_grid_thw") is not None:
+            tokenized_input["image_grid_thw"] = batch["image_grid_thw"]
         if batch.get("vision_attention_mask") is not None:
             tokenized_input["vision_attention_mask"] = batch["vision_attention_mask"]
         if batch.get("vision_input_mask") is not None:

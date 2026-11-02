@@ -428,7 +428,7 @@ class OpenRelexDecoder(SpanDecoder):
     ) -> list[list[dict]]:
         """Map token endpoints to character offsets like open relex."""
 
-        del kwargs
+        return_group_index = bool(kwargs.get("return_group_index", False))
         output = [[] for _ in range(num_original)]
         for valid_idx, per_text_groups in enumerate(task_results):
             original_idx = valid_to_orig_idx[valid_idx]
@@ -441,18 +441,19 @@ class OpenRelexDecoder(SpanDecoder):
                 if isinstance(per_text_groups, list)
                 else [per_text_groups]
             )
-            for group in groups:
+            for group_index, group in enumerate(groups):
                 values = group if isinstance(group, list) else [group]
                 for triple in values:
                     if isinstance(triple, dict):
-                        triples.append(
-                            self._map_triple_chars(
-                                triple,
-                                start_map,
-                                end_map,
-                                text,
-                            )
+                        mapped = self._map_triple_chars(
+                            triple,
+                            start_map,
+                            end_map,
+                            text,
                         )
+                        if return_group_index:
+                            mapped["group_index"] = group_index
+                        triples.append(mapped)
             output[original_idx] = triples
         return output
 

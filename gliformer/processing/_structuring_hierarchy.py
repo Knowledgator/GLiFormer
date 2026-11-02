@@ -26,13 +26,38 @@ from .structuring_types import (
     SchemaNode,
     parse_component_spec,
     schema_node_exemplar,
+    schema_node_typed_spec,
+)
+from .typed_fields import (
+    CLASS_KIND,
+    SPAN_KIND,
+    TypedFieldSpec,
+    is_typed_descriptor,
+    lookup_group_types,
 )
 
 MULTI_LEVEL_META_KEY = "_gliformer_structuring_multi_level"
 MULTI_LEVEL_ROOT_KEY = "$root"
 NODE_ID_KEY = "__gliformer_multi_level_node_id__"
 NODE_KEEP_KEY = "__gliformer_multi_level_keep__"
-INTERNAL_INSTANCE_KEYS = frozenset({NODE_ID_KEY, NODE_KEEP_KEY})
+# Gold values of class fields. They are not text spans, so they live
+# beside the span annotations instead of being grounded in the text.
+TYPED_VALUES_KEY = "__gliformer_typed_values__"
+# Gold value (float) per value-field label (number, date, ...) whose source
+# span was found in the text; normalization targets for that span.
+TYPED_ANCHORS_KEY = "__gliformer_typed_anchors__"
+# Value-field labels whose gold value may be written in the text in a form
+# the parser could not find. Their span-tagging loss is masked instead of
+# trained as "no span here".
+TYPED_UNRESOLVED_KEY = "__gliformer_typed_unresolved__"
+INTERNAL_INSTANCE_KEYS = frozenset({
+    NODE_ID_KEY,
+    NODE_KEEP_KEY,
+    TYPED_VALUES_KEY,
+    TYPED_ANCHORS_KEY,
+    TYPED_UNRESOLVED_KEY,
+})
+STRUCTURING_TYPES_KEY = "structuring_types"
 
 _ROOT_DATA_KEY = "__gliformer_multi_level_root__"
 _ROOT_SCHEMA_NAME = "root"
@@ -62,6 +87,21 @@ def _is_span_annotation(value: object) -> bool:
         and "start" in value
         and "end" in value
         and set(value).issubset({"text", "start", "end", "score"})
+    )
+
+
+def _is_value_annotation(value: object, spec) -> bool:
+    """A value field's gold written as ``{"value": v, "anchor": span|null}``.
+
+    It is one leaf (the structuring processor grounds it), not a nested object.
+    """
+
+    return (
+        spec is not None
+        and spec.value_type is not None
+        and isinstance(value, dict)
+        and "value" in value
+        and set(value).issubset({"value", "anchor", "text"})
     )
 
 
@@ -131,12 +171,14 @@ class _HierarchyNormalizer:
         data_key: str = "structuring",
         schema_key: str = "structuring_schema",
         meta_key: str = MULTI_LEVEL_META_KEY,
+        typed_fields: bool = False,
     ):
         self.child_token = child_token
         self.end_token = end_token
         self.data_key = str(data_key)
         self.schema_key = str(schema_key)
         self.meta_key = str(meta_key)
+        self.typed_fields = bool(typed_fields)
 
     @staticmethod
     def _new_group(data_key: str, name: str) -> dict:
@@ -154,6 +196,10 @@ class _HierarchyNormalizer:
             "node_instances": {},
             "next_node_id": 0,
             "hierarchy_by_path": {},
+            # label -> typed descriptor declared by the data or the schema.
+            "declared_types": {},
+            # label -> typed descriptor of every typed field actually seen.
+            "field_types": {},
         }
 
     @staticmethod
@@ -222,6 +268,16 @@ class _HierarchyNormalizer:
     ) -> None:
         canonical_path = node_path + local_path
         label = self._field_label(group, canonical_path, node_path)
+        declared = (
+            group["declared_types"].get(_path_label(canonical_path))
+            if self.typed_fields
+            else None
+        )
+        if declared is not None:
+            # Span-typed fields still carry their description into the prompt.
+            group["field_types"].setdefault(
+                label, TypedFieldSpec.from_value(declared).to_dict()
+            )
         shape_source = value if shape_value is None else shape_value
         if shape_source is None:
             shape = {"kind": "null"}
@@ -268,6 +324,57 @@ class _HierarchyNormalizer:
                 )
         instance[label] = deepcopy(value)
 
+    def _typed_spec_for(
+        self,
+        group: dict,
+        canonical_path: tuple[str, ...],
+        value: object,
+    ) -> TypedFieldSpec | None:
+        """Typed spec of a leaf, from its descriptor value or the data."""
+
+        if not self.typed_fields:
+            return None
+        if is_typed_descriptor(value):
+            return TypedFieldSpec.from_value(value)
+        declared = group["declared_types"].get(_path_label(canonical_path))
+        if declared is None:
+            return None
+        return TypedFieldSpec.from_value(declared)
+
+    def _add_typed_leaf(
+        self,
+        group: dict,
+        hierarchy_node: dict,
+        instance: dict,
+        node_path: tuple[str, ...],
+        local_path: tuple[str, ...],
+        value: object,
+        spec: TypedFieldSpec,
+    ) -> None:
+        """Register a class field, whose value is not a text span."""
+
+        canonical_path = node_path + local_path
+        label = self._field_label(group, canonical_path, node_path)
+        shape = {"kind": "scalar", "typed": spec.kind}
+        if spec.kind == CLASS_KIND and spec.multi:
+            shape["empty"] = []
+        if label not in group["field_paths"]:
+            group["field_paths"][label] = list(canonical_path)
+            group["field_owners"][label] = list(node_path)
+            group["fields"].append(label)
+            field_spec = {
+                "label": label,
+                "path": list(canonical_path),
+                "local_path": list(local_path),
+                "shape": shape,
+            }
+            hierarchy_node["fields"].append(field_spec)
+            group["field_specs"][label] = field_spec
+        group["field_types"][label] = spec.to_dict()
+        # A descriptor is an inference placeholder, not a gold value.
+        if not is_typed_descriptor(value):
+            instance.setdefault(TYPED_VALUES_KEY, {})[label] = deepcopy(value)
+
     @staticmethod
     def _add_container(
         hierarchy_node: dict,
@@ -312,7 +419,31 @@ class _HierarchyNormalizer:
             key = str(raw_key)
             local_path = prefix + (key,)
 
-            if _is_span_annotation(value):
+            spec = self._typed_spec_for(group, node_path + local_path, value)
+            if spec is not None and spec.kind != SPAN_KIND:
+                self._add_typed_leaf(
+                    group, hierarchy_node, instance, node_path, local_path,
+                    value, spec,
+                )
+                continue
+            if is_typed_descriptor(value):
+                # Span-typed (or typed-head disabled) inference placeholder.
+                if spec is not None:
+                    canonical = node_path + local_path
+                    group["field_types"][_path_label(canonical)] = spec.to_dict()
+                placeholder = (
+                    []
+                    if str(value.get("$type", "")).lower() in {"list", "array"}
+                    or "$items" in value
+                    else ""
+                )
+                self._add_leaf(
+                    group, hierarchy_node, instance, node_path, local_path,
+                    placeholder,
+                )
+                continue
+
+            if _is_span_annotation(value) or _is_value_annotation(value, spec):
                 self._add_leaf(
                     group, hierarchy_node, instance, node_path, local_path, value,
                 )
@@ -441,6 +572,7 @@ class _HierarchyNormalizer:
                 str(key): value for key, value in group["node_paths"].items()
             },
             "fields": group["fields"],
+            "field_types": group["field_types"],
         }
 
     @staticmethod
@@ -514,11 +646,22 @@ class _HierarchyNormalizer:
         if forced_output_mode == "schemas" and not isinstance(raw, dict):
             raise TypeError("Named structuring schemas must be a dictionary")
         existing_schema = deepcopy(item.get(self.schema_key) or {})
+        raw_types = (
+            item.get(STRUCTURING_TYPES_KEY) if self.typed_fields else None
+        )
         groups: list[dict] = []
+
+        def new_group(data_key: str, name: str, *aliases: str) -> dict:
+            group = self._new_group(data_key, name)
+            group["declared_types"] = lookup_group_types(
+                raw_types,
+                names=(name, data_key, *aliases),
+            )
+            return group
 
         if isinstance(raw, list) and forced_output_mode != "schemas":
             output_mode = "list"
-            group = self._new_group(_ROOT_DATA_KEY, _ROOT_SCHEMA_NAME)
+            group = new_group(_ROOT_DATA_KEY, _ROOT_SCHEMA_NAME, MULTI_LEVEL_ROOT_KEY)
             groups.append(group)
             self._ensure_hierarchy_node(group, (), None, ())
             for value in raw:
@@ -534,7 +677,7 @@ class _HierarchyNormalizer:
             output_mode = "schemas"
             for raw_name, values in raw.items():
                 name = str(raw_name)
-                group = self._new_group(name, name)
+                group = new_group(name, name)
                 groups.append(group)
                 self._ensure_hierarchy_node(group, (), None, ())
                 for value in values:
@@ -546,7 +689,7 @@ class _HierarchyNormalizer:
                     )
         else:
             output_mode = "object"
-            group = self._new_group(_ROOT_DATA_KEY, _ROOT_SCHEMA_NAME)
+            group = new_group(_ROOT_DATA_KEY, _ROOT_SCHEMA_NAME, MULTI_LEVEL_ROOT_KEY)
             groups.append(group)
             self._ensure_hierarchy_node(group, (), None, ())
             self._walk_object(
@@ -659,6 +802,8 @@ class _HierarchyNormalizer:
         field_token: str,
         sep_token: str,
         use_labels_encoder: bool,
+        option_token: str | None = None,
+        calc_token: str | None = None,
     ) -> list[str]:
         """Render a depth-first ``CHILD ... END`` hierarchy prompt."""
 
@@ -668,16 +813,47 @@ class _HierarchyNormalizer:
             prompt.append(field_map.name)
         if field_map.description:
             prompt.append(field_map.description)
+        field_types = getattr(struct_item, "field_types", None) or {}
 
         hierarchy = list(getattr(struct_item, "hierarchy", None) or [])
         if not hierarchy:
             if not use_labels_encoder:
-                prompt.extend(
-                    f"{field_token} {field_name}"
-                    for field_name in field_map.class_to_id
-                )
+                for field_name in field_map.class_to_id:
+                    prompt.extend(render_field_prompt(
+                        field_token,
+                        field_name,
+                        field_types.get(field_name),
+                        option_token,
+                        calc_token,
+                    ))
             prompt.append(sep_token)
             return prompt
+
+        for kind, value in self.iter_prompt_items(hierarchy):
+            if kind == "field":
+                if not use_labels_encoder:
+                    prompt.extend(render_field_prompt(
+                        field_token,
+                        value,
+                        field_types.get(value),
+                        option_token,
+                        calc_token,
+                    ))
+            elif kind == "child":
+                marker = self.child_token
+                prompt.append(f"{marker} {value}" if value else marker)
+            else:
+                prompt.append(self.end_token)
+        prompt.append(sep_token)
+        return prompt
+
+    @staticmethod
+    def iter_prompt_items(hierarchy: list[dict]):
+        """Yield ``("field", label)``, ``("child", name)``, ``("end", None)``.
+
+        This is the single depth-first traversal behind the hierarchy prompt,
+        so prompt order and typed option indices cannot drift apart.
+        """
 
         by_path = {tuple(node.get("path") or ()): node for node in hierarchy}
         children: dict[tuple[str, ...], list[dict]] = {}
@@ -687,24 +863,24 @@ class _HierarchyNormalizer:
                 continue
             children.setdefault(tuple(parent_path), []).append(node)
 
-        def render(node: dict) -> None:
-            if not use_labels_encoder:
-                for field in node.get("fields") or []:
-                    label = field.get("label") if isinstance(field, dict) else field
-                    if label:
-                        prompt.append(f"{field_token} {label}")
+        def visit(node: dict):
+            for field in node.get("fields") or []:
+                label = field.get("label") if isinstance(field, dict) else field
+                if label:
+                    yield "field", label
             for child in children.get(tuple(node.get("path") or ()), []):
-                child_name = ".".join(child.get("parent_field_path") or [])
-                marker = self.child_token
-                prompt.append(f"{marker} {child_name}" if child_name else marker)
-                render(child)
-                prompt.append(self.end_token)
+                yield "child", ".".join(child.get("parent_field_path") or [])
+                yield from visit(child)
+                yield "end", None
 
         root = by_path.get(())
         if root is not None:
-            render(root)
-        prompt.append(sep_token)
-        return prompt
+            yield from visit(root)
+
+    def prompt_field_order(self, struct_item) -> list[str]:
+        """Field labels in the order the prompt renders them."""
+
+        return prompt_field_order(struct_item)
 
 
 _PROCESSOR_MODE_ALIASES = {
@@ -746,12 +922,14 @@ class StructuringProcessorComponent:
         data_key: str = "structuring",
         schema_key: str = "structuring_schema",
         meta_key: str = MULTI_LEVEL_META_KEY,
+        typed_fields: bool = False,
     ):
         if mode not in {"flat", "multi_level"}:
             raise ValueError(f"Unknown structuring processor mode {mode!r}")
         self.multi_level = mode == "multi_level"
         self.data_key = str(data_key)
         self.schema_key = str(schema_key)
+        self.typed_fields = bool(typed_fields)
         self._hierarchy = (
             _HierarchyNormalizer(
                 child_token=child_token,
@@ -759,6 +937,7 @@ class StructuringProcessorComponent:
                 data_key=data_key,
                 schema_key=schema_key,
                 meta_key=meta_key,
+                typed_fields=typed_fields,
             )
             if self.multi_level
             else None
@@ -768,6 +947,11 @@ class StructuringProcessorComponent:
         if self._hierarchy is None:
             return None
         return self._hierarchy.normalize_item(item, **kwargs)
+
+    def prompt_field_order(self, struct_item) -> list[str]:
+        """Field labels in the order :meth:`contribute_prompt` renders them."""
+
+        return _component_prompt_field_order(self, struct_item)
 
     def contribute_inference_input(
         self,
@@ -787,6 +971,7 @@ class StructuringProcessorComponent:
 
         data = {}
         schemas = {}
+        types = {}
         for raw_name, spec in structures.items():
             schema_name = str(raw_name)
             from .schema import (
@@ -811,6 +996,15 @@ class StructuringProcessorComponent:
             data[schema_name] = (
                 [dict.fromkeys(fields, "")] if fields else []
             )
+            if self.typed_fields:
+                group_types = {
+                    name: spec.to_dict()
+                    for name, child in node.fields.items()
+                    if (spec := typed_spec_for_schema_node(child)) is not None
+                    and (spec.kind != SPAN_KIND or spec.value_type is not None)
+                }
+                if group_types:
+                    types[schema_name] = group_types
             schema_spec = {
                 "fields": fields,
                 "required_fields": list(node.required_fields),
@@ -820,6 +1014,8 @@ class StructuringProcessorComponent:
             schemas[schema_name] = schema_spec
         item[self.data_key] = data
         item[self.schema_key] = schemas
+        if types:
+            item[STRUCTURING_TYPES_KEY] = types
 
     def contribute_prompt(
         self,
@@ -829,6 +1025,8 @@ class StructuringProcessorComponent:
         field_token: str,
         sep_token: str,
         use_labels_encoder: bool,
+        option_token: str | None = None,
+        calc_token: str | None = None,
     ) -> list[str]:
         if self._hierarchy is not None:
             return self._hierarchy.contribute_prompt(
@@ -837,6 +1035,8 @@ class StructuringProcessorComponent:
                 field_token=field_token,
                 sep_token=sep_token,
                 use_labels_encoder=use_labels_encoder,
+                option_token=option_token,
+                calc_token=calc_token,
             )
         prompt = [parent_token]
         field_map = struct_item.field_class_to_id
@@ -844,13 +1044,120 @@ class StructuringProcessorComponent:
             prompt.append(field_map.name)
         if field_map.description:
             prompt.append(field_map.description)
+        field_types = getattr(struct_item, "field_types", None) or {}
         if not use_labels_encoder:
-            prompt.extend(
-                f"{field_token} {field_name}"
-                for field_name in field_map.class_to_id
-            )
+            for field_name in field_map.class_to_id:
+                prompt.extend(render_field_prompt(
+                    field_token,
+                    field_name,
+                    field_types.get(field_name),
+                    option_token,
+                    calc_token,
+                ))
         prompt.append(sep_token)
         return prompt
+
+
+def _component_prompt_field_order(component, struct_item) -> list[str]:
+    return prompt_field_order(struct_item)
+
+
+def prompt_field_order(struct_item) -> list[str]:
+    """Field labels in the order the structuring prompt renders them."""
+
+    hierarchy = list(getattr(struct_item, "hierarchy", None) or [])
+    if not hierarchy:
+        return list(struct_item.field_class_to_id.class_to_id)
+    return [
+        value
+        for kind, value in _HierarchyNormalizer.iter_prompt_items(hierarchy)
+        if kind == "field"
+    ]
+
+
+def class_field_layout(struct_item, spec_factory=None):
+    """Class fields of one schema group, in prompt order.
+
+    Entries are ``(label, field_id, TypedFieldSpec)``.  Processor tensors and
+    decoding both use this so class field slots line up exactly.
+    """
+
+    field_types = getattr(struct_item, "field_types", None) or {}
+    if not field_types:
+        return []
+    make_spec = spec_factory or TypedFieldSpec.from_value
+    field_to_id = struct_item.field_class_to_id.class_to_id
+    class_fields = []
+    for label in prompt_field_order(struct_item):
+        raw = field_types.get(label)
+        if raw is None or label not in field_to_id:
+            continue
+        spec = make_spec(raw)
+        if spec.kind == CLASS_KIND:
+            class_fields.append((label, field_to_id[label], spec))
+    return class_fields
+
+
+def render_field_prompt(
+    field_token: str,
+    label: str,
+    spec: object,
+    option_token: str | None,
+    calc_token: str | None = None,
+) -> list[str]:
+    """Render ``[FIELD] label ( type ... ) : description [OPTION] ...``.
+
+    A field marked ``$calculate`` is followed by a ``[CALC]`` marker when
+    ``calc_token`` is given; the calculation head reads that marker.
+
+    Untyped and plain text fields keep the historical ``[FIELD] label`` form,
+    so prompts of existing checkpoints and datasets do not change.
+    """
+
+    if spec is None:
+        return [f"{field_token} {label}"]
+    typed = TypedFieldSpec.from_value(spec)
+    text = f"{field_token} {label}"
+    suffix = typed.prompt_suffix()
+    if suffix:
+        text = f"{text} {suffix}"
+    if typed.description:
+        text = f"{text} : {typed.description}"
+    rendered = [text]
+    if typed.kind == CLASS_KIND and option_token:
+        rendered.extend(f"{option_token} {option}" for option in typed.options)
+    if typed.calculate and calc_token:
+        rendered.append(calc_token)
+    return rendered
+
+
+def calc_field_layout(struct_item, spec_factory=None):
+    """Fields marked ``$calculate`` of one schema group, in prompt order.
+
+    Entries are ``(label, field_id, TypedFieldSpec)``. The k-th entry owns the
+    k-th ``[CALC]`` marker of the group's prompt.
+    """
+
+    field_types = getattr(struct_item, "field_types", None) or {}
+    if not field_types:
+        return []
+    make_spec = spec_factory or TypedFieldSpec.from_value
+    field_to_id = struct_item.field_class_to_id.class_to_id
+    fields = []
+    for label in prompt_field_order(struct_item):
+        raw = field_types.get(label)
+        if raw is None or label not in field_to_id:
+            continue
+        spec = make_spec(raw)
+        if spec.calculate:
+            fields.append((label, field_to_id[label], spec))
+    return fields
+
+
+def typed_spec_for_schema_node(node: SchemaNode) -> TypedFieldSpec | None:
+    """Typed spec of a compiled scalar schema node, if it declares one."""
+
+    return schema_node_typed_spec(node)
 
 
 def resolve_structuring_processor(
@@ -862,6 +1169,7 @@ def resolve_structuring_processor(
     data_key: str = "structuring",
     schema_key: str = "structuring_schema",
     meta_key: str,
+    typed_fields: bool = False,
 ):
     """Build the common structuring processor with optional hierarchy hooks."""
 
@@ -869,6 +1177,7 @@ def resolve_structuring_processor(
     mode, params = _component_type(spec, default)
     if mode == "__instance__":
         return params["instance"]
+    params.setdefault("typed_fields", typed_fields)
     return StructuringProcessorComponent(
         mode,
         child_token=child_token,
@@ -886,7 +1195,16 @@ __all__ = [
     "MULTI_LEVEL_ROOT_KEY",
     "NODE_ID_KEY",
     "NODE_KEEP_KEY",
+    "STRUCTURING_TYPES_KEY",
     "StructuringProcessorComponent",
+    "TYPED_ANCHORS_KEY",
+    "TYPED_UNRESOLVED_KEY",
+    "TYPED_VALUES_KEY",
     "is_internal_instance_key",
+    "prompt_field_order",
+    "render_field_prompt",
     "resolve_structuring_processor",
+    "calc_field_layout",
+    "class_field_layout",
+    "typed_spec_for_schema_node",
 ]

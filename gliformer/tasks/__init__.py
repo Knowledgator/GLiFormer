@@ -17,6 +17,7 @@ from ..layers import (
     AttentionBias,
     RefinementPositionEncoding,
 )
+from ..layers.span_pooling import SpanTokenSource, build_span_pooler
 
 
 @dataclass
@@ -34,6 +35,22 @@ class SharedRepresentations:
     audio_embedding: Optional[torch.Tensor] = None    # (B, A, D) audio token embeddings
     audio_mask: Optional[torch.Tensor] = None         # (B, A) valid audio token mask
     image_sizes: Optional[torch.Tensor] = None        # (B, 2) original image sizes as (height, width)
+
+
+def text_token_states(shared: "SharedRepresentations") -> torch.Tensor:
+    """Encoder states of the text tokens only: ``(B, S, D)``, ``S = input_ids.shape[1]``.
+
+    Layout backbones append image patch states after the text when a batch
+    has images, so ``token_embeds`` can be longer than ``input_ids`` and
+    ``attention_mask``; heads that pair subword states with those (copy
+    pointers, ``span_token_words``) read this view.
+    """
+
+    tokens = shared.token_embeds
+    input_ids = getattr(shared, "input_ids", None)
+    if tokens is not None and input_ids is not None and tokens.shape[1] > input_ids.shape[1]:
+        tokens = tokens[:, : input_ids.shape[1]]
+    return tokens
 
 
 @dataclass
@@ -372,13 +389,42 @@ class TaskHead(ABC, nn.Module):
                 getattr(task_cfg, "span_loss_reduction", "mean")
             )
         if getattr(self, "represent_spans", False):
-            from gliner.modeling.span_rep import SpanRepLayer
-            self.span_rep_layer = SpanRepLayer(
-                span_mode="token_level",
-                hidden_size=hidden_size,
+            self.span_rep_layer = build_span_pooler(
+                task_cfg,
+                hidden_size,
+                dropout,
                 max_width=getattr(config, "max_width", 12),
-                dropout=dropout,
             )
+
+    @staticmethod
+    def _pool_spans(pooler, units, span_idx, token_source=None):
+        """Run a span pooler; ``token_source`` is passed only when there is one."""
+
+        if token_source is None:
+            return pooler(units, span_idx)
+        return pooler(units, span_idx, token_source=token_source)
+
+    @staticmethod
+    def _span_token_source(pooler, shared, flat_inputs, batch):
+        """Subword states for a pooler that reads them, aligned to the head's rows.
+
+        ``None`` (the pooler then reads unit states) when the pooler does not
+        need subwords or the subword map does not line up with the encoder
+        output, e.g. with sequence packing.
+        """
+
+        if not getattr(pooler, "uses_tokens", False) or shared is None:
+            return None
+        token_units = batch.get("span_token_words")
+        tokens = getattr(shared, "token_embeds", None)
+        if token_units is None or tokens is None or tokens.dim() != 3:
+            return None
+        if token_units.shape != tokens.shape[:2]:
+            return None
+        rows = getattr(flat_inputs, "batch_origin", None) if flat_inputs is not None else None
+        if rows is not None and (rows.numel() == 0 or int(rows.max()) >= tokens.shape[0]):
+            return None
+        return SpanTokenSource(tokens, token_units.to(tokens.device), rows)
 
     # Compatibility for external task heads that still call the old helper.
     def _init_anchor_pipeline(self, *args, **kwargs):
@@ -701,6 +747,12 @@ TASK_REGISTRY = TaskRegistry(
         TaskDefinition("joint_relex", "gliformer.tasks.joint_relex.model", "JointRelexHead", "text"),
         TaskDefinition("open_relex", "gliformer.tasks.open_relex.model", "OpenRelexHead", "text"),
         TaskDefinition("structuring", "gliformer.tasks.structuring.model", "StructuringHead", "text"),
+        # Computes "$calculate" fields from structuring records (programs over spans).
+        TaskDefinition("calculation", "gliformer.tasks.calculation.model", "CalculationHead", "text"),
+        # Reads values from the spans that the NER and structuring heads picked.
+        TaskDefinition("normalization", "gliformer.tasks.normalization.model", "NormalizationHead", "text"),
+        # Per-unit keep/delete/replace/append edits of the text.
+        TaskDefinition("sequence_editing", "gliformer.tasks.sequence_editing.model", "SequenceEditingHead", "text"),
         TaskDefinition("image_classification", "gliformer.tasks.vision.model", "ImageClassificationHead", "vision"),
         TaskDefinition("object_detection", "gliformer.tasks.vision.model", "ObjectDetectionHead", "vision"),
         TaskDefinition("segmentation", "gliformer.tasks.vision.model", "SegmentationHead", "vision"),

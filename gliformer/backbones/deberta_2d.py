@@ -23,6 +23,7 @@ from .flash_deberta import (
     FLASH_DISENTANGLED,
     SUPPORTED_HEAD_DIMS,
     FlashAttentionContext,
+    disentangled_takes_tables,
     flash_attention_bias,
     flash_attention_disentangled,
     flash_kernels_available,
@@ -447,10 +448,13 @@ class LayoutDisentangledSelfAttention(DisentangledSelfAttention):
         return context_layer.view(batch, query_length, -1)
 
     def _flash_position_scores(self, query, key, rel_embeddings):
-        """Content-to-position scores the disentangled kernel gathers from.
+        """Position inputs of the disentangled kernel.
 
-        Shaped ``(B, H, L, 2 * att_span)``: the kernel picks the bucket for each
-        query/key pair itself, so the full ``L x L`` bias is never built.
+        flashdeberta >= 0.0.8 takes the projected relative embeddings
+        ``(1, H, 2 * att_span, D)`` and forms the scores itself; older releases
+        take the content-to-position scores ``(B, H, L, 2 * att_span)``. Either
+        way the kernel picks the bucket for each query/key pair, so the full
+        ``L x L`` bias is never built.
         """
         att_span = self.pos_ebd_size
         rel_embeddings = self.pos_dropout(rel_embeddings)[: att_span * 2, :].unsqueeze(0)
@@ -460,13 +464,18 @@ class LayoutDisentangledSelfAttention(DisentangledSelfAttention):
             projected = layer(rel_embeddings)
             return projected.view(1, -1, heads, self.attention_head_size).permute(0, 2, 1, 3)
 
+        tables = disentangled_takes_tables()
         pos_key = pos_query = None
         if "c2p" in self.pos_att_type:
             key_proj = self.key_proj if self.share_att_key else self.pos_key_proj
-            pos_key = torch.matmul(query, project(key_proj).transpose(-1, -2))
+            pos_key = project(key_proj)
+            if not tables:
+                pos_key = torch.matmul(query, pos_key.transpose(-1, -2))
         if "p2c" in self.pos_att_type:
             query_proj = self.query_proj if self.share_att_key else self.pos_query_proj
-            pos_query = torch.matmul(key, project(query_proj).transpose(-1, -2))
+            pos_query = project(query_proj)
+            if not tables:
+                pos_query = torch.matmul(key, pos_query.transpose(-1, -2))
         return pos_key, pos_query
 
     def _flash_attention_bias(

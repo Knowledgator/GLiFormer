@@ -60,6 +60,25 @@ class GLiFormerTextOutput(GLiFormerBaseOutput):
     structuring_anchor_relation_scores: Optional[torch.FloatTensor] = None
     structuring_span_idx: Optional[torch.LongTensor] = None
     structuring_span_mask: Optional[torch.Tensor] = None
+    # Class fields, per (group, record slot, class field): option logits
+    # (G, A, Cc, Kc) and single-choice "none" logits (G, A, Cc).
+    structuring_typed_class_logits: Optional[torch.FloatTensor] = None
+    structuring_typed_class_none_logits: Optional[torch.FloatTensor] = None
+    # Normalization head, per text row: spans read (B, S, 2) inclusive word
+    # indices, their mask (B, S), and calendar logits by component.
+    normalization_span_idx: Optional[torch.LongTensor] = None
+    normalization_span_mask: Optional[torch.Tensor] = None
+    normalization_temporal: Optional[dict] = None
+    # Decoded numbers (B, S) float64 and their confidence, per number head.
+    normalization_number: Optional[dict] = None
+    normalization_number_confidence: Optional[dict] = None
+    # Calculation head: everything the decoder needs to run the programs
+    # (queries, operand spans, slot op/port/active logits); see
+    # tasks/calculation/model.py.
+    calculation: Optional[dict] = None
+    # Sequence editing head: per-group op logits and predicted contents; see
+    # tasks/sequence_editing/model.py.
+    sequence_editing: Optional[dict] = None
 
     embedding_logits: Optional[torch.FloatTensor] = None
 

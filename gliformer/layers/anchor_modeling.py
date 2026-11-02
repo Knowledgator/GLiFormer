@@ -9,6 +9,10 @@ Strategies:
 - RNNAnchorModeling: recurrent processing (GLiNER2-style)
 - MLPAnchorModeling: multi-layer perceptron fusion
 - TransformerAnchorModeling: self-attention over anchor sequence conditioned on child reps
+- ReadoutAnchorModeling: MLP fusion, then each (anchor, child) pair reads the text
+
+Strategies that read the text (``uses_memory``) take ``memory``/``memory_mask``;
+call :meth:`AnchorModeling.fuse` to pass them only to those strategies.
 """
 
 from collections.abc import Mapping
@@ -31,6 +35,8 @@ class AnchorModeling(nn.Module):
 
     _registry: dict = {}
     config_fields: frozenset[str] = frozenset()
+    # True for strategies whose forward takes ``memory``/``memory_mask``.
+    uses_memory: bool = False
 
     def __init_subclass__(cls, modeling_type: str = "", **kwargs):
         super().__init_subclass__(**kwargs)
@@ -93,6 +99,26 @@ class AnchorModeling(nn.Module):
         if child_mask is not None:
             output = output * child_mask[:, None, :, None].to(output.dtype)
         return output
+
+    def fuse(
+        self,
+        anchor_rep: torch.Tensor,
+        child_rep: torch.Tensor,
+        *,
+        anchor_mask: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run any strategy; the text memory goes only to those that read it."""
+
+        if self.uses_memory:
+            return self(
+                anchor_rep, child_rep,
+                anchor_mask=anchor_mask, child_mask=child_mask,
+                memory=memory, memory_mask=memory_mask,
+            )
+        return self(anchor_rep, child_rep, anchor_mask=anchor_mask, child_mask=child_mask)
 
     def forward(
         self,
@@ -339,3 +365,95 @@ class TransformerAnchorModeling(AnchorModeling, modeling_type="transformer"):
         # Reshape back to (B, A, C, D)
         output = fused.reshape(B, C, A, D).permute(0, 2, 1, 3)
         return self._mask_output(output, anchor_mask, child_mask)
+
+
+class ReadoutAnchorModeling(AnchorModeling, modeling_type="readout"):
+    """MLP fusion of ``[anchor, child, anchor * child]``, then a text readout.
+
+    Each (anchor, child) query reads the text memory through one
+    cross-attention layer and an FFN (post-norm residuals).  Without memory it
+    returns the fused query.  Used for record x field queries: the structuring
+    option scorer and the calculation head.
+    """
+
+    config_fields = frozenset({"num_heads", "dropout"})
+    uses_memory = True
+
+    def __init__(self, hidden_size: int, num_heads: int = 8, dropout: float = 0.1, **kwargs):
+        super().__init__()
+        num_heads = int(num_heads)
+        if num_heads < 1 or hidden_size % num_heads != 0:
+            num_heads = 1
+        self.query = create_mlp(
+            input_dim=3 * hidden_size,
+            intermediate_dims=[hidden_size],
+            output_dim=hidden_size,
+            dropout=dropout,
+            activation="gelu",
+        )
+        self.readout = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.readout_norm = nn.LayerNorm(hidden_size)
+        self.ffn = create_mlp(
+            input_dim=hidden_size,
+            intermediate_dims=[2 * hidden_size],
+            output_dim=hidden_size,
+            dropout=dropout,
+            activation="gelu",
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_size)
+
+    def forward(
+        self,
+        anchor_rep,
+        child_rep,
+        *,
+        anchor_mask=None,
+        child_mask=None,
+        memory=None,
+        memory_mask=None,
+    ):
+        B, A, D = anchor_rep.shape
+        C = child_rep.shape[1]
+        if A == 0 or C == 0:
+            return anchor_rep.new_zeros(B, A, C, D)
+        anchor_exp = anchor_rep.unsqueeze(2).expand(B, A, C, D)
+        child_exp = child_rep.unsqueeze(1).expand(B, A, C, D)
+        query = self.query(torch.cat([anchor_exp, child_exp, anchor_exp * child_exp], dim=-1))
+        if memory is None or memory.shape[1] == 0:
+            return self._mask_output(query, anchor_mask, child_mask)
+        flat = query.reshape(B, A * C, D)
+        if memory_mask is None:
+            key_padding = torch.zeros(memory.shape[:2], dtype=torch.bool, device=memory.device)
+        else:
+            key_padding = ~memory_mask.bool()
+        # Rows without visible memory would make attention undefined.
+        # Unmasking the first key of fully masked rows is a no-op elsewhere,
+        # so apply it unconditionally instead of branching on a device value.
+        empty = key_padding.all(dim=-1, keepdim=True)
+        key_padding = torch.cat(
+            [key_padding[:, :1] & ~empty, key_padding[:, 1:]],
+            dim=1,
+        )
+        attended, _ = self.readout(
+            flat, memory, memory, key_padding_mask=key_padding, need_weights=False,
+        )
+        hidden = self.readout_norm(flat + attended)
+        hidden = self.ffn_norm(hidden + self.ffn(hidden))
+        return self._mask_output(hidden.reshape(B, A, C, D), anchor_mask, child_mask)
+
+
+def rename_state_dict_keys(state_dict, prefix: str, renames: Mapping[str, str]) -> None:
+    """Rename ``prefix + old`` keys to ``prefix + new`` in place (checkpoint migration)."""
+
+    for key in list(state_dict):
+        if not key.startswith(prefix):
+            continue
+        local = key[len(prefix):]
+        for old, new in renames.items():
+            if local.startswith(old):
+                target = prefix + new + local[len(old):]
+                if target not in state_dict:
+                    state_dict[target] = state_dict.pop(key)
+                break

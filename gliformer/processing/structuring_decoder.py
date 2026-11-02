@@ -11,12 +11,15 @@ from ._structuring_alignment import (
     StructuringAnchorEntry,
     StructuringDecoderComponent,
     align_structuring_anchors,
+    field_value_with_span,
     is_multi_level_group_result,
     make_multi_level_group_result,
     resolve_structuring_decoder,
 )
+from ._structuring_hierarchy import calc_field_layout, class_field_layout
 from .structuring_processor import MULTI_LEVEL_ROOT_KEY
 from .structuring_types import is_structuring_descriptor
+from .typed_fields import TypedFieldSpec
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,23 @@ class StructuringDecoder(SpanDecoder):
             getattr(struct_cfg, "anchor_relations_threshold", 0.5)
             if struct_cfg is not None else 0.5
         )
+        self.typed_class_threshold = float(
+            getattr(struct_cfg, "typed_class_threshold", 0.5)
+            if struct_cfg is not None else 0.5
+        )
+        # Typed number/date fields read their value from the normalization head.
+        self.normalization = None
+        if getattr(config, "normalization_config", None) is not None:
+            from ..tasks.normalization.decoder import NormalizationDecoder
+
+            self.normalization = NormalizationDecoder(config)
+        # ``$calculate`` fields take the value of the calculation program.
+        self.calculation = None
+        if getattr(config, "calculation_config", None) is not None:
+            from ..tasks.calculation.decoder import CalculationDecoder
+
+            self.calculation = CalculationDecoder(config)
+        self._calculation_cache = (None, None)
         self.component = resolve_structuring_decoder(
             decoder_spec,
             multi_level=configured_multi_level,
@@ -247,6 +267,232 @@ class StructuringDecoder(SpanDecoder):
             id_to_fields=id_to_fields,
             multi_level_contexts=multi_level_contexts,
         )
+
+    def _attach_normalized_values(
+        self, anchor_entries, model_output, *, text_idx, struct_item, value_spans=False,
+    ):
+        """Values of declared number/date fields from the normalization head.
+
+        Only fields whose type was declared as a value type (``number``,
+        ``integer``, ``duration``, ``date``, ``time``, ``datetime``, or a list
+        of them) take the head's value; every other field keeps its span text.
+        A span the head did not read keeps its text too. With ``value_spans``
+        a value comes back as ``{"value": ..., "text": span text, "start",
+        "end"}`` (character offsets) so callers can show where it was read.
+        """
+
+        if self.normalization is None or struct_item is None:
+            return anchor_entries
+        specs = {}
+        for label, raw in (getattr(struct_item, "field_types", None) or {}).items():
+            spec = TypedFieldSpec.from_value(raw)
+            if spec.value_type is not None:
+                specs[label] = spec
+        if not specs:
+            return anchor_entries
+        for entry in anchor_entries:
+            for field in entry["fields"]:
+                spec = specs.get(field.get("field"))
+                if spec is None or "start" not in field or "value" in field:
+                    continue
+                value = self.normalization.field_value(
+                    model_output, text_idx, int(field["start"]), int(field["end"]), spec,
+                )
+                if value is not None:
+                    field["value"] = (
+                        {"value": value, "text": field.get("text", "")} if value_spans else value
+                    )
+        return anchor_entries
+
+    def _calculation_results(self, model_output):
+        """Per-query calculation results, computed once per model output."""
+
+        key, cached = self._calculation_cache
+        if key is not model_output:
+            cached = {}
+            for result in self.calculation.query_results(model_output):
+                cached[(result["group"], result["anchor"], result["marker"])] = result
+            self._calculation_cache = (model_output, cached)
+        return cached
+
+    def _attach_calculated_values(
+        self,
+        anchor_entries,
+        model_output,
+        *,
+        group_idx,
+        struct_item,
+        objectness_logits,
+        value_spans=False,
+        output_mode=None,
+    ):
+        """Values of ``$calculate`` fields from the calculation head.
+
+        Records are chosen as for class fields (anchors with decoded spans or
+        reliable presence, else the most confident one). A computed value
+        replaces any span the structuring head picked for the field; when the
+        program fails, the picked span (if any) stays.
+        """
+
+        if self.calculation is None or struct_item is None:
+            return anchor_entries
+        layout = calc_field_layout(struct_item)
+        if not layout:
+            return anchor_entries
+        results = self._calculation_results(model_output)
+        if not anchor_entries:
+            # No slot passed objectness, but the head computed values for its
+            # best slot: that slot becomes the record.
+            anchors = sorted({
+                anchor for (group, anchor, _marker), result in results.items()
+                if group == group_idx and result["value"] is not None
+            })
+            if anchors:
+                anchor_entries = [{
+                    "anchor_index": anchors[0], "fields": [], "presence_is_reliable": False,
+                }]
+        carriers = [
+            entry for entry in anchor_entries
+            if entry["fields"] or entry.get("presence_is_reliable")
+        ]
+
+        def confidence(entry):
+            if objectness_logits is None:
+                return (len(entry["fields"]), -entry["anchor_index"])
+            return (
+                float(objectness_logits[group_idx, entry["anchor_index"]].item()),
+                len(entry["fields"]),
+            )
+
+        if not carriers and anchor_entries:
+            carriers = [max(anchor_entries, key=confidence)]
+        root_only = output_mode == "object" and carriers
+        if root_only:
+            carriers = [max(carriers, key=confidence)]
+        for entry in carriers:
+            anchor = int(entry["anchor_index"])
+            for slot, (label, _field_id, spec) in enumerate(layout):
+                result = results.get((group_idx, anchor, slot))
+                if result is None:
+                    continue
+                value = self.calculation.format_value(result["value"], spec)
+                if value is None:
+                    continue
+                entry["fields"] = [
+                    field for field in entry["fields"] if field.get("field") != label
+                ]
+                entry["fields"].append({
+                    "field": label,
+                    "value": {"value": value, "text": str(value)} if value_spans else value,
+                    "text": str(value),
+                    "score": float(result["score"]),
+                })
+        return anchor_entries
+
+    def _attach_typed_fields(
+        self,
+        anchor_entries,
+        model_output,
+        *,
+        group_idx,
+        struct_item,
+        objectness_logits,
+        class_threshold=None,
+        output_mode=None,
+    ):
+        """Attach decoded class-field values to the group's records.
+
+        Class values are attached to anchors that are records: anchors with
+        decoded spans or reliable presence. When no anchor of a group
+        qualifies (a schema of only class fields), the most confident active
+        anchor carries them.
+        """
+
+        if struct_item is None:
+            return anchor_entries
+        class_fields = class_field_layout(struct_item)
+        if not class_fields:
+            return anchor_entries
+        typed_labels = {label for label, _, _ in class_fields}
+        class_logits = getattr(model_output, "structuring_typed_class_logits", None)
+        none_logits = getattr(model_output, "structuring_typed_class_none_logits", None)
+        class_threshold = (
+            self.typed_class_threshold if class_threshold is None else float(class_threshold)
+        )
+
+        for entry in anchor_entries:
+            entry["fields"] = [
+                field for field in entry["fields"]
+                if field.get("field") not in typed_labels
+            ]
+        carriers = [
+            entry for entry in anchor_entries
+            if entry["fields"] or entry.get("presence_is_reliable")
+        ]
+        def confidence(entry):
+            if objectness_logits is None:
+                return (len(entry["fields"]), -entry["anchor_index"])
+            return (
+                float(objectness_logits[group_idx, entry["anchor_index"]].item()),
+                len(entry["fields"]),
+            )
+
+        if not carriers and anchor_entries:
+            carriers = [max(anchor_entries, key=confidence)]
+
+        # A raw object root is a single record: when several slots look like
+        # it, only the most confident one carries its typed values; otherwise
+        # merging the roots would turn every typed scalar into a list.
+        root_labels = set()
+        if output_mode == "object":
+            hierarchy = list(getattr(struct_item, "hierarchy", None) or [])
+            root_nodes = [node for node in hierarchy if not node.get("path")]
+            root_labels = {
+                field.get("label") if isinstance(field, dict) else field
+                for node in root_nodes
+                for field in node.get("fields") or []
+            } if hierarchy else typed_labels
+        root_carrier = max(carriers, key=confidence) if carriers and root_labels else None
+
+        def carries(entry, label):
+            return label not in root_labels or entry is root_carrier
+
+        for entry in carriers:
+            anchor = int(entry["anchor_index"])
+            if class_logits is not None:
+                for slot, (label, _field_id, spec) in enumerate(class_fields):
+                    if slot >= class_logits.shape[2]:
+                        break
+                    if not carries(entry, label):
+                        continue
+                    count = min(len(spec.options), class_logits.shape[3])
+                    logits = class_logits[group_idx, anchor, slot, :count].float()
+                    if spec.multi:
+                        scores = torch.sigmoid(logits)
+                        chosen = [
+                            spec.options[index]
+                            for index in range(count)
+                            if float(scores[index]) > class_threshold
+                        ]
+                        score = float(scores.max()) if count else 0.0
+                        value = chosen
+                    else:
+                        none = (
+                            none_logits[group_idx, anchor, slot].float().reshape(1)
+                            if none_logits is not None
+                            else logits.new_full((1,), -1e4)
+                        )
+                        scores = torch.softmax(torch.cat([logits, none]), dim=-1)
+                        best = int(scores.argmax())
+                        score = float(scores[best])
+                        value = spec.options[best] if best < count else None
+                    entry["fields"].append({
+                        "field": label,
+                        "value": value,
+                        "text": "" if value is None else str(value),
+                        "score": score,
+                    })
+        return anchor_entries
 
     def _spans_to_fields(self, spans, texts, batch_idx):
         """Convert Span objects to field dicts with text."""
@@ -483,6 +729,9 @@ class StructuringDecoder(SpanDecoder):
             if key not in target or target[key] is None:
                 target[key] = value
                 continue
+            if value is None:
+                # An empty field on another root adds nothing to a filled one.
+                continue
             existing = target[key]
             if isinstance(existing, dict) and isinstance(value, dict):
                 cls._merge_nested_result(existing, value)
@@ -689,6 +938,11 @@ class StructuringDecoder(SpanDecoder):
     def _map_field_to_value(field, start_map, end_map, text):
         if not isinstance(field, dict) or "field" not in field:
             return None
+        if "value" in field:
+            return {
+                "field": field["field"],
+                "value": field_value_with_span(field, start_map, end_map, text),
+            }
         st = field.get("start", 0)
         ed = field.get("end", 0)
         if st < len(start_map) and ed < len(end_map):

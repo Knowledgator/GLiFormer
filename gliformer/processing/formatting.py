@@ -372,6 +372,28 @@ class StructuringOutputFormatter:
         if isinstance(ft, _UnionFieldType):
             return self._convert_union_value(value, ft, schema_name, field_name)
 
+        typed = getattr(ft, "typed", None)
+        if typed is not None and (typed.kind != "span" or typed.value_type is not None):
+            # Class values come from the option scorer and number/date values
+            # from the normalization head. Span text of a value field gets the
+            # same builtin conversion as an untyped schema field; times and
+            # durations have none.
+            def is_text(item):
+                # ``{"value", "text"}`` is a normalized value with its span.
+                return isinstance(item, str) or (
+                    isinstance(item, dict) and "text" in item and "value" not in item
+                )
+
+            text_like = is_text(value) or (
+                isinstance(value, list) and all(is_text(item) for item in value)
+            )
+            if (
+                not text_like
+                or typed.kind == "class"
+                or typed.value_type in {"time", "duration"}
+            ):
+                return value
+
         if ft.type_name == "list":
             return self._convert_list_value(value, ft)
 

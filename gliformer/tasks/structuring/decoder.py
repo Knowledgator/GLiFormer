@@ -237,6 +237,38 @@ class StructuringDecoder(_BaseStructuringDecoder):
                         )
                     ),
                 })
+            if group_context and group_context.get("mapping") is not None:
+                anchor_entries = self._attach_normalized_values(
+                    anchor_entries,
+                    model_output,
+                    text_idx=text_idx,
+                    struct_item=group_context.get("mapping"),
+                    value_spans=bool(resolve_batch_control(
+                        kwargs.get("value_spans"), text_idx, False
+                    )),
+                )
+                anchor_entries = self._attach_typed_fields(
+                    anchor_entries,
+                    model_output,
+                    group_idx=batch_idx,
+                    struct_item=group_context.get("mapping"),
+                    objectness_logits=objectness_logits,
+                    class_threshold=resolve_batch_control(
+                        kwargs.get("typed_class_threshold"), text_idx, None
+                    ),
+                    output_mode=group_context.get("output_mode"),
+                )
+                anchor_entries = self._attach_calculated_values(
+                    anchor_entries,
+                    model_output,
+                    group_idx=batch_idx,
+                    struct_item=group_context.get("mapping"),
+                    objectness_logits=objectness_logits,
+                    value_spans=bool(resolve_batch_control(
+                        kwargs.get("value_spans"), text_idx, False
+                    )),
+                    output_mode=group_context.get("output_mode"),
+                )
             flat_results.append(
                 self._finalize_anchor_group(
                     anchor_entries,

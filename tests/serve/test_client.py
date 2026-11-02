@@ -1,173 +1,164 @@
 import asyncio
+import io
+import json
+import urllib.error
 
 import pytest
 
-from gliformer.serve.client import GLiFormerClient, PerText
+from gliformer.serve.client import (
+    AnalyzeResult,
+    GLiFormerAPIError,
+    GLiFormerClient,
+    GLiFormerClientError,
+)
 
 
-def test_client_dispatches_lists_concurrently_and_preserves_adapter_ids(monkeypatch):
-    client = GLiFormerClient(max_concurrency=2)
-    payloads = []
+class Recorder:
+    """Stand-in for ``GLiFormerClient._request``."""
 
-    def post(payload):
-        payloads.append(payload)
-        return {"text": payload["text"], "adapter": payload.get("adapter_id")}
+    def __init__(self, responses=None):
+        self.calls = []
+        self.responses = responses or {}
 
-    monkeypatch.setattr(client, "_post", post)
-    result = client.predict(
-        ["one", "two"],
-        entities=["item"],
-        adapter_id=["legal", "finance"],
+    def __call__(self, method, suffix, payload=None):
+        self.calls.append((method, suffix, payload))
+        if suffix == "/models":
+            return {"data": [{"id": "served/model", "aliases": []}]}
+        response = self.responses.get(suffix)
+        if callable(response):
+            return response(payload)
+        if response is not None:
+            return response
+        tasks = (payload or {}).get("tasks", {})
+        return {
+            "model": "served/model",
+            "results": {name: {"type": task["type"], "value": f"{name}-value"} for name, task in tasks.items()},
+        }
+
+
+def make_client(monkeypatch, **responses):
+    client = GLiFormerClient("http://server:8000/")
+    recorder = Recorder(responses)
+    monkeypatch.setattr(client, "_request", recorder)
+    return client, recorder
+
+
+def test_url_and_model_lookup(monkeypatch):
+    client, recorder = make_client(monkeypatch)
+    assert client.url == "http://server:8000/v1"
+    assert client.model == "served/model"
+    assert client.model == "served/model"
+    assert [call[1] for call in recorder.calls] == ["/models"]
+    assert GLiFormerClient(model="given").model == "given"
+
+
+def test_analyze_builds_body_and_wraps_results(monkeypatch):
+    client, recorder = make_client(monkeypatch)
+    result = client.analyze(
+        {"ticket": "Refund"},
+        tasks={"intent": {"type": "classify", "labels": ["refund"]}},
+        options={"include_usage": True},
     )
-    assert result == [
-        {"text": "one", "adapter": "legal"},
-        {"text": "two", "adapter": "finance"},
-    ]
-    assert {payload["adapter_id"] for payload in payloads} == {"legal", "finance"}
+    method, suffix, payload = recorder.calls[-1]
+    assert (method, suffix) == ("POST", "/analyze")
+    assert payload == {
+        "model": "served/model",
+        "input": {"ticket": "Refund"},
+        "tasks": {"intent": {"type": "classify", "labels": ["refund"]}},
+        "options": {"include_usage": True},
+    }
+    assert isinstance(result, AnalyzeResult)
+    assert result["intent"].value == "intent-value"
+    assert result.model == "served/model"
+    with pytest.raises(AttributeError):
+        _ = result["intent"].missing
 
 
-def test_client_rejects_wrong_number_of_adapter_ids():
-    client = GLiFormerClient()
-    with pytest.raises(ValueError, match="length 2"):
-        client.predict(["one", "two"], entities=["item"], adapter_id=["legal"])
+@pytest.mark.parametrize("method, args, kwargs, task", [
+    ("classify", ("x", ["a", "b"]), {"multi_label": True}, {"type": "classify", "labels": ["a", "b"], "multi_label": True}),
+    ("judge", ("x",), {"instruction": "Refund?"}, {"type": "boolean", "instruction": "Refund?"}),
+    ("extract_spans", ("x",), {"labels": "person", "flat": False}, {"type": "span", "labels": "person", "flat": False}),
+    ("extract_relations", ("x", ["founded"]), {"entity_labels": ["person"]}, {"type": "relation", "labels": ["founded"], "entity_labels": ["person"]}),
+    ("extract_json", ("x",), {"labels": {"vendor": "Vendor"}}, {"type": "json", "labels": {"vendor": "Vendor"}}),
+    ("rank", ("q", [{"id": "a", "input": "x"}]), {"top_k": 1}, {"type": "rank", "candidates": [{"id": "a", "input": "x"}], "top_k": 1}),
+])
+def test_wrappers_compile_to_one_task(monkeypatch, method, args, kwargs, task):
+    client, recorder = make_client(monkeypatch)
+    result = getattr(client, method)(*args, **kwargs)
+    assert recorder.calls[-1][2]["tasks"] == {"result": task}
+    assert result.value == "result-value"
 
 
-def test_client_supports_per_text_task_schemas(monkeypatch):
-    client = GLiFormerClient(max_concurrency=2)
-    monkeypatch.setattr(client, "_post", lambda payload: payload)
-    results = client.predict(
-        ["Alice", "Paris"],
-        entities=[["person"], {"location": ["city", "country"]}],
-    )
-    assert [result["entities"] for result in results] == [
-        ["person"],
-        {"location": ["city", "country"]},
-    ]
+def test_embed_returns_vector(monkeypatch):
+    client, recorder = make_client(monkeypatch, **{"/analyze": {"results": {"result": {"type": "embedding", "value": [0.6, 0.8]}}}})
+    assert client.embed("x", normalize=False) == [0.6, 0.8]
+    assert recorder.calls[-1][2]["tasks"]["result"] == {"type": "embedding", "normalize": False}
 
 
-def test_client_supports_complex_per_text_tasks_without_schema_heuristics(monkeypatch):
-    client = GLiFormerClient(max_concurrency=2)
-    monkeypatch.setattr(client, "_post", lambda payload: payload)
-    results = client.predict(
-        ["Alice works at Acme", "Carol joined Globex"],
-        per_text_tasks=[
-            {
-                "joint_relations": {
-                    "employment": {
-                        "entities": ["person", "organization"],
-                        "relations": ["works_at"],
-                    }
-                }
-            },
-            {"structures": {"employee": ["name", "company"]}},
+def test_extract_json_accepts_pydantic_models(monkeypatch):
+    pydantic = pytest.importorskip("pydantic")
+
+    class Invoice(pydantic.BaseModel):
+        vendor: str
+
+    client, recorder = make_client(monkeypatch)
+    client.extract_json("x", schema=Invoice)
+    schema = recorder.calls[-1][2]["tasks"]["result"]["schema"]
+    assert schema["properties"]["vendor"]["type"] == "string"
+
+
+def test_batch_returns_results_and_item_errors(monkeypatch):
+    client, recorder = make_client(monkeypatch, **{"/analyze/batch": {
+        "model": "served/model",
+        "items": [
+            {"id": "a", "results": {"t": {"type": "classify", "value": "x"}}},
+            {"id": "b", "error": {"code": "INVALID_REQUEST", "message": "bad", "path": "/items/1/tasks"}},
         ],
-    )
-    assert "joint_relations" in results[0]
-    assert results[1]["structures"] == {"employee": ["name", "company"]}
+    }})
+    outcomes = client.analyze_batch([{"id": "a", "input": "x", "tasks": {}}], options={"include_usage": True})
+    assert recorder.calls[-1][2]["options"] == {"include_usage": True}
+    assert outcomes[0].id == "a" and outcomes[0]["t"].value == "x"
+    assert isinstance(outcomes[1], GLiFormerAPIError)
+    assert (outcomes[1].id, outcomes[1].code, outcomes[1].path) == ("b", "INVALID_REQUEST", "/items/1/tasks")
 
 
-def test_client_supports_explicit_per_text_complex_schemas(monkeypatch):
-    client = GLiFormerClient(max_concurrency=2)
-    monkeypatch.setattr(client, "_post", lambda payload: payload)
-    results = client.predict(
-        ["Alice works at Acme", "Paris is in France"],
-        joint_relations=PerText([
-            {
-                "employment": {
-                    "entities": ["person", "organization"],
-                    "relations": ["works_at"],
-                }
-            },
-            None,
-        ]),
-        structures=PerText([
-            None,
-            {"place": ["name", "country"]},
-        ]),
-    )
+def test_async_variants(monkeypatch):
+    client, _ = make_client(monkeypatch)
 
-    assert results[0]["joint_relations"]["employment"]["relations"] == [
-        "works_at"
-    ]
-    assert "structures" not in results[0]
-    assert "joint_relations" not in results[1]
-    assert results[1]["structures"] == {"place": ["name", "country"]}
+    async def run():
+        return await asyncio.gather(*(
+            client.analyze_async("x", {"t": {"type": "span"}}) for _ in range(3)
+        ))
+
+    assert [result["t"].value for result in asyncio.run(run())] == ["t-value"] * 3
 
 
-def test_client_preserves_shared_list_structuring_schema(monkeypatch):
-    client = GLiFormerClient(max_concurrency=2)
-    monkeypatch.setattr(client, "_post", lambda payload: payload)
-    schema = [{"name": "str"}, {"company": "str"}]
-
-    results = client.predict(["one", "two"], structures=schema)
-
-    assert results[0]["structures"] == schema
-    assert results[1]["structures"] == schema
+def test_capabilities_quotes_model_ids(monkeypatch):
+    client, recorder = make_client(monkeypatch)
+    client.capabilities("org/model name")
+    assert recorder.calls[-1][1] == "/models/org/model%20name/capabilities"
 
 
-def test_client_predict_requests_preserves_fully_independent_payloads(monkeypatch):
-    client = GLiFormerClient(max_concurrency=2)
-    monkeypatch.setattr(client, "_post", lambda payload: payload)
-    requests = [
-        {"text": "one", "structures": [{"name": "str"}], "threshold": 0.2},
-        {"text": "two", "entities": ["item"], "flat_ner": False},
-    ]
-    assert client.predict_requests(requests) == requests
+def test_http_errors_become_api_errors(monkeypatch):
+    client = GLiFormerClient(model="m")
+
+    def fail(*_args, **_kwargs):
+        payload = json.dumps({"error": {"code": "UNSUPPORTED_LABEL_TYPE", "message": "typed", "path": "/tasks/t"}}).encode()
+        raise urllib.error.HTTPError("http://x", 422, "Unprocessable", {}, io.BytesIO(payload))
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    with pytest.raises(GLiFormerAPIError) as error:
+        client.analyze("x", {"t": {"type": "json", "labels": ["a"]}})
+    assert (error.value.status, error.value.code, error.value.path) == (422, "UNSUPPORTED_LABEL_TYPE", "/tasks/t")
 
 
-def test_client_can_request_embeddings(monkeypatch):
-    client = GLiFormerClient()
-    monkeypatch.setattr(
-        client,
-        "_post",
-        lambda payload, suffix="": {"embedding": [1.0]} if suffix else payload,
-    )
-    result = client.predict("hello", embed=True)
-    assert result == [1.0]
+def test_unreachable_server_is_a_client_error(monkeypatch):
+    client = GLiFormerClient(model="m")
 
+    def fail(*_args, **_kwargs):
+        raise urllib.error.URLError("connection refused")
 
-def test_client_embed_text_uses_dedicated_endpoint(monkeypatch):
-    client = GLiFormerClient()
-    calls = []
-
-    def post(payload, suffix=""):
-        calls.append((payload, suffix))
-        return {"embedding": [1.0, 2.0]}
-
-    monkeypatch.setattr(client, "_post", post)
-    assert client.embed_text("hello") == [1.0, 2.0]
-    assert calls == [({"text": "hello"}, "/embeddings")]
-
-
-def test_task_convenience_methods_unwrap_their_outputs(monkeypatch):
-    client = GLiFormerClient()
-    monkeypatch.setattr(
-        client,
-        "predict",
-        lambda text, **kwargs: {"ner": [{"text": "Alice"}]},
-    )
-    assert client.predict_entities("Alice", ["person"]) == [{"text": "Alice"}]
-
-
-def test_async_client_dispatches_all_requests(monkeypatch):
-    client = GLiFormerClient(max_concurrency=2)
-    monkeypatch.setattr(client, "_post", lambda payload: {"text": payload["text"]})
-
-    async def run_inline(function, *args, **kwargs):
-        return function(*args, **kwargs)
-
-    monkeypatch.setattr(asyncio, "to_thread", run_inline)
-    result = asyncio.run(client.predict_async(["one", "two"], entities=["item"]))
-    assert result == [{"text": "one"}, {"text": "two"}]
-
-
-def test_client_rejects_wrong_complex_per_text_count():
-    client = GLiFormerClient()
-    with pytest.raises(ValueError, match="per_text_tasks must have length 2"):
-        client.predict(["one", "two"], per_text_tasks=[{"entities": ["item"]}])
-
-
-def test_client_rejects_wrong_per_text_wrapper_count():
-    client = GLiFormerClient()
-    with pytest.raises(ValueError, match="PerText structures must have length 2"):
-        client.predict(["one", "two"], structures=PerText([{"record": ["field"]}]))
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    with pytest.raises(GLiFormerClientError) as error:
+        client.health()
+    assert not isinstance(error.value, GLiFormerAPIError)

@@ -12,6 +12,13 @@ from .label_augmentation import (
     BatchLabelAugmenter,
     LabelAugmentationConfig,
 )
+from ..prompt_features import (
+    PROMPT_MARKER_COUNTS_KEY,
+    count_prompt_markers,
+    prompt_marker_token_indices,
+)
+from ..encoders.native_vision import NativeVisionHost, uses_native_vision
+from .token_units import is_token_level, unit_pieces_batch
 from .processor import (
     BaseGLiFormerProcessor,
     GLiFormerAudioProcessor,
@@ -128,11 +135,41 @@ class BaseGLiFormerDataCollator(ABC):
         if isinstance(text_lengths, torch.Tensor) and "word_lengths" not in model_input:
             model_input["word_lengths"] = text_lengths.view(-1).tolist()
 
+    def _add_prompt_marker_counts(self, model_input: Dict[str, Any]) -> None:
+        """Per-row prompt-marker counts as Python lists.
+
+        The model sizes its prompt-feature tensors from these, so it never has
+        to read them back from the GPU.
+        """
+
+        input_ids = model_input.get("input_ids")
+        attention_mask = model_input.get("attention_mask")
+        if (
+            PROMPT_MARKER_COUNTS_KEY in model_input
+            or not isinstance(input_ids, torch.Tensor)
+            or not isinstance(attention_mask, torch.Tensor)
+            or input_ids.device.type != "cpu"
+            or attention_mask.device.type != "cpu"
+            or input_ids.dim() != 2
+            or attention_mask.shape != input_ids.shape
+        ):
+            return
+        token_indices = prompt_marker_token_indices(self.config)
+        if token_indices:
+            model_input[PROMPT_MARKER_COUNTS_KEY] = count_prompt_markers(
+                input_ids,
+                attention_mask,
+                token_indices,
+            )
+
     def _add_common_returns(self, model_input: Dict[str, Any], raw_batch: Dict[str, Any]) -> None:
         if self.return_classes_mapping and "classes_mapping" not in model_input:
             model_input["classes_mapping"] = raw_batch.get("classes_mapping")
         if self.return_tokens:
-            model_input["tokens"] = raw_batch.get("tokens")
+            tokens = raw_batch.get("tokens")
+            if is_token_level(self.config):
+                tokens = unit_pieces_batch(tokens, raw_batch.get("text"))
+            model_input["tokens"] = tokens
         if self.return_id_to_classes:
             model_input["id_to_classes"] = raw_batch.get("id_to_classes")
         if self.return_entities:
@@ -168,6 +205,7 @@ class GLiFormerTextDataCollator(BaseGLiFormerDataCollator):
         self._add_text_fields(model_input, raw_batch)
         self._add_common_returns(model_input, raw_batch)
         self._add_precomputed_lengths(model_input)
+        self._add_prompt_marker_counts(model_input)
         return self._filter_none_values(model_input)
 
 
@@ -217,6 +255,27 @@ class GLiFormerOmniDataCollator(GLiFormerTextDataCollator):
     """Collator for omni-modal GLiFormer models."""
 
     data_processor_type = GLiFormerOmniProcessor
+
+    def __call__(self, input_x: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+        model_input = super().__call__(input_x, **kwargs)
+        self._add_native_vision_host(model_input)
+        return model_input
+
+    def _add_native_vision_host(self, model_input: Dict[str, Any]) -> None:
+        """CPU copies of the inputs that size a native vision batch, so the model
+        lays the image blocks out without reading them back from the GPU."""
+        if not uses_native_vision(self.config):
+            return
+        input_ids = model_input.get("input_ids")
+        image_grid_thw = model_input.get("image_grid_thw")
+        if not torch.is_tensor(input_ids) or not torch.is_tensor(image_grid_thw):
+            return
+        model_input["native_vision_host"] = NativeVisionHost(
+            input_ids=input_ids,
+            attention_mask=model_input.get("attention_mask"),
+            image_grid_thw=image_grid_thw,
+            vision_input_mask=model_input.get("vision_input_mask"),
+        )
 
 
 class GLiFormerDataCollator(GLiFormerOmniDataCollator):

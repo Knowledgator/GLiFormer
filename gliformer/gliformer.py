@@ -47,6 +47,15 @@ from .processing.collator import (
     GLiFormerVisionDataCollator,
     resolve_gliformer_collator_class,
 )
+from .processing.word_spacing import SpaceAwareWordsSplitter
+from .processing.token_units import (
+    TOKEN_UNIT_MARKER,
+    TokenSplitter,
+    is_token_level,
+    set_digit_split,
+    snaps_to_words,
+    word_snapped_maps,
+)
 from .processing.schema import (
     GLiFormerSchema,
     build_structuring_output_formatter,
@@ -212,8 +221,17 @@ class BaseGLiFormer(BaseGLiNER):
             if variant in {"vision", "audio"}:
                 labels_tokenizer = tokenizer
 
-        if words_splitter is None:
-            words_splitter = WordsSplitter(config.words_splitter_type)
+        if getattr(config, "split_digits", False):
+            set_digit_split(tokenizer, config.split_digits)
+
+        if is_token_level(config):
+            if words_splitter is None:
+                words_splitter = TokenSplitter(tokenizer)
+        else:
+            if words_splitter is None:
+                words_splitter = WordsSplitter(config.words_splitter_type)
+            if getattr(config, "preserve_word_spaces", False):
+                words_splitter = SpaceAwareWordsSplitter(words_splitter)
 
         processor_cls = resolve_gliformer_processor_class(config)
         self.data_processor = processor_cls(
@@ -309,6 +327,10 @@ class BaseGLiFormer(BaseGLiNER):
 
         if self.config.structuring_config is not None:
             tokens.append(self.config.child_token)
+            if getattr(self.config.structuring_config, "typed_fields", False):
+                tokens.append(getattr(self.config, "option_token", "[OPTION]"))
+            if getattr(self.config, "calculation_config", None) is not None:
+                tokens.append(getattr(self.config, "calc_token", "[CALC]"))
             if getattr(self.config.structuring_config, "multi_level", False):
                 tokens.extend(
                     [
@@ -316,6 +338,9 @@ class BaseGLiFormer(BaseGLiNER):
                         self.config.structuring_end_token,
                     ]
                 )
+
+        if getattr(self.config, "sequence_editing_config", None) is not None:
+            tokens.append(getattr(self.config, "edit_token", "[EDIT]"))
 
         if (self.config.image_classification_config is not None
                 or self.config.object_detection_config is not None
@@ -386,6 +411,31 @@ class BaseGLiFormer(BaseGLiNER):
             child_idx = _idx(self.config.child_token)
             self.config.structuring_config.child_token_index = child_idx
             self.config.child_token_index = child_idx
+            if getattr(self.config.structuring_config, "typed_fields", False):
+                self.config.structuring_config.option_token_index = _idx(
+                    getattr(self.config, "option_token", "[OPTION]")
+                )
+                boundary_tokens = [
+                    self.config.sep_token,
+                    self.config.struct_parent_token,
+                    self.config.structuring_child_token,
+                    self.config.structuring_end_token,
+                ]
+                unknown = tok.convert_tokens_to_ids(tok.unk_token) if tok.unk_token else None
+                self.config.structuring_config.typed_boundary_token_indices = [
+                    index
+                    for index in (_idx(token) for token in boundary_tokens if token)
+                    if index is not None and index != unknown
+                ]
+            if getattr(self.config, "calculation_config", None) is not None:
+                self.config.calculation_config.calc_token_index = _idx(
+                    getattr(self.config, "calc_token", "[CALC]")
+                )
+
+        if getattr(self.config, "sequence_editing_config", None) is not None:
+            self.config.sequence_editing_config.edit_token_index = _idx(
+                getattr(self.config, "edit_token", "[EDIT]")
+            )
 
         if (self.config.image_classification_config is not None
                 or self.config.object_detection_config is not None
@@ -407,10 +457,473 @@ class BaseGLiFormer(BaseGLiNER):
             if getattr(token_rep_layer, "resizes_labels_encoder_only", False):
                 self.config.vocab_size = new_num_tokens
             else:
+                old_num_tokens = int(self.config.vocab_size or 0)
                 model_embeds = token_rep_layer.resize_token_embeddings(new_num_tokens, None)
+                self._init_option_token_embedding(model_embeds, old_num_tokens)
+                self._init_calc_token_embedding(model_embeds, old_num_tokens)
+                self._init_edit_token_embedding(model_embeds, old_num_tokens)
                 self.config.vocab_size = model_embeds.num_embeddings
                 if hasattr(self.config, "encoder_config") and self.config.encoder_config is not None:
                     self.config.encoder_config.vocab_size = model_embeds.num_embeddings
+                    # Multimodal backbones build their embedding table from the nested text config.
+                    text_config = getattr(self.config.encoder_config, "text_config", None)
+                    if text_config is not None:
+                        text_config.vocab_size = model_embeds.num_embeddings
+
+    def enable_typed_structuring(self, **settings) -> bool:
+        """Add class fields to a loaded checkpoint.
+
+        Checkpoints trained before typed fields existed have no ``[OPTION]``
+        token and no option scorer. This registers the token (its embedding
+        row starts as a copy of ``[FIELD]``), builds the option scorer from
+        ``settings`` (any ``typed_*`` structuring option and
+        ``embed_option_token``), and rebuilds the structuring processor.
+        Returns ``True`` when the model changed.
+        """
+
+        struct_cfg = self.config.structuring_config
+        heads = getattr(self.model, "heads", {})
+        if struct_cfg is None or "structuring" not in heads:
+            raise ValueError("Typed fields need a model with a structuring head")
+        head = heads["structuring"]
+        for name, value in settings.items():
+            if name.startswith("typed_") or name == "embed_option_token":
+                if not hasattr(struct_cfg, name):
+                    raise ValueError(f"Unknown structuring option {name!r}")
+                if name != "typed_fields":
+                    setattr(struct_cfg, name, value)
+        if bool(getattr(struct_cfg, "typed_fields", False)) and hasattr(head, "option_modeling"):
+            return False
+
+        struct_cfg.typed_fields = True
+        option_token = getattr(self.config, "option_token", None) or "[OPTION]"
+        self.config.option_token = option_token
+        tokenizer = self.data_processor.transformer_tokenizer
+        if option_token not in tokenizer.get_vocab():
+            tokenizer.add_tokens([option_token], special_tokens=True)
+        # Sets the option/boundary indices, grows the embedding table, and
+        # initializes the new row from [FIELD].
+        self.resize_embeddings()
+
+        parameter = next(head.parameters())
+        head._initialize_typed_fields(
+            struct_cfg,
+            int(self.config.hidden_size),
+            float(getattr(self.config, "dropout", 0.0)),
+        )
+        for module in head._option_modules():
+            module.to(device=parameter.device, dtype=parameter.dtype)
+
+        self._rebuild_structuring_processor()
+        return True
+
+    def enable_normalization(self, settings: Optional[Dict[str, Any]] = None) -> bool:
+        """Add a normalization head to a loaded checkpoint.
+
+        ``settings`` is a ``normalization_config`` mapping. The head starts
+        from scratch; its processor and decoder are registered with it.
+        Returns ``True`` when the model changed, ``False`` when the checkpoint
+        already has a normalization head.
+        """
+
+        from .config import NormalizationHeadConfig
+        from .tasks.normalization.model import NormalizationHead
+        from .tasks.normalization.processor import NormalizationProcessor
+
+        heads = self.model.heads
+        if "normalization" in heads:
+            return False
+        if self.config.structuring_config is None and self.config.ner_config is None:
+            raise ValueError("A normalization head needs a model with a structuring or NER head")
+        self.config.normalization_config = NormalizationHeadConfig(**dict(settings or {}))
+        head = NormalizationHead.from_config(self.config)
+        parameter = next(self.model.parameters())
+        heads["normalization"] = head.to(device=parameter.device, dtype=parameter.dtype)
+        processor = self.data_processor
+        normalization = NormalizationProcessor(
+            self.config,
+            processor.transformer_tokenizer,
+            getattr(processor, "words_splitter", None),
+        )
+        normalization.structuring_processor = processor.task_processors.get("structuring")
+        processor.task_processors["normalization"] = normalization
+        self.decoder = self.decoder_class(self.config)
+        return True
+
+    def set_text_unit(self, text_unit: str, span_boundary: Optional[str] = None) -> bool:
+        """Switch a loaded checkpoint between word and token units.
+
+        Text units create no parameters, so a word-level checkpoint can be
+        fine-tuned (or run) at token level: only the data processor changes.
+        Returns ``True`` when the unit changed.
+        """
+
+        from .config import TEXT_UNITS
+
+        text_unit = str(text_unit).lower()
+        if text_unit not in TEXT_UNITS:
+            raise ValueError(f"text_unit must be one of {list(TEXT_UNITS)}, got {text_unit!r}")
+        changed = text_unit != getattr(self.config, "text_unit", "word")
+        if span_boundary is not None and span_boundary != getattr(self.config, "span_boundary", None):
+            self.config.span_boundary = span_boundary
+            changed = True
+        if not changed:
+            return False
+        self.config.text_unit = text_unit
+        if text_unit == "token":
+            self.config.preserve_word_spaces = False
+        processor = self.data_processor
+        self._create_data_processor(
+            self.config, cache_dir=None, tokenizer=processor.transformer_tokenizer,
+        )
+        return True
+
+    def set_split_digits(self, mode) -> bool:
+        """Set per-digit tokenization for a loaded checkpoint.
+
+        ``mode`` is false, true/"all" or "keep_dates". No parameters change
+        (single digits are already in the vocabulary), but the encoder reads
+        numbers differently, so the model needs fine-tuning after a switch.
+        Returns ``True`` when it changed.
+        """
+
+        from .processing.token_units import normalize_digit_split
+
+        mode = normalize_digit_split(mode)
+        if mode == normalize_digit_split(getattr(self.config, "split_digits", False)):
+            return False
+        self.config.split_digits = mode or False
+        tokenizer = self.data_processor.transformer_tokenizer
+        set_digit_split(tokenizer, mode)
+        self._create_data_processor(self.config, cache_dir=None, tokenizer=tokenizer)
+        return True
+
+    def _rebuild_structuring_processor(self):
+        processor = self.data_processor
+        old = processor.task_processors.get("structuring")
+        if old is not None:
+            processor.task_processors["structuring"] = type(old)(
+                self.config,
+                processor.transformer_tokenizer,
+                getattr(processor, "words_splitter", None),
+            )
+            normalization = processor.task_processors.get("normalization")
+            if normalization is not None:
+                normalization.structuring_processor = processor.task_processors["structuring"]
+            calculation = processor.task_processors.get("calculation")
+            if calculation is not None:
+                calculation.structuring_processor = processor.task_processors["structuring"]
+
+    def enable_calculation(self, settings: Optional[Dict[str, Any]] = None) -> bool:
+        """Add a calculation head to a loaded checkpoint.
+
+        Registers the ``[CALC]`` token (its embedding row starts as a copy of
+        ``[FIELD]``), builds the head from ``settings`` (a
+        ``calculation_config`` mapping) and its processor and decoder.
+        Returns ``True`` when the model changed, ``False`` when the checkpoint
+        already has a calculation head.
+        """
+
+        from .config import CalculationHeadConfig
+        from .tasks.calculation.model import CalculationHead
+        from .tasks.calculation.processor import CalculationProcessor
+
+        heads = self.model.heads
+        if "calculation" in heads:
+            # Existing head: only settings that do not change its weights.
+            tunable = {
+                "loss_coef", "bio_loss_coef", "port_loss_coef", "op_loss_coef", "active_loss_coef",
+                "max_operand_spans", "port_threshold", "active_threshold", "operand_threshold",
+                "candidate_mode", "candidate_threshold", "bio_focal_loss_alpha", "bio_focal_loss_gamma",
+                "port_focal_loss_alpha", "port_focal_loss_gamma", "detach_record_anchors",
+            }
+            current = self.config.calculation_config
+            values = {**current.__dict__, **{k: v for k, v in dict(settings or {}).items() if k in tunable}}
+            updated = CalculationHeadConfig(**values)
+            for config in {id(current): current, id(heads["calculation"].cfg): heads["calculation"].cfg}.values():
+                for key in tunable:
+                    setattr(config, key, getattr(updated, key))
+            return False
+        if self.config.structuring_config is None:
+            raise ValueError("A calculation head needs a model with a structuring head")
+        self.config.calculation_config = CalculationHeadConfig(**dict(settings or {}))
+        calc_token = getattr(self.config, "calc_token", None) or "[CALC]"
+        self.config.calc_token = calc_token
+        tokenizer = self.data_processor.transformer_tokenizer
+        if calc_token not in tokenizer.get_vocab():
+            tokenizer.add_tokens([calc_token], special_tokens=True)
+        # Sets the [CALC] index, grows the embedding table, copies [FIELD].
+        self.resize_embeddings()
+        head = CalculationHead.from_config(self.config)
+        parameter = next(self.model.parameters())
+        heads["calculation"] = head.to(device=parameter.device, dtype=parameter.dtype)
+        processor = self.data_processor
+        calculation = CalculationProcessor(
+            self.config,
+            processor.transformer_tokenizer,
+            getattr(processor, "words_splitter", None),
+        )
+        calculation.structuring_processor = processor.task_processors.get("structuring")
+        processor.task_processors["calculation"] = calculation
+        normalization = processor.task_processors.get("normalization")
+        if normalization is not None:
+            normalization.calculation_processor = calculation
+        # The structuring processor renders [CALC] only when a calculation
+        # head exists.
+        self._rebuild_structuring_processor()
+        self.decoder = self.decoder_class(self.config)
+        return True
+
+    def enable_sequence_editing(self, settings: Optional[Dict[str, Any]] = None) -> bool:
+        """Add a sequence editing head to a loaded checkpoint.
+
+        Registers the ``[EDIT]`` token (its embedding row starts as a copy of
+        ``[SEP]``), builds the head from ``settings`` (a
+        ``sequence_editing_config`` mapping), its processor and decoder.
+        Returns ``True`` when the model changed; an existing head only takes
+        settings that do not change its weights.
+        """
+
+        from .config import SequenceEditingHeadConfig
+        from .tasks.sequence_editing.model import SequenceEditingHead
+        from .tasks.sequence_editing.processor import SequenceEditingProcessor
+
+        heads = self.model.heads
+        if "sequence_editing" in heads:
+            tunable = {
+                "loss_coef", "op_loss_coef", "length_loss_coef", "token_loss_coef", "space_loss_coef",
+                "keep_weight", "op_label_smoothing", "detach_vocab", "keep_bias", "min_edit_prob",
+                "num_iterations", "tag_loss_coef",
+            }
+            current = self.config.sequence_editing_config
+            values = {**current.__dict__, **{k: v for k, v in dict(settings or {}).items() if k in tunable}}
+            updated = SequenceEditingHeadConfig(**values)
+            head = heads["sequence_editing"]
+            for config in {id(current): current, id(head.cfg): head.cfg}.values():
+                for key in tunable:
+                    setattr(config, key, getattr(updated, key))
+            head.loss_coef = float(updated.loss_coef)
+            return False
+        self.config.sequence_editing_config = SequenceEditingHeadConfig(**dict(settings or {}))
+        edit_token = getattr(self.config, "edit_token", None) or "[EDIT]"
+        self.config.edit_token = edit_token
+        tokenizer = self.data_processor.transformer_tokenizer
+        if edit_token not in tokenizer.get_vocab():
+            tokenizer.add_tokens([edit_token], special_tokens=True)
+        # Sets the [EDIT] index, grows the embedding table, copies [SEP].
+        self.resize_embeddings()
+        head = SequenceEditingHead.from_config(
+            self.config, embedding_dim=self.model._input_embedding_dim(),
+        )
+        parameter = next(self.model.parameters())
+        heads["sequence_editing"] = head.to(device=parameter.device, dtype=parameter.dtype)
+        head.attach_vocab(self.model)
+        processor = self.data_processor
+        processor.task_processors["sequence_editing"] = SequenceEditingProcessor(
+            self.config,
+            processor.transformer_tokenizer,
+            getattr(processor, "words_splitter", None),
+        )
+        self.decoder = self.decoder_class(self.config)
+        return True
+
+    def _init_edit_token_embedding(self, embeddings, old_num_tokens: int) -> None:
+        """Start a newly added ``[EDIT]`` row from the ``[SEP]`` row."""
+
+        edit_cfg = getattr(self.config, "sequence_editing_config", None)
+        weight = getattr(embeddings, "weight", None)
+        if edit_cfg is None or weight is None:
+            return
+        edit_idx = int(getattr(edit_cfg, "edit_token_index", -1))
+        tokenizer = self.data_processor.transformer_tokenizer
+        sep_idx = tokenizer.convert_tokens_to_ids(self.config.sep_token)
+        if (
+            edit_idx < old_num_tokens
+            or not 0 <= edit_idx < weight.shape[0]
+            or not isinstance(sep_idx, int)
+            or not 0 <= sep_idx < weight.shape[0]
+        ):
+            return
+        with torch.no_grad():
+            weight[edit_idx].copy_(weight[sep_idx])
+
+    @torch.no_grad()
+    def edit_text(
+        self,
+        texts: Union[str, List[str]],
+        instruction: Optional[Union[str, List[Optional[str]]]] = None,
+        *,
+        batch_size: int = 8,
+        keep_bias: Optional[float] = None,
+        min_edit_prob: Optional[float] = None,
+        num_iterations: Optional[int] = None,
+        return_ops: bool = False,
+    ):
+        """Edit texts with the sequence editing head.
+
+        Args:
+            texts: one text or a list.
+            instruction: one instruction for all texts or one per text
+                (e.g. ``"fix grammar"``); ``None`` = the empty instruction.
+            keep_bias: added to the KEEP logit (higher = fewer edits);
+                defaults to ``sequence_editing_config.keep_bias``.
+            min_edit_prob: a text is edited only if some unit's edit
+                probability reaches it.
+            num_iterations: run the model again on its own output until
+                nothing changes, at most this many times.
+            return_ops: also return the per-slot ops of the last pass.
+
+        Returns:
+            Per text (a dict for a single string input)::
+
+                {"instruction": str, "text": edited text, "iterations": int,
+                 "edits": [{"op": "replace", "start": 4, "end": 6,
+                            "source": "go", "replacement": "went",
+                            "score": 0.97, "space": True}, ...]}
+
+            Edit offsets refer to the input text. After more than one pass
+            the edits are re-aligned against the input and carry no score.
+        """
+
+        from .tasks.sequence_editing.alignment import char_edits, plan_edits
+        from .tasks.sequence_editing.decoder import SequenceEditingDecoder
+
+        self._require_task_heads("sequence_editing")
+        cfg = self.config.sequence_editing_config
+        texts, single = self._normalize_texts(texts)
+        if instruction is None or isinstance(instruction, str):
+            instruction = [instruction] * len(texts)
+        elif len(instruction) != len(texts):
+            raise ValueError("instruction must be one string or one per text")
+        instructions = [str(value or "").strip() for value in instruction]
+        num_iterations = int(num_iterations or cfg.num_iterations)
+        self.eval()
+
+        tokenizer = self.data_processor.transformer_tokenizer
+        splitter = self.data_processor.words_splitter
+        decoder = SequenceEditingDecoder(self.config, tokenizer)
+        blocked = sorted(set(tokenizer.all_special_ids) | set(tokenizer.added_tokens_encoder.values()))
+        blocked_tensor = torch.tensor(blocked, dtype=torch.long, device=self.device)
+        collator = self.create_inference_collator(return_tokens=True)
+        model_dtype = self._model_floating_dtype()
+        forward_kwargs = {"seq_edit_blocked_tokens": blocked_tensor}
+        if keep_bias is not None:
+            forward_kwargs["seq_edit_keep_bias"] = float(keep_bias)
+        if min_edit_prob is not None:
+            forward_kwargs["seq_edit_min_edit_prob"] = float(min_edit_prob)
+
+        def run_pass(batch_texts, batch_instructions):
+            units = [[tuple(unit) for unit in splitter(text)] for text in batch_texts]
+            items = []
+            for text, pieces, text_instruction in zip(batch_texts, units, batch_instructions):
+                item = {
+                    "text": text,
+                    "tokenized_text": [unit[0] for unit in pieces] or ["[PAD]"],
+                    "sequence_editing": [{"instruction": text_instruction}],
+                }
+                if is_token_level(self.config):
+                    item[TOKEN_UNIT_MARKER] = "token"
+                items.append(item)
+            batch = collator(items)
+            model_batch = {}
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    value = value.to(self.device)
+                    if value.is_floating_point() and model_dtype is not None:
+                        value = value.to(dtype=model_dtype)
+                model_batch[key] = value
+            output = self.model(**model_batch, **forward_kwargs)
+            decode = getattr(output, "sequence_editing", None)
+            results = decoder.decode_groups(decode, batch_texts, units)
+            by_row = {result["row"]: result for result in results}
+            return [
+                by_row.get(row, {"text": text, "edits": [], "ops": []})
+                for row, text in enumerate(batch_texts)
+            ]
+
+        current = list(texts)
+        first_pass: List[Optional[dict]] = [None] * len(texts)
+        last_pass: List[Optional[dict]] = [None] * len(texts)
+        iterations = [0] * len(texts)
+        active = [index for index, text in enumerate(texts) if isinstance(text, str) and text.strip()]
+        for _ in range(num_iterations):
+            if not active:
+                break
+            still_active = []
+            for offset in range(0, len(active), batch_size):
+                chunk = active[offset: offset + batch_size]
+                outputs = run_pass([current[i] for i in chunk], [instructions[i] for i in chunk])
+                for index, result in zip(chunk, outputs):
+                    iterations[index] += 1
+                    if first_pass[index] is None:
+                        first_pass[index] = result
+                    last_pass[index] = result
+                    if result["text"] != current[index]:
+                        current[index] = result["text"]
+                        still_active.append(index)
+            active = still_active
+
+        results = []
+        for index, source in enumerate(texts):
+            if iterations[index] <= 1 or current[index] == source:
+                edits = first_pass[index]["edits"] if first_pass[index] is not None else []
+            else:
+                source_units = [tuple(unit) for unit in splitter(source)]
+                plan = plan_edits(source, source_units, current[index], [tuple(u) for u in splitter(current[index])])
+                edits = char_edits(source, source_units, plan.ops, plan.contents)
+            result = {
+                "instruction": instructions[index],
+                "text": current[index],
+                "edits": edits,
+                "iterations": iterations[index],
+            }
+            if return_ops:
+                result["ops"] = last_pass[index]["ops"] if last_pass[index] is not None else []
+            results.append(result)
+        return self._single_or_batch(results, single)
+
+    def _init_calc_token_embedding(self, embeddings, old_num_tokens: int) -> None:
+        """Start a newly added ``[CALC]`` row from the ``[FIELD]`` row."""
+
+        calc_cfg = getattr(self.config, "calculation_config", None)
+        struct_cfg = self.config.structuring_config
+        weight = getattr(embeddings, "weight", None)
+        if calc_cfg is None or struct_cfg is None or weight is None:
+            return
+        calc_idx = int(getattr(calc_cfg, "calc_token_index", -1))
+        child_idx = int(getattr(struct_cfg, "child_token_index", -1))
+        if (
+            calc_idx < old_num_tokens
+            or not 0 <= calc_idx < weight.shape[0]
+            or not 0 <= child_idx < weight.shape[0]
+        ):
+            return
+        with torch.no_grad():
+            weight[calc_idx].copy_(weight[child_idx])
+
+    def _init_option_token_embedding(self, embeddings, old_num_tokens: int) -> None:
+        """Start a newly added ``[OPTION]`` row from the ``[FIELD]`` row.
+
+        Options are field-like prompt markers; copying an existing trained
+        marker avoids a random row when typed fields are enabled on top of an
+        existing checkpoint.
+        """
+
+        struct_cfg = self.config.structuring_config
+        if struct_cfg is None or not getattr(struct_cfg, "typed_fields", False):
+            return
+        weight = getattr(embeddings, "weight", None)
+        option_idx = int(getattr(struct_cfg, "option_token_index", -1))
+        child_idx = int(getattr(struct_cfg, "child_token_index", -1))
+        if (
+            weight is None
+            or option_idx < old_num_tokens
+            or not 0 <= option_idx < weight.shape[0]
+            or not 0 <= child_idx < weight.shape[0]
+        ):
+            return
+        with torch.no_grad():
+            weight[option_idx].copy_(weight[child_idx])
 
     def _build_inference_input(
         self,
@@ -420,6 +933,7 @@ class BaseGLiFormer(BaseGLiNER):
         relations=None,
         joint_relations=None,
         structures=None,
+        texts: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build ``input_x`` dicts for the collator from label arguments.
 
@@ -429,8 +943,9 @@ class BaseGLiFormer(BaseGLiNER):
         """
         input_x = []
         task_processors = self.data_processor.task_processors.values()
-        for tokens in all_tokens:
+        for row, tokens in enumerate(all_tokens):
             item: Dict[str, Any] = {"tokenized_text": tokens}
+            self._attach_source_text(item, texts, row)
             for processor in task_processors:
                 processor.contribute_inference_input(
                     item,
@@ -447,12 +962,16 @@ class BaseGLiFormer(BaseGLiNER):
         self,
         all_tokens: List[List[str]],
         requests: List[Dict[str, Any]],
+        texts: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build one collator batch whose rows may use different task schemas."""
         input_x = []
         task_processors = self.data_processor.task_processors.values()
-        for tokens, request in zip(all_tokens, requests, strict=True):
+        for row, (tokens, request) in enumerate(zip(all_tokens, requests, strict=True)):
             item: Dict[str, Any] = {"tokenized_text": tokens}
+            self._attach_source_text(item, texts, row)
+            if request.get("reference_date") is not None:
+                item["reference_date"] = str(request["reference_date"])
             for processor in task_processors:
                 processor.contribute_inference_input(
                     item,
@@ -462,8 +981,43 @@ class BaseGLiFormer(BaseGLiNER):
                     joint_relations=request.get("joint_relations"),
                     structures=request.get("structures"),
                 )
+            self._apply_request_prompts(item, request)
             input_x.append(item)
         return input_x
+
+    def _attach_source_text(self, item: Dict[str, Any], texts: Optional[List[str]], row: int) -> None:
+        """Token-unit rows carry their text: units are encoded from it."""
+
+        if texts is None or not is_token_level(self.config):
+            return
+        item["text"] = texts[row]
+        item[TOKEN_UNIT_MARKER] = "token"
+
+    @staticmethod
+    def _apply_request_prompts(item: Dict[str, Any], request: Dict[str, Any]) -> None:
+        """Apply a row's ``prompt`` and per-group ``group_prompts``.
+
+        ``prompt`` behaves like ``inference(prompt=...)``: it becomes the
+        description of every entity/classification group and the structuring
+        prompt. ``group_prompts`` maps a group key (the key used in
+        ``entities``/``classes``/``joint_relations``) to ``{"name": ...,
+        "description": ...}``; ``name`` replaces the rendered group name
+        (``None`` renders no name) and ``description`` sets the group text.
+        """
+        prompt = request.get("prompt")
+        group_prompts = request.get("group_prompts") or {}
+        for group in (*item.get("extraction", ()), *item.get("classification", ())):
+            key = group.get("name")
+            override = group_prompts.get(key) if key is not None else None
+            if override:
+                if "description" in override:
+                    group["description"] = override["description"]
+                if "name" in override:
+                    group["name"] = override["name"]
+            if prompt:
+                group.setdefault("description", prompt)
+        if prompt and request.get("structures") is not None:
+            item.setdefault("prompt", prompt)
 
     def _build_pdf_inference_input(
         self,
@@ -524,14 +1078,20 @@ class BaseGLiFormer(BaseGLiNER):
         all_start_token_idx_to_text_idx = []
         all_end_token_idx_to_text_idx = []
 
+        snap = snaps_to_words(self.config)
         for text in texts:
             tokens = []
             start_token_idx_to_text_idx = []
             end_token_idx_to_text_idx = []
-            for token, start, end in self.data_processor.words_splitter(text):
+            units = list(self.data_processor.words_splitter(text))
+            for token, start, end in units:
                 tokens.append(token)
                 start_token_idx_to_text_idx.append(start)
                 end_token_idx_to_text_idx.append(end)
+            if snap:
+                # span_boundary="word": a unit span reads as the words it touches.
+                words = list(self.data_processor.word_splitter(text))
+                start_token_idx_to_text_idx, end_token_idx_to_text_idx = word_snapped_maps(units, words)
             all_tokens.append(tokens)
             all_start_token_idx_to_text_idx.append(start_token_idx_to_text_idx)
             all_end_token_idx_to_text_idx.append(end_token_idx_to_text_idx)
@@ -615,6 +1175,9 @@ class BaseGLiFormer(BaseGLiNER):
             return dict(value)
         if isinstance(value, (str, Path)):
             return {path_key: value}
+        # Loaded images (e.g. PIL) go through the image processor like paths do.
+        if hasattr(value, "convert") and hasattr(value, "size") and not isinstance(value, torch.Tensor):
+            return {path_key: value}
         return {tensor_key: value}
 
     def _require_task_heads(self, *task_names: str):
@@ -628,7 +1191,7 @@ class BaseGLiFormer(BaseGLiNER):
                     "ner", "classification", "joint_relex", "open_relex",
                     "structuring", "image_classification", "object_detection",
                     "segmentation", "audio_classification", "audio_segmentation",
-                    "count", "embedding",
+                    "count", "embedding", "sequence_editing",
                 )
                 if getattr(self.config, f"{name}_config", None) is not None
             ]
@@ -675,6 +1238,9 @@ class BaseGLiFormer(BaseGLiNER):
         preserve_empty_records: bool = False,
         return_anchor_diagnostics: bool = False,
         inference_collator: Optional[Any] = None,
+        images: Optional[Any] = None,
+        prompt: Optional[Union[str, List[Optional[str]]]] = None,
+        reference_date: Optional[Union[str, List[Optional[str]]]] = None,
         **kwargs,
     ) -> Dict[str, List]:
         """Run multi-task inference.
@@ -684,6 +1250,19 @@ class BaseGLiFormer(BaseGLiNER):
 
         Args:
             texts: Input text(s).
+            images: Optional image per text (path or PIL image, ``None`` for a
+                text-only row) that the text is read together with. Needs a
+                model whose processor loads images, e.g.
+                ``vision_encoder_type='native'``.
+            prompt: Optional instruction, one for all texts or one per text,
+                placed in front of the labels of every entity and
+                classification group, the way training rows carry it in a
+                group's ``description``, and in front of every structuring
+                schema, the way training rows carry it in their ``prompt``.
+            reference_date: Optional ISO date/datetime, one for all texts or
+                one per text. Typed date/datetime fields that are not read
+                from a span in the text are predicted relative to it (for
+                example "next Friday" in a dated letter).
             entities: NER entity types. ``List[str]`` for single group,
                 ``Dict[str, List[str]]`` for named groups.
             classes: Classification labels. Same format as entities.
@@ -736,6 +1315,22 @@ class BaseGLiFormer(BaseGLiNER):
         if isinstance(texts, str):
             texts = [texts]
         num_original = len(texts)
+        if images is not None:
+            if not isinstance(images, (list, tuple)):
+                images = [images]
+            if len(images) != num_original:
+                raise ValueError(f"images must contain one entry per text: expected {num_original}, got {len(images)}")
+        if prompt is None or isinstance(prompt, str):
+            prompt = [prompt] * num_original
+        elif len(prompt) != num_original:
+            raise ValueError(f"prompt must be one string or one per text: expected {num_original}, got {len(prompt)}")
+        if reference_date is None or not isinstance(reference_date, (list, tuple)):
+            reference_date = [reference_date] * num_original
+        elif len(reference_date) != num_original:
+            raise ValueError(
+                "reference_date must be one value or one per text: "
+                f"expected {num_original}, got {len(reference_date)}"
+            )
 
         # Filter empty texts
         valid_texts, valid_to_orig_idx = self._filter_valid_texts(texts)
@@ -782,7 +1377,18 @@ class BaseGLiFormer(BaseGLiNER):
             relations,
             joint_relations,
             structures,
+            texts=valid_texts,
         )
+        for item, orig_idx in zip(input_x, valid_to_orig_idx):
+            if images is not None and images[orig_idx] is not None:
+                item["image"] = images[orig_idx]
+            if prompt[orig_idx]:
+                for group in (*item.get("extraction", ()), *item.get("classification", ())):
+                    group.setdefault("description", prompt[orig_idx])
+                if structures is not None:
+                    item.setdefault("prompt", prompt[orig_idx])
+            if structures is not None and reference_date[orig_idx] is not None:
+                item["reference_date"] = str(reference_date[orig_idx])
 
         # Create collator (inference mode: no labels)
         collator = inference_collator or self.create_inference_collator(return_tokens=True)
@@ -841,12 +1447,19 @@ class BaseGLiFormer(BaseGLiNER):
         inference_collator: Optional[Any] = None,
         objectness_threshold: Optional[float] = None,
         preserve_empty_records: bool = False,
+        return_group_index: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """Infer heterogeneous text/task schemas in shared model forwards.
 
         Task presence, schemas, adapters, and decoding controls may differ per
         row while the compatible rows share model forwards.
+
+        Besides the ``inference()`` task arguments, a row may carry
+        ``prompt``, ``group_prompts`` (see ``_apply_request_prompts``),
+        ``reference_date`` and ``decoder_kwargs``. With
+        ``return_group_index=True`` every entity and relation carries the
+        index of the extraction group it was decoded from.
         """
         if not requests:
             return []
@@ -920,7 +1533,9 @@ class BaseGLiFormer(BaseGLiNER):
             key: collapse(values) for key, values in row_decoder_controls.items()
         }
         all_tokens, all_start_maps, all_end_maps = self.prepare_inputs(valid_texts)
-        input_x = self._build_heterogeneous_inference_input(all_tokens, valid_requests)
+        input_x = self._build_heterogeneous_inference_input(
+            all_tokens, valid_requests, texts=valid_texts,
+        )
         collator = inference_collator or self.create_inference_collator(return_tokens=True)
         batches = (
             collator(input_x[offset:offset + batch_size])
@@ -959,6 +1574,7 @@ class BaseGLiFormer(BaseGLiNER):
                 return_anchor_diagnostics=valid_requests[valid_index].get(
                     "return_anchor_diagnostics", False
                 ),
+                return_group_index=return_group_index,
             )
             requested_tasks = {
                 "ner": "entities",
@@ -966,6 +1582,8 @@ class BaseGLiFormer(BaseGLiNER):
                 "open_relex": "relations",
                 "joint_relex": "joint_relations",
                 "structuring": "structures",
+                # Programs behind "$calculate" field values.
+                "calculation": "structures",
             }
             results[original_index] = {
                 task: values[0]
@@ -1064,6 +1682,10 @@ class BaseGLiFormer(BaseGLiNER):
             if not tokens:
                 continue
             text, start_map, end_map = self._pdf_tokens_to_text_and_maps(tokens)
+            if is_token_level(self.config):
+                # Words are split into units with the row's boxes; spans index units.
+                _, start_map, end_map = self.prepare_inputs([text])
+                start_map, end_map = start_map[0], end_map[0]
             item["text"] = text
             valid_items.append(item)
             valid_to_orig_idx.append(idx)
@@ -1165,7 +1787,7 @@ class BaseGLiFormer(BaseGLiNER):
                 )
             result["adapter_ids"] = [adapter_ids[idx] for idx in valid_to_orig_idx]
         for key in (
-            "pixel_values", "vision_attention_mask", "vision_input_mask",
+            "pixel_values", "image_grid_thw", "vision_attention_mask", "vision_input_mask",
             "audio_values", "audio_attention_mask", "audio_input_mask", "bbox",
             "layout_input_mask", "page_token_ids", "page_input_mask",
         ):
@@ -1217,7 +1839,9 @@ class BaseGLiFormer(BaseGLiNER):
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     v = v.to(device)
-                    if v.is_floating_point() and model_dtype is not None:
+                    # float64 inputs carry exact values (copied numbers, bin
+                    # targets) and must not be rounded to the model's dtype.
+                    if v.is_floating_point() and v.dtype != torch.float64 and model_dtype is not None:
                         v = v.to(dtype=model_dtype)
                     model_batch[k] = v
                 else:
@@ -1369,6 +1993,7 @@ class BaseGLiFormer(BaseGLiNER):
         ] = None,
         structuring_dedup: bool = True,
         return_anchor_diagnostics: bool = False,
+        **extra,
     ) -> Dict[str, List]:
         """Map decoded results back to original text indices and char positions."""
         return self.decoder.map_results(
@@ -1382,6 +2007,7 @@ class BaseGLiFormer(BaseGLiNER):
             structures=structures,
             structuring_dedup=structuring_dedup,
             return_anchor_diagnostics=return_anchor_diagnostics,
+            **extra,
         )
 
     # ── Per-task convenience methods ───────────────────────────────────
@@ -2362,6 +2988,9 @@ class GLiFormer(nn.Module, PyTorchModelHubMixin):
         **model_kwargs,
     ):
         config_instance = cls._coerce_config(config)
+        if _attn_implementation is None:
+            # transformers leaves this field out of to_dict(), which the loader rebuilds the config from.
+            _attn_implementation = getattr(config_instance, "_attn_implementation", None)
         gliformer_class = cls._get_gliformer_class(config_instance)
         loader_kwargs = BaseGLiFormer._supported_base_loader_kwargs(
             gliformer_class.load_from_config,

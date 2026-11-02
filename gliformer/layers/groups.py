@@ -510,8 +510,8 @@ class _AnchorCrossAttentionBlock(nn.Module):
                 raise ValueError("query_mask must match the first two anchor dimensions")
             safe_queries = valid_queries.clone()
             all_invalid = ~safe_queries.any(dim=1)
-            if all_invalid.any():
-                safe_queries[all_invalid, 0] = True
+            # A no-op for rows with a valid query; avoids a host sync.
+            safe_queries[:, 0] |= all_invalid
             self_attention_mask = ~safe_queries
         source_length = token_emb.shape[1] if source_length is None else source_length
         if self.norm_first:

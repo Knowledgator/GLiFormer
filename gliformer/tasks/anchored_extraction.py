@@ -168,9 +168,9 @@ class AnchoredSpanExtractionHead(TaskHead):
         span_idx = span_idx * span_mask.unsqueeze(-1).long()
         return span_idx, span_mask
 
-    def _span_logits_from_fused(self, feature_embeddings, fused_flat, B, A, C, span_idx):
+    def _span_logits_from_fused(self, feature_embeddings, fused_flat, B, A, C, span_idx, token_source=None):
         """Default span-level scoring: span_rep · fused — shape (BN, A, S, C)."""
-        span_rep = self.span_rep_layer(feature_embeddings, span_idx)          # (B, S, D)
+        span_rep = self._pool_spans(self.span_rep_layer, feature_embeddings, span_idx, token_source)  # (B, S, D)
         span_logits_flat = torch.einsum("BSD,BND->BSN", span_rep, fused_flat)  # (B, S, A*C)
         S = span_rep.shape[1]
         return span_logits_flat.reshape(B, S, A, C).permute(0, 2, 1, 3)

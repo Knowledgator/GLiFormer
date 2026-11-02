@@ -52,6 +52,8 @@ class BackboneSpec:
     config_class: type | None = None
     aliases: tuple[str, ...] = ()
     model_class_names: tuple[str, ...] = ()
+    # Modalities the checkpoint encodes itself, with its own tower and placeholder tokens.
+    native_modalities: tuple[str, ...] = ()
 
 
 BACKBONE_REGISTRY: dict[str, BackboneSpec] = {}
@@ -63,6 +65,7 @@ def register_backbone(
     config_class: type | None = None,
     aliases: Iterable[str] = (),
     model_class_names: Iterable[str] = (),
+    native_modalities: Iterable[str] = (),
 ) -> BackboneSpec:
     normalized = normalize_backbone_type(name)
     alias_tuple = tuple(normalize_backbone_type(alias) for alias in aliases)
@@ -72,6 +75,7 @@ def register_backbone(
         config_class=config_class,
         aliases=alias_tuple,
         model_class_names=tuple(model_class_names),
+        native_modalities=tuple(native_modalities),
     )
     keys = (normalized, *alias_tuple)
     seen = set()
@@ -129,6 +133,7 @@ if QWEN3_5_AVAILABLE:
         Qwen3_5Config,
         aliases=("qwen3_5_bidirectional",),
         model_class_names=("GLiFormerQwen3_5Model", "Qwen3_5BidirectionalModel"),
+        native_modalities=("vision",),
     )
     register_backbone(
         "qwen3_5_text",

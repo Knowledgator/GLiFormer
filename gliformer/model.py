@@ -4,14 +4,11 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from gliner.modeling.base import BaseModel
 from gliner.modeling.layers import CrossFuser, LstmSeq2SeqEncoder
-from gliner.modeling.utils import (
-    extract_prompt_features,
-    extract_prompt_features_and_word_embeddings,
-    extract_word_embeddings,
-)
+from gliner.modeling.utils import extract_word_embeddings
 from torch import nn
 
 from .config import GLiFormerConfig
@@ -27,6 +24,13 @@ from .encoders.omni import (
 from .encoders.text import TextBiEncoder, TextEncoder
 from .encoders.vision import VisionBiEncoder, vision_encoder_kwargs, vision_token_mask
 from .layers import AnchorCrossAttentionLayer, AnchorModeling
+from .prompt_features import (
+    PROMPT_MARKER_COUNTS_KEY,
+    PromptMarkerCounts,
+    extract_prompt_features,
+    prompt_marker_token_indices,
+)
+from .tasks.matcher import host_to_device
 from .outputs import (
     GLiFormerAudioOutput,
     GLiFormerLayoutOutput,
@@ -43,9 +47,38 @@ def _normalize_model_variant(value: Optional[str]) -> str:
     return value or "text"
 
 
+def _subtoken_pooling(config) -> str:
+    """Pooling the processor built ``words_mask`` for (it marks subtokens to match)."""
+
+    pooling = getattr(config, "subtoken_pooling", "first")
+    return pooling if isinstance(pooling, str) else "first"
+
+
 _VARIANT_MODALITIES = {
     "omni": ("text", "vision", "audio"),
 }
+
+
+def _extra_head_kwargs(kwargs, words_mask=None):
+    """Typed structuring and normalization tensors travel through ``**kwargs``.
+
+    Heads that read a span's subword states get ``span_token_words``: the
+    source unit id of every subword. The processor sends ``token_words_mask``
+    when a head needs it (``words_mask`` marks only the subwords that
+    ``subtoken_pooling`` keeps, e.g. the first one of each word).
+    """
+
+    extra = {
+        key: value
+        for key, value in kwargs.items()
+        if key.startswith(("structuring_typed_", "normalization_", "calculation_", "seq_edit_"))
+    }
+    token_words = kwargs.get("token_words_mask")
+    if token_words is None:
+        token_words = words_mask
+    if token_words is not None:
+        extra["span_token_words"] = token_words
+    return extra
 
 _SET_PREDICTION_COUNT_KEYS = {
     "object_detection": "object_detection_count",
@@ -56,12 +89,20 @@ _SET_PREDICTION_COUNT_KEYS = {
 
 @dataclass(frozen=True)
 class _FlatGroupLayout:
-    """Indexes one task's groups in flattened BN order."""
+    """Indexes one task's groups in flattened BN order.
+
+    The ``host_*`` tuples mirror the tensors as Python ints so slicing and
+    gathering can plan their copies without reading device values.
+    """
 
     batch_origin: torch.Tensor
     group_index: torch.Tensor
     starts: torch.Tensor
     sizes: torch.Tensor
+    host_batch_origin: Tuple[int, ...] = ()
+    host_group_index: Tuple[int, ...] = ()
+    host_starts: Tuple[int, ...] = ()
+    host_sizes: Tuple[int, ...] = ()
 
     @property
     def count(self) -> int:
@@ -204,12 +245,26 @@ class BaseGLiFormerModel(BaseModel):
                     if "ner" in self.heads
                     else None
                 )
+            if HeadClass.__name__ == "SequenceEditingHead":
+                head_kwargs["embedding_dim"] = self._input_embedding_dim()
             head = HeadClass.from_config(config, **head_kwargs)
             if head is not None:
                 canonical_name = task_definition.name
                 if enabled_task_names is not None and canonical_name not in enabled_task_names:
                     continue
                 self.heads[canonical_name] = head
+                if hasattr(head, "attach_vocab"):
+                    head.attach_vocab(self)
+
+    def _input_embedding_dim(self):
+        """Width of the backbone's token embedding table (None if unknown)."""
+
+        from .tasks.sequence_editing.model import input_embedding_module
+
+        try:
+            return int(input_embedding_module(self.token_rep_layer).embedding_dim)
+        except (AttributeError, TypeError):
+            return None
 
     def _migrate_renamed_task_state_dict(
         self,
@@ -738,6 +793,95 @@ class BaseGLiFormerModel(BaseModel):
         audio_mask = apply_input_mask(audio_mask, kwargs.get("audio_input_mask"))
         return audio_tokens, audio_mask
 
+    def _forward_host_counts(self, input_ids, attention_mask):
+        cache = getattr(self, "_forward_marker_counts", None)
+        if cache is None or not cache.matches(input_ids, attention_mask):
+            return None
+        return cache
+
+    def _start_forward_host_counts(self, input_ids, attention_mask, text_lengths, kwargs) -> None:
+        """Remember host-side marker counts and word lengths for this forward.
+
+        The collator supplies them as Python lists (``prompt_marker_counts``,
+        ``word_lengths``); missing marker counts are read from the device
+        once, together, the first time one is needed.
+        """
+
+        if input_ids is None or attention_mask is None:
+            self._forward_marker_counts = None
+            return
+        self._forward_marker_counts = PromptMarkerCounts(
+            input_ids,
+            attention_mask,
+            prompt_marker_token_indices(self.config),
+            kwargs.get(PROMPT_MARKER_COUNTS_KEY),
+            text_lengths=text_lengths if torch.is_tensor(text_lengths) else None,
+            word_lengths=kwargs.get("word_lengths"),
+        )
+
+    def _extract_prompt_features(
+        self,
+        token_index: int,
+        token_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        batch_size: int,
+        embed_dim: int,
+        embed_token: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """gliner's ``extract_prompt_features`` with host-side marker counts."""
+
+        cache = self._forward_host_counts(input_ids, attention_mask)
+        return extract_prompt_features(
+            token_index,
+            token_embeds,
+            input_ids,
+            attention_mask,
+            batch_size,
+            embed_dim,
+            embed_token,
+            counts=None if cache is None else cache.get(token_index),
+        )
+
+    def _extract_prompt_features_and_word_embeddings(
+        self,
+        class_token_index: int,
+        token_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        text_lengths: torch.Tensor,
+        words_mask: torch.Tensor,
+        embed_ent_token: bool = True,
+        subtoken_pooling: str = "first",
+    ):
+        """gliner's combined prompt/word extraction without device reads."""
+
+        batch_size, _, embed_dim = token_embeds.shape
+        cache = self._forward_host_counts(input_ids, attention_mask)
+        max_text_length = None if cache is None else cache.max_text_length(text_lengths)
+        if max_text_length is None:
+            max_text_length = text_lengths.max()
+        prompts_embedding, prompts_embedding_mask = self._extract_prompt_features(
+            class_token_index,
+            token_embeds,
+            input_ids,
+            attention_mask,
+            batch_size,
+            embed_dim,
+            embed_ent_token,
+        )
+        words_embedding, mask = extract_word_embeddings(
+            token_embeds,
+            words_mask,
+            attention_mask,
+            batch_size,
+            max_text_length,
+            embed_dim,
+            text_lengths,
+            subtoken_pooling,
+        )
+        return prompts_embedding, prompts_embedding_mask, words_embedding, mask
+
     @staticmethod
     def _build_group_layout(
         classes_mapping,
@@ -747,34 +891,38 @@ class BaseGLiFormerModel(BaseModel):
         label_kind: str = "primary",
         explicit_sizes: Optional[torch.Tensor] = None,
     ) -> _FlatGroupLayout:
-        """Describe task groups, their source slices, and original batch rows."""
+        """Describe task groups, their source slices, and original batch rows.
+
+        Everything is planned on the host; the four index rows reach the
+        device with one asynchronous copy. Explicit (labels-encoder) sizes are
+        read once when they live on the device.
+        """
 
         groups = list(classes_mapping.flat_iter(task_name))
-        batch_origin = torch.tensor(
-            [batch_idx for _, batch_idx, _, _ in groups],
-            dtype=torch.long,
-            device=device,
-        )
-        group_index = torch.tensor(
-            [group_idx for _, _, group_idx, _ in groups],
-            dtype=torch.long,
-            device=device,
-        )
+        batch_origin = [batch_idx for _, batch_idx, _, _ in groups]
+        group_index = [group_idx for _, _, group_idx, _ in groups]
 
         if explicit_sizes is not None:
-            sizes = explicit_sizes.to(device=device, dtype=torch.long).flatten()
-            if sizes.numel() != len(groups):
+            if torch.is_tensor(explicit_sizes):
+                sizes = explicit_sizes.to(dtype=torch.long).flatten().tolist()
+            else:
+                sizes = [int(size) for size in np.asarray(explicit_sizes).reshape(-1)]
+            if len(sizes) != len(groups):
                 raise ValueError(
                     f"{task_name} has {len(groups)} flat groups but received "
-                    f"{sizes.numel()} label-group sizes"
+                    f"{len(sizes)} label-group sizes"
                 )
-            if bool((sizes < 0).any()):
+            if any(size < 0 for size in sizes):
                 raise ValueError("label-group sizes must be non-negative")
-            starts = torch.cumsum(sizes, dim=0) - sizes
+            starts = []
+            offset = 0
+            for size in sizes:
+                starts.append(offset)
+                offset += size
         else:
             offsets = {}
-            starts_list = []
-            sizes_list = []
+            starts = []
+            sizes = []
             for _, batch_idx, group_idx, _ in groups:
                 size = classes_mapping.label_size(
                     task_name,
@@ -783,17 +931,24 @@ class BaseGLiFormerModel(BaseModel):
                     label_kind=label_kind,
                 )
                 start = offsets.get(batch_idx, 0)
-                starts_list.append(start)
-                sizes_list.append(size)
+                starts.append(start)
+                sizes.append(size)
                 offsets[batch_idx] = start + size
-            starts = torch.tensor(starts_list, dtype=torch.long, device=device)
-            sizes = torch.tensor(sizes_list, dtype=torch.long, device=device)
 
+        table = np.asarray(
+            [batch_origin, group_index, starts, sizes],
+            dtype=np.int64,
+        ).reshape(4, len(groups))
+        table = host_to_device(table, device)
         return _FlatGroupLayout(
-            batch_origin=batch_origin,
-            group_index=group_index,
-            starts=starts,
-            sizes=sizes,
+            batch_origin=table[0],
+            group_index=table[1],
+            starts=table[2],
+            sizes=table[3],
+            host_batch_origin=tuple(int(value) for value in batch_origin),
+            host_group_index=tuple(int(value) for value in group_index),
+            host_starts=tuple(int(value) for value in starts),
+            host_sizes=tuple(int(value) for value in sizes),
         )
 
     @staticmethod
@@ -804,7 +959,12 @@ class BaseGLiFormerModel(BaseModel):
         *,
         mask_dtype: torch.dtype = torch.float,
     ) -> _FlatEmbeddingBatch:
-        """Slice packed 2D or batch-packed 3D embeddings into padded groups."""
+        """Slice packed 2D or batch-packed 3D embeddings into padded groups.
+
+        The copy plan (destination slot, source row, source position) is built
+        from the layout's host ints and applied with one gather and one
+        ``index_copy`` instead of a slice assignment per group.
+        """
 
         if embeddings.dim() not in {2, 3}:
             raise ValueError(
@@ -821,53 +981,72 @@ class BaseGLiFormerModel(BaseModel):
                     "grouped embedding mask must match the embedding label axes"
                 )
 
-        max_size = int(layout.sizes.max().item()) if layout.count else 0
-        flat_embeddings = embeddings.new_zeros(
-            layout.count,
-            max_size,
-            embeddings.shape[-1],
-        )
+        count = layout.count
+        max_size = max(layout.host_sizes, default=0) if count else 0
+        hidden = embeddings.shape[-1]
+        flat_embeddings = embeddings.new_zeros(count, max_size, hidden)
         flat_mask = torch.zeros(
-            layout.count,
+            count,
             max_size,
             device=embeddings.device,
             dtype=mask_dtype,
         )
-        descriptors = zip(
-            layout.batch_origin.tolist(),
-            layout.starts.tolist(),
-            layout.sizes.tolist(),
-        )
-        for flat_idx, (batch_idx, start, size) in enumerate(descriptors):
+
+        flat_ids, rows, starts, sizes = [], [], [], []
+        for flat_idx, (batch_idx, start, size) in enumerate(
+            zip(layout.host_batch_origin, layout.host_starts, layout.host_sizes)
+        ):
             if size <= 0:
                 continue
             end = start + size
             if embeddings.dim() == 2:
                 if end > embeddings.shape[0]:
                     continue
-                flat_embeddings[flat_idx, :size] = embeddings[start:end]
-            else:
-                if batch_idx >= embeddings.shape[0] or end > embeddings.shape[1]:
-                    continue
-                flat_embeddings[flat_idx, :size] = embeddings[
-                    batch_idx,
-                    start:end,
-                ]
+            elif batch_idx >= embeddings.shape[0] or end > embeddings.shape[1]:
+                continue
+            flat_ids.append(flat_idx)
+            rows.append(batch_idx)
+            starts.append(start)
+            sizes.append(size)
+        if not sizes:
+            return _FlatEmbeddingBatch(flat_embeddings, flat_mask)
 
-            if source_mask is None:
-                flat_mask[flat_idx, :size] = 1
-            elif embeddings.dim() == 2:
-                flat_mask[flat_idx, :size] = source_mask[start:end].to(
-                    device=flat_mask.device,
-                    dtype=mask_dtype,
-                )
-            else:
-                flat_mask[flat_idx, :size] = source_mask[
-                    batch_idx,
-                    start:end,
-                ].to(device=flat_mask.device, dtype=mask_dtype)
+        sizes_np = np.asarray(sizes, dtype=np.int64)
+        total = int(sizes_np.sum())
+        group_offsets = np.repeat(np.cumsum(sizes_np) - sizes_np, sizes_np)
+        within = np.arange(total, dtype=np.int64) - group_offsets
+        plan = np.empty((3, total), dtype=np.int64)
+        plan[0] = np.repeat(np.asarray(flat_ids, dtype=np.int64) * max_size, sizes_np) + within
+        plan[1] = np.repeat(np.asarray(rows, dtype=np.int64), sizes_np)
+        plan[2] = np.repeat(np.asarray(starts, dtype=np.int64), sizes_np) + within
+        plan = host_to_device(plan, embeddings.device)
+        destination, source_rows, source_positions = plan[0], plan[1], plan[2]
 
-        return _FlatEmbeddingBatch(flat_embeddings, flat_mask)
+        if embeddings.dim() == 2:
+            values = embeddings[source_positions]
+        else:
+            values = embeddings[source_rows, source_positions]
+        flat_embeddings = flat_embeddings.view(count * max_size, hidden).index_copy(
+            0, destination, values
+        ).view(count, max_size, hidden)
+
+        flat_mask = flat_mask.view(count * max_size)
+        if source_mask is None:
+            flat_mask = flat_mask.index_fill(0, destination, 1)
+        else:
+            source_rows = source_rows.to(source_mask.device)
+            source_positions = source_positions.to(source_mask.device)
+            mask_values = (
+                source_mask[source_positions]
+                if embeddings.dim() == 2
+                else source_mask[source_rows, source_positions]
+            )
+            flat_mask = flat_mask.index_copy(
+                0,
+                destination,
+                mask_values.to(device=flat_mask.device, dtype=mask_dtype),
+            )
+        return _FlatEmbeddingBatch(flat_embeddings, flat_mask.view(count, max_size))
 
     @staticmethod
     def _slice_prompt_features(
@@ -1025,8 +1204,9 @@ class BaseGLiFormerModel(BaseModel):
             layout.count,
             parent_embeddings.shape[-1],
         )
+        plan = []
         for flat_idx, (batch_idx, group_idx) in enumerate(
-            zip(layout.batch_origin.tolist(), layout.group_index.tolist())
+            zip(layout.host_batch_origin, layout.host_group_index)
         ):
             parent_idx = group_idx
             if not per_task_parents:
@@ -1038,8 +1218,18 @@ class BaseGLiFormerModel(BaseModel):
                 batch_idx < parent_embeddings.shape[0]
                 and parent_idx < parent_embeddings.shape[1]
             ):
-                flat_parents[flat_idx] = parent_embeddings[batch_idx, parent_idx]
-        return flat_parents
+                plan.append((flat_idx, batch_idx, parent_idx))
+        if not plan:
+            return flat_parents
+        plan = host_to_device(
+            np.asarray(plan, dtype=np.int64).T,
+            parent_embeddings.device,
+        )
+        return flat_parents.index_copy(
+            0,
+            plan[0],
+            parent_embeddings[plan[1], plan[2]],
+        )
 
     def _build_flat_rel_prompts(
         self,
@@ -1142,6 +1332,20 @@ class BaseGLiFormerModel(BaseModel):
             feature_mask=flat_word_mask,
         )
 
+    @staticmethod
+    def _pad_rnn_output(output, width: int):
+        """Pad a packed RNN's output back to the input width.
+
+        ``pad_packed_sequence`` stops at the longest row's mask sum. That is
+        shorter than the mask when it has holes, e.g. layout image states
+        appended after padded words; the positions past it get zeros, as
+        padding does.
+        """
+
+        if output.shape[1] >= width:
+            return output
+        return torch.nn.functional.pad(output, (0, 0, 0, width - output.shape[1]))
+
     def _apply_word_rnn(self, words_embedding, mask):
         """Run the packed RNN only for rows containing at least one word."""
 
@@ -1151,11 +1355,11 @@ class BaseGLiFormerModel(BaseModel):
         if not nonempty_rows.any():
             return words_embedding
         if nonempty_rows.all():
-            return self.rnn(words_embedding, mask)
+            return BaseGLiFormerModel._pad_rnn_output(self.rnn(words_embedding, mask), words_embedding.shape[1])
         row_indices = torch.where(nonempty_rows)[0]
-        encoded = self.rnn(
-            words_embedding[row_indices],
-            mask[row_indices],
+        encoded = BaseGLiFormerModel._pad_rnn_output(
+            self.rnn(words_embedding[row_indices], mask[row_indices]),
+            words_embedding.shape[1],
         )
         output = encoded.new_zeros(
             words_embedding.shape[0],
@@ -1190,6 +1394,7 @@ class BaseGLiFormerModel(BaseModel):
             words_embedding, mask = extract_word_embeddings(
                 token_embeds, words_mask, attention_mask,
                 batch_size, max_text_length, embed_dim, text_lengths,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
             labels_embeds = labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
@@ -1200,9 +1405,10 @@ class BaseGLiFormerModel(BaseModel):
         else:
             token_embeds = self.token_rep_layer(input_ids, attention_mask, **encoder_kwargs)
             prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
-                extract_prompt_features_and_word_embeddings(
+                self._extract_prompt_features_and_word_embeddings(
                     self.config.class_token_index, token_embeds, input_ids, attention_mask,
                     text_lengths, words_mask, self.config.embed_ent_token,
+                    subtoken_pooling=_subtoken_pooling(self.config),
                 )
             )
             words_embedding = self._apply_word_rnn(words_embedding, mask)
@@ -1287,6 +1493,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             "page_token_ids",
             "page_input_mask",
             "pixel_values",
+            "image_grid_thw",
             "audio_values",
             "vision_attention_mask",
             "audio_attention_mask",
@@ -1295,6 +1502,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             "interpolate_pos_encoding",
             "pixel_mask",
             "audio_input_mask",
+            "native_vision_host",
         }
         direct_media_keys = {
             "pixel_values",
@@ -1492,7 +1700,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
                 prompt_task_names = tuple(prompt_parent_cfgs)
                 for task_name, task_cfg in task_parent_cfgs.items():
                     if task_cfg is not None and getattr(task_cfg, "parent_token_index", -1) > 0:
-                        parent_e, parent_m = extract_prompt_features(
+                        parent_e, parent_m = self._extract_prompt_features(
                             task_cfg.parent_token_index,
                             token_embeds,
                             input_ids,
@@ -1532,7 +1740,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
                 if "ner" in per_task_parent_embeds:
                     per_task_parent_embeds["joint_relex"] = per_task_parent_embeds["ner"]
             elif self.config.parent_token_index > 0:
-                parent_embeds, _ = extract_prompt_features(
+                parent_embeds, _ = self._extract_prompt_features(
                     self.config.parent_token_index,
                     token_embeds,
                     input_ids,
@@ -1548,7 +1756,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         cat_child_embeds, cat_child_mask = None, None
         if "classification" in self.heads and cat_label_embeds is None:
             cat_cfg = self.config.classification_config
-            cat_child_embeds, cat_child_mask = extract_prompt_features(
+            cat_child_embeds, cat_child_mask = self._extract_prompt_features(
                 cat_cfg.cat_token_index,
                 token_embeds,
                 input_ids,
@@ -1568,7 +1776,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         joint_rel_flat_prompts, joint_rel_flat_mask = None, None
         if joint_relex_active and rel_label_embeds is None:
             jr_cfg = self.config.joint_relex_config
-            rel_prompts_batch, rel_prompts_batch_mask = extract_prompt_features(
+            rel_prompts_batch, rel_prompts_batch_mask = self._extract_prompt_features(
                 jr_cfg.rel_token_index,
                 token_embeds,
                 input_ids,
@@ -1592,7 +1800,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         open_rel_child_embeds, open_rel_child_mask = None, None
         if "open_relex" in self.heads and open_rel_label_embeds is None:
             or_cfg = self.config.open_relex_config
-            open_rel_child_embeds, open_rel_child_mask = extract_prompt_features(
+            open_rel_child_embeds, open_rel_child_mask = self._extract_prompt_features(
                 or_cfg.rel_token_index,
                 token_embeds,
                 input_ids,
@@ -1621,7 +1829,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         if "structuring" in self.heads and child_label_embeds is None:
             s_cfg = self.config.structuring_config
             all_struct_child_embeds, all_struct_child_mask = (
-                extract_prompt_features(
+                self._extract_prompt_features(
                 s_cfg.child_token_index,
                 token_embeds,
                 input_ids,
@@ -1649,7 +1857,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
 
         obj_child_embeds, obj_child_mask = None, None
         if media_tasks and any(name in self.heads for name in media_tasks):
-            obj_child_embeds, obj_child_mask = extract_prompt_features(
+            obj_child_embeds, obj_child_mask = self._extract_prompt_features(
                 self.config.obj_token_index,
                 token_embeds,
                 input_ids,
@@ -2029,6 +2237,9 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
         seg_out = head_outputs.get("segmentation", TaskHeadOutput())
         audio_seg_out = head_outputs.get("audio_segmentation", TaskHeadOutput())
         emb_out = head_outputs.get("embedding", TaskHeadOutput())
+        norm_out = head_outputs.get("normalization", TaskHeadOutput())
+        calc_out = head_outputs.get("calculation", TaskHeadOutput())
+        edit_out = head_outputs.get("sequence_editing", TaskHeadOutput())
 
         effective_ner_logits = ner_out.logits if ner_out.logits is not None else joint_rel_out.logits
         effective_ner_extra = ner_out.extra if ner_out.logits is not None else joint_rel_out.extra
@@ -2094,6 +2305,17 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             ),
             structuring_span_idx=struct_out.extra.get("span_idx"),
             structuring_span_mask=struct_out.extra.get("span_mask"),
+            structuring_typed_class_logits=struct_out.extra.get("typed_class_logits"),
+            structuring_typed_class_none_logits=struct_out.extra.get(
+                "typed_class_none_logits"
+            ),
+            normalization_span_idx=norm_out.extra.get("span_idx"),
+            normalization_span_mask=norm_out.extra.get("span_mask"),
+            normalization_temporal=norm_out.extra.get("temporal"),
+            normalization_number=norm_out.extra.get("number"),
+            normalization_number_confidence=norm_out.extra.get("number_confidence"),
+            calculation=calc_out.extra.get("decode") if calc_out.extra else None,
+            sequence_editing=edit_out.extra.get("decode") if edit_out.extra else None,
             embedding_logits=emb_out.logits,
             image_classification_logits=image_cls_out.logits,
             image_classification_batch_origin=flat_inputs_map["image_classification"].batch_origin if "image_classification" in flat_inputs_map else None,
@@ -2224,6 +2446,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
     ) -> GLiFormerOutput:
 
         self._forward_modality_cache = {}
+        self._start_forward_host_counts(input_ids, attention_mask, text_lengths, kwargs)
         classes_mapping = kwargs.get("classes_mapping")
         pixel_values = self._resolve_media_argument(pixel_values, kwargs, "pixel_values")
         vision_attention_mask = self._resolve_media_argument(
@@ -2369,6 +2592,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             embedding_encodings=embedding_encodings,
             embedding_encoding_mask=embedding_encoding_mask,
             threshold=threshold, adjacency_threshold=adjacency_threshold,
+            **_extra_head_kwargs(kwargs, words_mask),
         )
 
         # ── 2-3. Execute heads and collect outputs ─────────────────────
@@ -2487,6 +2711,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             for key in kwargs
             if key in representation_keys
         }
+        self._start_forward_host_counts(input_ids, attention_mask, text_lengths, kwargs)
         token_embeds, prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
             self.get_representations(
                 input_ids,
@@ -2589,6 +2814,7 @@ class _GLiFormerJointForwardModel(BaseGLiFormerModel):
             embedding_encodings=embedding_encodings,
             embedding_encoding_mask=embedding_encoding_mask,
             threshold=threshold, adjacency_threshold=adjacency_threshold,
+            **_extra_head_kwargs(kwargs, words_mask),
         )
         final_loss, head_outputs = self._execute_forward_heads(
             shared=shared,
@@ -3208,6 +3434,7 @@ class GLiFormerLayoutModel(_GLiFormerJointForwardModel):
             words_embedding, mask = extract_word_embeddings(
                 token_embeds, words_mask, attention_mask,
                 batch_size, max_text_length, embed_dim, text_lengths,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
             labels_embeds = labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
@@ -3223,9 +3450,10 @@ class GLiFormerLayoutModel(_GLiFormerJointForwardModel):
             **encoder_kwargs,
         )
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
-            extract_prompt_features_and_word_embeddings(
+            self._extract_prompt_features_and_word_embeddings(
                 self.config.class_token_index, token_embeds, input_ids, attention_mask,
                 text_lengths, words_mask, self.config.embed_ent_token,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
         )
         words_embedding, mask = self._append_layout_extra_tokens(token_embeds, input_ids, words_embedding, mask)
@@ -3319,12 +3547,12 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
     @classmethod
     def _omni_kwargs(cls, kwargs: dict) -> dict:
         allowed = {
-            "packing_config", "pair_attention_mask", "pixel_values",
+            "packing_config", "pair_attention_mask", "pixel_values", "image_grid_thw",
             "token_lengths",
             "vision_attention_mask", "audio_values", "audio_attention_mask",
             "vision_input_mask", "audio_input_mask", "bbox", "layout_input_mask",
             "vision_encoder_kwargs", "interpolate_pos_encoding", "pixel_mask",
-            "adapter_ids",
+            "adapter_ids", "native_vision_host",
         }
         cls._reject_unsupported_input_names(kwargs)
         return {key: kwargs[key] for key in allowed if key in kwargs}
@@ -3367,6 +3595,7 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
             words_embedding, mask = extract_word_embeddings(
                 token_embeds, words_mask, attention_mask,
                 batch_size, max_text_length, embed_dim, text_lengths,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
             labels_embeds = labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
             labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
@@ -3394,9 +3623,10 @@ class GLiFormerOmniModel(_GLiFormerJointForwardModel):
         if getattr(output, "audio_embeddings", None) is not None:
             _cache_forward_modality(self, "audio", output.audio_embeddings, output.audio_attention_mask)
         prompts_embedding, prompts_embedding_mask, words_embedding, mask = (
-            extract_prompt_features_and_word_embeddings(
+            self._extract_prompt_features_and_word_embeddings(
                 self.config.class_token_index, token_embeds, input_ids, attention_mask,
                 text_lengths, words_mask, self.config.embed_ent_token,
+                subtoken_pooling=_subtoken_pooling(self.config),
             )
         )
         words_embedding = self._apply_word_rnn(words_embedding, mask)

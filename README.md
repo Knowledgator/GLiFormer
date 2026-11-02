@@ -219,6 +219,90 @@ Illustrative output:
 
 Each employee stays under its department. Results are dictionaries and lists validated against the Pydantic schema; actual predictions depend on the checkpoint and threshold.
 
+### Typed Fields
+
+Checkpoints trained with `structuring_config.typed_fields: true` fill typed fields in the same single pass as text fields. There are two kinds:
+
+- **Extraction:** `{"$type": "text", "$format": "date"}`. The value is copied from the text (a span), then normalized by `$format` (`number`, `date`, `time`, `datetime`, `duration`). If the span can't be parsed, the raw text is returned.
+- **Regression:** `number`, `duration`, `date`, `time`, `datetime`, `estimate`, `forecast`. The value is predicted and may not appear in the text at all ("30 days after March 3", a total, an estimate).
+
+`class` fields choose labels from `$options`.
+
+```python
+structures = {"$root": {
+    "title": "str",
+    "issued": {"$type": "text", "$format": "date"},               # extraction
+    "category": {"$type": "class", "$options": ["electronics", "furniture", "toys"]},
+    "total": {"$type": "number", "$unit": "USD"},                 # regression
+    "revenue": {"$type": "number", "$unit_scale": 1e6},           # predicted in millions
+    "change": {"$type": "number", "$signed": True},               # may cross zero
+    "due": {"$type": "date", "$stats": ["value", "p10", "p90"]},
+    "fair_price": {"$type": "estimate", "$min": 1, "$max": 5000, "$scale": "log"},
+    "sales": {"$type": "forecast", "$min": 0, "$max": 1000, "$horizon": 6,
+              "$interval": "month", "$quantiles": [0.05, 0.5, 0.95]},
+}}
+result = model.inference(
+    texts,
+    structures=structures,
+    reference_date="2024-01-01",
+    decoder_kwargs={"typed_details": True},  # adds p_null, confidence, guess
+)
+```
+
+| Type | Output | Options |
+|---|---|---|
+| `text` + `$format` | normalized span value | `$format`, `$dayfirst`, `$unit`, `$decimals` |
+| `class` | list of options (`"$multi": false` returns one option or `null`) | `$options`, `$multi` |
+| `number`, `duration` | number | `$unit`, `$decimals`, `$integer`, `$min`/`$max`, `$step`, `$scale`, `$signed`, `$unit_scale` |
+| `date`, `time`, `datetime` | ISO string | `$dayfirst` |
+| `estimate` | `{"value", "median", "p10", "p90"}` | `$min`, `$max`, `$step`, `$scale`, `$unit` |
+| `forecast` | the same keys, each a list of `$horizon` values | as `estimate`, plus `$horizon`, `$interval` |
+| `list` with `$items: "number"\|"date"` | list of typed items | `$items` |
+
+`$stats` (e.g. `["value", "median", "p25", "p75"]`) or `$quantiles` choose the statistics of any regressed field; `value` is the median.
+
+**Regression head** (`typed_quantity_head: "regression"`; see `configs/gliformer_large_typed_regression.yaml`):
+
+- **Numbers:** x = sign · 10^(k + f).
+  - The exponent k is a class (−6…15, plus a zero class); the digits f are regressed.
+  - A direct log10 regression settles decade edges.
+  - Bounded fields regress their position within `$min`–`$max`; `$signed` fields regress asinh(x).
+- **Dates and times:**
+  - The year is regressed directly as (year − 2000)/10 and rounded.
+  - Month, day, hour, minute and second are classes; impossible days are masked at decode.
+- **Uncertainty:** quantiles are non-crossing offsets around the median, in the same space (log10 for numbers, days or minutes for dates and times). Pinball loss against point labels makes intervals reflect the model's actual error.
+- **Numeric memory:** every number and year in the input gets an extra memory vector built from its parsed value, so the heads read magnitudes directly instead of from sub-word pieces.
+
+The earlier histogram head (`typed_quantity_head: "histogram"`, the default for old checkpoints) predicts a binned offset from a span the model tags in the text.
+
+**Training data.** Rows carry gold values next to their types:
+
+```json
+{"text": "...", "prompt": "...",
+ "structuring": {"$root": {"category": ["toys"], "posted": "2024-03-03",
+                           "fair_price": {"value": 30, "median": 30, "p10": 20, "p90": 45}}},
+ "structuring_types": {"$root": {"category": {"$type": "class", "$options": ["toys", "books"]},
+                                 "posted": {"$type": "date"},
+                                 "fair_price": {"$type": "estimate", "$min": 1, "$max": 500}}},
+ "structuring_evidence": {"$root": {"posted": ["March 3, 2024"]}},
+ "reference_date": null}
+```
+
+```bash
+# Generator output -> rows; 30% of verbatim numbers/dates become extraction
+# fields; 200 source items held out for evaluation.
+python data/convert_items_to_gliformer.py --only typed \
+    --typed-extraction-ratio 0.3 --typed-val-size 200
+# Derived and relative dates ("3 weeks after X", "this coming Thursday").
+python data/augment_typed_dates.py
+python train.py --config configs/gliformer_large_typed_regression.yaml
+# Metrics per mode/type, p10-p90 coverage, and conformal interval widening.
+python -m gliformer_eval.eval_typed --model logs/gliformer_large_typed_regression/checkpoint-1500 \
+    --data data/typed_json_extraction_gliformer_val.jsonl --write-config
+```
+
+`--write-config` stores split-conformal widening constants (`typed_conformal`) so the predicted p10–p90 intervals cover about 80% of held-out values. If you use `reference_date`, supply it the same way in training and at inference.
+
 ### Multi-Task Inference
 
 Construct a reusable schema independently of the model:
@@ -390,30 +474,34 @@ python -m gliformer.serve \
   --dtype float16
 ```
 
-The `/gliformer` endpoint accepts any compatible combination of `entities`,
-`classes`, `relations`, `joint_relations`, and `structures`. Embeddings are
-available at `/gliformer/embeddings`.
+`POST /v1/analyze` takes one input and any number of named tasks; the task
+`type` (`classify`, `boolean`, `score`, `span`, `relation`, `json`,
+`embedding`, `rank`) selects the head and the result shape.
 
 ```bash
-curl -X POST http://localhost:8000/gliformer \
+curl -X POST http://localhost:8000/v1/analyze \
   -H "Content-Type: application/json" \
   -d '{
-    "text": "Alice works for Acme in Paris.",
-    "entities": ["person", "organization", "location"],
-    "classes": ["employment", "geography"],
-    "threshold": 0.3
+    "model": "knowledgator/gliformer-base-v1",
+    "input": {"ticket": "Alice from Acme was charged twice.", "plan": "pro"},
+    "tasks": {
+      "people": {"type": "span", "labels": ["person", "organization"]},
+      "topic": {"type": "classify", "labels": ["billing", "technical"]},
+      "refund": {"type": "boolean", "instruction": "Does the customer ask for a refund?"}
+    }
   }'
 ```
 
-Dynamic batches may contain different task combinations, schemas, decoding
-controls, and PolyLoRA adapter IDs. A schema or label set passed with a list of
-texts is shared by all texts by default; use `PerText` when values differ per
-text. `GLiFormerClient` provides HTTP access, while `GLiFormerFactory` provides
-a lifecycle-managed in-process Ray deployment.
+Structured input is rendered as one Markdown text, and located results report
+the input field they came from (`"source": "/ticket"`). Requests are batched
+dynamically across clients; `/v1/analyze/batch` runs many independent items
+with per-item errors. `GLiFormerClient` provides HTTP access, and
+`GLiFormerFactory` a lifecycle-managed in-process Ray deployment. The full
+contract is in [NEW_API.md](NEW_API.md).
 
-See the **[complete serving guide](docs/serving.md)** for the HTTP API, Python
-client, heterogeneous batching, sequence packing, memory calibration,
-containers, and PolyLoRA configuration.
+See the **[complete serving guide](docs/serving.md)** for the routes, Python
+client, how tasks map onto model rows, batching, sequence packing, memory
+calibration, containers, and PolyLoRA configuration.
 
 ## Evaluation
 

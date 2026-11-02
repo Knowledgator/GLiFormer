@@ -23,7 +23,10 @@ class RnnSeq2SeqEncoder(nn.Module):
         # Passing packed sequence through RNN
         packed_output, hidden = self.rnn(packed_x, hidden)
 
-        # Unpacking the output sequence
-        output, _ = pad_packed_sequence(packed_output, batch_first=True)
+        # Unpacking the output sequence. Keep the input width: without
+        # total_length the output ends at the longest row's mask sum, which is
+        # shorter than the mask when invalid positions sit inside it (layout
+        # image tokens appended after padded words).
+        output, _ = pad_packed_sequence(packed_output, batch_first=True, total_length=x.shape[1])
 
         return output

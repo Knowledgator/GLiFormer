@@ -21,6 +21,7 @@ from .anchor_modeling import (
     IdentityAnchorModeling,
     LinearAnchorModeling,
     MLPAnchorModeling,
+    ReadoutAnchorModeling,
     RNNAnchorModeling,
     TransformerAnchorModeling,
 )
@@ -81,6 +82,7 @@ from .position import (
     masked_normalized_grid_1d,
     normalized_grid_1d,
     normalized_grid_2d,
+    ragged_normalized_grid_2d,
 )
 from .rnn import RnnSeq2SeqEncoder
 from .rotary import RotaryEmbedding, apply_rotary_pos_emb, rotate_half
@@ -101,6 +103,7 @@ __all__ = [
     "RotaryAnchorLayer", "QueryRNNAnchorLayer", "QueryTransformerAnchorLayer",
     "AnchorModeling", "IdentityAnchorModeling", "LinearAnchorModeling",
     "RNNAnchorModeling", "MLPAnchorModeling", "TransformerAnchorModeling",
+    "ReadoutAnchorModeling",
     "AnchorNormalizer", "NoAnchorNormalization",
     "LayerNormAnchorNormalization", "RMSNormAnchorNormalization",
     "L2AnchorNormalization", "CenterRMSAnchorNormalization",
@@ -118,6 +121,6 @@ __all__ = [
     "MLP1DPositionEmbedding",
     "Linear2DPositionEmbedding", "MLP2DPositionEmbedding",
     "LearnedIndexPositionEmbedding", "LearnedGrid2DPositionEmbedding",
-    "covering_grid_2d", "normalized_grid_1d", "normalized_grid_2d",
+    "covering_grid_2d", "normalized_grid_1d", "normalized_grid_2d", "ragged_normalized_grid_2d",
     "masked_normalized_grid_1d",
 ]

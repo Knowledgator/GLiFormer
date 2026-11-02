@@ -1,6 +1,8 @@
 """Shared tensor machinery for entity-first structuring."""
 
+import json
 import random
+import re
 from copy import deepcopy
 
 import torch
@@ -12,9 +14,14 @@ from ._structuring_hierarchy import (
     MULTI_LEVEL_ROOT_KEY,
     NODE_ID_KEY,
     NODE_KEEP_KEY,
+    STRUCTURING_TYPES_KEY,
+    TYPED_ANCHORS_KEY,
+    TYPED_UNRESOLVED_KEY,
+    TYPED_VALUES_KEY,
     StructuringProcessorComponent,
     is_internal_instance_key,
     resolve_structuring_processor,
+    class_field_layout,
 )
 from .label_augmentation import AugmentableLabelGroup
 from .mappings import (
@@ -22,6 +29,110 @@ from .mappings import (
     StructuringClassMapping,
     StructuringItemMapping,
 )
+from .typed_fields import _DAYFIRST, _SCALE_WORDS_EN, _TENS_WORDS_EN, _UNIT_WORDS_EN
+from .typed_fields import (
+    TypedFieldSpec,
+    candidate_spans,
+    find_anchor,
+    is_typed_descriptor,
+    lookup_group_types,
+)
+
+STRUCTURING_EVIDENCE_KEY = "structuring_evidence"
+_TYPED_PREPARED_FLAG = "_gliformer_structuring_typed_prepared"
+
+
+# Multiplier words written after a number in other languages ("29 Tausend",
+# "6,07 mil millones", "47,97 Mrd.", "610 milliards"), longest first.
+_LOCAL_MULTIPLIERS = (
+    ("mil millones", 1e9), ("mil m", 1e9), ("milliarden", 1e9), ("milliarde", 1e9),
+    ("milliards", 1e9), ("milliard", 1e9), ("mrd", 1e9), ("millionen", 1e6),
+    ("millones", 1e6), ("millón", 1e6), ("millon", 1e6), ("mio", 1e6), ("mm", 1e6),
+    ("tausend", 1e3), ("mil", 1e3),
+)
+# Words a written number can start, end or continue with ("eighty point four
+# two", "minus 54,000,000", "8 and one half", "29 Tausend").
+_NUMBER_WORDS = (
+    set(_UNIT_WORDS_EN) | set(_TENS_WORDS_EN) | set(_SCALE_WORDS_EN)
+    | {"hundred", "point", "minus", "negative", "half", "halves", "quarter", "quarters",
+       "third", "thirds", "fourth", "fourths", "millions", "billions", "mn", "bn", "k", "m"}
+    | {word for phrase, _ in _LOCAL_MULTIPLIERS for word in phrase.split()}
+)
+_NUMBER_CONNECTORS = {"and", "a", "an", "-"}
+_MAX_NUMBER_WORDS = 8
+
+
+def _numberish(token: str) -> bool:
+    core = token.strip(".,;:!?\"'").lower()
+    if re.search(r"\d|[½¼¾⅓⅔⅛]", core):
+        return True
+    core = core.strip("()$€£¥.")
+    if core in {"$", "€", "£", "¥"}:
+        return True
+    # "eighty-two", "forty-eight"
+    return bool(core) and all(part in _NUMBER_WORDS for part in core.split("-") if part)
+
+
+def span_number_readings(spec, span_text: str) -> list[float]:
+    """Values the text of a number span converts to, by itself.
+
+    Only the span's own characters count (no surrounding context), so a span
+    that matches a gold value converts to it exactly.
+    """
+
+    text = span_text.strip()
+    readings = [spec.parse_text(text)]
+    lowered = text.lower()
+    for word in ("minus ", "negative "):
+        if lowered.startswith(word):
+            rest = spec.parse_text(text[len(word):])
+            if rest is not None:
+                readings.append(-abs(rest))
+    for phrase, factor in _LOCAL_MULTIPLIERS:
+        local = re.fullmatch(r"(.*\d)\s*" + re.escape(phrase) + r"\.?", text, re.IGNORECASE)
+        if local:
+            base = spec.parse_text(local.group(1))
+            if base is not None:
+                readings.append(base * factor)
+            break
+    grouped = re.fullmatch(r"([-−]?[$€£¥]?)(\d{1,3}(?:\.\d{3})+)", text)
+    if grouped:  # "275.200": thousands grouped with dots
+        value = float(grouped.group(2).replace(".", ""))
+        readings.append(-value if "-" in grouped.group(1) or "−" in grouped.group(1) else value)
+    return [value for value in readings if value is not None]
+
+
+def _converts_to(spec, span_text: str, target: float) -> bool:
+    tolerance = 1e-9 * max(1.0, abs(target))
+    return any(abs(value - target) <= tolerance for value in span_number_readings(spec, span_text))
+
+
+def ground_number_by_words(text: str, spec, target: float) -> dict | None:
+    """Longest span of number words that converts exactly to ``target``.
+
+    A fallback for written forms the digit patterns miss: number words,
+    fractions, European grouping, local multipliers, and minus words.
+    """
+
+    tokens = [(match.start(), match.end()) for match in re.finditer(r"\S+", text)]
+    best = None
+    for first in range(len(tokens)):
+        if not _numberish(text[tokens[first][0]:tokens[first][1]]):
+            continue
+        for last in range(first, min(first + _MAX_NUMBER_WORDS, len(tokens))):
+            word = text[tokens[last][0]:tokens[last][1]]
+            if not _numberish(word):
+                if word.lower().strip(",") in _NUMBER_CONNECTORS:
+                    continue
+                break
+            start = tokens[first][0]
+            end = tokens[last][1]
+            while end > start and text[end - 1] in ".,;:!?":
+                end -= 1
+            if _converts_to(spec, text[start:end], target):
+                if best is None or end - start > best["end"] - best["start"]:
+                    best = {"text": text[start:end], "start": start, "end": end, "x": target}
+    return best
 
 
 class StructuringProcessor(SpanProcessor):
@@ -47,6 +158,16 @@ class StructuringProcessor(SpanProcessor):
         self.task_config = getattr(config, self.config_attr, None)
         if self.task_config is None:
             raise ValueError(f"{self.config_attr} is required for {self.task_name}")
+        self.typed_enabled = bool(getattr(self.task_config, "typed_fields", False))
+        self.option_token = getattr(config, "option_token", "[OPTION]")
+        # ``$calculate`` fields get a ``[CALC]`` marker when the model has a
+        # calculation head.
+        self.calc_token = (
+            getattr(config, "calc_token", "[CALC]")
+            if getattr(config, "calculation_config", None) is not None
+            else None
+        )
+        self._typed_spec_cache = {}
 
         # Resolve the processing strategy independently of the prediction
         # slot width. Gold records remain a compact rectangular target axis;
@@ -73,6 +194,7 @@ class StructuringProcessor(SpanProcessor):
             data_key=self.data_key,
             schema_key=self.schema_key,
             meta_key=self.meta_key,
+            typed_fields=self.typed_enabled,
         )
         self.multi_level = bool(
             getattr(self.component, "multi_level", configured_multi_level)
@@ -163,6 +285,9 @@ class StructuringProcessor(SpanProcessor):
         enforce_limit=False,
     ):
         if instance.get(NODE_KEEP_KEY, False) and not enforce_limit:
+            return True
+        if instance.get(TYPED_VALUES_KEY):
+            # Class supervision does not depend on a visible span.
             return True
         for key, value in instance.items():
             if is_internal_instance_key(key):
@@ -278,6 +403,7 @@ class StructuringProcessor(SpanProcessor):
         for item in batch_list:
             self._ensure_task_payload(item)
             self.component.normalize_item(item)
+            self._prepare_typed_instances(item)
             structuring_data = item.get(self.data_key, {})
             structuring_schema = item.get(self.schema_key) or {}
             multi_meta = item.get(self.meta_key) or {}
@@ -300,6 +426,12 @@ class StructuringProcessor(SpanProcessor):
                 schema_field_names = self._structure_fields(
                     structuring_schema.get(data_key, [])
                 )
+                if not schema_field_names and not self.multi_level:
+                    # Declared typed fields describe the schema: keep their
+                    # order so training prompts match inference prompts.
+                    schema_field_names = list(
+                        self._raw_group_types(item, data_key, schema_name)
+                    )
                 for field_name in schema_field_names:
                     if field_name not in seen:
                         field_names.append(field_name)
@@ -311,6 +443,25 @@ class StructuringProcessor(SpanProcessor):
                         if field_name not in seen:
                             field_names.append(field_name)
                             seen.add(field_name)
+                raw_types = self._raw_group_types(item, data_key, schema_name)
+                typed_names = [
+                    *raw_types,
+                    *(
+                        label
+                        for instance in instances
+                        for label in (instance.get(TYPED_VALUES_KEY) or {})
+                    ),
+                ]
+                for field_name in typed_names:
+                    if field_name not in seen and (
+                        field_name in raw_types
+                    ):
+                        field_names.append(field_name)
+                        seen.add(field_name)
+                field_types = self._mapping_field_types(
+                    raw_types,
+                    training=shuffle_labels,
+                )
                 if shuffle_labels:
                     random.shuffle(field_names)
                 field_class_to_id = {name: idx for idx, name in enumerate(field_names)}
@@ -335,13 +486,361 @@ class StructuringProcessor(SpanProcessor):
                     data_key=data_key,
                     hierarchy=deepcopy(group_meta.get('hierarchy') or []),
                     multi_level=bool(group_meta),
+                    field_types=field_types,
                 ))
+            reference = item.get("reference_date")
             structuring_mapping.append(StructuringClassMapping(
                 items=item_mappings,
                 output_mode=multi_meta.get('output_mode', 'schemas'),
                 multi_level=bool(multi_meta),
+                reference_date=str(reference) if reference is not None else None,
             ))
         return structuring_mapping
+
+    # -- typed fields -------------------------------------------------------
+
+    def _spec(self, raw):
+        """Cached :class:`TypedFieldSpec` for a descriptor dictionary."""
+
+        if isinstance(raw, TypedFieldSpec):
+            return raw
+        key = json.dumps(raw, sort_keys=True, default=str)
+        spec = self._typed_spec_cache.get(key)
+        if spec is None:
+            spec = TypedFieldSpec.from_value(raw)
+            if len(self._typed_spec_cache) > 4096:
+                self._typed_spec_cache.clear()
+            self._typed_spec_cache[key] = spec
+        return spec
+
+    def _raw_group_types(self, item, data_key, schema_name=None):
+        """Typed descriptors (label -> dict) declared for one schema group."""
+
+        if not self.typed_enabled:
+            return {}
+        multi_meta = item.get(self.meta_key) or {}
+        for group in multi_meta.get('groups', []):
+            if group.get('data_key') == data_key:
+                return {
+                    label: (spec.to_dict() if isinstance(spec, TypedFieldSpec) else spec)
+                    for label, spec in (group.get('field_types') or {}).items()
+                }
+        raw = lookup_group_types(
+            item.get(STRUCTURING_TYPES_KEY),
+            names=tuple(
+                name for name in (schema_name, data_key, MULTI_LEVEL_ROOT_KEY)
+                if name is not None
+            ),
+        )
+        return {
+            str(label): self._spec(spec).to_dict()
+            for label, spec in raw.items()
+        }
+
+    def _mapping_field_types(self, raw_types, *, training):
+        """Copy typed descriptors, applying training-time prompt augmentation."""
+
+        result = {}
+        dropout = float(getattr(self.task_config, "typed_description_dropout", 0.0))
+        shuffle_options = bool(getattr(self.task_config, "typed_shuffle_options", False))
+        for label, raw in raw_types.items():
+            spec = dict(raw)
+            if training:
+                if spec.get("$description") and random.random() < dropout:
+                    spec.pop("$description", None)
+                if shuffle_options and spec.get("$options"):
+                    options = list(spec["$options"])
+                    random.shuffle(options)
+                    spec["$options"] = options
+            result[label] = spec
+        return result
+
+    def _prepare_typed_instances(self, item):
+        """Move class values of flat records beside their spans.
+
+        Multi-level normalization already stores class values under
+        ``TYPED_VALUES_KEY``; flat records still carry them as ordinary keys.
+        """
+
+        if not self.typed_enabled or self.multi_level or item.get(_TYPED_PREPARED_FLAG):
+            return
+        structuring = item.get(self.data_key)
+        if not isinstance(structuring, dict):
+            return
+        for data_key, instances in structuring.items():
+            if not isinstance(instances, list):
+                continue
+            typed_labels = {
+                label
+                for label, raw in self._raw_group_types(item, data_key, data_key).items()
+                if self._spec(raw).kind != "span"
+            }
+            for instance in instances:
+                if not isinstance(instance, dict):
+                    continue
+                for label in typed_labels:
+                    # Run once: a class value already moved is not moved again.
+                    if label not in instance or label in (
+                        instance.get(TYPED_VALUES_KEY) or {}
+                    ):
+                        continue
+                    value = instance.pop(label)
+                    if not is_typed_descriptor(value):
+                        instance.setdefault(TYPED_VALUES_KEY, {})[label] = value
+        item[_TYPED_PREPARED_FLAG] = True
+
+    def _group_evidence(self, item, data_key, schema_name):
+        evidence = item.get(STRUCTURING_EVIDENCE_KEY)
+        if not isinstance(evidence, dict):
+            return {}
+        for name in (schema_name, data_key, MULTI_LEVEL_ROOT_KEY):
+            group = evidence.get(name)
+            if isinstance(group, dict):
+                return group
+        return evidence
+
+    def _attach_value_spans(self, item, text):
+        """Ground gold values of number/date fields on their source spans.
+
+        Value fields (``number``, ``duration``, ``date``, ``time``,
+        ``datetime``, and lists of them) hold normalized values ("2024-03-03",
+        4300000000) that rarely occur verbatim.  Each value is mapped to the
+        span it was read from.  The gold value is kept under
+        ``TYPED_ANCHORS_KEY`` as ``{label: {span text: gold value}}``: the
+        normalization target of that span.  Values without a source span mark
+        the field so its span loss is not trained as "nothing here".
+        """
+
+        structuring = item.get(self.data_key, {})
+        multi_meta = item.get(self.meta_key) or {}
+        names = {
+            group.get('data_key'): group.get('name')
+            for group in multi_meta.get('groups', [])
+        }
+        for data_key, instances in structuring.items():
+            schema_name = names.get(data_key, data_key)
+            scalar_specs = {}
+            list_specs = {}
+            for label, raw in self._raw_group_types(item, data_key, schema_name).items():
+                spec = self._spec(raw)
+                if spec.value_type is None:
+                    continue
+                if spec.type == "list":
+                    list_specs[label] = TypedFieldSpec(
+                        type=spec.items, unit=spec.unit, dayfirst=spec.dayfirst,
+                    )
+                else:
+                    scalar_specs[label] = spec
+            if not scalar_specs and not list_specs:
+                continue
+            evidence = self._group_evidence(item, data_key, schema_name)
+            for instance in instances:
+                if not isinstance(instance, dict):
+                    continue
+                for label, spec in scalar_specs.items():
+                    value = instance.get(label)
+                    if value is None or isinstance(value, list):
+                        continue
+                    grounded = self._ground_value(text, spec, value, evidence.get(label))
+                    if grounded is None:
+                        self._mark_unresolved(instance, label)
+                        instance.pop(label, None)
+                        continue
+                    span, gold = grounded
+                    instance[label] = span
+                    self._keep_gold(instance, label, span, gold)
+                for label, item_spec in list_specs.items():
+                    values = instance.get(label)
+                    if not isinstance(values, list):
+                        continue
+                    grounded_items = []
+                    missing = False
+                    cursor = 0
+                    for value in values:
+                        grounded = self._ground_value(text[cursor:], item_spec, value, None)
+                        if grounded is None:
+                            missing = True
+                            continue
+                        span, gold = grounded
+                        self._keep_gold(instance, label, span, gold)
+                        if isinstance(span, dict) and "start" in span and span is not value:
+                            span = {
+                                "text": span["text"],
+                                "start": cursor + span["start"],
+                                "end": cursor + span["end"],
+                            }
+                            cursor = span["end"]
+                        grounded_items.append(span)
+                    instance[label] = grounded_items
+                    if missing:
+                        self._mark_unresolved(instance, label)
+
+    @staticmethod
+    def _keep_gold(instance, label, span, gold):
+        """Remember the gold value of a grounded span, keyed by its text."""
+
+        if gold is None:
+            return
+        text = span.get("text") if isinstance(span, dict) else span
+        if isinstance(text, str) and text:
+            instance.setdefault(TYPED_ANCHORS_KEY, {}).setdefault(label, {})[text] = gold
+
+    @staticmethod
+    def _mark_unresolved(instance, label):
+        unresolved = instance.setdefault(TYPED_UNRESOLVED_KEY, [])
+        if label not in unresolved:
+            unresolved.append(label)
+
+    @staticmethod
+    def _ground_value(text, spec, value, snippets):
+        """``(span, gold)`` for one value of a value field, or ``None``.
+
+        Explicit spans and strings written verbatim are kept as they are;
+        other values are searched for by parsing candidate spans.  ``gold``
+        is the gold value as written in the data.
+        """
+
+        if isinstance(value, dict):
+            anchor = value.get("anchor", value)
+            gold = value.get("value")
+            if isinstance(anchor, dict) and "start" in anchor and "end" in anchor:
+                start, end = int(anchor["start"]), int(anchor["end"])
+                return (
+                    {"text": anchor.get("text", text[start:end]), "start": start, "end": end},
+                    gold,
+                )
+            if "anchor" in value or gold is None:
+                # ``"anchor": null`` marks a derived value (a computed total):
+                # a span that happens to hold the same number is no target.
+                return (value, None) if "text" in value else None
+            value = gold
+        if isinstance(value, str) and value and value in text:
+            return value, value
+        if spec.temporal:
+            return StructuringProcessor._ground_temporal(text, spec, value, snippets)
+        target_x = spec.encode(value)
+        if target_x is None:
+            return None
+        anchor = find_anchor(
+            text,
+            spec,
+            target_x,
+            snippets=snippets if isinstance(snippets, list) else (),
+        )
+        if spec.value_type in {"number", "duration"}:
+            # Train only on spans that convert to the gold value by themselves:
+            # a span completed or signed by its context is not a sound target.
+            if anchor is not None and not _converts_to(spec, anchor["text"], target_x):
+                anchor = None
+            if anchor is None:
+                anchor = ground_number_by_words(text, spec, target_x)
+        if anchor is None:
+            return None
+        return (
+            {"text": anchor["text"], "start": anchor["start"], "end": anchor["end"]},
+            value,
+        )
+
+    @staticmethod
+    def _ground_temporal(text, spec, value, snippets):
+        """Source span of a date/time value, matched by its written components.
+
+        "2024-05" matches "May 2024" but not "May 3, 2024": a span counts only
+        when it writes exactly the gold value's components.
+        """
+
+        from ..tasks.normalization.parser import gold_parts
+        from ..tasks.normalization.values import VALUE_TYPE_FAMILY
+
+        family = VALUE_TYPE_FAMILY[spec.value_type]
+        gold = gold_parts(value, family, partial=spec.partial)
+        if gold is None:
+            return None
+        regions = []
+        for snippet in snippets if isinstance(snippets, list) else ():
+            if isinstance(snippet, str) and snippet:
+                start = text.find(snippet)
+                if start >= 0:
+                    regions.append((start, start + len(snippet)))
+        regions.append((0, len(text)))
+        # Numeric dates ("05/11/2024") are tried in both day/month orders
+        # unless the field fixes one.
+        orders = (spec.dayfirst,) if spec.dayfirst is not None else (None, True)
+        for region_start, region_end in regions:
+            region = text[region_start:region_end]
+            for start, end in candidate_spans(region, spec.value_type):
+                written = region[start:end]
+                for dayfirst in orders:
+                    token = _DAYFIRST.set(dayfirst)
+                    try:
+                        parts = gold_parts(written, family, partial=spec.partial)
+                    finally:
+                        _DAYFIRST.reset(token)
+                    if parts == gold:
+                        return (
+                            {"text": written, "start": region_start + start, "end": region_start + end},
+                            value,
+                        )
+        return None
+
+    def typed_layout(self, struct_item):
+        """Class fields of one group in prompt order.
+
+        Entries are ``(label, field_id, TypedFieldSpec)``.
+        """
+
+        if not self.typed_enabled:
+            return []
+        return class_field_layout(struct_item, spec_factory=self._spec)
+
+    def prepare_typed_inputs(self, classes_mapping, use_labels_encoder=False, texts=None):
+        """Label-free tensors the option scorer needs at training and inference."""
+
+        if not self.typed_enabled:
+            return {}
+        mapping_list = self._mapping_list(classes_mapping)
+        layouts = [
+            (batch_idx, self.typed_layout(struct_item))
+            for _flat, batch_idx, _group, struct_item in self._flat_structuring_iter(
+                classes_mapping
+            )
+        ]
+        if not any(class_fields for _, class_fields in layouts):
+            return {}
+        total_groups = len(layouts)
+        batch_size = len(mapping_list)
+        max_class = max((len(c) for _, c in layouts), default=0)
+        max_options = max(
+            (len(spec.options) for _, c in layouts for _, _, spec in c),
+            default=0,
+        )
+        if max_class == 0 or max_options == 0:
+            return {}
+        class_field_idx = torch.zeros(total_groups, max_class, dtype=torch.long)
+        class_field_mask = torch.zeros(total_groups, max_class, dtype=torch.bool)
+        class_multi = torch.zeros(total_groups, max_class, dtype=torch.bool)
+        option_index = torch.zeros(total_groups, max_class, max_options, dtype=torch.long)
+        option_mask = torch.zeros(total_groups, max_class, max_options, dtype=torch.bool)
+        option_count = torch.zeros(batch_size, dtype=torch.long)
+        for group_idx, (batch_idx, class_fields) in enumerate(layouts):
+            for slot, (_label, field_id, spec) in enumerate(class_fields):
+                class_field_idx[group_idx, slot] = field_id
+                class_field_mask[group_idx, slot] = not use_labels_encoder
+                class_multi[group_idx, slot] = spec.multi
+                for option_slot in range(len(spec.options)):
+                    option_index[group_idx, slot, option_slot] = option_count[batch_idx]
+                    option_mask[group_idx, slot, option_slot] = not use_labels_encoder
+                    option_count[batch_idx] += 1
+        if use_labels_encoder:
+            option_count.zero_()
+        return {
+            "structuring_typed_class_field_idx": class_field_idx,
+            "structuring_typed_class_field_mask": class_field_mask,
+            "structuring_typed_class_multi": class_multi,
+            "structuring_typed_option_index": option_index,
+            "structuring_typed_option_mask": option_mask,
+            "structuring_typed_option_count": option_count,
+        }
 
     @staticmethod
     def _hierarchy_field_label(field):
@@ -448,10 +947,17 @@ class StructuringProcessor(SpanProcessor):
                     continue
                 data_key = struct_item.data_key or struct_item.name
                 positives = list(dict.fromkeys(
-                    field_name
-                    for instance in structuring_data.get(data_key, [])
-                    for field_name in instance
-                    if not is_internal_instance_key(field_name)
+                    [
+                        field_name
+                        for instance in structuring_data.get(data_key, [])
+                        for field_name in instance
+                        if not is_internal_instance_key(field_name)
+                    ]
+                    + [
+                        field_name
+                        for instance in structuring_data.get(data_key, [])
+                        for field_name in (instance.get(TYPED_VALUES_KEY) or {})
+                    ]
                 ))
 
                 def apply_labels(labels, struct_item=struct_item):
@@ -483,6 +989,8 @@ class StructuringProcessor(SpanProcessor):
                 field_token=self.child_token,
                 sep_token=self.sep_token,
                 use_labels_encoder=use_labels_encoder,
+                option_token=self.option_token if self.typed_enabled else None,
+                calc_token=self.calc_token,
             ))
         return prompt
 
@@ -578,6 +1086,11 @@ class StructuringProcessor(SpanProcessor):
         tokens_with_spans, _ = self._tokenize_text(item)
         if tokens_with_spans is None:
             return
+        if self.typed_enabled:
+            self._prepare_typed_instances(item)
+            if not text and item.get("tokenized_text"):
+                text = " ".join(item["tokenized_text"])
+            self._attach_value_spans(item, text)
 
         for schema_name, instances in list(structuring.items()):
             used_spans_by_field = {}
@@ -617,10 +1130,21 @@ class StructuringProcessor(SpanProcessor):
                             instance[field_name] = normalized[0]
                         else:
                             instance.pop(field_name, None)
+                anchors = instance.get(TYPED_ANCHORS_KEY)
+                if anchors:
+                    for label in list(anchors):
+                        if label not in instance:
+                            # The value's span could not be mapped to tokens.
+                            anchors.pop(label)
+                            unresolved = instance.setdefault(TYPED_UNRESOLVED_KEY, [])
+                            if label not in unresolved:
+                                unresolved.append(label)
                 if any(
                     not is_internal_instance_key(key)
                     for key in instance
-                ) or instance.get(NODE_KEEP_KEY, False):
+                ) or instance.get(NODE_KEEP_KEY, False) or instance.get(
+                    TYPED_VALUES_KEY
+                ):
                     resolved_instances.append(instance)
             structuring[schema_name] = resolved_instances
         item[self.resolved_flag] = True
@@ -702,6 +1226,7 @@ class StructuringProcessor(SpanProcessor):
             else None
         )
 
+        group_instances = {}
         for flat_idx, batch_idx, _group_idx, struct_item in self._flat_structuring_iter(classes_mapping):
             structuring_batch_idx[flat_idx] = batch_idx
             structuring_data = batch_list[batch_idx].get(self.data_key, {})
@@ -726,6 +1251,7 @@ class StructuringProcessor(SpanProcessor):
                 enforce_limit=enforce_limit,
             )
             instances = sorted(instances, key=self._instance_sort_key)
+            group_instances[flat_idx] = (instances[:max_instances], item_limit)
             field_to_id = struct_item.field_class_to_id.class_to_id
             structuring_mask[flat_idx] = True
             structuring_count[flat_idx] = len(instances)
@@ -806,6 +1332,91 @@ class StructuringProcessor(SpanProcessor):
             result[self._tensor_key("relation_group_mask")] = (
                 structuring_relation_group_mask
             )
+        if self.typed_enabled:
+            result.update(self._create_typed_labels(
+                classes_mapping,
+                group_instances,
+                batch_list=batch_list,
+                total_groups=total_groups,
+                max_instances=max_instances,
+                max_fields=max_fields,
+            ))
+        return result
+
+    @staticmethod
+    def _class_gold_labels(gold):
+        if gold is None:
+            return []
+        if isinstance(gold, (list, tuple)):
+            return [str(value) for value in gold if value is not None]
+        return [str(gold)]
+
+    def _create_typed_labels(
+        self,
+        classes_mapping,
+        group_instances,
+        *,
+        total_groups,
+        max_instances,
+        max_fields,
+        batch_list=None,
+    ):
+        """Targets for class fields on the gold-record axis.
+
+        Shapes (G groups, R gold records, Cc class fields, Kc options):
+
+        * ``typed_class_targets``   (G, R, Cc, Kc) multi-hot option targets
+        * ``typed_class_unit_mask`` (G, R, Cc) record/field pairs with a label
+        * ``typed_bio_field_mask``  (G, C) false where a value may sit in the
+          text in a form the parser could not find (do not train "no span")
+        """
+
+        layouts = {}
+        field_maps = {}
+        for flat_idx, _batch_idx, _group, struct_item in self._flat_structuring_iter(
+            classes_mapping
+        ):
+            layouts[flat_idx] = self.typed_layout(struct_item)
+            field_maps[flat_idx] = struct_item.field_class_to_id.class_to_id
+        max_class = max((len(c) for c in layouts.values()), default=0)
+        max_options = max(
+            (len(spec.options) for c in layouts.values() for _, _, spec in c),
+            default=0,
+        )
+
+        bio_field_mask = torch.ones(total_groups, max(max_fields, 1), dtype=torch.bool)
+        class_targets = torch.zeros(
+            total_groups, max_instances, max(max_class, 1), max(max_options, 1)
+        )
+        class_unit_mask = torch.zeros(
+            total_groups, max_instances, max(max_class, 1), dtype=torch.bool
+        )
+        for flat_idx, (instances, _item_limit) in group_instances.items():
+            class_fields = layouts[flat_idx]
+            for inst_idx, instance in enumerate(instances):
+                typed_values = instance.get(TYPED_VALUES_KEY) or {}
+                for label in instance.get(TYPED_UNRESOLVED_KEY) or ():
+                    field_id = field_maps[flat_idx].get(label)
+                    if field_id is not None and field_id < bio_field_mask.shape[1]:
+                        bio_field_mask[flat_idx, field_id] = False
+                for slot, (label, _field_id, spec) in enumerate(class_fields):
+                    if label not in typed_values:
+                        continue
+                    gold = self._class_gold_labels(typed_values[label])
+                    option_ids = {option: index for index, option in enumerate(spec.options)}
+                    known = [option_ids[value] for value in gold if value in option_ids]
+                    if gold and not known:
+                        continue
+                    class_unit_mask[flat_idx, inst_idx, slot] = True
+                    for option_id in known:
+                        class_targets[flat_idx, inst_idx, slot, option_id] = 1.0
+
+        result = {
+            "structuring_typed_bio_field_mask": bio_field_mask,
+        }
+        if max_class > 0 and max_options > 0:
+            result["structuring_typed_class_targets"] = class_targets
+            result["structuring_typed_class_unit_mask"] = class_unit_mask
         return result
 
     def create_span_labels(self, batch_list, classes_mapping, max_seq_len=0, **kwargs):

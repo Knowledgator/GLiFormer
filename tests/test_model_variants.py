@@ -315,6 +315,8 @@ def test_task_registry_exposes_head_order():
         "joint_relex",
         "open_relex",
         "structuring",
+        "calculation",
+        "normalization",
         "image_classification",
         "object_detection",
         "segmentation",
@@ -329,6 +331,8 @@ def test_task_registry_exposes_head_order():
         "joint_relex",
         "open_relex",
         "structuring",
+        "calculation",
+        "normalization",
         "embedding",
     )
     assert TASK_REGISTRY.vision_tasks == (

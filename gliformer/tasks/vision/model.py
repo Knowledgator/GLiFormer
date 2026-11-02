@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 import weakref
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -10,19 +10,26 @@ from torch import nn
 
 from .. import TaskHead, TaskHeadOutput
 from ..box_ops import (
+    aligned_box_iou,
     aligned_generalized_box_iou,
     box_cxcywh_to_xyxy,
     box_xyxy_to_cxcywh,
 )
-from ...layers import covering_grid_2d, normalized_grid_2d
+from ...layers import covering_grid_2d, normalized_grid_2d, ragged_normalized_grid_2d
 from ...layers.mlp import create_mlp
 from ..media import (
     MediaClassificationHead,
+    all_slot_classification_loss,
     MediaSetPredictionHead,
     flat_features,
     matched_classification_loss,
     matched_mask_loss,
     normalized_objectness_loss,
+)
+from ..matcher import (
+    batched_minimum_cost_assignment,
+    match_index_array,
+    match_index_tensors,
 )
 
 
@@ -104,8 +111,34 @@ class DetectionPredictions:
     anchor_mask: torch.Tensor
     dense_features: torch.Tensor
     dense_mask: Optional[torch.Tensor]
-    spatial_shape: Tuple[int, int]
+    # One (height, width) for the batch, or a (BN, 2) tensor when rows differ.
+    spatial_shape: Union[Tuple[int, int], torch.Tensor]
     auxiliary_predictions: tuple[DetectionStagePredictions, ...] = ()
+    # Two-stage query selection: per-token proposals over the image grid and
+    # the token mask they are matched under.
+    encoder_predictions: Optional[DetectionStagePredictions] = None
+    encoder_mask: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DenseGrid:
+    """Dense vision tokens with the geometry of each row's patch grid.
+
+    Rows either share one grid (``uniform_shape``) or flatten their own
+    ``(h, w)`` grid row-major into the first ``h * w`` token slots, e.g. a
+    dynamic-resolution backbone such as Qwen3.5. Coordinates are normalized to
+    each row's own image, so boxes stay in one ``[0, 1]`` frame either way.
+    """
+
+    features: torch.Tensor  # (BN, N, D)
+    mask: Optional[torch.Tensor]  # (BN, N)
+    coordinates: torch.Tensor  # (N, 2) shared, or (BN, N, 2) per row
+    row_shapes: torch.Tensor  # (BN, 2)
+    uniform_shape: Optional[Tuple[int, int]]
+
+    @property
+    def spatial_shape(self) -> Union[Tuple[int, int], torch.Tensor]:
+        return self.uniform_shape if self.uniform_shape is not None else self.row_shapes
 
 
 class ObjectDetectionHead(MediaSetPredictionHead):
@@ -170,6 +203,37 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             dropout=dropout,
             activation="gelu",
         )
+        memory_norm = getattr(cfg, "memory_norm", "none")
+        if memory_norm == "layernorm":
+            self.memory_norm = nn.LayerNorm(hidden_size)
+        elif memory_norm == "linear_layernorm":
+            self.memory_norm = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+            )
+        else:
+            self.memory_norm = None
+        self.query_selection_topk = int(getattr(cfg, "query_selection_topk", 0) or 0)
+        if self.query_selection_topk > 0:
+            self.encoder_proposal = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+            )
+            self.encoder_bbox_head = create_mlp(
+                input_dim=hidden_size,
+                intermediate_dims=[hidden_size // 2],
+                output_dim=4,
+                dropout=dropout,
+                activation="gelu",
+            )
+            self._zero_output_layer(self.encoder_bbox_head)
+            self.encoder_objectness_head = create_mlp(
+                input_dim=hidden_size,
+                intermediate_dims=[hidden_size // 2],
+                output_dim=1,
+                dropout=dropout,
+                activation="gelu",
+            )
         self.reference_boxes = None
         if getattr(cfg, "reference_box_mode", "learned") == "learned":
             fixed_modes = {"fixed", "fixed_rnn", "fixed_transformer"}
@@ -309,19 +373,25 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         if bias_type != "gaussian":
             raise ValueError(f"Unsupported spatial attention bias {bias_type!r}")
 
-        rows, cols = spatial_shape
-        patch_centers = normalized_grid_2d(
-            rows,
-            cols,
-            device=device,
-            dtype=torch.float32,
-        )
+        if isinstance(spatial_shape, torch.Tensor):
+            patch_centers, _ = ragged_normalized_grid_2d(
+                spatial_shape,
+                int(spatial_shape.prod(-1).max()),
+                device=device,
+            )
+            patch_centers = patch_centers[:, None]  # (BN, 1, N, 2)
+        else:
+            patch_centers = normalized_grid_2d(
+                *spatial_shape,
+                device=device,
+                dtype=torch.float32,
+            )[None, None]
         reference_centers = reference_boxes[..., :2].to(
             device=device,
             dtype=torch.float32,
         )
         squared_distance = (
-            patch_centers[None, None] - reference_centers[..., None, :]
+            patch_centers - reference_centers[..., None, :]
         ).square().sum(dim=-1)
         sigma = float(getattr(self.det_cfg, "spatial_attention_sigma", 0.2))
         weight = float(
@@ -392,7 +462,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             for name, value in module.state_dict(keep_vars=keep_vars).items():
                 destination[f"{prefix}{role}_position_embedding.{name}"] = value
 
-    def _dense_features(self, flat_inputs):
+    def _dense_grid(self, flat_inputs) -> DenseGrid:
         image_features, image_mask = flat_features(flat_inputs)
         spatial_shapes = getattr(flat_inputs, "feature_spatial_shape", None)
         prefix_tokens = getattr(flat_inputs, "feature_prefix_tokens", None)
@@ -401,14 +471,24 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 "Dense vision heads require feature_spatial_shape and "
                 "feature_prefix_tokens from VisionEncoderOutput"
             )
-        if not torch.equal(spatial_shapes, spatial_shapes[:1].expand_as(spatial_shapes)):
-            raise ValueError("A dense token tensor must have one spatial shape per padded batch")
-        if not torch.equal(prefix_tokens, prefix_tokens[:1].expand_as(prefix_tokens)):
+        # Grid metadata is read on the host in one copy (free when it already
+        # lives on the CPU) instead of one synchronization per check.
+        host_prefix = torch.as_tensor(prefix_tokens).detach().reshape(-1).long()
+        host_shapes = torch.as_tensor(spatial_shapes).detach().long()
+        packed = torch.cat(
+            [host_prefix.to(host_shapes.device), host_shapes.reshape(-1)]
+        ).cpu()
+        host_prefix = packed[:host_prefix.numel()]
+        host_shapes = packed[host_prefix.numel():].reshape(host_shapes.shape)
+        if not torch.equal(host_prefix, host_prefix[:1].expand_as(host_prefix)):
             raise ValueError("A dense token tensor must have one prefix-token count per padded batch")
+        spatial_shapes = spatial_shapes.to(device=image_features.device, dtype=torch.long)
+        uniform = bool(torch.equal(host_shapes, host_shapes[:1].expand_as(host_shapes)))
+        dense_count = int(host_shapes.prod(-1).max())
+        if dense_count == 0:
+            raise ValueError("Dense vision heads received no image tokens")
 
-        rows, cols = (int(value) for value in spatial_shapes[0].tolist())
-        prefix_count = int(prefix_tokens[0].item())
-        dense_count = rows * cols
+        prefix_count = int(host_prefix[0])
         end = prefix_count + dense_count
         if prefix_count < 0 or end > image_features.shape[1]:
             raise ValueError(
@@ -419,29 +499,174 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         if image_mask is not None:
             image_mask = image_mask[:, prefix_count:end]
 
-        coordinates = normalized_grid_2d(
-            rows,
-            cols,
-            device=image_features.device,
-            dtype=torch.float32,
-        )
-        memory_positions = None
-        if self.anchor_refine_positions is not None:
-            memory_positions = self.anchor_refine_positions.memory_positions(
-                image_features,
-                image_mask,
-                coordinates=coordinates,
-                spatial_shape=(rows, cols),
+        if uniform:
+            rows, cols = (int(value) for value in host_shapes[0].tolist())
+            coordinates = normalized_grid_2d(
+                rows,
+                cols,
+                device=image_features.device,
+                dtype=torch.float32,
             )
-        return image_features, image_mask, memory_positions, (rows, cols)
+            return DenseGrid(image_features, image_mask, coordinates, spatial_shapes, (rows, cols))
+
+        # Rows carry grids of different sizes: each row's tokens fill the front
+        # of the padded sequence, and slots past its own grid are masked out.
+        coordinates, in_grid = ragged_normalized_grid_2d(
+            spatial_shapes,
+            dense_count,
+            device=image_features.device,
+        )
+        if image_mask is None:
+            image_mask = in_grid.long()
+        else:
+            image_mask = (image_mask.to(device=in_grid.device).bool() & in_grid).to(image_mask.dtype)
+        return DenseGrid(image_features, image_mask, coordinates, spatial_shapes, None)
+
+    def _grid_memory_positions(self, grid: DenseGrid) -> Optional[torch.Tensor]:
+        positions = self.anchor_refine_positions
+        if positions is None:
+            return None
+        if grid.uniform_shape is not None or not positions.memory_strategy.requires_grid_size:
+            return positions.memory_positions(
+                grid.features,
+                grid.mask,
+                coordinates=grid.coordinates,
+                spatial_shape=grid.uniform_shape,
+            )
+        # Grid-table positions resize to one shape per call: encode each
+        # distinct grid on its own rows and place them back in the padded layout.
+        output = None
+        for shape in torch.unique(grid.row_shapes, dim=0):
+            height, width = (int(value) for value in shape.tolist())
+            count = height * width
+            if count == 0:
+                continue
+            rows = (grid.row_shapes == shape).all(dim=-1).nonzero().squeeze(-1)
+            part = positions.memory_positions(
+                grid.features[rows, :count],
+                grid.mask[rows, :count] if grid.mask is not None else None,
+                coordinates=grid.coordinates[rows, :count],
+                spatial_shape=(height, width),
+            )
+            if part is None:
+                return None
+            if output is None:
+                output = part.new_zeros(*grid.features.shape[:2], part.shape[-1])
+            output[rows, :count] = part
+        return output
+
+    def _dense_features(self, flat_inputs):
+        grid = self._dense_grid(flat_inputs)
+        return grid.features, grid.mask, self._grid_memory_positions(grid), grid.spatial_shape
+
+    def _encoder_proposals(
+        self,
+        grid: DenseGrid,
+        flat_inputs,
+    ) -> Tuple[DetectionStagePredictions, torch.Tensor, torch.Tensor]:
+        """Score every image token as an object proposal.
+
+        Each token predicts a box relative to a prior centred on its own cell
+        and class logits against the prompt labels. Returns the proposals, the
+        box logits and the boolean token mask.
+        """
+
+        features = grid.features
+        batch_size, token_count = features.shape[:2]
+        if grid.mask is None:
+            token_mask = torch.ones(
+                batch_size, token_count, dtype=torch.bool, device=features.device,
+            )
+        else:
+            token_mask = grid.mask.to(device=features.device).bool()
+        coordinates = grid.coordinates.to(device=features.device, dtype=torch.float32)
+        if coordinates.dim() == 2:
+            coordinates = coordinates.unsqueeze(0).expand(batch_size, -1, -1)
+        if grid.uniform_shape is not None:
+            rows, cols = grid.uniform_shape
+            cell = coordinates.new_tensor([1.0 / cols, 1.0 / rows]).expand_as(coordinates)
+        else:
+            shapes = grid.row_shapes.to(device=features.device, dtype=torch.float32)
+            cell = (1.0 / shapes.flip(-1).clamp(min=1.0))[:, None, :].expand_as(coordinates)
+        # A prior twice the cell size, centred on the token.
+        prior = torch.cat([coordinates, (2.0 * cell).clamp(max=0.5)], dim=-1)
+        prior_logits = _inverse_sigmoid(prior)
+
+        tokens = self.encoder_proposal(features)
+        box_logits = self.encoder_bbox_head(tokens).float() + prior_logits
+        boxes_cxcywh = box_logits.sigmoid()
+        class_logits = self._score_anchor_labels(
+            tokens,
+            flat_inputs.child_embedding,
+            flat_inputs.child_mask,
+            token_mask,
+        )
+        proposals = DetectionStagePredictions(
+            class_logits=class_logits,
+            boxes_xyxy=box_cxcywh_to_xyxy(boxes_cxcywh),
+            boxes_cxcywh=boxes_cxcywh,
+            objectness_logits=self.encoder_objectness_head(tokens).squeeze(-1),
+            anchors=tokens,
+        )
+        return proposals, box_logits, token_mask
+
+    def _select_reference_logits(
+        self,
+        reference_logits: torch.Tensor,
+        proposals: DetectionStagePredictions,
+        proposal_box_logits: torch.Tensor,
+        token_mask: torch.Tensor,
+        child_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Seed the first ``query_selection_topk`` slots with the best tokens.
+
+        Slots keep their learned content embeddings ("mixed" query selection,
+        as in DINO-DETR); only their starting boxes come from the image. A
+        selected padding token (an image with fewer tokens than ``k``) keeps
+        the learned reference box instead, so no step reads a device value.
+        """
+
+        k = min(
+            self.query_selection_topk,
+            reference_logits.shape[1],
+            proposals.class_logits.shape[1],
+        )
+        if k <= 0:
+            return reference_logits
+        class_count = proposals.class_logits.shape[-1]
+        label_mask = child_mask[:, None, :class_count].to(
+            device=token_mask.device,
+        ).bool()
+        scores = proposals.class_logits.detach().float().masked_fill(~label_mask, -1e4)
+        scores = scores.max(dim=-1).values if class_count > 0 else torch.zeros_like(
+            token_mask, dtype=torch.float32,
+        )
+        scores = scores + proposals.objectness_logits.detach().float()
+        scores = scores.masked_fill(~token_mask, float("-inf"))
+        top = scores.topk(k, dim=1).indices
+        selected = proposal_box_logits.detach().gather(
+            1, top.unsqueeze(-1).expand(-1, -1, 4),
+        )
+        selected_valid = token_mask.gather(1, top).unsqueeze(-1)
+        head = torch.where(selected_valid, selected, reference_logits[:, :k])
+        return torch.cat([head, reference_logits[:, k:]], dim=1)
 
     def _compute_detection(self, flat_inputs, count=None, threshold=0.5) -> DetectionPredictions:
-        image_features, image_mask, memory_positions, spatial_shape = self._dense_features(flat_inputs)
-        memory_coordinates = normalized_grid_2d(
-            *spatial_shape,
-            device=image_features.device,
-            dtype=torch.float32,
-        )
+        grid = self._dense_grid(flat_inputs)
+        image_features, image_mask = grid.features, grid.mask
+        # Mask-head features stay raw; the decoder reads the normalized memory.
+        dense_features = image_features
+        if self.memory_norm is not None:
+            image_features = self.memory_norm(image_features)
+            grid = DenseGrid(
+                image_features, image_mask, grid.coordinates,
+                grid.row_shapes, grid.uniform_shape,
+            )
+        memory_positions = self._grid_memory_positions(grid)
+        memory_coordinates = grid.coordinates
+        # Grid-table position strategies need one shape; per-row grids pass None.
+        memory_spatial_shape = grid.uniform_shape
+        spatial_shape = grid.spatial_shape
         anchors, anchor_mask = self._generate_anchors(
             flat_inputs.parent_embedding,
             image_features,
@@ -465,7 +690,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 image_mask,
                 memory_positions,
                 memory_coordinates=memory_coordinates,
-                memory_spatial_shape=spatial_shape,
+                memory_spatial_shape=memory_spatial_shape,
                 position_encoding=self.anchor_refine_positions,
             )
             reference_logits = self.reference_boxes.unsqueeze(0).expand(
@@ -473,6 +698,19 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 -1,
                 -1,
             ).float()
+            encoder_predictions = None
+            encoder_mask = None
+            if self.query_selection_topk > 0:
+                encoder_predictions, proposal_logits, encoder_mask = (
+                    self._encoder_proposals(grid, flat_inputs)
+                )
+                reference_logits = self._select_reference_logits(
+                    reference_logits,
+                    encoder_predictions,
+                    proposal_logits,
+                    encoder_mask,
+                    flat_inputs.child_mask,
+                )
             stage_predictions: list[DetectionStagePredictions] = []
             for layer_index in range(num_layers):
                 reference_boxes = reference_logits.sigmoid()
@@ -525,10 +763,12 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 objectness_logits=final.objectness_logits,
                 anchors=final.anchors,
                 anchor_mask=anchor_mask,
-                dense_features=image_features,
+                dense_features=dense_features,
                 dense_mask=image_mask,
                 spatial_shape=spatial_shape,
                 auxiliary_predictions=tuple(stage_predictions[:-1]),
+                encoder_predictions=encoder_predictions,
+                encoder_mask=encoder_mask,
             )
 
         static_references = None
@@ -550,7 +790,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             memory_coordinates=memory_coordinates,
             memory_positions=memory_positions,
             query_spatial_shape=covering_grid_2d(anchors.shape[1]),
-            memory_spatial_shape=spatial_shape,
+            memory_spatial_shape=memory_spatial_shape,
         )
 
         class_logits = self._score_anchor_labels(
@@ -574,7 +814,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             objectness_logits=objectness_logits,
             anchors=anchors,
             anchor_mask=anchor_mask,
-            dense_features=image_features,
+            dense_features=dense_features,
             dense_mask=image_mask,
             spatial_shape=spatial_shape,
         )
@@ -609,6 +849,79 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             target_giou_geometry=gold_boxes,
         )
 
+    def _matching_geometry(self, bbox_preds, bbox_cxcywh, gold_boxes):
+        if (
+            getattr(self.det_cfg, "bbox_l1_format", "cxcywh") == "cxcywh"
+            and bbox_cxcywh is not None
+        ):
+            return bbox_cxcywh, box_xyxy_to_cxcywh(gold_boxes)
+        return bbox_preds, gold_boxes
+
+    @torch.no_grad()
+    def _match_stages(
+        self,
+        stages,
+        class_labels,
+        bbox_labels,
+        object_mask,
+        anchor_mask,
+        stage_masks=None,
+    ) -> list[list[list[tuple[int, int]]]]:
+        """Hungarian-match every decoder stage with one host round trip.
+
+        ``stages`` holds ``(class_logits, boxes_xyxy, boxes_cxcywh)`` per stage,
+        optionally followed by the stage's objectness logits. Costs of all
+        stages and samples are stacked into one padded tensor, so the main and
+        auxiliary matchings share a single device-to-host copy.
+        """
+
+        objectness_cost = float(getattr(self.det_cfg, "matcher_objectness_cost", 0.0))
+        costs = []
+        for stage in stages:
+            class_logits, bbox_preds, bbox_cxcywh = stage[:3]
+            objectness_logits = stage[3] if len(stage) > 3 else None
+            geometry_preds, target_geometry = self._matching_geometry(
+                bbox_preds, bbox_cxcywh, bbox_labels,
+            )
+            costs.append(
+                self.matcher.pairwise_cost(
+                    class_logits,
+                    geometry_preds,
+                    class_labels,
+                    target_geometry,
+                    giou_geometry_preds=bbox_preds,
+                    target_giou_geometry=bbox_labels,
+                    objectness_logits=objectness_logits,
+                    cost_objectness=objectness_cost,
+                )
+            )
+        batch_size = costs[0].shape[0]
+        stage_count = len(costs)
+        if stage_masks is None:
+            stage_masks = [anchor_mask] * stage_count
+        # Stages may predict different numbers of slots (decoder slots vs
+        # image tokens): pad them to one width, padded rows masked out.
+        width = max(cost.shape[1] for cost in costs)
+        padded_costs = []
+        padded_masks = []
+        for cost, mask in zip(costs, stage_masks, strict=True):
+            extra = width - cost.shape[1]
+            mask = (mask > 0).to(device=cost.device)
+            if extra:
+                cost = F.pad(cost, (0, 0, 0, extra))
+                mask = F.pad(mask, (0, extra), value=False)
+            padded_costs.append(cost)
+            padded_masks.append(mask)
+        matches = batched_minimum_cost_assignment(
+            torch.cat(padded_costs, dim=0),
+            torch.cat(padded_masks, dim=0),
+            (object_mask > 0).to(padded_costs[0].device).repeat(stage_count, 1),
+        )
+        return [
+            matches[stage * batch_size:(stage + 1) * batch_size]
+            for stage in range(stage_count)
+        ]
+
     def _detection_loss(
         self,
         class_logits,
@@ -622,58 +935,111 @@ class ObjectDetectionHead(MediaSetPredictionHead):
         object_mask,
         base_loss_fn=None,
         auxiliary_predictions: tuple[DetectionStagePredictions, ...] = (),
+        matches: Optional[list] = None,
+        encoder_predictions: Optional[DetectionStagePredictions] = None,
+        encoder_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[int, list]]:
         B, A, C = class_logits.shape
         device = class_logits.device
-        target_objectness = torch.zeros_like(objectness_logits)
-        matches_by_batch: Dict[int, list] = {}
-
-        # Flat (batch, anchor, target) indices of all matched pairs.
-        src_batch_idx: list = []
-        src_anchor_idx: list = []
-        tgt_obj_idx: list = []
-        for b in range(B):
-            matches = self._match_single(
-                class_logits[b],
-                bbox_preds[b],
-                class_labels[b],
-                bbox_labels[b],
-                object_mask[b],
-                anchor_mask[b],
-                bbox_cxcywh[b],
-            )
-            matches_by_batch[b] = matches
-            if matches:
-                src_idx = torch.tensor([a for a, _ in matches], dtype=torch.long, device=device)
-                target_objectness[b, src_idx] = 1.0
-                for anchor_idx, obj_idx in matches:
-                    src_batch_idx.append(b)
-                    src_anchor_idx.append(anchor_idx)
-                    tgt_obj_idx.append(obj_idx)
-
-        num_matched = max(len(src_batch_idx), 1)
-        loss_fn = base_loss_fn or self._default_binary_loss
-
-        if src_batch_idx:
-            sb = torch.tensor(src_batch_idx, dtype=torch.long, device=device)
-            sa = torch.tensor(src_anchor_idx, dtype=torch.long, device=device)
-            tt = torch.tensor(tgt_obj_idx, dtype=torch.long, device=device)
-
-            class_loss = matched_classification_loss(
-                class_logits,
+        auxiliary_coef = float(
+            getattr(self.det_cfg, "auxiliary_detection_loss_coef", 0.0)
+        )
+        auxiliary_predictions = (
+            tuple(auxiliary_predictions) if auxiliary_coef > 0.0 else ()
+        )
+        auxiliary_matches = [None] * len(auxiliary_predictions)
+        encoder_coef = float(getattr(self.det_cfg, "encoder_loss_coef", 1.0))
+        if encoder_predictions is None or encoder_coef <= 0.0:
+            encoder_predictions = None
+        encoder_stages = (
+            [(
+                encoder_predictions.class_logits,
+                encoder_predictions.boxes_xyxy,
+                encoder_predictions.boxes_cxcywh,
+                encoder_predictions.objectness_logits,
+            )]
+            if encoder_predictions is not None
+            else []
+        )
+        encoder_matches = None
+        if matches is None:
+            stage_matches = self._match_stages(
+                [
+                    (class_logits, bbox_preds, bbox_cxcywh, objectness_logits),
+                    *(
+                        (
+                            auxiliary.class_logits,
+                            auxiliary.boxes_xyxy,
+                            auxiliary.boxes_cxcywh,
+                            auxiliary.objectness_logits,
+                        )
+                        for auxiliary in auxiliary_predictions
+                    ),
+                    *encoder_stages,
+                ],
                 class_labels,
-                child_mask,
-                matches_by_batch,
-                loss_fn,
-                class_probability=getattr(
-                    self.det_cfg,
-                    "class_probability",
-                    "sigmoid",
-                ),
+                bbox_labels,
+                object_mask,
+                anchor_mask,
+                stage_masks=[anchor_mask] * (1 + len(auxiliary_predictions))
+                + ([encoder_mask] if encoder_stages else []),
             )
+            matches = stage_matches[0]
+            auxiliary_matches = stage_matches[1:1 + len(auxiliary_predictions)]
+            if encoder_stages:
+                encoder_matches = stage_matches[-1]
+        matches_by_batch: Dict[int, list] = {
+            b: matches[b] for b in range(B)
+        }
 
+        # Flat (batch, anchor, target) indices of all matched pairs, shipped
+        # to the device in one asynchronous copy.
+        flat_matches = match_index_array(matches)
+        num_matched = max(flat_matches.shape[1], 1)
+        loss_fn = base_loss_fn or self._default_binary_loss
+        target_objectness = torch.zeros_like(objectness_logits)
+
+        class_loss_scope = getattr(self.det_cfg, "class_loss_scope", "matched")
+        if flat_matches.shape[1] > 0:
+            sb, sa, tt = match_index_tensors(flat_matches, device)
             matched_bbox_pred = bbox_preds[sb, sa]
             matched_bbox_target = bbox_labels[sb, tt].to(device=device, dtype=bbox_preds.dtype)
+            if getattr(self.det_cfg, "objectness_target", "binary") == "iou":
+                # Quality-aware objectness: a matched slot's target is its
+                # box IoU, so the score ranks well-localized boxes first.
+                matched_iou = aligned_box_iou(
+                    matched_bbox_pred.detach().float(),
+                    matched_bbox_target.float(),
+                ).clamp(min=0.01, max=1.0)
+                target_objectness[sb, sa] = matched_iou.to(target_objectness.dtype)
+            else:
+                target_objectness[sb, sa] = 1.0
+
+            if class_loss_scope == "all_slots":
+                class_loss = all_slot_classification_loss(
+                    class_logits,
+                    class_labels,
+                    child_mask,
+                    anchor_mask,
+                    (sb, sa, tt),
+                    loss_fn,
+                    float(num_matched),
+                )
+            else:
+                class_loss = matched_classification_loss(
+                    class_logits,
+                    class_labels,
+                    child_mask,
+                    matches_by_batch,
+                    loss_fn,
+                    class_probability=getattr(
+                        self.det_cfg,
+                        "class_probability",
+                        "sigmoid",
+                    ),
+                    match_indices=(sb, sa, tt),
+                )
+
             if getattr(self.det_cfg, "bbox_l1_format", "cxcywh") == "cxcywh":
                 matched_l1_pred = bbox_cxcywh[sb, sa]
                 matched_l1_target = box_xyxy_to_cxcywh(matched_bbox_target)
@@ -692,7 +1058,15 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 )
             ).sum() / num_matched
         else:
-            class_loss = class_logits.new_tensor(0.0)
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            class_loss = (
+                all_slot_classification_loss(
+                    class_logits, class_labels, child_mask, anchor_mask,
+                    (empty, empty, empty), loss_fn, 1.0,
+                )
+                if class_loss_scope == "all_slots"
+                else class_logits.new_tensor(0.0)
+            )
             bbox_loss = class_logits.new_tensor(0.0)
             iou_loss = class_logits.new_tensor(0.0)
 
@@ -723,12 +1097,11 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             + float(getattr(self.det_cfg, "iou_loss_coef", 0.0)) * iou_loss
             + float(getattr(self.det_cfg, "objectness_loss_coef", 1.0)) * objectness_loss
         )
-        auxiliary_coef = float(
-            getattr(self.det_cfg, "auxiliary_detection_loss_coef", 0.0)
-        )
-        if auxiliary_coef > 0.0 and auxiliary_predictions:
+        if auxiliary_predictions:
             auxiliary_losses = []
-            for auxiliary in auxiliary_predictions:
+            for auxiliary, stage_matches in zip(
+                auxiliary_predictions, auxiliary_matches, strict=True,
+            ):
                 auxiliary_loss, _ = self._detection_loss(
                     auxiliary.class_logits,
                     auxiliary.boxes_xyxy,
@@ -740,9 +1113,25 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                     bbox_labels,
                     object_mask,
                     base_loss_fn=base_loss_fn,
+                    matches=stage_matches,
                 )
                 auxiliary_losses.append(auxiliary_loss)
             loss = loss + auxiliary_coef * torch.stack(auxiliary_losses).mean()
+        if encoder_predictions is not None and encoder_matches is not None:
+            encoder_loss, _ = self._detection_loss(
+                encoder_predictions.class_logits,
+                encoder_predictions.boxes_xyxy,
+                encoder_predictions.boxes_cxcywh,
+                encoder_predictions.objectness_logits,
+                encoder_mask,
+                child_mask,
+                class_labels,
+                bbox_labels,
+                object_mask,
+                base_loss_fn=base_loss_fn,
+                matches=encoder_matches,
+            )
+            loss = loss + encoder_coef * encoder_loss
         return loss, matches_by_batch
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
@@ -770,6 +1159,8 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 flat_inputs.child_mask, class_labels, bbox_labels, object_mask,
                 base_loss_fn=batch.get("base_loss_fn"),
                 auxiliary_predictions=predictions.auxiliary_predictions,
+                encoder_predictions=predictions.encoder_predictions,
+                encoder_mask=predictions.encoder_mask,
             )
 
         return TaskHeadOutput(
@@ -933,6 +1324,42 @@ class SegmentationHead(ObjectDetectionHead):
             return left.shape == right.shape and torch.equal(left, right)
         return left == right
 
+    def _refine_prototype_grid(self, tokens, height, width, coarse_validity=None):
+        """Project ``(B, height * width, D)`` grid tokens to refined prototype maps."""
+
+        proto = self.proto_proj(tokens).transpose(1, 2).reshape(
+            tokens.shape[0],
+            self.num_prototypes,
+            height,
+            width,
+        )
+        if coarse_validity is not None:
+            # Linear and convolutional biases can recreate values in padded
+            # cells, so preserve validity at every refinement boundary.
+            proto = proto * coarse_validity
+        for layer in self.proto_refine:
+            proto = layer(proto)
+            if coarse_validity is not None:
+                proto = proto * coarse_validity
+        return proto
+
+    def _upsample_prototypes(self, proto, coarse_validity=None):
+        proto = F.interpolate(
+            proto,
+            size=(self.mask_size, self.mask_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        output_validity = None
+        if coarse_validity is not None:
+            output_validity = F.interpolate(
+                coarse_validity,
+                size=(self.mask_size, self.mask_size),
+                mode="nearest",
+            ).squeeze(1).bool()
+            proto = proto * output_validity.unsqueeze(1)
+        return proto, output_validity
+
     def _prototype_masks(
         self,
         vision_tokens,
@@ -941,6 +1368,14 @@ class SegmentationHead(ObjectDetectionHead):
         *,
         return_validity=False,
     ):
+        if isinstance(spatial_shape, torch.Tensor):
+            proto, output_validity = self._ragged_prototype_masks(
+                vision_tokens,
+                spatial_shape,
+                vision_mask,
+            )
+            return (proto, output_validity) if return_validity else proto
+
         batch_size, token_count, _ = vision_tokens.shape
         height, width = spatial_shape
         if height * width != token_count:
@@ -965,37 +1400,87 @@ class SegmentationHead(ObjectDetectionHead):
                 height,
                 width,
             )
-        proto = self.proto_proj(vision_tokens).transpose(1, 2).reshape(
-            batch_size,
-            self.num_prototypes,
-            height,
-            width,
-        )
-        if coarse_validity is not None:
-            # Linear and convolutional biases can recreate values in padded
-            # cells, so preserve validity at every refinement boundary.
-            proto = proto * coarse_validity
-        for layer in self.proto_refine:
-            proto = layer(proto)
-            if coarse_validity is not None:
-                proto = proto * coarse_validity
-        proto = F.interpolate(
-            proto,
-            size=(self.mask_size, self.mask_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        output_validity = None
-        if coarse_validity is not None:
-            output_validity = F.interpolate(
-                coarse_validity,
-                size=(self.mask_size, self.mask_size),
-                mode="nearest",
-            ).squeeze(1).bool()
-            proto = proto * output_validity.unsqueeze(1)
+        proto = self._refine_prototype_grid(vision_tokens, height, width, coarse_validity)
+        proto, output_validity = self._upsample_prototypes(proto, coarse_validity)
         if return_validity:
             return proto, output_validity
         return proto
+
+    def _ragged_prototype_masks(self, vision_tokens, spatial_shapes, vision_mask=None):
+        """Prototype masks for rows whose tokens flatten grids of different sizes.
+
+        Each row's grid is laid onto a shared zero canvas, so the convolutions
+        see exactly the zero padding they would see on the row's own grid. The
+        row's own crop is then upsampled to the full mask, which keeps masks in
+        the same normalized image frame as the boxes.
+        """
+
+        batch_size, token_count, hidden_size = vision_tokens.shape
+        device = vision_tokens.device
+        shapes = spatial_shapes.to(device=device, dtype=torch.long)
+        if shapes.shape != (batch_size, 2):
+            raise ValueError(
+                f"spatial_shapes must have shape {(batch_size, 2)}, got {tuple(shapes.shape)}"
+            )
+        if int(shapes.prod(-1).max()) > token_count:
+            raise ValueError(
+                f"Segmentation received {token_count} dense tokens for grids up to "
+                f"{int(shapes.prod(-1).max())} cells"
+            )
+        _, valid = ragged_normalized_grid_2d(shapes, token_count, device=device)
+        if vision_mask is not None:
+            if vision_mask.shape != vision_tokens.shape[:2]:
+                raise ValueError(
+                    "vision feature mask must match the prototype token sequence"
+                )
+            valid = valid & vision_mask.to(device=device).bool()
+
+        height = int(shapes[:, 0].max())
+        width = int(shapes[:, 1].max())
+        canvas_cells = height * width
+        slots = torch.arange(token_count, device=device).unsqueeze(0)
+        row_widths = shapes[:, 1:].clamp(min=1)
+        canvas_index = (slots // row_widths) * width + slots % row_widths
+        # Padding slots all land in one extra cell that is dropped afterwards.
+        canvas_index = torch.where(valid, canvas_index, torch.full_like(canvas_index, canvas_cells))
+        valid_values = valid.to(dtype=vision_tokens.dtype)
+        canvas = vision_tokens.new_zeros(batch_size, canvas_cells + 1, hidden_size).scatter_add(
+            1,
+            canvas_index.unsqueeze(-1).expand(-1, -1, hidden_size),
+            vision_tokens * valid_values.unsqueeze(-1),
+        )[:, :canvas_cells]
+        coarse_validity = valid_values.new_zeros(batch_size, canvas_cells + 1).scatter_add(
+            1,
+            canvas_index,
+            valid_values,
+        )[:, :canvas_cells].reshape(batch_size, 1, height, width)
+
+        proto = self._refine_prototype_grid(canvas, height, width, coarse_validity)
+        output = None
+        output_validity = torch.zeros(
+            batch_size,
+            self.mask_size,
+            self.mask_size,
+            dtype=torch.bool,
+            device=device,
+        )
+        for shape in torch.unique(shapes, dim=0):
+            row_height, row_width = (int(value) for value in shape.tolist())
+            if row_height * row_width == 0:
+                continue
+            rows = (shapes == shape).all(dim=-1).nonzero().squeeze(-1)
+            upsampled, upsampled_validity = self._upsample_prototypes(
+                proto[rows, :, :row_height, :row_width],
+                coarse_validity[rows, :, :row_height, :row_width],
+            )
+            if output is None:
+                # Interpolation may change dtype under autocast; follow it.
+                output = upsampled.new_zeros(batch_size, *upsampled.shape[1:])
+            output[rows] = upsampled
+            output_validity[rows] = upsampled_validity
+        if output is None:
+            output = proto.new_zeros(batch_size, self.num_prototypes, self.mask_size, self.mask_size)
+        return output, output_validity
 
     def forward(self, shared, dependency_outputs, flat_inputs=None, **batch):
         class_labels = batch.get("segmentation_class_labels")
@@ -1051,6 +1536,8 @@ class SegmentationHead(ObjectDetectionHead):
                 flat_inputs.child_mask, class_labels, bbox_labels, object_mask,
                 base_loss_fn=batch.get("base_loss_fn"),
                 auxiliary_predictions=predictions.auxiliary_predictions,
+                encoder_predictions=predictions.encoder_predictions,
+                encoder_mask=predictions.encoder_mask,
             )
             mask_loss = predictions.class_logits.new_tensor(0.0)
             if mask_labels is not None:

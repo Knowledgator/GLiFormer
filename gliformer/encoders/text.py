@@ -68,6 +68,18 @@ class InputsEmbedsEncoderMixin:
             token_embeddings = self.projection(token_embeddings)
         return token_embeddings
 
+    def encode_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Run the backbone on token ids, passing its own extra inputs (e.g. image patches) through."""
+        token_embeddings = self.bert_layer(input_ids, attention_mask=attention_mask, **kwargs)
+        if hasattr(self, "projection"):
+            token_embeddings = self.projection(token_embeddings)
+        return token_embeddings
+
 
 class TextTransformer(Transformer):
     """GLiFormer transformer variant exposed from GLiFormer."""
@@ -75,8 +87,55 @@ class TextTransformer(Transformer):
     pass
 
 
+# Inputs laid out per token or per image that sequence packing would have to
+# move with the tokens; a batch carrying any of them is encoded padded.
+_PACKING_BLOCKING_KWARGS = (
+    "pair_attention_mask", "inputs_embeds", "position_ids", "bbox", "layout_input_mask",
+    "page_token_ids", "page_input_mask", "pixel_values", "vision_attention_mask",
+    "image_batch_idx", "image_page_ids",
+)
+
+
 class TextEncoder(InputsEmbedsEncoderMixin, GLiNEREncoder):
-    """GLiNER Encoder methods backed by GLiFormer's transformer wrapper."""
+    """GLiNER Encoder methods backed by GLiFormer's transformer wrapper.
+
+    With ``config.train_sequence_packing`` the rows of a training batch are
+    packed into streams no longer than the padded batch (first-fit, block
+    diagonal attention), so padding is not encoded. GLiNER only packs at
+    inference; the packing itself is index bookkeeping, so gradients flow.
+    """
+
+    def _packs_in_training(self, input_ids, attention_mask, args, kwargs) -> bool:
+        if not self.training or args:
+            return False
+        if not getattr(self.bert_layer.config, "train_sequence_packing", False):
+            return False
+        if not (isinstance(input_ids, torch.Tensor) and isinstance(attention_mask, torch.Tensor)):
+            return False
+        if input_ids.dim() != 2 or input_ids.shape[0] < 2:
+            return False
+        if any(kwargs.get(name) is not None for name in _PACKING_BLOCKING_KWARGS):
+            return False
+        token_type_ids = kwargs.get("token_type_ids")
+        # Segment ids would need packing too; all-zero ones (DeBERTa-v3) do not.
+        return token_type_ids is None or not bool(token_type_ids.any())
+
+    def encode_text(self, input_ids, attention_mask, *args, **kwargs):
+        if not self._packs_in_training(input_ids, attention_mask, args, kwargs):
+            return super().encode_text(input_ids, attention_mask, *args, **kwargs)
+        from gliner.infer_packing import InferencePackingConfig
+
+        kwargs.pop("token_type_ids", None)
+        kwargs.pop("packing_config", None)
+        token_lengths = kwargs.pop("token_lengths", None)
+        # Streams never exceed the padded batch, so no row is truncated.
+        config = InferencePackingConfig(max_length=int(input_ids.shape[1]))
+        token_embeddings = self._encode_with_packing(
+            input_ids, attention_mask, config, None, token_lengths=token_lengths, **kwargs,
+        )
+        if hasattr(self, "projection"):
+            token_embeddings = self.projection(token_embeddings)
+        return token_embeddings
 
     def __init__(
         self,
