@@ -100,6 +100,7 @@ class AnchorPairRelationsLayer(nn.Module):
         entity_representations: torch.Tensor,
         entity_mask: torch.Tensor,
         threshold: float,
+        schema=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = context_embedding.shape[0]
         context_mask = torch.ones(
@@ -141,6 +142,7 @@ class AnchorPairRelationsLayer(nn.Module):
                 position_encoding=self.refinement_positions,
                 self_attention_bias_module=self.self_attention_bias,
                 cross_attention_bias_module=self.cross_attention_bias,
+                extra_memory=schema,
             )
         return anchors, anchor_mask
 
@@ -152,7 +154,9 @@ class AnchorPairRelationsLayer(nn.Module):
         *,
         threshold: float = 0.5,
         deduplicate: bool = True,
+        schema=None,
     ) -> AnchorPairRelationsOutput:
+        """``schema`` is an optional ``MemorySegment`` the refinement also reads."""
         if entity_representations.dim() != 3:
             raise ValueError(
                 "entity_representations must have shape (B, E, D)"
@@ -170,6 +174,7 @@ class AnchorPairRelationsLayer(nn.Module):
             entity_representations,
             entity_mask,
             threshold,
+            schema=schema,
         )
         batch_size, anchor_count, hidden_size = anchors.shape
         entity_count = entity_representations.shape[1]

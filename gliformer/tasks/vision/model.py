@@ -692,6 +692,9 @@ class ObjectDetectionHead(MediaSetPredictionHead):
                 memory_coordinates=memory_coordinates,
                 memory_spatial_shape=memory_spatial_shape,
                 position_encoding=self.anchor_refine_positions,
+                extra_memory=self._schema_segment(
+                    self.anchor_schema_memory, flat_inputs,
+                ),
             )
             reference_logits = self.reference_boxes.unsqueeze(0).expand(
                 anchors.shape[0],
@@ -791,6 +794,7 @@ class ObjectDetectionHead(MediaSetPredictionHead):
             memory_positions=memory_positions,
             query_spatial_shape=covering_grid_2d(anchors.shape[1]),
             memory_spatial_shape=memory_spatial_shape,
+            schema_inputs=flat_inputs,
         )
 
         class_logits = self._score_anchor_labels(

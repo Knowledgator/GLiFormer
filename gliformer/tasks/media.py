@@ -578,6 +578,7 @@ class MediaClassificationHead(TaskHead):
             features,
             memory_mask=feature_mask,
             anchor_mask=anchor_mask,
+            schema_inputs=flat_inputs,
         )
         fused = self._reduce_fused_anchors(
             self._model_anchors(

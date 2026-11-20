@@ -266,7 +266,7 @@ _OPEN_REL_ASSIGNMENT_PREDICTION_FIELDS = frozenset(
 )
 
 
-_REBALANCE_STRATEGIES = ("batch_rebalance", "task_batch_rebalance")
+_REBALANCE_STRATEGIES = ("batch_rebalance", "task_batch_rebalance", "task_homogeneous")
 
 
 def _native_vision_spec_of(model: nn.Module):
@@ -368,7 +368,9 @@ class GLiFormerTrainer(GLiNERTrainer):
         into variable-size micro-batches of balanced padded cost
         (``BatchRebalanceSampler``). ``task_batch_rebalance`` does the same
         with every micro-batch holding a single task group
-        (``TaskGroupedBatchRebalanceSampler``). The sampler yields whole
+        (``TaskGroupedBatchRebalanceSampler``). ``task_homogeneous`` never mixes
+        task groups in a micro-batch (``TaskHomogeneousBatchSampler``); rows per
+        step vary. The sampler yields whole
         micro-batches, so it is passed as ``batch_sampler``.
         """
         if getattr(self.args, "train_sampling_strategy", None) not in _REBALANCE_STRATEGIES or isinstance(
@@ -409,6 +411,7 @@ class GLiFormerTrainer(GLiNERTrainer):
         from .batch_rebalance import (
             BatchRebalanceSampler,
             TaskGroupedBatchRebalanceSampler,
+            TaskHomogeneousBatchSampler,
             estimate_lengths,
             row_task,
         )
@@ -430,6 +433,23 @@ class GLiFormerTrainer(GLiNERTrainer):
             )
         world_size = max(1, self.args.world_size)
         grad_accum = self.args.gradient_accumulation_steps
+        if self.args.train_sampling_strategy == "task_homogeneous":
+            tasks = [row_task(row) for row in self.train_dataset]
+            sampler = TaskHomogeneousBatchSampler(
+                lengths=lengths,
+                tasks=tasks,
+                batch_size=self.args.train_batch_size,
+                dp_size=world_size,
+                grad_accum=grad_accum,
+                rank=self.args.process_index if world_size > 1 else 0,
+                seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+                drop_last=self.args.dataloader_drop_last,
+            )
+            print(
+                "task_homogeneous: token budget %.0f per micro-batch; %s"
+                % (sampler.token_budget, sampler.summary())
+            )
+            return sampler
         options = {}
         sampler_class = BatchRebalanceSampler
         if self.args.train_sampling_strategy == "task_batch_rebalance":

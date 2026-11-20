@@ -82,6 +82,7 @@ class AnchoredSpanExtractionHead(TaskHead):
             feature_embeddings,
             memory_mask=feature_mask,
             anchor_mask=anchor_mask,
+            schema_inputs=flat_inputs,
         )
 
         fused = self._model_anchors(

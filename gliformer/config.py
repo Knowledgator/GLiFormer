@@ -149,6 +149,14 @@ class AnchorHeadConfig(TaskHeadConfig):
     anchor_memory_position_usage: Optional[str] = None
     anchor_self_attention_bias: Any = None
     anchor_cross_attention_bias: Any = None
+    # Anchor refinement reads its main memory (text words, image/audio
+    # tokens, entities) only by default. True, or a mapping
+    # ``{tokens: all|parent|children, norm: none|layernorm, head_bias: bool}``,
+    # also lets the anchors cross-attend to the prompt schema: the parent
+    # token and its child tokens (fields, labels, relation types), appended
+    # after the main memory with a learned "schema" embedding in place of a
+    # position. A cross-attention bias still applies to the main memory.
+    anchor_memory_schema: Any = False
     feature_anchor_mlp: bool = False
     feature_anchor_mlp_hidden_multiplier: int = 1
     anchor_refine_layers: int = 0
@@ -393,6 +401,10 @@ class AnchorHeadConfig(TaskHeadConfig):
                 self.anchor_cross_attention_bias,
                 num_heads=self.anchor_refine_heads,
             )
+        from .layers.schema_memory import parse_schema_memory_spec
+
+        self.anchor_memory_schema = copy.deepcopy(self.anchor_memory_schema)
+        parse_schema_memory_spec(self.anchor_memory_schema)
 
         if self.anchor_refine_norm not in {"post_norm", "pre_norm"}:
             raise ValueError(
@@ -606,6 +618,7 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
         "anchor_memory_position_usage",
         "anchor_self_attention_bias",
         "anchor_cross_attention_bias",
+        "anchor_memory_schema",
         "feature_anchor_mlp",
         "feature_anchor_mlp_hidden_multiplier",
         "anchor_refine_layers",
@@ -894,6 +907,7 @@ class ObjectDetectionHeadConfig(SetPredictionHeadConfig):
             "anchor_memory_position_usage",
             "anchor_self_attention_bias",
             "anchor_cross_attention_bias",
+            "anchor_memory_schema",
             "parent_token_index",
             "embed_parent_token",
             "scorer_type",
@@ -1786,18 +1800,11 @@ class StructuringHeadConfig(_StructuringHeadConfigBase):
     typed_shuffle_options: bool = True
     typed_class_focal_loss_alpha: Optional[float] = None
     typed_class_focal_loss_gamma: Optional[float] = None
-    # Record-slot refinement reads the text words only by default. True also
-    # lets the slots cross-attend to the schema: the structure token and its
-    # field tokens, appended after the text with no position and a learned
-    # "schema" embedding instead. Needs no cross-attention bias.
-    anchor_memory_schema: bool = False
 
     def __post_init__(self):
         super().__post_init__()
         if not isinstance(self.reuse_ner_head, bool):
             raise TypeError("reuse_ner_head must be a boolean")
-        if not isinstance(self.anchor_memory_schema, bool):
-            raise TypeError("anchor_memory_schema must be a boolean")
         self.typed_fields = bool(self.typed_fields)
         self.typed_shuffle_options = bool(self.typed_shuffle_options)
         if int(self.typed_readout_heads) < 1:
@@ -2095,6 +2102,10 @@ class NormalizationNumberConfig:
 NORMALIZATION_SPAN_ENCODERS = ("marker", "mean", "tokens")
 
 
+# Tasks a normalization train_rows list can name (row fields that hold their data).
+NORMALIZATION_TRAIN_ROW_TASKS = ("ner", "structuring", "calculation")
+
+
 @dataclass
 class NormalizationHeadConfig:
     """Span-level normalization head: reads values from spans.
@@ -2124,9 +2135,11 @@ class NormalizationHeadConfig:
     # (the structuring decoder can only take values of spans the head read).
     max_spans: int = 64
     max_inference_spans: int = 512
-    # Rows that supply training targets: "all", or "calculation" (only rows
-    # with calculation programs; other rows give the head no targets).
-    train_rows: str = "all"
+    # Rows that supply training targets: "all", "calculation" (only rows
+    # with calculation programs; other rows give the head no targets), or a
+    # list of tasks from NORMALIZATION_TRAIN_ROW_TASKS (rows with data for any
+    # of them, e.g. [ner, structuring, calculation]).
+    train_rows: str | list[str] = "all"
     span_sources: list[str] = dataclasses.field(
         default_factory=lambda: ["structuring", "ner"]
     )
@@ -2155,9 +2168,22 @@ class NormalizationHeadConfig:
             if value < 1:
                 raise ValueError(f"{name} must be positive")
             setattr(self, name, value)
-        self.train_rows = str(self.train_rows).lower()
-        if self.train_rows not in ("all", "calculation"):
-            raise ValueError("train_rows must be 'all' or 'calculation'")
+        if isinstance(self.train_rows, (list, tuple)):
+            tasks = [str(task).lower() for task in self.train_rows]
+            unknown = set(tasks) - set(NORMALIZATION_TRAIN_ROW_TASKS)
+            if not tasks or unknown:
+                raise ValueError(
+                    f"train_rows list must name tasks from {list(NORMALIZATION_TRAIN_ROW_TASKS)}"
+                )
+            # One task list is the same as the string form.
+            self.train_rows = tasks[0] if tasks == ["calculation"] else sorted(set(tasks))
+        else:
+            self.train_rows = str(self.train_rows).lower()
+            if self.train_rows not in ("all", "calculation"):
+                raise ValueError(
+                    "train_rows must be 'all', 'calculation' or a list of tasks from "
+                    f"{list(NORMALIZATION_TRAIN_ROW_TASKS)}"
+                )
         self.span_sources = [str(source) for source in self.span_sources]
         unknown = set(self.span_sources) - {"structuring", "ner", "calculation"}
         if unknown:
@@ -2232,6 +2258,11 @@ class CalculationHeadConfig:
     # Stop gradients from the calculation head into the structuring anchors.
     detach_record_anchors: bool = False
     calc_token_index: int = -1
+    # Slot refinement memory is (query | operand spans | words) by default.
+    # True, or a mapping ``{tokens, norm, head_bias}`` (see
+    # ``AnchorHeadConfig.anchor_memory_schema``), also appends the record's
+    # schema: the structure token and its field tokens.
+    schema_memory: Any = False
 
     def __post_init__(self):
         for name in ("loss_coef", "bio_loss_coef", "port_loss_coef", "op_loss_coef", "active_loss_coef"):
@@ -2266,6 +2297,9 @@ class CalculationHeadConfig:
             setattr(self, name, value)
         self.detach_record_anchors = bool(self.detach_record_anchors)
         self.calc_token_index = int(self.calc_token_index)
+        from .layers.schema_memory import parse_schema_memory_spec
+
+        parse_schema_memory_spec(self.schema_memory, component_name="schema_memory")
 
 
 SEQUENCE_EDITING_VOCABS = ("tied",)

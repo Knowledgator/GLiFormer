@@ -177,6 +177,105 @@ class AnchorCrossAttentionMemory:
     source_length: int
     coordinates: torch.Tensor | None = None
     spatial_shape: tuple[int, int] | None = None
+    # Keys of an appended :class:`MemorySegment`: the main memory is the
+    # first ``source_length - extra_length`` caller keys.
+    extra_length: int = 0
+    extra_bias: torch.Tensor | None = None
+
+    @property
+    def main_length(self) -> int:
+        return self.source_length - self.extra_length
+
+
+@dataclass(frozen=True)
+class MemorySegment:
+    """Tokens appended after the main cross-attention memory.
+
+    Used for the prompt schema. The tokens have no position: ``embedding``
+    (``(D,)`` or ``(B, S, D)``) is used in place of one, and an attention
+    bias computed from main-memory coordinates gets ``bias`` (per head,
+    ``(H,)``; 0 when None) for these keys.
+    """
+
+    tokens: torch.Tensor
+    mask: torch.Tensor | None
+    embedding: torch.Tensor
+    bias: torch.Tensor | None = None
+
+
+def _append_memory_segment(token_emb, token_mask, memory_pos_emb, segment):
+    """Concatenate ``segment`` after the main memory, positions included."""
+
+    batch_size, length, hidden_size = token_emb.shape
+    extra = segment.tokens.to(device=token_emb.device, dtype=token_emb.dtype)
+    if extra.dim() != 3 or extra.shape[0] != batch_size or extra.shape[2] != hidden_size:
+        raise ValueError(
+            f"memory segment tokens must have shape ({batch_size}, S, {hidden_size}), "
+            f"got {tuple(extra.shape)}"
+        )
+    count = extra.shape[1]
+    if token_mask is None:
+        token_mask = torch.ones(batch_size, length, dtype=torch.bool, device=token_emb.device)
+    extra_mask = (
+        segment.mask.to(device=token_emb.device).bool()
+        if segment.mask is not None
+        else torch.ones(batch_size, count, dtype=torch.bool, device=token_emb.device)
+    )
+    if memory_pos_emb is None:
+        memory_pos_emb = token_emb.new_zeros(batch_size, length, hidden_size)
+    else:
+        memory_pos_emb = memory_pos_emb.to(token_emb.dtype).expand(
+            batch_size, length, hidden_size,
+        )
+    extra_pos = segment.embedding.to(device=token_emb.device, dtype=token_emb.dtype)
+    extra_pos = extra_pos.expand(batch_size, count, hidden_size)
+    return (
+        torch.cat([token_emb, extra], dim=1),
+        torch.cat([token_mask.to(device=token_emb.device).bool(), extra_mask], dim=1),
+        torch.cat([memory_pos_emb, extra_pos], dim=1),
+    )
+
+
+def _bias_4d(bias, batch_size, num_heads):
+    """View an additive bias as ``(B or 1, H or 1, A, L)``."""
+
+    if bias.dim() == 2:
+        return bias[None, None]
+    if bias.dim() == 3:
+        if num_heads > 1 and bias.shape[0] == batch_size * num_heads:
+            return bias.view(batch_size, num_heads, *bias.shape[1:])
+        return bias[:, None]
+    if bias.dim() == 4:
+        return bias
+    raise ValueError(
+        "cross_attention_bias must have shape (A, L), (B, A, L), "
+        "(B * H, A, L), or (B, H, A, L)"
+    )
+
+
+def _pad_segment_bias(bias, memory, *, batch_size, num_heads, query_length, reference):
+    """Extend a main-memory bias over the keys of an appended segment."""
+
+    extra = memory.extra_length
+    if extra == 0:
+        return bias
+    head_bias = memory.extra_bias
+    if bias is None and head_bias is None:
+        return None
+    if bias is None:
+        bias = reference.new_zeros(1, 1, query_length, memory.main_length)
+    else:
+        if bias.shape[-1] != memory.main_length:
+            # A caller bias that already covers the full memory.
+            return bias
+        bias = _bias_4d(bias.to(device=reference.device), batch_size, num_heads)
+    if head_bias is None:
+        tail = bias.new_zeros(*bias.shape[:-1], extra)
+    else:
+        bias = bias.expand(bias.shape[0], num_heads, *bias.shape[2:])
+        tail = head_bias.to(device=bias.device, dtype=bias.dtype).view(1, num_heads, 1, 1)
+        tail = tail.expand(bias.shape[0], num_heads, query_length, extra)
+    return torch.cat([bias, tail], dim=-1)
 
 
 def _apply_layer_scale(value: torch.Tensor, scale: nn.Parameter | None):
@@ -761,8 +860,13 @@ class AnchorCrossAttentionLayer(nn.Module):
         memory_coordinates: torch.Tensor | None = None,
         memory_spatial_shape: tuple[int, int] | None = None,
         position_encoding: RefinementPositionEncoding | None = None,
+        extra_memory: MemorySegment | None = None,
     ) -> AnchorCrossAttentionMemory:
-        """Prepare encoder memory once for one or more decoder layers."""
+        """Prepare encoder memory once for one or more decoder layers.
+
+        ``extra_memory`` is appended after the main memory; positions and
+        coordinates describe the main memory only.
+        """
 
         source_length = token_emb.shape[1]
         conditioning = position_encoding or self.position_encoding
@@ -790,6 +894,20 @@ class AnchorCrossAttentionLayer(nn.Module):
                 coordinates=memory_coordinates,
                 spatial_shape=memory_spatial_shape,
             )
+        extra_length = 0
+        extra_bias = None
+        if extra_memory is not None and extra_memory.tokens.shape[1] > 0:
+            token_emb, token_mask, memory_pos_emb = _append_memory_segment(
+                token_emb, token_mask, memory_pos_emb, extra_memory,
+            )
+            extra_length = extra_memory.tokens.shape[1]
+            extra_bias = extra_memory.bias
+            if extra_bias is not None and tuple(extra_bias.shape) != (self.num_heads,):
+                raise ValueError(
+                    f"memory segment bias must have shape ({self.num_heads},), "
+                    f"got {tuple(extra_bias.shape)}"
+                )
+            source_length = token_emb.shape[1]
         token_emb, token_mask, memory_pos_emb = _safe_cross_attention_memory(
             token_emb,
             token_mask,
@@ -802,6 +920,8 @@ class AnchorCrossAttentionLayer(nn.Module):
             source_length=source_length,
             coordinates=memory_coordinates,
             spatial_shape=memory_spatial_shape,
+            extra_length=extra_length,
+            extra_bias=extra_bias,
         )
 
     @staticmethod
@@ -911,10 +1031,18 @@ class AnchorCrossAttentionLayer(nn.Module):
                 query_coordinates=query_coordinates,
                 key_coordinates=memory.coordinates,
                 query_length=anchor_rep.shape[1],
-                key_length=memory.source_length,
+                key_length=memory.main_length,
                 anchor_rep=anchor_rep,
                 layer_index=layer_index,
             )
+        cross_attention_bias = _pad_segment_bias(
+            cross_attention_bias,
+            memory,
+            batch_size=anchor_rep.shape[0],
+            num_heads=self.num_heads,
+            query_length=anchor_rep.shape[1],
+            reference=anchor_rep,
+        )
         return layer(
             anchor_rep=anchor_rep,
             token_emb=memory.token_emb,
@@ -947,6 +1075,7 @@ class AnchorCrossAttentionLayer(nn.Module):
         position_encoding: RefinementPositionEncoding | None = None,
         self_attention_bias_module: AttentionBias | None = None,
         cross_attention_bias_module: AttentionBias | None = None,
+        extra_memory: MemorySegment | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -964,7 +1093,10 @@ class AnchorCrossAttentionLayer(nn.Module):
                 unmodified content for backward compatibility.
             cross_attention_bias: Optional additive spatial bias with shape
                 ``(A, L)``, ``(B, A, L)``, ``(B * H, A, L)``, or
-                ``(B, H, A, L)``.
+                ``(B, H, A, L)``. ``L`` covers the main memory; it is padded
+                over the ``extra_memory`` keys.
+            extra_memory: Optional :class:`MemorySegment` (e.g. the prompt
+                schema) appended after ``token_emb``.
 
         Returns:
             refined: (B, A, D) refined anchor embeddings
@@ -978,6 +1110,7 @@ class AnchorCrossAttentionLayer(nn.Module):
             memory_coordinates=memory_coordinates,
             memory_spatial_shape=memory_spatial_shape,
             position_encoding=position_encoding,
+            extra_memory=extra_memory,
         )
         for layer_index in range(self.num_layers):
             anchor_rep = self.forward_layer(

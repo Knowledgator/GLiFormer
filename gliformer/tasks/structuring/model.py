@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from gliner.modeling.utils import extract_spans_from_tokens
 
-from ...layers import AnchorModeling, NoAttentionBias
+from ...layers import AnchorModeling
 from ...layers.anchor_modeling import rename_state_dict_keys
 from ...layers.mlp import create_mlp
 from ...layers.span_pooling import build_span_pooler
@@ -93,6 +93,7 @@ class StructuringHead(NERHead):
                 anchor_query_position="none",
                 anchor_self_attention_bias="none",
                 anchor_cross_attention_bias="none",
+                anchor_memory_schema=False,
                 position_bucket_normalization="none",
                 position_bucket_attention_bias_type="none",
                 represent_spans=False,
@@ -187,24 +188,13 @@ class StructuringHead(NERHead):
                 task_cfg,
                 num_heads=self.record_anchor_refine.num_heads,
             )
-        self.anchor_memory_schema = bool(
-            getattr(task_cfg, "anchor_memory_schema", False)
+        self.record_schema_memory = self._build_schema_memory(
+            task_cfg.anchor_memory_schema,
+            hidden_size,
+            getattr(self, "record_anchor_refine", None),
         )
-        if self.anchor_memory_schema:
-            if not hasattr(self, "record_anchor_refine"):
-                raise ValueError(
-                    "anchor_memory_schema needs anchor refinement layers"
-                )
-            if not isinstance(self.record_cross_attention_bias, NoAttentionBias):
-                raise ValueError(
-                    "anchor_memory_schema does not support a cross-attention "
-                    "bias: schema tokens have no text position"
-                )
-            # Added to schema keys (and values, as text positions are) in
-            # place of a position, so slots can tell schema from text.
-            self.schema_memory_embedding = nn.Parameter(
-                torch.randn(hidden_size) * 0.02
-            )
+        # The first schema-memory version stored its embedding directly.
+        self._register_load_state_dict_pre_hook(self._migrate_schema_memory)
 
         # As in joint relation extraction, the second stage always needs a
         # token-level representation for each selected entity regardless of
@@ -422,68 +412,26 @@ class StructuringHead(NERHead):
             source_mask=feature_mask,
         )
         if hasattr(self, "record_anchor_refine"):
-            memory, memory_mask, memory_positions = (
-                feature_embeddings, feature_mask, None,
-            )
-            if self.anchor_memory_schema:
-                memory, memory_mask, memory_positions = self._schema_memory(
-                    flat_inputs, feature_embeddings, feature_mask,
-                )
             anchors = self.record_anchor_refine(
                 anchors,
-                memory,
-                token_mask=memory_mask,
+                feature_embeddings,
+                token_mask=feature_mask,
                 query_mask=anchor_mask,
-                memory_pos_emb=memory_positions,
                 position_encoding=self.record_anchor_refine_positions,
                 self_attention_bias_module=self.record_self_attention_bias,
                 cross_attention_bias_module=self.record_cross_attention_bias,
+                extra_memory=self._schema_segment(
+                    self.record_schema_memory, flat_inputs,
+                ),
             )
         return anchors, anchor_mask
 
-    def _schema_memory(self, flat_inputs, text, text_mask):
-        """Text words followed by the structure and field tokens.
-
-        Text keeps the positions it gets without the schema; schema tokens
-        get ``schema_memory_embedding`` instead of a position.
-        """
-        batch_size, _, hidden_size = text.shape
-        if text_mask is None:
-            text_mask = text.new_ones(text.shape[:2], dtype=torch.bool)
-        text_mask = text_mask.bool()
-        schema = torch.cat(
-            [
-                flat_inputs.parent_embedding.unsqueeze(1).to(text.dtype),
-                flat_inputs.child_embedding.to(text.dtype),
-            ],
-            dim=1,
-        )
-        schema_mask = torch.cat(
-            [
-                text_mask.new_ones(batch_size, 1),
-                flat_inputs.child_mask.to(device=text.device).bool(),
-            ],
-            dim=1,
-        )
-        positions = self.record_anchor_refine_positions
-        text_positions = (
-            positions.memory_positions(text, text_mask)
-            if positions is not None
-            else None
-        )
-        if text_positions is None:
-            text_positions = text.new_zeros(batch_size, text.shape[1], hidden_size)
-        else:
-            text_positions = text_positions.to(text.dtype).expand(
-                batch_size, -1, -1,
-            )
-        schema_positions = self.schema_memory_embedding.to(text.dtype).expand(
-            batch_size, schema.shape[1], hidden_size,
-        )
-        return (
-            torch.cat([text, schema], dim=1),
-            torch.cat([text_mask, schema_mask], dim=1),
-            torch.cat([text_positions, schema_positions], dim=1),
+    @staticmethod
+    def _migrate_schema_memory(state_dict, prefix, *args, **kwargs):
+        rename_state_dict_keys(
+            state_dict,
+            prefix,
+            {"schema_memory_embedding": "record_schema_memory.embedding"},
         )
 
     def _pool_entity_spans(self, words_embedding, span_idx, span_mask, token_source=None):
@@ -1404,8 +1352,11 @@ class StructuringHead(NERHead):
             "groups_output": record_anchors,
             "anchor_mask": anchor_mask,
             "batch_origin": flat_inputs.batch_origin if flat_inputs is not None else None,
-            # Schema parent vector per group (the calculation head reads it).
+            # Schema parent and field vectors per group (the calculation
+            # head reads them).
             "parent_embedding": flat_inputs.parent_embedding if flat_inputs is not None else None,
+            "child_embedding": flat_inputs.child_embedding if flat_inputs is not None else None,
+            "child_mask": flat_inputs.child_mask if flat_inputs is not None else None,
             "objectness_logits": objectness_logits,
             "entity_loss": (
                 entity_loss.detach() if entity_loss is not None else None

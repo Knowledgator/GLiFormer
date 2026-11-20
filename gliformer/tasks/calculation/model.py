@@ -153,6 +153,12 @@ class CalculationHead(TaskHead):
                 dropout,
                 {},
             )
+        self.schema_memory = TaskHead._build_schema_memory(
+            cfg.schema_memory,
+            hidden_size,
+            self.slot_refine,
+            option_name="schema_memory",
+        )
         # Slot identity at the scale of the (LayerNorm'd) query: the fixed
         # slot table rows have norm 1, so on their own every slot would look
         # like the query and slots could not learn their step position.
@@ -596,7 +602,18 @@ class CalculationHead(TaskHead):
             torch.ones_like(operand_mask[:, :1]), operand_mask, query_word_mask,
         ], dim=1)
         if self.slot_refine is not None:
-            slots = self.slot_refine(slots, memory, token_mask=memory_mask, query_mask=slot_mask)
+            schema = None
+            if self.schema_memory is not None:
+                children = extra_in.get("child_embedding")
+                child_mask = extra_in.get("child_mask")
+                schema = self.schema_memory(
+                    parent[group],
+                    children[group] if children is not None else None,
+                    child_mask[group] if child_mask is not None else None,
+                )
+            slots = self.slot_refine(
+                slots, memory, token_mask=memory_mask, query_mask=slot_mask, extra_memory=schema,
+            )
 
         scale = 1.0 / math.sqrt(self.hidden_size)
         port_queries = self.port_query(slots.unsqueeze(2) + self.port_role.weight[None, None])
