@@ -17,6 +17,7 @@ from ..layers import (
     AttentionBias,
     RefinementPositionEncoding,
 )
+from ..layers.schema_memory import SchemaMemory
 from ..layers.span_pooling import SpanTokenSource, build_span_pooler
 
 
@@ -325,6 +326,48 @@ class TaskHead(ABC, nn.Module):
             AttentionBias.from_config(cross_bias_spec, num_heads=num_heads),
         )
 
+    @staticmethod
+    def _build_schema_memory(
+        spec,
+        hidden_size,
+        refinement,
+        *,
+        option_name="anchor_memory_schema",
+    ):
+        """Schema tokens as extra memory of ``refinement``; None when off."""
+
+        schema_memory = SchemaMemory.from_config(
+            spec,
+            hidden_size,
+            getattr(refinement, "num_heads", 1),
+        )
+        if schema_memory is None:
+            return None
+        if refinement is None:
+            raise ValueError(f"{option_name} needs anchor refinement layers")
+        if not isinstance(refinement, AnchorCrossAttentionLayer):
+            raise ValueError(
+                f"{option_name} needs a cross_attention anchor refinement"
+            )
+        return schema_memory
+
+    @staticmethod
+    def _schema_segment(schema_memory, schema_inputs):
+        """The prompt schema of ``schema_inputs`` (flat inputs) as memory."""
+
+        if schema_memory is None:
+            return None
+        if schema_inputs is None:
+            raise ValueError(
+                "anchor_memory_schema is enabled but the head passed no "
+                "schema inputs to anchor refinement"
+            )
+        return schema_memory(
+            getattr(schema_inputs, "parent_embedding", None),
+            getattr(schema_inputs, "child_embedding", None),
+            getattr(schema_inputs, "child_mask", None),
+        )
+
     def _init_anchor_components(
         self,
         task_cfg,
@@ -381,6 +424,11 @@ class TaskHead(ABC, nn.Module):
                 task_cfg,
                 num_heads=self.anchor_refine.num_heads,
             )
+        self.anchor_schema_memory = self._build_schema_memory(
+            getattr(task_cfg, "anchor_memory_schema", False),
+            hidden_size,
+            getattr(self, "anchor_refine", None),
+        )
 
         if hasattr(task_cfg, "represent_spans"):
             self.represent_spans = bool(task_cfg.represent_spans)
@@ -466,9 +514,19 @@ class TaskHead(ABC, nn.Module):
         memory_positions: torch.Tensor | None = None,
         query_spatial_shape: tuple[int, int] | None = None,
         memory_spatial_shape: tuple[int, int] | None = None,
+        schema_inputs=None,
     ) -> torch.Tensor:
+        """Refine anchors against ``memory``.
+
+        ``schema_inputs`` (the head's flat inputs) supplies the prompt schema
+        appended to the memory when ``anchor_memory_schema`` is on.
+        """
         if not hasattr(self, "anchor_refine"):
             return anchors
+        extra_memory = self._schema_segment(
+            getattr(self, "anchor_schema_memory", None),
+            schema_inputs,
+        )
         if not isinstance(self.anchor_refine, AnchorCrossAttentionLayer):
             return self.anchor_refine(
                 anchors,
@@ -494,6 +552,7 @@ class TaskHead(ABC, nn.Module):
             ),
             self_attention_bias_module=self.anchor_self_attention_bias,
             cross_attention_bias_module=self.anchor_cross_attention_bias,
+            extra_memory=extra_memory,
         )
 
     @property

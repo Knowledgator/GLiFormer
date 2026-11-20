@@ -2558,6 +2558,31 @@ class BaseGLiFormer(BaseGLiNER):
             "frozen_shared_head_params": frozen_shared_params,
         }
 
+    def freeze_component(self, component_name: str) -> int:
+        """Freeze one component: ``"text_encoder"``, ``"labels_encoder"``,
+        ``"rnn"`` or a task head name. Returns the number of frozen parameters."""
+        model = self.model
+        token_rep = getattr(model, "token_rep_layer", None)
+        if component_name == "text_encoder":
+            module = getattr(token_rep, "bert_layer", None) or getattr(token_rep, "encoder", None) or token_rep
+        elif component_name == "labels_encoder":
+            module = getattr(token_rep, "labels_encoder", None)
+        elif component_name == "rnn":
+            module = getattr(model, "rnn", None)
+        elif component_name in getattr(model, "heads", {}):
+            module = model.heads[component_name]
+        else:
+            module = None
+        if module is None:
+            raise ValueError(f"Unknown or missing component to freeze: {component_name!r}")
+        count = 0
+        for param in module.parameters():
+            if param.requires_grad:
+                param.requires_grad_(False)
+                count += param.numel()
+        logger.info("Froze %s: %s params", component_name, count)
+        return count
+
     def train_model(
         self,
         train_dataset,

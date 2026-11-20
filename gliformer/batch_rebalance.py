@@ -546,3 +546,122 @@ class TaskGroupedBatchRebalanceSampler(BatchRebalanceSampler):
         for position, group in enumerate(ordered):
             sequence.extend(group if position % 2 == 0 else reversed(group))
         return super()._balance_groups(sequence)
+
+
+class TaskHomogeneousBatchSampler(Sampler):
+    """Micro-batches that each hold rows of a single task group (``task_homogeneous``).
+
+    Unlike ``TaskGroupedBatchRebalanceSampler``, no micro-batch ever mixes two
+    task groups, so every forward pass runs only one task's heads. Per epoch,
+    each group's rows are shuffled, sorted by length inside pools of
+    ``pool_batches`` micro-batches (less padding), and cut into micro-batches
+    whose padded cost stays within ``token_budget``: short rows travel in large
+    micro-batches, long rows in small ones. All micro-batches are then shuffled
+    together, so an optimizer step (``grad_accum`` micro-batches per rank)
+    mixes tasks across its micro-batches in proportion to their token volume.
+
+    The budget defaults to ``batch_size`` rows of the dataset's mean cost, the
+    same average as a ``batch_rebalance`` micro-batch. Rows per step vary.
+    """
+
+    QUADRATIC_COST_COEF = getattr(BatchRebalanceSampler, "QUADRATIC_COST_COEF", 0.001)
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        tasks: Sequence[str],
+        batch_size: int,
+        dp_size: int = 1,
+        grad_accum: int = 1,
+        rank: int = 0,
+        seed: int = 42,
+        token_budget: Optional[float] = None,
+        max_batch_size: Optional[int] = None,
+        pool_batches: int = 50,
+        drop_last: bool = True,
+    ):
+        if len(tasks) != len(lengths):
+            raise ValueError(f"Got {len(tasks)} task labels for {len(lengths)} samples.")
+        self.lengths = [max(1, int(length)) for length in lengths]
+        self.tasks = list(tasks)
+        self.batch_size = int(batch_size)
+        self.dp_size = max(1, int(dp_size))
+        self.grad_accum = max(1, int(grad_accum))
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.pool_batches = max(1, int(pool_batches))
+        self.max_batch_size = int(max_batch_size) if max_batch_size else 8 * self.batch_size
+        self.drop_last = drop_last
+        self.epoch = 0
+        if token_budget is None:
+            token_budget = self.batch_size * float(np.mean([self._row_cost(length) for length in self.lengths]))
+        self.token_budget = float(token_budget)
+        self._plan_epoch = None
+        self._plan: List[List[int]] = []
+
+    def _row_cost(self, length: int) -> float:
+        return length + self.QUADRATIC_COST_COEF * length * length
+
+    def _cost(self, bs: int, max_len: int) -> float:
+        return bs * self._row_cost(max_len)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def _build_plan(self) -> List[List[int]]:
+        if self._plan_epoch == self.epoch:
+            return self._plan
+        rng = random.Random(self.seed + self.epoch)
+        by_task: Dict[str, List[int]] = defaultdict(list)
+        for index, task in enumerate(self.tasks):
+            by_task[task].append(index)
+        micro_batches: List[List[int]] = []
+        for task in sorted(by_task):
+            indices = by_task[task]
+            rng.shuffle(indices)
+            pool = self.pool_batches * self.batch_size
+            for start in range(0, len(indices), pool):
+                chunk = sorted(indices[start : start + pool], key=lambda i: self.lengths[i], reverse=True)
+                current: List[int] = []
+                for index in chunk:  # longest first: the first row sets the padded length
+                    max_len = self.lengths[current[0]] if current else self.lengths[index]
+                    if current and (
+                        self._cost(len(current) + 1, max_len) > self.token_budget
+                        or len(current) >= self.max_batch_size
+                    ):
+                        micro_batches.append(current)
+                        current = []
+                    current.append(index)
+                if current:
+                    micro_batches.append(current)
+        rng.shuffle(micro_batches)
+        per_step = self.dp_size * self.grad_accum
+        if self.drop_last:
+            micro_batches = micro_batches[: len(micro_batches) // per_step * per_step]
+        elif len(micro_batches) % per_step:
+            pad = per_step - len(micro_batches) % per_step
+            micro_batches = micro_batches + micro_batches[:pad]
+        self._plan_epoch = self.epoch
+        self._plan = micro_batches
+        return micro_batches
+
+    def __iter__(self):
+        plan = self._build_plan()
+        per_step = self.dp_size * self.grad_accum
+        for step_start in range(0, len(plan), per_step):
+            step = plan[step_start : step_start + per_step]
+            yield from step[self.rank * self.grad_accum : (self.rank + 1) * self.grad_accum]
+
+    def __len__(self):
+        return len(self._build_plan()) // self.dp_size
+
+    def summary(self) -> Dict[str, Any]:
+        """Micro-batch count and mean rows per task group for the current epoch."""
+        plan = self._build_plan()
+        stats: Dict[str, List[int]] = defaultdict(list)
+        for batch in plan:
+            stats[self.tasks[batch[0]]].append(len(batch))
+        return {
+            task: {"micro_batches": len(sizes), "mean_rows": round(sum(sizes) / len(sizes), 1)}
+            for task, sizes in sorted(stats.items(), key=lambda kv: -len(kv[1]))
+        }

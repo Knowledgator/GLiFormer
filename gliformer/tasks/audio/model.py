@@ -120,6 +120,7 @@ class AudioSegmentationHead(MediaSetPredictionHead):
             audio_features,
             memory_mask=audio_mask,
             anchor_mask=anchor_mask,
+            schema_inputs=flat_inputs,
         )
         class_logits = self._score_anchor_labels(
             anchors,

@@ -157,6 +157,12 @@ class JointRelexHead(NERHead):
                     getattr(groups_layer, "max_count", rel_cfg.max_count),
                 )
             )
+            # Schema here: the relation-task parent and the relation types.
+            self.relation_schema_memory = self._build_schema_memory(
+                rel_cfg.anchor_memory_schema,
+                hidden_size,
+                relation_anchor_refinement,
+            )
             self.anchor_relations_layer = AnchorPairRelationsLayer(
                 hidden_size=hidden_size,
                 anchor_layer=relation_anchor_layer,
@@ -992,11 +998,17 @@ class JointRelexHead(NERHead):
                     "anchor-modeling relation selection requires a parent "
                     "context embedding"
                 )
+            schema = None
+            if self.relation_schema_memory is not None:
+                schema = self.relation_schema_memory(
+                    relation_context, rel_prompts, rel_prompts_mask,
+                )
             anchor_output = self.anchor_relations_layer(
                 relation_context,
                 target_span_rep,
                 target_span_mask,
                 threshold=anchor_threshold,
+                schema=schema,
                 # During training Hungarian matching decides which gold pair
                 # belongs to each anchor. At inference repeated predictions are
                 # collapsed before relation decoding.

@@ -64,6 +64,7 @@ class OpenRelexHead(NERHead):
         entity_cfg.anchor_query_position = "none"
         entity_cfg.anchor_self_attention_bias = "none"
         entity_cfg.anchor_cross_attention_bias = "none"
+        entity_cfg.anchor_memory_schema = False
         entity_cfg.represent_spans = False
         super().__init__(
             config,
@@ -121,6 +122,12 @@ class OpenRelexHead(NERHead):
                 task_cfg,
                 num_heads=self.relation_anchor_refine.num_heads,
             )
+        # Schema here: the relation-task parent and the relation types.
+        self.relation_schema_memory = self._build_schema_memory(
+            task_cfg.anchor_memory_schema,
+            hidden_size,
+            getattr(self, "relation_anchor_refine", None),
+        )
 
         self.entity_span_rep_layer = build_span_pooler(
             task_cfg,
@@ -311,6 +318,9 @@ class OpenRelexHead(NERHead):
                 position_encoding=self.relation_anchor_refine_positions,
                 self_attention_bias_module=self.relation_self_attention_bias,
                 cross_attention_bias_module=self.relation_cross_attention_bias,
+                extra_memory=self._schema_segment(
+                    self.relation_schema_memory, flat_inputs,
+                ),
             )
         return anchors, anchor_mask
 

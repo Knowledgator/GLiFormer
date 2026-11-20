@@ -225,14 +225,25 @@ class NormalizationProcessor(TaskProcessor):
             targets.append(target)
         return targets
 
+    def _is_train_row(self, item) -> bool:
+        """Whether ``train_rows`` lets this row supply targets.
+
+        The collator fills every row with empty task fields, so only a
+        non-empty field marks a row with data of that task.
+        """
+
+        rows = self.task_config.train_rows
+        if rows == "all":
+            return True
+        tasks = [rows] if isinstance(rows, str) else rows
+        fields = {"ner": "extraction", "structuring": "structuring", "calculation": CALCULATION_DATA_KEY}
+        return any(item.get(fields[task]) for task in tasks)
+
     def item_targets(self, item, *, limit: int | None = None) -> list[SpanTarget]:
         """Labelled spans of one row in reading order, within ``limit`` words."""
 
         cfg = self.task_config
-        # The collator fills every row with an empty ``calculation`` dict, so
-        # only a non-empty one marks a row with calculation programs.
-        programs = item.get(CALCULATION_DATA_KEY)
-        if cfg.train_rows == "calculation" and not (isinstance(programs, dict) and programs):
+        if not self._is_train_row(item):
             return []
         merged: dict[tuple[int, int], SpanTarget] = {}
         for target in self._gold_targets(item):
